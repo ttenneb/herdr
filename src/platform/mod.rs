@@ -42,6 +42,42 @@ pub(crate) fn configure_background_command(command: &mut std::process::Command) 
 #[cfg(not(windows))]
 fn configure_background_command_platform(_command: &mut std::process::Command) {}
 
+/// A child launched in the strongest practical platform process-tree isolation.
+///
+/// Choice providers use this wrapper so timeout cleanup cannot leave descendants
+/// behind. Platform details remain confined to this module and its OS backends.
+pub(crate) struct IsolatedChild {
+    child: std::process::Child,
+    isolation: ProcessIsolation,
+}
+
+impl IsolatedChild {
+    pub(crate) fn spawn(command: &mut std::process::Command) -> std::io::Result<Self> {
+        let (child, isolation) = spawn_isolated_process_platform(command)?;
+        Ok(Self { child, isolation })
+    }
+
+    pub(crate) fn stdout(&mut self) -> Option<std::process::ChildStdout> {
+        self.child.stdout.take()
+    }
+
+    pub(crate) fn stderr(&mut self) -> Option<std::process::ChildStderr> {
+        self.child.stderr.take()
+    }
+
+    pub(crate) fn try_wait(&mut self) -> std::io::Result<Option<std::process::ExitStatus>> {
+        self.child.try_wait()
+    }
+
+    pub(crate) fn wait(&mut self) -> std::io::Result<std::process::ExitStatus> {
+        self.child.wait()
+    }
+
+    pub(crate) fn terminate_tree(&mut self) -> std::io::Result<()> {
+        terminate_isolated_process_platform(&mut self.child, &mut self.isolation)
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct PlatformCapabilities {
     pub(crate) live_handoff: bool,

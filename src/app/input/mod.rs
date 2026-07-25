@@ -379,9 +379,18 @@ impl App {
                     }
                     MouseAction::ConfirmCloseAccept => self.confirm_close_accept_via_api(),
                     MouseAction::ContextMenu { menu, idx } => {
-                        self.apply_context_menu_action_via_api(menu, idx)
+                        self.apply_context_menu_action_via_api(*menu, idx)
                     }
                 }
+            }
+            if self.state.mode == crate::app::state::Mode::ContextMenu
+                && self
+                    .state
+                    .context_menu
+                    .as_ref()
+                    .is_some_and(|menu| menu.plugin.is_none())
+            {
+                self.initialize_context_menu_plugins();
             }
             if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left))
                 && self

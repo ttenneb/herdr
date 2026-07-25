@@ -907,6 +907,7 @@ fn plugin_link_list_unlink_round_trip() {
             contexts: vec![PluginActionContext::Workspace],
             platforms: None,
             command: vec!["bun".into(), "run".into(), "bootstrap.ts".into()],
+            choices_command: Some(vec!["bun".into(), "run".into(), "choices.ts".into()]),
         }],
         events: vec![PluginManifestEventHook {
             on: "worktree.created".into(),
@@ -1241,6 +1242,7 @@ fn plugin_action_list_and_invoke_round_trips() {
         description: Some("Open the issue assignment UI".into()),
         contexts: vec![PluginActionContext::Workspace, PluginActionContext::Pane],
         command: vec!["assign".into(), "--issue".into()],
+        choices_command: Some(vec!["assign".into(), "--choices".into()]),
         platforms: Some(vec![PluginPlatform::Linux, PluginPlatform::Macos]),
     };
     assert_eq!(
@@ -1250,6 +1252,36 @@ fn plugin_action_list_and_invoke_round_trips() {
     let json = serde_json::to_string(&action_info).unwrap();
     let restored: PluginActionInfo = serde_json::from_str(&json).unwrap();
     assert_eq!(restored, action_info);
+
+    let legacy = serde_json::json!({
+        "plugin_id": "example.issue-flow",
+        "action_id": "assign-issue",
+        "title": "Assign Issue",
+        "contexts": [],
+        "command": ["assign"]
+    });
+    let restored: PluginActionInfo = serde_json::from_value(legacy).unwrap();
+    assert_eq!(restored.choices_command, None);
+
+    let legacy_manifest_action: PluginManifestAction = serde_json::from_value(serde_json::json!({
+        "id": "assign-issue",
+        "title": "Assign Issue",
+        "command": ["assign"]
+    }))
+    .unwrap();
+    assert_eq!(legacy_manifest_action.choices_command, None);
+
+    let choices = PluginActionChoices {
+        version: 1,
+        choices: vec![PluginActionChoice {
+            id: "mine".into(),
+            label: "My issues".into(),
+            payload: serde_json::json!({ "assignee": "me" }),
+        }],
+    };
+    let restored: PluginActionChoices =
+        serde_json::from_value(serde_json::to_value(&choices).unwrap()).unwrap();
+    assert_eq!(restored, choices);
 }
 
 #[test]

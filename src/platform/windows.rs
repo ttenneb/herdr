@@ -3,6 +3,7 @@ use std::{
     ffi::c_void,
     mem::{size_of, MaybeUninit},
     path::PathBuf,
+    process::{Child, Command},
     ptr::{copy_nonoverlapping, null_mut},
     sync::{Arc, Mutex},
     time::{Duration, Instant},
@@ -25,13 +26,17 @@ use windows_sys::{
                     TH32CS_SNAPPROCESS,
                 },
             },
-            JobObjects::IsProcessInJob,
+            JobObjects::{
+                AssignProcessToJobObject, CreateJobObjectW, IsProcessInJob,
+                JobObjectExtendedLimitInformation, SetInformationJobObject, TerminateJobObject,
+                JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+            },
             Memory::{GlobalAlloc, GlobalLock, GlobalUnlock, GMEM_MOVEABLE},
             Ole::CF_UNICODETEXT,
             Threading::{
                 GetCurrentProcess, GetExitCodeProcess, OpenProcess, TerminateProcess,
                 CREATE_NO_WINDOW, DETACHED_PROCESS, PROCESS_BASIC_INFORMATION,
-                PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_VM_READ,
+                PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_TERMINATE, PROCESS_VM_READ,
             },
         },
         UI::{
@@ -55,6 +60,95 @@ use super::{ClipboardImage, ForegroundJob, Signal};
 
 const STILL_ACTIVE: u32 = 259;
 const FOREGROUND_PROCESS_SNAPSHOT_CACHE_TTL: Duration = Duration::from_millis(250);
+
+pub(crate) struct ProcessIsolation(Option<HANDLE>);
+
+impl Drop for ProcessIsolation {
+    fn drop(&mut self) {
+        if let Some(job) = self.0.take() {
+            unsafe { CloseHandle(job) };
+        }
+    }
+}
+
+pub(crate) fn spawn_isolated_process_platform(
+    command: &mut Command,
+) -> std::io::Result<(Child, ProcessIsolation)> {
+    use std::os::windows::io::AsRawHandle;
+
+    let child = command.spawn()?;
+    let job = unsafe { CreateJobObjectW(null_mut(), std::ptr::null()) };
+    if job.is_null() {
+        return Ok((child, ProcessIsolation(None)));
+    }
+
+    let mut limits = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
+    limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+    let configured = unsafe {
+        SetInformationJobObject(
+            job,
+            JobObjectExtendedLimitInformation,
+            (&limits as *const JOBOBJECT_EXTENDED_LIMIT_INFORMATION).cast(),
+            size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+        ) != 0
+    };
+    let assigned = configured
+        && unsafe { AssignProcessToJobObject(job, child.as_raw_handle() as HANDLE) != 0 };
+    if assigned {
+        Ok((child, ProcessIsolation(Some(job))))
+    } else {
+        unsafe { CloseHandle(job) };
+        // Assignment can fail when the host itself is in a restrictive job.
+        // Keep the child and use the descendant-snapshot fallback at timeout.
+        Ok((child, ProcessIsolation(None)))
+    }
+}
+
+pub(crate) fn terminate_isolated_process_platform(
+    child: &mut Child,
+    isolation: &mut ProcessIsolation,
+) -> std::io::Result<()> {
+    if let Some(job) = isolation.0 {
+        if unsafe { TerminateJobObject(job, 1) != 0 } {
+            return Ok(());
+        }
+    }
+
+    let root_pid = child.id();
+    let entries = snapshot_processes();
+    let mut descendant_error = None;
+    for pid in descendant_entries(root_pid, &entries)
+        .into_iter()
+        .map(|entry| entry.pid)
+    {
+        if let Err(err) = terminate_process(pid) {
+            descendant_error.get_or_insert(err);
+        }
+    }
+
+    let root_result = match child.kill() {
+        Ok(()) => Ok(()),
+        Err(err) => match child.try_wait()? {
+            Some(_) => Ok(()),
+            None => Err(err),
+        },
+    };
+    root_result.and_then(|()| descendant_error.map_or(Ok(()), Err))
+}
+
+fn terminate_process(pid: u32) -> std::io::Result<()> {
+    let handle = unsafe { OpenProcess(PROCESS_TERMINATE, 0, pid) };
+    if handle.is_null() {
+        return Err(std::io::Error::last_os_error());
+    }
+    let terminated = unsafe { TerminateProcess(handle, 1) != 0 };
+    unsafe { CloseHandle(handle) };
+    if terminated {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
 
 #[derive(Debug)]
 struct CachedProcessSnapshot {

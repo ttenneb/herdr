@@ -5,9 +5,8 @@ use tracing::warn;
 
 use crate::{
     app::state::{
-        AgentPanelSort, AppState, ContextMenuKind, ContextMenuState, DragState, DragTarget,
-        MenuListState, Mode, RightClickPassthroughGesture, TabPressState, ViewLayout,
-        WorkspacePressState,
+        AgentPanelSort, AppState, ContextMenuKind, ContextMenuState, DragState, DragTarget, Mode,
+        RightClickPassthroughGesture, TabPressState, ViewLayout, WorkspacePressState,
     },
     layout::{PaneInfo, SplitBorder},
     selection::Selection,
@@ -55,7 +54,7 @@ pub(super) enum MouseAction {
     RenameModal(ModalAction),
     ConfirmCloseAccept,
     ContextMenu {
-        menu: ContextMenuState,
+        menu: Box<ContextMenuState>,
         idx: usize,
     },
 }
@@ -411,7 +410,10 @@ impl AppState {
                     let item_idx = self.context_menu_item_at(mouse.column, mouse.row);
                     if let Some(menu) = self.context_menu.take() {
                         if let Some(idx) = item_idx {
-                            return Some(MouseAction::ContextMenu { menu, idx });
+                            return Some(MouseAction::ContextMenu {
+                                menu: Box::new(menu),
+                                idx,
+                            });
                         } else {
                             leave_modal(self);
                         }
@@ -891,6 +893,22 @@ impl AppState {
             }
 
             MouseEventKind::ScrollUp | MouseEventKind::ScrollDown
+                if self.mode == Mode::ContextMenu =>
+            {
+                let visible_rows = self
+                    .context_menu_rect()
+                    .map_or(0, |rect| rect.height.saturating_sub(2) as usize);
+                let delta = if matches!(mouse.kind, MouseEventKind::ScrollUp) {
+                    -1
+                } else {
+                    1
+                };
+                if let Some(menu) = &mut self.context_menu {
+                    menu.scroll(delta, visible_rows);
+                }
+            }
+
+            MouseEventKind::ScrollUp | MouseEventKind::ScrollDown
                 if self.on_tab_bar(mouse.column, mouse.row) =>
             {
                 match mouse.kind {
@@ -975,7 +993,13 @@ impl AppState {
             }
 
             MouseEventKind::Moved if self.mode == Mode::ContextMenu => {
-                let hovered = self.context_menu_item_at(mouse.column, mouse.row);
+                let hovered = self
+                    .context_menu_item_at(mouse.column, mouse.row)
+                    .filter(|index| {
+                        self.context_menu
+                            .as_ref()
+                            .is_some_and(|menu| menu.entry_enabled(*index))
+                    });
                 if let Some(menu) = &mut self.context_menu {
                     menu.list.hover(hovered);
                 }
@@ -1030,12 +1054,7 @@ impl AppState {
                             })
                         })
                         .unwrap_or(ContextMenuKind::Workspace { ws_idx: idx });
-                    self.context_menu = Some(ContextMenuState {
-                        kind,
-                        x: mouse.column,
-                        y: mouse.row,
-                        list: MenuListState::new(0),
-                    });
+                    self.context_menu = Some(ContextMenuState::new(kind, mouse.column, mouse.row));
                     self.mode = Mode::ContextMenu;
                 }
             }
@@ -1046,12 +1065,11 @@ impl AppState {
                 if let (Some(ws_idx), Some(tab_idx)) =
                     (self.active, self.tab_at(mouse.column, mouse.row))
                 {
-                    self.context_menu = Some(ContextMenuState {
-                        kind: ContextMenuKind::Tab { ws_idx, tab_idx },
-                        x: mouse.column,
-                        y: mouse.row,
-                        list: MenuListState::new(0),
-                    });
+                    self.context_menu = Some(ContextMenuState::new(
+                        ContextMenuKind::Tab { ws_idx, tab_idx },
+                        mouse.column,
+                        mouse.row,
+                    ));
                     self.mode = Mode::ContextMenu;
                 }
             }
@@ -1076,18 +1094,17 @@ impl AppState {
                         .and_then(|pane| self.terminals.get(&pane.attached_terminal_id))
                         .and_then(|terminal| terminal.manual_label.as_ref())
                         .is_some();
-                    self.context_menu = Some(ContextMenuState {
-                        kind: ContextMenuKind::Pane {
+                    self.context_menu = Some(ContextMenuState::new(
+                        ContextMenuKind::Pane {
                             ws_idx,
                             tab_idx,
                             pane_id: info.id,
                             source_pane_id,
                             has_manual_label,
                         },
-                        x: mouse.column,
-                        y: mouse.row,
-                        list: MenuListState::new(0),
-                    });
+                        mouse.column,
+                        mouse.row,
+                    ));
                     self.mode = Mode::ContextMenu;
                 }
             }
@@ -1197,13 +1214,13 @@ impl AppState {
         let menu = self.context_menu.as_ref()?;
         let screen = self.screen_rect();
         let max_item_w = menu
-            .items()
-            .iter()
-            .map(|item| item.len() as u16)
+            .entry_indices()
+            .filter_map(|index| menu.entry_label(index))
+            .map(|label| unicode_width::UnicodeWidthStr::width(label) as u16)
             .max()
             .unwrap_or(0);
         let menu_w = (max_item_w + 4).max(14).min(screen.width.max(1));
-        let menu_h = (menu.items().len() as u16 + 2).min(screen.height.max(1));
+        let menu_h = (menu.len() as u16 + 2).min(screen.height.max(1));
         let x = menu.x.min(screen.x + screen.width.saturating_sub(menu_w));
         let y = menu.y.min(screen.y + screen.height.saturating_sub(menu_h));
         Some(Rect::new(x, y, menu_w, menu_h))
@@ -1222,14 +1239,19 @@ impl AppState {
         let item_count = self
             .context_menu
             .as_ref()
-            .map(|menu| menu.items().len() as u16)
+            .map(|menu| menu.len() as u16)
             .unwrap_or(0);
         if col >= inner_x
             && col < inner_x + inner_w
             && row >= inner_y
             && row < inner_y + inner_h.min(item_count)
         {
-            Some((row - inner_y) as usize)
+            let offset = self
+                .context_menu
+                .as_ref()
+                .map_or(0, |menu| menu.scroll_offset);
+            let index = offset + (row - inner_y) as usize;
+            (index < usize::from(item_count)).then_some(index)
         } else {
             None
         }
@@ -1856,6 +1878,40 @@ mod tests {
         detect::{Agent, AgentState},
         workspace::Workspace,
     };
+
+    fn plugin_choice_snapshot() -> crate::app::state::ContextMenuActionSnapshot {
+        let action = crate::api::schema::PluginManifestAction {
+            id: "choose".into(),
+            title: "Choose".into(),
+            description: None,
+            contexts: vec![crate::api::schema::PluginActionContext::Workspace],
+            platforms: None,
+            command: vec!["action".into()],
+            choices_command: Some(vec!["provider".into()]),
+        };
+        crate::app::state::ContextMenuActionSnapshot {
+            plugin: crate::api::schema::InstalledPluginInfo {
+                plugin_id: "example".into(),
+                name: "Example".into(),
+                version: "1".into(),
+                min_herdr_version: "0.7.0".into(),
+                description: None,
+                manifest_path: "/example/herdr-plugin.toml".into(),
+                plugin_root: "/example".into(),
+                enabled: true,
+                platforms: None,
+                build: vec![],
+                startup: vec![],
+                actions: vec![action.clone()],
+                events: vec![],
+                panes: vec![],
+                link_handlers: vec![],
+                source: crate::api::schema::PluginSourceInfo::default(),
+                warnings: vec![],
+            },
+            action,
+        }
+    }
 
     fn mark_worktree_space_member(workspace: &mut Workspace, ws_idx: usize, key: &str) {
         workspace.worktree_space = Some(crate::workspace::WorktreeSpaceMembership {
@@ -2537,6 +2593,139 @@ mod tests {
     }
 
     #[test]
+    fn context_menu_clamps_to_screen_edges_and_hits_only_item_interiors() {
+        let mut app = app_for_mouse_test();
+        app.state.view.sidebar_rect = Rect::new(5, 3, 10, 10);
+        app.state.view.terminal_area = Rect::new(15, 3, 20, 10);
+        app.state.context_menu = Some(ContextMenuState {
+            kind: ContextMenuKind::Workspace { ws_idx: 0 },
+            x: u16::MAX,
+            y: u16::MAX,
+            list: MenuListState::new(0),
+            scroll_offset: 0,
+            plugin: None,
+        });
+
+        let rect = app.state.context_menu_rect().expect("context menu rect");
+        assert_eq!(rect, Rect::new(21, 9, 14, 4));
+        assert_eq!(app.state.context_menu_item_at(22, 10), Some(0));
+        assert_eq!(app.state.context_menu_item_at(33, 11), Some(1));
+        assert_eq!(app.state.context_menu_item_at(21, 10), None);
+        assert_eq!(app.state.context_menu_item_at(34, 10), None);
+        assert_eq!(app.state.context_menu_item_at(22, 9), None);
+        assert_eq!(app.state.context_menu_item_at(22, 12), None);
+    }
+
+    #[test]
+    fn dynamic_context_menu_uses_unicode_width_and_scroll_aware_hit_testing() {
+        let mut app = app_for_mouse_test();
+        app.state.view.sidebar_rect = Rect::new(0, 0, 10, 5);
+        app.state.view.terminal_area = Rect::new(10, 0, 30, 5);
+        let mut menu = ContextMenuState::new(ContextMenuKind::Workspace { ws_idx: 0 }, 0, 0);
+        menu.plugin = Some(crate::app::state::ContextMenuPluginState {
+            generation: 1,
+            context: serde_json::from_str("{}").unwrap(),
+            target: crate::app::state::ContextMenuTarget::Workspace("workspace-1".into()),
+            providers: vec![crate::app::state::ContextMenuPluginProvider {
+                request_id: "geometry".into(),
+                snapshot: plugin_choice_snapshot(),
+                running: false,
+                settled: true,
+                choices: vec![
+                    crate::api::schema::PluginActionChoice {
+                        id: "wide".into(),
+                        label: "界界界界界界界界".into(),
+                        payload: serde_json::Value::Null,
+                    },
+                    crate::api::schema::PluginActionChoice {
+                        id: "last".into(),
+                        label: "Last".into(),
+                        payload: serde_json::Value::Null,
+                    },
+                ],
+            }],
+            entries: vec![
+                crate::app::state::ContextMenuEntry::PluginChoice {
+                    provider_index: 0,
+                    choice_index: 0,
+                },
+                crate::app::state::ContextMenuEntry::PluginChoice {
+                    provider_index: 0,
+                    choice_index: 1,
+                },
+            ],
+        });
+        menu.list.highlighted = 3;
+        menu.scroll_offset = 1;
+        app.state.context_menu = Some(menu);
+
+        let rect = app.state.context_menu_rect().unwrap();
+        assert_eq!(rect.width, 20); // 8 CJK glyphs * 2 columns + padding.
+        assert_eq!(rect.height, 5);
+        // Four rows are clipped to three interiors and hit testing uses the
+        // same persistent offset as rendering.
+        assert_eq!(
+            app.state.context_menu_item_at(rect.x + 1, rect.y + 1),
+            Some(1)
+        );
+        assert_eq!(
+            app.state.context_menu_item_at(rect.x + 1, rect.y + 3),
+            Some(3)
+        );
+    }
+
+    #[test]
+    fn context_menu_wheel_scrolls_and_hover_keeps_persistent_offset() {
+        let mut app = app_for_mouse_test();
+        app.state.view.sidebar_rect = Rect::new(0, 0, 10, 5);
+        app.state.view.terminal_area = Rect::new(10, 0, 30, 5);
+        let mut menu = ContextMenuState::new(ContextMenuKind::Workspace { ws_idx: 0 }, 0, 0);
+        menu.plugin = Some(crate::app::state::ContextMenuPluginState {
+            generation: 1,
+            context: serde_json::from_str("{}").unwrap(),
+            target: crate::app::state::ContextMenuTarget::Workspace("workspace-1".into()),
+            providers: vec![crate::app::state::ContextMenuPluginProvider {
+                request_id: "wheel".into(),
+                snapshot: plugin_choice_snapshot(),
+                running: false,
+                settled: true,
+                choices: (0..6)
+                    .map(|index| crate::api::schema::PluginActionChoice {
+                        id: format!("choice-{index}"),
+                        label: format!("Choice {index}"),
+                        payload: serde_json::Value::Null,
+                    })
+                    .collect(),
+            }],
+            entries: (0..6)
+                .map(
+                    |choice_index| crate::app::state::ContextMenuEntry::PluginChoice {
+                        provider_index: 0,
+                        choice_index,
+                    },
+                )
+                .collect(),
+        });
+        app.state.context_menu = Some(menu);
+        app.state.mode = Mode::ContextMenu;
+
+        app.handle_mouse(mouse(MouseEventKind::ScrollDown, 1, 1));
+        assert_eq!(app.state.context_menu.as_ref().unwrap().scroll_offset, 1);
+        let rect = app.state.context_menu_rect().unwrap();
+        assert_eq!(
+            app.state.context_menu_item_at(rect.x + 1, rect.y + 1),
+            Some(1)
+        );
+        app.handle_mouse(mouse(MouseEventKind::Moved, rect.x + 1, rect.y + 2));
+        let menu = app.state.context_menu.as_ref().unwrap();
+        assert_eq!(menu.scroll_offset, 1);
+        assert_eq!(menu.list.highlighted, 2);
+
+        app.handle_mouse(mouse(MouseEventKind::ScrollUp, rect.x + 1, rect.y + 2));
+        assert_eq!(app.state.context_menu.as_ref().unwrap().scroll_offset, 0);
+    }
+
+    #[test]
     fn hovering_context_menu_updates_highlight() {
         let mut app = app_for_mouse_test();
         app.state.context_menu = Some(ContextMenuState {
@@ -2544,6 +2733,8 @@ mod tests {
             x: 2,
             y: 2,
             list: MenuListState::new(0),
+            scroll_offset: 0,
+            plugin: None,
         });
         app.state.mode = Mode::ContextMenu;
 
@@ -2838,6 +3029,8 @@ mod tests {
             x: 2,
             y: 2,
             list: MenuListState::new(1),
+            scroll_offset: 0,
+            plugin: None,
         });
         app.state.mode = Mode::ContextMenu;
         handle_context_menu_key(
@@ -2878,6 +3071,8 @@ mod tests {
             x: 2,
             y: 2,
             list: MenuListState::new(1),
+            scroll_offset: 0,
+            plugin: None,
         });
         app.state.mode = Mode::ContextMenu;
 
@@ -2930,6 +3125,8 @@ mod tests {
             x: 2,
             y: 2,
             list: MenuListState::new(1),
+            scroll_offset: 0,
+            plugin: None,
         });
         app.state.mode = Mode::ContextMenu;
 

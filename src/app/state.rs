@@ -1218,16 +1218,72 @@ pub enum ContextMenuKind {
     },
 }
 
+/// Stable identity for a row in a context menu. Native rows retain their
+/// historical labels and positions; plugin rows never share native identity.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ContextMenuEntry {
+    Native(&'static str),
+    PluginLoading,
+    PluginChoice {
+        provider_index: usize,
+        choice_index: usize,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ContextMenuTarget {
+    Workspace(String),
+    Tab(String),
+    Pane(String),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ContextMenuActionSnapshot {
+    pub plugin: crate::api::schema::InstalledPluginInfo,
+    pub action: crate::api::schema::PluginManifestAction,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct ContextMenuPluginProvider {
+    pub request_id: String,
+    pub snapshot: ContextMenuActionSnapshot,
+    pub running: bool,
+    pub settled: bool,
+    pub choices: Vec<crate::api::schema::PluginActionChoice>,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct ContextMenuPluginState {
+    pub generation: u64,
+    pub context: crate::api::schema::PluginInvocationContext,
+    pub target: ContextMenuTarget,
+    pub providers: Vec<ContextMenuPluginProvider>,
+    pub entries: Vec<ContextMenuEntry>,
+}
+
 /// Right-click context menu state.
 pub struct ContextMenuState {
     pub kind: ContextMenuKind,
     pub x: u16,
     pub y: u16,
     pub list: MenuListState,
+    pub scroll_offset: usize,
+    pub(crate) plugin: Option<ContextMenuPluginState>,
 }
 
 impl ContextMenuState {
-    pub fn items(&self) -> &'static [&'static str] {
+    pub fn new(kind: ContextMenuKind, x: u16, y: u16) -> Self {
+        Self {
+            kind,
+            x,
+            y,
+            list: MenuListState::new(0),
+            scroll_offset: 0,
+            plugin: None,
+        }
+    }
+
+    pub fn native_items(&self) -> &'static [&'static str] {
         match self.kind {
             ContextMenuKind::Workspace { .. } => &["Rename", "Close"],
             ContextMenuKind::GitWorkspace {
@@ -1312,6 +1368,151 @@ impl ContextMenuState {
                 "Zoom",
                 "Close pane",
             ],
+        }
+    }
+
+    /// Historical native rows, kept for characterization tests.
+    #[cfg(test)]
+    pub fn items(&self) -> &'static [&'static str] {
+        self.native_items()
+    }
+
+    pub fn entry_indices(&self) -> std::ops::Range<usize> {
+        0..self.len()
+    }
+
+    pub fn entry_label(&self, index: usize) -> Option<&str> {
+        match self.entry(index)? {
+            ContextMenuEntry::Native(label) => Some(label),
+            ContextMenuEntry::PluginLoading => Some("Loading plugin actions…"),
+            ContextMenuEntry::PluginChoice {
+                provider_index,
+                choice_index,
+            } => self
+                .plugin
+                .as_ref()?
+                .providers
+                .get(provider_index)?
+                .choices
+                .get(choice_index)
+                .map(|choice| choice.label.as_str()),
+        }
+    }
+
+    pub fn entry_enabled(&self, index: usize) -> bool {
+        self.entry(index)
+            .is_some_and(|entry| !matches!(entry, ContextMenuEntry::PluginLoading))
+    }
+
+    pub fn selected_plugin_choice(
+        &self,
+        index: usize,
+    ) -> Option<(
+        ContextMenuActionSnapshot,
+        crate::api::schema::PluginActionChoice,
+    )> {
+        let ContextMenuEntry::PluginChoice {
+            provider_index,
+            choice_index,
+        } = self.entry(index)?
+        else {
+            return None;
+        };
+        let provider = self.plugin.as_ref()?.providers.get(provider_index)?;
+        Some((
+            provider.snapshot.clone(),
+            provider.choices.get(choice_index)?.clone(),
+        ))
+    }
+
+    #[cfg(test)]
+    pub fn entry_labels(&self) -> Vec<&str> {
+        self.entry_indices()
+            .filter_map(|index| self.entry_label(index))
+            .collect()
+    }
+
+    pub fn len(&self) -> usize {
+        self.native_items().len()
+            + self
+                .plugin
+                .as_ref()
+                .map_or(0, |plugin| plugin.entries.len())
+    }
+
+    pub fn entry(&self, index: usize) -> Option<ContextMenuEntry> {
+        if let Some(label) = self.native_items().get(index) {
+            return Some(ContextMenuEntry::Native(label));
+        }
+        self.plugin
+            .as_ref()?
+            .entries
+            .get(index.saturating_sub(self.native_items().len()))
+            .copied()
+    }
+
+    pub fn ensure_highlight_visible(&mut self, visible_rows: usize) {
+        if visible_rows == 0 {
+            self.scroll_offset = 0;
+        } else if self.list.highlighted < self.scroll_offset {
+            self.scroll_offset = self.list.highlighted;
+        } else if self.list.highlighted >= self.scroll_offset + visible_rows {
+            self.scroll_offset = self.list.highlighted + 1 - visible_rows;
+        }
+        self.scroll_offset = self
+            .scroll_offset
+            .min(self.len().saturating_sub(visible_rows));
+    }
+
+    pub fn scroll(&mut self, delta: isize, visible_rows: usize) {
+        let maximum = self.len().saturating_sub(visible_rows);
+        self.scroll_offset = if delta < 0 {
+            self.scroll_offset.saturating_sub(delta.unsigned_abs())
+        } else {
+            self.scroll_offset
+                .saturating_add(delta as usize)
+                .min(maximum)
+        };
+        if visible_rows == 0 {
+            return;
+        }
+        let end = (self.scroll_offset + visible_rows).min(self.len());
+        if self.list.highlighted < self.scroll_offset || self.list.highlighted >= end {
+            let candidate = if delta < 0 {
+                (self.scroll_offset..end).find(|index| self.entry_enabled(*index))
+            } else {
+                (self.scroll_offset..end)
+                    .rev()
+                    .find(|index| self.entry_enabled(*index))
+            };
+            if let Some(index) = candidate {
+                self.list.highlighted = index;
+            }
+        }
+    }
+
+    pub fn move_prev(&mut self) {
+        while self.list.highlighted > 0 {
+            self.list.move_prev();
+            if self.entry_enabled(self.list.highlighted) {
+                break;
+            }
+        }
+    }
+
+    pub fn move_next(&mut self) {
+        let len = self.len();
+        let starting = self.list.highlighted;
+        loop {
+            let previous = self.list.highlighted;
+            self.list.move_next(len);
+            if self.list.highlighted == previous {
+                self.list.highlighted = starting;
+                break;
+            }
+            if self.entry_enabled(self.list.highlighted) {
+                break;
+            }
         }
     }
 }
@@ -1579,6 +1780,13 @@ pub struct AppState {
     pub(crate) plugin_command_logs: Vec<crate::api::schema::PluginCommandLogInfo>,
     pub(crate) next_plugin_command_log_id: u64,
     pub(crate) plugin_commands_in_flight: usize,
+    /// Choice providers have dedicated admission so they cannot consume the
+    /// normal plugin-command pool (or vice versa).
+    pub(crate) plugin_action_choices_providers_in_flight: usize,
+    /// Request identities are authoritative even when bounded logs are evicted.
+    pub(crate) plugin_action_choices_requests_in_flight: std::collections::HashSet<String>,
+    /// Monotonic identity allocator for context-menu async generations.
+    pub(crate) next_context_menu_generation: u64,
     /// Highlight state for the bottom-right global launcher menu.
     pub global_menu: MenuListState,
     /// Resolved host terminal default colors for theming embedded panes.
@@ -1943,6 +2151,9 @@ impl AppState {
             plugin_command_logs: Vec::new(),
             next_plugin_command_log_id: 1,
             plugin_commands_in_flight: 0,
+            plugin_action_choices_providers_in_flight: 0,
+            plugin_action_choices_requests_in_flight: std::collections::HashSet::new(),
+            next_context_menu_generation: 1,
             global_menu: MenuListState::new(0),
             host_terminal_theme: TerminalTheme::default(),
             host_cell_size: crate::kitty_graphics::HostCellSize::default(),
@@ -2461,6 +2672,119 @@ mod tests {
     }
 
     #[test]
+    fn remaining_native_context_menu_variants_keep_exact_labels_and_order() {
+        let pane_id = crate::workspace::Workspace::test_new("test").tabs[0].root_pane;
+        let cases: Vec<(ContextMenuKind, &[&str])> = vec![
+            (
+                ContextMenuKind::Workspace { ws_idx: 0 },
+                &["Rename", "Close"],
+            ),
+            (
+                ContextMenuKind::GitWorkspace {
+                    ws_idx: 0,
+                    is_linked_worktree: false,
+                    has_worktree_children: true,
+                    collapsed: true,
+                },
+                &[
+                    "Rename",
+                    "Close group",
+                    "New worktree",
+                    "Open worktree...",
+                    "Expand",
+                ],
+            ),
+            (
+                ContextMenuKind::Tab {
+                    ws_idx: 0,
+                    tab_idx: 0,
+                },
+                &["New tab", "Rename", "Close"],
+            ),
+            (
+                ContextMenuKind::Pane {
+                    ws_idx: 0,
+                    tab_idx: 0,
+                    pane_id,
+                    source_pane_id: Some(pane_id),
+                    has_manual_label: true,
+                },
+                &[
+                    "Rename pane",
+                    "Clear pane name",
+                    "Swap with focused pane",
+                    "Split right",
+                    "Split down",
+                    "Zoom",
+                    "Close pane",
+                ],
+            ),
+            (
+                ContextMenuKind::Pane {
+                    ws_idx: 0,
+                    tab_idx: 0,
+                    pane_id,
+                    source_pane_id: Some(pane_id),
+                    has_manual_label: false,
+                },
+                &[
+                    "Rename pane",
+                    "Swap with focused pane",
+                    "Split right",
+                    "Split down",
+                    "Zoom",
+                    "Close pane",
+                ],
+            ),
+            (
+                ContextMenuKind::Pane {
+                    ws_idx: 0,
+                    tab_idx: 0,
+                    pane_id,
+                    source_pane_id: None,
+                    has_manual_label: true,
+                },
+                &[
+                    "Rename pane",
+                    "Clear pane name",
+                    "Split right",
+                    "Split down",
+                    "Zoom",
+                    "Close pane",
+                ],
+            ),
+            (
+                ContextMenuKind::Pane {
+                    ws_idx: 0,
+                    tab_idx: 0,
+                    pane_id,
+                    source_pane_id: None,
+                    has_manual_label: false,
+                },
+                &[
+                    "Rename pane",
+                    "Split right",
+                    "Split down",
+                    "Zoom",
+                    "Close pane",
+                ],
+            ),
+        ];
+
+        for (kind, expected) in cases {
+            let menu = ContextMenuState {
+                kind,
+                x: 0,
+                y: 0,
+                list: MenuListState::new(0),
+                scroll_offset: 0,
+                plugin: None,
+            };
+            assert_eq!(menu.items(), expected);
+        }
+    }
+
+    #[test]
     fn linked_worktree_context_menu_keeps_safe_close_and_explicit_remove() {
         let menu = ContextMenuState {
             kind: ContextMenuKind::GitWorkspace {
@@ -2472,6 +2796,8 @@ mod tests {
             x: 0,
             y: 0,
             list: MenuListState::new(0),
+            scroll_offset: 0,
+            plugin: None,
         };
 
         assert_eq!(
@@ -2492,6 +2818,8 @@ mod tests {
             x: 0,
             y: 0,
             list: MenuListState::new(0),
+            scroll_offset: 0,
+            plugin: None,
         };
 
         assert_eq!(
@@ -2512,6 +2840,8 @@ mod tests {
             x: 0,
             y: 0,
             list: MenuListState::new(0),
+            scroll_offset: 0,
+            plugin: None,
         };
 
         assert_eq!(

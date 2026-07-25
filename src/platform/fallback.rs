@@ -1,10 +1,25 @@
 use std::path::PathBuf;
-use std::process::Command;
+use std::process::{Child, Command};
 
 use super::{ClipboardImage, ForegroundJob, Signal};
 
 /// Unsupported platform stub.
 pub fn raise_server_nofile_limit() {}
+
+pub(crate) struct ProcessIsolation;
+
+pub(crate) fn spawn_isolated_process_platform(
+    command: &mut Command,
+) -> std::io::Result<(Child, ProcessIsolation)> {
+    command.spawn().map(|child| (child, ProcessIsolation))
+}
+
+pub(crate) fn terminate_isolated_process_platform(
+    child: &mut Child,
+    _isolation: &mut ProcessIsolation,
+) -> std::io::Result<()> {
+    child.kill()
+}
 
 pub(crate) fn should_draw_host_cursor_by_default() -> bool {
     false

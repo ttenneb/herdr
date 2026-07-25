@@ -2,8 +2,9 @@ use std::ffi::OsStr;
 use std::io::Write;
 use std::os::fd::RawFd;
 use std::os::unix::ffi::OsStrExt;
+use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, Stdio};
 use std::ptr::NonNull;
 use std::sync::OnceLock;
 
@@ -14,6 +15,35 @@ use super::{
 
 const PROC_PGRP_ONLY: u32 = 2;
 const SERVER_NOFILE_LIMIT_TARGET: libc::rlim_t = 8192;
+
+pub(crate) struct ProcessIsolation;
+
+pub(crate) fn spawn_isolated_process_platform(
+    command: &mut Command,
+) -> std::io::Result<(Child, ProcessIsolation)> {
+    unsafe {
+        command.pre_exec(|| {
+            if libc::setpgid(0, 0) != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    command.spawn().map(|child| (child, ProcessIsolation))
+}
+
+pub(crate) fn terminate_isolated_process_platform(
+    child: &mut Child,
+    _isolation: &mut ProcessIsolation,
+) -> std::io::Result<()> {
+    let pid = child.id();
+    let result = unsafe { libc::kill(-(pid as i32), libc::SIGKILL) };
+    if result == 0 {
+        Ok(())
+    } else {
+        child.kill()
+    }
+}
 
 pub(crate) fn should_draw_host_cursor_by_default() -> bool {
     false

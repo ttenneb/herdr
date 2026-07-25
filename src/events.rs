@@ -152,6 +152,19 @@ pub enum AppEvent {
         stderr: String,
         error: Option<String>,
     },
+    /// A plugin action choices provider finished. Request and provider identity
+    /// let neutral consumers correlate completion without relying on UI state.
+    PluginActionChoicesFinished {
+        request_id: String,
+        plugin_id: String,
+        action_id: String,
+        log_id: String,
+        finished_unix_ms: u64,
+        exit_code: Option<i32>,
+        stdout: String,
+        stderr: String,
+        result: Result<crate::api::schema::PluginActionChoices, String>,
+    },
     /// Background `git worktree add` completed.
     WorktreeAddFinished(Box<WorktreeAddResult>),
     /// Background `git worktree remove` completed.

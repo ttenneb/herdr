@@ -1,9 +1,9 @@
 use std::{
     collections::{HashSet, VecDeque},
     io::Write,
-    os::fd::RawFd,
+    os::{fd::RawFd, unix::process::CommandExt},
     path::PathBuf,
-    process::{Command, Stdio},
+    process::{Child, Command, Stdio},
 };
 
 use super::{
@@ -20,6 +20,35 @@ struct ProcGroupMember {
 }
 
 pub fn raise_server_nofile_limit() {}
+
+pub(crate) struct ProcessIsolation;
+
+pub(crate) fn spawn_isolated_process_platform(
+    command: &mut Command,
+) -> std::io::Result<(Child, ProcessIsolation)> {
+    unsafe {
+        command.pre_exec(|| {
+            if libc::setpgid(0, 0) != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    command.spawn().map(|child| (child, ProcessIsolation))
+}
+
+pub(crate) fn terminate_isolated_process_platform(
+    child: &mut Child,
+    _isolation: &mut ProcessIsolation,
+) -> std::io::Result<()> {
+    let pid = child.id();
+    let result = unsafe { libc::kill(-(pid as i32), libc::SIGKILL) };
+    if result == 0 {
+        Ok(())
+    } else {
+        child.kill()
+    }
+}
 
 pub(crate) fn should_draw_host_cursor_by_default() -> bool {
     running_inside_wsl()

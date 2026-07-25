@@ -689,6 +689,9 @@ impl App {
             plugin_command_logs: Vec::new(),
             next_plugin_command_log_id: 1,
             plugin_commands_in_flight: 0,
+            plugin_action_choices_providers_in_flight: 0,
+            plugin_action_choices_requests_in_flight: std::collections::HashSet::new(),
+            next_context_menu_generation: 1,
             global_menu: state::MenuListState::new(0),
             host_terminal_theme: crate::terminal_theme::TerminalTheme::default(),
             host_cell_size: crate::kitty_graphics::HostCellSize::default(),
@@ -5596,6 +5599,8 @@ last_pane = "prefix+tab"
             x: 2,
             y: 2,
             list: state::MenuListState::new(1),
+            scroll_offset: 0,
+            plugin: None,
         });
         app.state.mode = Mode::ContextMenu;
 

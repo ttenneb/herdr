@@ -224,7 +224,7 @@ impl App {
         context
     }
 
-    fn plugin_context_for_tab_id(
+    pub(super) fn plugin_context_for_tab_id(
         &self,
         tab_id: &str,
         correlation_id: &str,

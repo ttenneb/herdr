@@ -2854,7 +2854,8 @@ impl AppState {
             }
             AppEvent::WorktreeAddFinished(_) => Vec::new(),
             AppEvent::WorktreeRemoveFinished(_) => Vec::new(),
-            AppEvent::PluginCommandFinished { .. } => Vec::new(),
+            AppEvent::PluginCommandFinished { .. }
+            | AppEvent::PluginActionChoicesFinished { .. } => Vec::new(),
         }
     }
 

@@ -163,6 +163,64 @@ impl App {
             return;
         }
 
+        if let AppEvent::PluginActionChoicesFinished {
+            request_id,
+            plugin_id,
+            action_id,
+            log_id,
+            finished_unix_ms,
+            exit_code,
+            stdout,
+            stderr,
+            result,
+        } = ev
+        {
+            let error = result.as_ref().err().cloned();
+            let first_completion = self
+                .state
+                .plugin_action_choices_requests_in_flight
+                .remove(&request_id);
+            if first_completion {
+                self.state.plugin_action_choices_providers_in_flight = self
+                    .state
+                    .plugin_action_choices_providers_in_flight
+                    .saturating_sub(1);
+                if let Some(log) = self
+                    .state
+                    .plugin_command_logs
+                    .iter_mut()
+                    .find(|log| log.log_id == log_id)
+                {
+                    log.finished_unix_ms = Some(finished_unix_ms);
+                    log.exit_code = exit_code;
+                    log.stdout = Some(stdout);
+                    log.stderr = Some(stderr);
+                    log.error = error.clone();
+                    log.status = if result.is_ok() {
+                        crate::api::schema::PluginCommandStatus::Succeeded
+                    } else {
+                        crate::api::schema::PluginCommandStatus::Failed
+                    };
+                }
+            }
+            self.correlate_context_menu_plugin_completion(
+                &request_id,
+                &plugin_id,
+                &action_id,
+                &result,
+            );
+            if let Some(error) = error {
+                tracing::warn!(
+                    request_id,
+                    plugin_id,
+                    action_id,
+                    error,
+                    "plugin action choices provider failed"
+                );
+            }
+            return;
+        }
+
         if let AppEvent::WorktreeAddFinished(result) = ev {
             self.handle_worktree_add_finished(*result);
             return;
