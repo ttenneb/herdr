@@ -6,11 +6,11 @@ use std::process::{Command, ExitStatus, Stdio};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::api::schema::{
-    InstalledPluginInfo, Method, PluginActionInvokeParams, PluginActionListParams,
-    PluginInvocationContext, PluginLinkParams, PluginListParams, PluginLogListParams,
-    PluginPaneCloseParams, PluginPaneFocusParams, PluginPaneOpenParams, PluginPanePlacement,
-    PluginPlatform, PluginSetEnabledParams, PluginSourceInfo, PluginSourceKind, PluginUnlinkParams,
-    Request, ResponseResult, SplitDirection, SuccessResponse,
+    InstalledPluginInfo, Method, PluginActionContext, PluginActionInvokeParams,
+    PluginActionListParams, PluginInvocationContext, PluginLinkParams, PluginListParams,
+    PluginLogListParams, PluginPaneCloseParams, PluginPaneFocusParams, PluginPaneOpenParams,
+    PluginPanePlacement, PluginPlatform, PluginSetEnabledParams, PluginSourceInfo,
+    PluginSourceKind, PluginUnlinkParams, Request, ResponseResult, SplitDirection, SuccessResponse,
 };
 use crate::popup_size::PopupSize;
 
@@ -1204,30 +1204,44 @@ fn print_install_preview(
     source: &PluginSourceInfo,
     existing: Option<&InstalledPluginInfo>,
 ) {
-    eprintln!("Plugin install preview:");
-    eprintln!("  id: {}", plugin.plugin_id);
-    eprintln!("  name: {}", plugin.name);
-    eprintln!("  version: {}", plugin.version);
+    for line in install_preview_lines(plugin, source, existing) {
+        eprintln!("{line}");
+    }
+}
+
+fn install_preview_lines(
+    plugin: &InstalledPluginInfo,
+    source: &PluginSourceInfo,
+    existing: Option<&InstalledPluginInfo>,
+) -> Vec<String> {
+    let mut lines = vec![
+        "Plugin install preview:".to_string(),
+        format!("  id: {}", plugin.plugin_id),
+        format!("  name: {}", plugin.name),
+        format!("  version: {}", plugin.version),
+    ];
     if let (Some(owner), Some(repo)) = (&source.owner, &source.repo) {
         let subdir = source
             .subdir
             .as_deref()
             .map(|subdir| format!("/{subdir}"))
             .unwrap_or_default();
-        eprintln!("  source: {owner}/{repo}{subdir}");
+        lines.push(format!("  source: {owner}/{repo}{subdir}"));
     }
     if let Some(reference) = &source.requested_ref {
-        eprintln!("  ref: {reference}");
+        lines.push(format!("  ref: {reference}"));
     }
     if let Some(commit) = &source.resolved_commit {
-        eprintln!("  commit: {commit}");
+        lines.push(format!("  commit: {commit}"));
     }
-    eprintln!("  actions: {}", plugin.actions.len());
-    eprintln!("  startup commands: {}", plugin.startup.len());
-    eprintln!("  events: {}", plugin.events.len());
-    eprintln!("  panes: {}", plugin.panes.len());
-    eprintln!("  link handlers: {}", plugin.link_handlers.len());
-    eprintln!("  build commands: {}", plugin.build.len());
+    lines.extend([
+        format!("  actions: {}", plugin.actions.len()),
+        format!("  startup commands: {}", plugin.startup.len()),
+        format!("  events: {}", plugin.events.len()),
+        format!("  panes: {}", plugin.panes.len()),
+        format!("  link handlers: {}", plugin.link_handlers.len()),
+        format!("  build commands: {}", plugin.build.len()),
+    ]);
     for build in &plugin.build {
         let support = if build_platform_supported(&build.platforms, &plugin.platforms) {
             String::new()
@@ -1237,30 +1251,83 @@ fn print_install_preview(
                 plugin_platform_name(current_plugin_platform())
             )
         };
-        eprintln!("    build{}: {}", support, build.command.join(" "));
+        lines.push(format!("    build{}: {}", support, build.command.join(" ")));
     }
     for startup in &plugin.startup {
-        eprintln!("    startup: {}", startup.command.join(" "));
+        lines.push(format!("    startup: {}", startup.command.join(" ")));
     }
     for action in &plugin.actions {
-        eprintln!("    action {}: {}", action.id, action.command.join(" "));
+        lines.push(format!(
+            "    action {}: {}",
+            action.id,
+            action.command.join(" ")
+        ));
+        if let Some(command) = &action.choices_command {
+            let contexts = choice_provider_contexts(&action.contexts);
+            let platforms = choice_provider_platforms(&action.platforms, &plugin.platforms);
+            lines.push(format!(
+                "    choices provider for action {} (runs automatically when matching context menus open; contexts: {contexts}; platforms: {platforms}): {}",
+                action.id,
+                command.join(" ")
+            ));
+        }
     }
     for event in &plugin.events {
-        eprintln!("    event {}: {}", event.on, event.command.join(" "));
+        lines.push(format!(
+            "    event {}: {}",
+            event.on,
+            event.command.join(" ")
+        ));
     }
     for pane in &plugin.panes {
-        eprintln!("    pane {}: {}", pane.id, pane.command.join(" "));
+        lines.push(format!("    pane {}: {}", pane.id, pane.command.join(" ")));
     }
     for warning in &plugin.warnings {
-        eprintln!("  warning: {warning}");
+        lines.push(format!("  warning: {warning}"));
     }
     if let Some(existing) = existing {
-        eprintln!(
+        lines.push(format!(
             "  replaces: {} from {}",
             existing.plugin_id,
             source_display(existing)
-        );
+        ));
     }
+    lines
+}
+
+fn choice_provider_contexts(contexts: &[PluginActionContext]) -> String {
+    let contexts = contexts
+        .iter()
+        .filter_map(|context| match context {
+            PluginActionContext::Workspace => Some("workspace"),
+            PluginActionContext::Tab => Some("tab"),
+            PluginActionContext::Pane => Some("pane"),
+            PluginActionContext::Global | PluginActionContext::Selection => None,
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    if contexts.is_empty() {
+        "none".to_string()
+    } else {
+        contexts
+    }
+}
+
+fn choice_provider_platforms(
+    action_platforms: &Option<Vec<PluginPlatform>>,
+    plugin_platforms: &Option<Vec<PluginPlatform>>,
+) -> String {
+    action_platforms
+        .as_ref()
+        .or(plugin_platforms.as_ref())
+        .map(|platforms| {
+            platforms
+                .iter()
+                .map(|platform| plugin_platform_name(*platform))
+                .collect::<Vec<_>>()
+                .join(", ")
+        })
+        .unwrap_or_else(|| "linux, macos, windows".to_string())
 }
 
 fn run_plugin_build_commands(
@@ -1710,6 +1777,80 @@ mod tests {
             },
             warnings: vec![],
         }
+    }
+
+    fn plugin_action(
+        id: &str,
+        contexts: Vec<PluginActionContext>,
+        platforms: Option<Vec<PluginPlatform>>,
+        choices_command: Option<&str>,
+    ) -> crate::api::schema::PluginManifestAction {
+        crate::api::schema::PluginManifestAction {
+            id: id.to_string(),
+            title: id.to_string(),
+            description: None,
+            contexts,
+            platforms,
+            command: vec![format!("run-{id}")],
+            choices_command: choices_command.map(|command| vec![command.to_string()]),
+        }
+    }
+
+    #[test]
+    fn install_preview_discloses_each_choices_provider_separately() {
+        let mut plugin = github_plugin("example.preview", "example", "plugins", None);
+        plugin.platforms = Some(vec![PluginPlatform::Linux, PluginPlatform::Macos]);
+        plugin.actions = vec![
+            plugin_action(
+                "inherited",
+                vec![PluginActionContext::Workspace, PluginActionContext::Pane],
+                None,
+                Some("list-inherited"),
+            ),
+            plugin_action(
+                "override",
+                vec![PluginActionContext::Tab],
+                Some(vec![PluginPlatform::Windows]),
+                Some("list-override"),
+            ),
+            plugin_action("static", vec![PluginActionContext::Pane], None, None),
+        ];
+        let source = plugin.source.clone();
+
+        let lines = install_preview_lines(&plugin, &source, None);
+        let provider_lines = lines
+            .iter()
+            .filter(|line| line.contains("choices provider"))
+            .map(String::as_str)
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            provider_lines,
+            [
+                "    choices provider for action inherited (runs automatically when matching context menus open; contexts: workspace, pane; platforms: linux, macos): list-inherited",
+                "    choices provider for action override (runs automatically when matching context menus open; contexts: tab; platforms: windows): list-override",
+            ]
+        );
+    }
+
+    #[test]
+    fn install_preview_lists_all_platforms_and_only_context_menu_contexts() {
+        let mut plugin = github_plugin("example.preview", "example", "plugins", None);
+        plugin.actions = vec![plugin_action(
+            "all-platforms",
+            vec![
+                PluginActionContext::Global,
+                PluginActionContext::Selection,
+                PluginActionContext::Pane,
+            ],
+            None,
+            Some("list-all"),
+        )];
+        let source = plugin.source.clone();
+
+        let lines = install_preview_lines(&plugin, &source, None);
+
+        assert!(lines.iter().any(|line| line == "    choices provider for action all-platforms (runs automatically when matching context menus open; contexts: pane; platforms: linux, macos, windows): list-all"));
     }
 
     #[test]
