@@ -329,6 +329,12 @@ impl App {
 
         let previous_agent_panel_sort = self.state.agent_panel_sort;
         let previous_settings_section = self.state.settings.section;
+        let previous_context_menu_generation = self
+            .state
+            .context_menu
+            .as_ref()
+            .and_then(|menu| menu.plugin.as_ref())
+            .map(|plugin| plugin.generation);
         if !handled_pane_double_click {
             if let Some(action) = self.state.handle_mouse(&mut self.terminal_runtimes, mouse) {
                 match action {
@@ -381,6 +387,17 @@ impl App {
                     MouseAction::ContextMenu { menu, idx } => {
                         self.apply_context_menu_action_via_api(*menu, idx)
                     }
+                }
+            }
+            let current_context_menu_generation = self
+                .state
+                .context_menu
+                .as_ref()
+                .and_then(|menu| menu.plugin.as_ref())
+                .map(|plugin| plugin.generation);
+            if previous_context_menu_generation != current_context_menu_generation {
+                if let Some(generation) = previous_context_menu_generation {
+                    self.cancel_context_menu_plugin_generation(generation);
                 }
             }
             if self.state.mode == crate::app::state::Mode::ContextMenu

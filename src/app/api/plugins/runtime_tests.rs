@@ -63,7 +63,7 @@ fn shell(script: &str) -> ChoicesProviderCompletion {
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    run_choices_provider(command)
+    run_choices_provider(command, &std::sync::atomic::AtomicBool::new(false))
 }
 
 #[test]
@@ -99,10 +99,12 @@ fn provider_success_malformed_nonzero_and_spawn_failure() {
 
     let mut missing = Command::new("/definitely/missing/herdr-provider");
     missing.stdout(Stdio::piped()).stderr(Stdio::piped());
-    assert!(run_choices_provider(missing)
-        .result
-        .unwrap_err()
-        .contains("failed to spawn"));
+    assert!(
+        run_choices_provider(missing, &std::sync::atomic::AtomicBool::new(false))
+            .result
+            .unwrap_err()
+            .contains("failed to spawn")
+    );
 }
 
 #[test]
@@ -354,6 +356,69 @@ fn provider_admission_is_dedicated_and_bounded_to_four() {
         let event = app.event_rx.blocking_recv().unwrap();
         app.handle_internal_event(event);
     }
+    assert_eq!(app.state.plugin_action_choices_providers_in_flight, 0);
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[test]
+fn dismiss_and_reopen_releases_full_provider_capacity_immediately() {
+    use crate::app::state::{
+        ContextMenuKind, ContextMenuPluginState, ContextMenuState, ContextMenuTarget, Mode,
+    };
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+    let root = root("choices-dismiss-reopen");
+    let plugin = plugin(&root);
+    let mut app = test_app();
+    for index in 0..MAX_PLUGIN_ACTION_CHOICES_PROVIDERS_IN_FLIGHT {
+        app.start_plugin_action_choices_provider(
+            format!("context-menu-11-{index}"),
+            &plugin,
+            "choose".into(),
+            vec!["sh".into(), "-c".into(), "sleep 30".into()],
+            &context(),
+        )
+        .unwrap();
+    }
+    let mut menu = ContextMenuState::new(ContextMenuKind::Workspace { ws_idx: 0 }, 0, 0);
+    menu.plugin = Some(ContextMenuPluginState {
+        generation: 11,
+        context: context(),
+        target: ContextMenuTarget::Workspace("gone".into()),
+        providers: vec![],
+        entries: vec![],
+    });
+    app.state.context_menu = Some(menu);
+    app.state.mode = Mode::ContextMenu;
+
+    app.handle_context_menu_key_via_api(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+
+    assert_eq!(app.state.plugin_action_choices_providers_in_flight, 0);
+    assert!(app
+        .state
+        .plugin_action_choices_requests_in_flight
+        .is_empty());
+    assert!(app.plugin_choice_provider_cancellations.is_empty());
+    assert!(app.state.plugin_command_logs.iter().all(|log| {
+        log.status == PluginCommandStatus::Failed
+            && log.error.as_deref() == Some("choices provider cancelled")
+            && log.finished_unix_ms.is_some()
+    }));
+    for index in 0..MAX_PLUGIN_ACTION_CHOICES_PROVIDERS_IN_FLIGHT {
+        app.start_plugin_action_choices_provider(
+            format!("context-menu-12-{index}"),
+            &plugin,
+            "choose".into(),
+            vec!["sh".into(), "-c".into(), "sleep 30".into()],
+            &context(),
+        )
+        .unwrap();
+    }
+    assert_eq!(
+        app.state.plugin_action_choices_providers_in_flight,
+        MAX_PLUGIN_ACTION_CHOICES_PROVIDERS_IN_FLIGHT
+    );
+    app.cancel_context_menu_plugin_generation(12);
     assert_eq!(app.state.plugin_action_choices_providers_in_flight, 0);
     std::fs::remove_dir_all(root).ok();
 }

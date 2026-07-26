@@ -1179,6 +1179,7 @@ impl App {
     pub(crate) fn handle_context_menu_key_via_api(&mut self, key: KeyEvent) {
         match key.code {
             KeyCode::Esc => {
+                self.cancel_open_context_menu_plugin_generation();
                 self.state.context_menu = None;
                 leave_modal(&mut self.state);
             }
@@ -1212,7 +1213,60 @@ impl App {
         }
     }
 
-    pub(crate) fn apply_context_menu_action_via_api(&mut self, menu: ContextMenuState, idx: usize) {
+    fn re_resolve_context_menu_kind(&self, menu: &ContextMenuState) -> Option<ContextMenuKind> {
+        let target = &menu.plugin.as_ref()?.target;
+        match (&menu.kind, target) {
+            (
+                ContextMenuKind::Workspace { .. },
+                crate::app::state::ContextMenuTarget::Workspace(id),
+            ) => self
+                .parse_workspace_id(id)
+                .map(|ws_idx| ContextMenuKind::Workspace { ws_idx }),
+            (
+                ContextMenuKind::GitWorkspace {
+                    is_linked_worktree,
+                    has_worktree_children,
+                    collapsed,
+                    ..
+                },
+                crate::app::state::ContextMenuTarget::Workspace(id),
+            ) => self
+                .parse_workspace_id(id)
+                .map(|ws_idx| ContextMenuKind::GitWorkspace {
+                    ws_idx,
+                    is_linked_worktree: *is_linked_worktree,
+                    has_worktree_children: *has_worktree_children,
+                    collapsed: *collapsed,
+                }),
+            (ContextMenuKind::Tab { .. }, crate::app::state::ContextMenuTarget::Tab(id)) => self
+                .parse_tab_id(id)
+                .map(|(ws_idx, tab_idx)| ContextMenuKind::Tab { ws_idx, tab_idx }),
+            (
+                ContextMenuKind::Pane {
+                    source_pane_id,
+                    has_manual_label,
+                    ..
+                },
+                crate::app::state::ContextMenuTarget::Pane(id),
+            ) => self.parse_pane_id(id).and_then(|(ws_idx, pane_id)| {
+                let tab_idx = self.state.workspaces[ws_idx].find_tab_index_for_pane(pane_id)?;
+                Some(ContextMenuKind::Pane {
+                    ws_idx,
+                    tab_idx,
+                    pane_id,
+                    source_pane_id: *source_pane_id,
+                    has_manual_label: *has_manual_label,
+                })
+            }),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn apply_context_menu_action_via_api(
+        &mut self,
+        mut menu: ContextMenuState,
+        idx: usize,
+    ) {
         if let Some((snapshot, choice)) = menu.selected_plugin_choice(idx) {
             self.invoke_context_menu_plugin_choice(menu, snapshot, choice);
             return;
@@ -1228,6 +1282,19 @@ impl App {
             Some(crate::app::state::ContextMenuEntry::Native(label)) => Some(label),
             _ => None,
         };
+        let generation = menu.plugin.as_ref().map(|plugin| plugin.generation);
+        let Some(kind) = self.re_resolve_context_menu_kind(&menu) else {
+            if let Some(generation) = generation {
+                self.cancel_context_menu_plugin_generation(generation);
+            }
+            self.show_plugin_action_failure("menu target no longer exists");
+            leave_modal(&mut self.state);
+            return;
+        };
+        if let Some(generation) = generation {
+            self.cancel_context_menu_plugin_generation(generation);
+        }
+        menu.kind = kind;
         match (menu.kind, item) {
             (ContextMenuKind::GitWorkspace { ws_idx, .. }, Some("New worktree")) => {
                 self.state.request_new_linked_worktree = Some(ws_idx);
@@ -2312,6 +2379,9 @@ mod tests {
             .iter()
             .position(|item| *item == "Close")
             .expect("close tab item");
+        app.state.context_menu = Some(menu);
+        app.initialize_context_menu_plugins();
+        let menu = app.state.context_menu.take().expect("initialized menu");
 
         app.apply_context_menu_action_via_api(menu, idx);
 
@@ -2350,6 +2420,7 @@ mod tests {
             .expect("close pane item");
         menu.list.highlighted = close_idx;
         app.state.context_menu = Some(menu);
+        app.initialize_context_menu_plugins();
 
         app.handle_context_menu_key_via_api(KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()));
 

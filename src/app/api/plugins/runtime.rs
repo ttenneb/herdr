@@ -295,13 +295,21 @@ impl App {
         self.state
             .plugin_action_choices_requests_in_flight
             .insert(request_id.clone());
+        let cancellation = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        self.plugin_choice_provider_cancellations.insert(
+            request_id.clone(),
+            crate::app::PluginChoiceProviderCancellation {
+                signal: cancellation.clone(),
+                log_id: log_id.clone(),
+            },
+        );
 
         let event_tx = self.event_tx.clone();
         std::thread::spawn(move || {
             let mut command = crate::plugin_command::command_for_argv(&program, &args);
             configure_plugin_command(&mut command, &plugin_root, &env);
             command.stdin(Stdio::null());
-            let completion = run_choices_provider(command);
+            let completion = run_choices_provider(command, &cancellation);
             let event = crate::events::AppEvent::PluginActionChoicesFinished {
                 request_id,
                 plugin_id,
@@ -497,7 +505,10 @@ struct ChoicesProviderCompletion {
     result: Result<crate::api::schema::PluginActionChoices, String>,
 }
 
-fn run_choices_provider(mut command: Command) -> ChoicesProviderCompletion {
+fn run_choices_provider(
+    mut command: Command,
+    cancellation: &std::sync::atomic::AtomicBool,
+) -> ChoicesProviderCompletion {
     let mut child = match crate::platform::IsolatedChild::spawn(&mut command) {
         Ok(child) => child,
         Err(err) => {
@@ -524,8 +535,20 @@ fn run_choices_provider(mut command: Command) -> ChoicesProviderCompletion {
                 drain_provider_output_available(&mut child, &mut stdout, &mut stderr, &mut buffer);
                 break (Some(status), None);
             }
-            Ok(None) if Instant::now() < deadline => {
+            Ok(None)
+                if !cancellation.load(std::sync::atomic::Ordering::Acquire)
+                    && Instant::now() < deadline =>
+            {
                 std::thread::sleep(Duration::from_millis(10));
+            }
+            Ok(None) if cancellation.load(std::sync::atomic::Ordering::Acquire) => {
+                let termination_error = child.terminate_tree().err();
+                let status = child.wait().ok();
+                let message = termination_error.map_or_else(
+                    || "choices provider cancelled".to_string(),
+                    |err| format!("choices provider cancellation failed: {err}"),
+                );
+                break (status, Some(message));
             }
             Ok(None) => {
                 let termination_error = child.terminate_tree().err();
@@ -650,7 +673,7 @@ fn reap_terminated_provider(
     }
 }
 
-fn current_unix_ms() -> u64 {
+pub(super) fn current_unix_ms() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|duration| duration.as_millis().min(u128::from(u64::MAX)) as u64)

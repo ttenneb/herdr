@@ -256,11 +256,6 @@ impl App {
         {
             return;
         }
-        if let Err(err) = self.refresh_installed_plugins() {
-            tracing::warn!(%err, "failed to refresh plugins for context menu");
-            return;
-        }
-
         let kind = match self.state.context_menu.as_ref() {
             Some(menu) => menu.kind.clone(),
             None => return,
@@ -317,11 +312,20 @@ impl App {
         };
         context.invocation_source = Some("context_menu".to_string());
 
+        let plugins_available = self.refresh_installed_plugins().map_or_else(
+            |err| {
+                tracing::warn!(%err, "failed to refresh plugins for context menu");
+                false
+            },
+            |()| true,
+        );
         let mut providers = self
             .state
             .installed_plugins
             .values()
-            .filter(|plugin| plugin.enabled && plugin_manifest_available(plugin))
+            .filter(|plugin| {
+                plugins_available && plugin.enabled && plugin_manifest_available(plugin)
+            })
             .flat_map(|plugin| {
                 plugin.actions.iter().filter_map(|action| {
                     action.choices_command.as_ref()?;
@@ -499,6 +503,54 @@ impl App {
         self.publish_context_menu_plugin_choices_if_settled();
     }
 
+    pub(crate) fn cancel_context_menu_plugin_generation(&mut self, generation: u64) {
+        let prefix = format!("context-menu-{generation}-");
+        let request_ids = self
+            .state
+            .plugin_action_choices_requests_in_flight
+            .iter()
+            .filter(|request_id| request_id.starts_with(&prefix))
+            .cloned()
+            .collect::<Vec<_>>();
+        for request_id in &request_ids {
+            if let Some(cancellation) = self.plugin_choice_provider_cancellations.remove(request_id)
+            {
+                cancellation
+                    .signal
+                    .store(true, std::sync::atomic::Ordering::Release);
+                if let Some(log) = self
+                    .state
+                    .plugin_command_logs
+                    .iter_mut()
+                    .find(|log| log.log_id == cancellation.log_id)
+                {
+                    log.finished_unix_ms = Some(runtime::current_unix_ms());
+                    log.error = Some("choices provider cancelled".to_string());
+                    log.status = crate::api::schema::PluginCommandStatus::Failed;
+                }
+            }
+            self.state
+                .plugin_action_choices_requests_in_flight
+                .remove(request_id);
+        }
+        self.state.plugin_action_choices_providers_in_flight = self
+            .state
+            .plugin_action_choices_providers_in_flight
+            .saturating_sub(request_ids.len());
+    }
+
+    pub(crate) fn cancel_open_context_menu_plugin_generation(&mut self) {
+        if let Some(generation) = self
+            .state
+            .context_menu
+            .as_ref()
+            .and_then(|menu| menu.plugin.as_ref())
+            .map(|plugin| plugin.generation)
+        {
+            self.cancel_context_menu_plugin_generation(generation);
+        }
+    }
+
     pub(crate) fn correlate_context_menu_plugin_completion(
         &mut self,
         request_id: &str,
@@ -603,6 +655,7 @@ impl App {
         let Some(plugin_state) = menu.plugin else {
             return;
         };
+        self.cancel_context_menu_plugin_generation(plugin_state.generation);
         if let Err(err) = self.refresh_installed_plugins() {
             tracing::warn!(%err, "failed to refresh plugin before context-menu invocation");
             self.show_plugin_action_failure("plugin action unavailable");
@@ -691,7 +744,7 @@ impl App {
         leave_context_menu_after_plugin_choice(&mut self.state);
     }
 
-    fn show_plugin_action_failure(&mut self, message: &str) {
+    pub(crate) fn show_plugin_action_failure(&mut self, message: &str) {
         self.state.copy_feedback = Some(crate::app::state::CopyFeedback {
             message: message.to_string(),
         });
@@ -1673,6 +1726,73 @@ choices_command = ["sh", "-c", "printf '%s' '{{\"version\":1,\"choices\":[{{\"id
             .entries
             .is_empty());
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn native_context_menu_action_re_resolves_reordered_workspace_target() {
+        use crate::app::state::{
+            ContextMenuKind, ContextMenuPluginState, ContextMenuState, ContextMenuTarget,
+        };
+        let mut app = test_app();
+        app.state.workspaces = vec![
+            crate::workspace::Workspace::test_new("other"),
+            crate::workspace::Workspace::test_new("target"),
+        ];
+        let target_id = app.public_workspace_id(1);
+        let context = app.plugin_context_for_workspace(1, "reorder");
+        let mut menu = ContextMenuState::new(ContextMenuKind::Workspace { ws_idx: 1 }, 0, 0);
+        menu.plugin = Some(ContextMenuPluginState {
+            generation: 41,
+            context,
+            target: ContextMenuTarget::Workspace(target_id.clone()),
+            providers: vec![],
+            entries: vec![],
+        });
+
+        app.state.workspaces.swap(0, 1);
+        app.apply_context_menu_action_via_api(menu, 0);
+
+        assert_eq!(app.state.selected, 0);
+        assert_eq!(app.public_workspace_id(0), target_id);
+        assert_eq!(app.state.name_input, "target");
+    }
+
+    #[test]
+    fn native_context_menu_action_closes_safely_when_provider_removed_target() {
+        use crate::app::state::{
+            ContextMenuKind, ContextMenuPluginState, ContextMenuState, ContextMenuTarget,
+        };
+        let mut app = test_app();
+        app.state.workspaces = vec![
+            crate::workspace::Workspace::test_new("target"),
+            crate::workspace::Workspace::test_new("survivor"),
+        ];
+        app.state.active = Some(1);
+        let target_id = app.public_workspace_id(0);
+        let survivor_id = app.public_workspace_id(1);
+        let context = app.plugin_context_for_workspace(0, "removed-by-provider");
+        let mut menu = ContextMenuState::new(ContextMenuKind::Workspace { ws_idx: 0 }, 0, 0);
+        menu.plugin = Some(ContextMenuPluginState {
+            generation: 42,
+            context,
+            target: ContextMenuTarget::Workspace(target_id),
+            providers: vec![],
+            entries: vec![],
+        });
+
+        app.state.workspaces.remove(0);
+        app.apply_context_menu_action_via_api(menu, 1);
+
+        assert_eq!(app.state.workspaces.len(), 1);
+        assert_eq!(app.public_workspace_id(0), survivor_id);
+        assert!(app.state.context_menu.is_none());
+        assert_eq!(
+            app.state
+                .copy_feedback
+                .as_ref()
+                .map(|feedback| feedback.message.as_str()),
+            Some("menu target no longer exists")
+        );
     }
 
     #[test]

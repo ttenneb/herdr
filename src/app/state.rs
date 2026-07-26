@@ -1487,6 +1487,11 @@ impl ContextMenuState {
             };
             if let Some(index) = candidate {
                 self.list.highlighted = index;
+            } else {
+                // Ratatui scrolls its local ListState back to the selection. Keep
+                // the persisted offset identical so rendering and hit-testing
+                // cannot disagree when the only visible row is disabled loading.
+                self.ensure_highlight_visible(visible_rows);
             }
         }
     }

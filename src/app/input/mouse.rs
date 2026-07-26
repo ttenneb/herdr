@@ -2675,6 +2675,33 @@ mod tests {
     }
 
     #[test]
+    fn one_row_loading_menu_keeps_scroll_render_and_hit_test_synchronized() {
+        let mut app = app_for_mouse_test();
+        app.state.view.sidebar_rect = Rect::new(0, 0, 10, 3);
+        app.state.view.terminal_area = Rect::new(10, 0, 30, 3);
+        let mut menu = ContextMenuState::new(ContextMenuKind::Workspace { ws_idx: 0 }, 0, 0);
+        menu.plugin = Some(crate::app::state::ContextMenuPluginState {
+            generation: 1,
+            context: serde_json::from_str("{}").unwrap(),
+            target: crate::app::state::ContextMenuTarget::Workspace("workspace-1".into()),
+            providers: vec![],
+            entries: vec![crate::app::state::ContextMenuEntry::PluginLoading],
+        });
+        menu.scroll(2, 1);
+        app.state.context_menu = Some(menu);
+
+        let rect = app.state.context_menu_rect().unwrap();
+        let menu = app.state.context_menu.as_ref().unwrap();
+        assert_eq!(rect.height.saturating_sub(2), 1);
+        assert_eq!(menu.list.highlighted, 0);
+        assert_eq!(menu.scroll_offset, 0);
+        assert_eq!(
+            app.state.context_menu_item_at(rect.x + 1, rect.y + 1),
+            Some(0)
+        );
+    }
+
+    #[test]
     fn context_menu_wheel_scrolls_and_hover_keeps_persistent_offset() {
         let mut app = app_for_mouse_test();
         app.state.view.sidebar_rect = Rect::new(0, 0, 10, 5);
@@ -3075,6 +3102,7 @@ mod tests {
             plugin: None,
         });
         app.state.mode = Mode::ContextMenu;
+        app.initialize_context_menu_plugins();
 
         let menu = app.state.context_menu_rect().unwrap();
         app.handle_mouse(mouse(

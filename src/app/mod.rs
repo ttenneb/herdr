@@ -96,6 +96,11 @@ impl PaneClickState {
     }
 }
 
+pub(crate) struct PluginChoiceProviderCancellation {
+    pub(crate) signal: Arc<AtomicBool>,
+    pub(crate) log_id: String,
+}
+
 pub struct App {
     pub state: AppState,
     pub(crate) terminal_runtimes: crate::terminal::TerminalRuntimeRegistry,
@@ -138,6 +143,10 @@ pub struct App {
     pub(crate) session_save_deadline: Option<Instant>,
     pub(crate) session_save_thread: Option<std::thread::JoinHandle<()>>,
     pub(crate) detached_custom_command_children: Vec<std::process::Child>,
+    /// Runtime cancellation signals for provider processes. These stay out of
+    /// `AppState` so pure state and rendering never own process lifecycle.
+    pub(crate) plugin_choice_provider_cancellations:
+        HashMap<String, PluginChoiceProviderCancellation>,
     pub(crate) persist_pane_history: bool,
     pub(crate) last_render_at: Option<Instant>,
     pub(crate) pressed_terminal_keys:
@@ -769,6 +778,7 @@ impl App {
             session_save_deadline: None,
             session_save_thread: None,
             detached_custom_command_children: Vec::new(),
+            plugin_choice_provider_cancellations: HashMap::new(),
             selection_autoscroll_deadline: None,
             selection_highlight_clear_deadline: None,
             persist_pane_history: config.experimental.pane_history,
@@ -5603,6 +5613,7 @@ last_pane = "prefix+tab"
             plugin: None,
         });
         app.state.mode = Mode::ContextMenu;
+        app.initialize_context_menu_plugins();
 
         app.route_client_input(b"\r".to_vec());
 

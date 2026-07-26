@@ -176,6 +176,8 @@ impl App {
         } = ev
         {
             let error = result.as_ref().err().cloned();
+            self.plugin_choice_provider_cancellations
+                .remove(&request_id);
             let first_completion = self
                 .state
                 .plugin_action_choices_requests_in_flight
