@@ -42,6 +42,66 @@ pub(crate) fn configure_background_command(command: &mut std::process::Command) 
 #[cfg(not(windows))]
 fn configure_background_command_platform(_command: &mut std::process::Command) {}
 
+/// A child launched in the strongest practical platform process-tree isolation.
+///
+/// Choice providers use this wrapper so timeout cleanup cannot leave descendants
+/// behind. Platform details remain confined to this module and its OS backends.
+pub(crate) struct IsolatedChild {
+    child: std::process::Child,
+    isolation: ProcessIsolation,
+}
+
+impl IsolatedChild {
+    pub(crate) fn spawn(command: &mut std::process::Command) -> std::io::Result<Self> {
+        let (mut child, mut isolation) = spawn_isolated_process_platform(command)?;
+        if let Err(error) = configure_isolated_output_platform(&child) {
+            let _ = terminate_isolated_process_platform(&mut child, &mut isolation);
+            let _ = child.wait();
+            return Err(error);
+        }
+        Ok(Self { child, isolation })
+    }
+
+    /// Read bytes currently available on stdout without waiting for a writer.
+    pub(crate) fn read_stdout_available(
+        &mut self,
+        buffer: &mut [u8],
+    ) -> std::io::Result<AvailableOutput> {
+        read_child_stdout_available_platform(&mut self.child, buffer)
+    }
+
+    /// Read bytes currently available on stderr without waiting for a writer.
+    pub(crate) fn read_stderr_available(
+        &mut self,
+        buffer: &mut [u8],
+    ) -> std::io::Result<AvailableOutput> {
+        read_child_stderr_available_platform(&mut self.child, buffer)
+    }
+
+    pub(crate) fn try_wait(&mut self) -> std::io::Result<Option<std::process::ExitStatus>> {
+        self.child.try_wait()
+    }
+
+    pub(crate) fn terminate_tree(&mut self) -> std::io::Result<()> {
+        terminate_isolated_process_platform(&mut self.child, &mut self.isolation)
+    }
+
+    /// Finish teardown after the bounded provider-result path has completed.
+    /// Callers run this on their existing worker thread and retain admission
+    /// capacity until it returns.
+    pub(crate) fn reap(mut self) {
+        let _ = self.terminate_tree();
+        let _ = self.child.wait();
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AvailableOutput {
+    Bytes(usize),
+    Open,
+    Closed,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct PlatformCapabilities {
     pub(crate) live_handoff: bool,

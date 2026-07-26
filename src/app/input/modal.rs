@@ -975,13 +975,21 @@ pub(crate) fn handle_context_menu_key(
             leave_modal(state);
         }
         KeyCode::Up => {
+            let visible_rows = state
+                .context_menu_rect()
+                .map_or(0, |rect| rect.height.saturating_sub(2) as usize);
             if let Some(menu) = &mut state.context_menu {
-                menu.list.move_prev();
+                menu.move_prev();
+                menu.ensure_highlight_visible(visible_rows);
             }
         }
         KeyCode::Down => {
+            let visible_rows = state
+                .context_menu_rect()
+                .map_or(0, |rect| rect.height.saturating_sub(2) as usize);
             if let Some(menu) = &mut state.context_menu {
-                menu.list.move_next(menu.items().len());
+                menu.move_next();
+                menu.ensure_highlight_visible(visible_rows);
             }
         }
         KeyCode::Enter => {
@@ -1171,17 +1179,28 @@ impl App {
     pub(crate) fn handle_context_menu_key_via_api(&mut self, key: KeyEvent) {
         match key.code {
             KeyCode::Esc => {
+                self.cancel_open_context_menu_plugin_generation();
                 self.state.context_menu = None;
                 leave_modal(&mut self.state);
             }
             KeyCode::Up => {
+                let visible_rows = self
+                    .state
+                    .context_menu_rect()
+                    .map_or(0, |rect| rect.height.saturating_sub(2) as usize);
                 if let Some(menu) = &mut self.state.context_menu {
-                    menu.list.move_prev();
+                    menu.move_prev();
+                    menu.ensure_highlight_visible(visible_rows);
                 }
             }
             KeyCode::Down => {
+                let visible_rows = self
+                    .state
+                    .context_menu_rect()
+                    .map_or(0, |rect| rect.height.saturating_sub(2) as usize);
                 if let Some(menu) = &mut self.state.context_menu {
-                    menu.list.move_next(menu.items().len());
+                    menu.move_next();
+                    menu.ensure_highlight_visible(visible_rows);
                 }
             }
             KeyCode::Enter => {
@@ -1194,8 +1213,88 @@ impl App {
         }
     }
 
-    pub(crate) fn apply_context_menu_action_via_api(&mut self, menu: ContextMenuState, idx: usize) {
-        let item = menu.items().get(idx).copied();
+    fn re_resolve_context_menu_kind(&self, menu: &ContextMenuState) -> Option<ContextMenuKind> {
+        let target = &menu.plugin.as_ref()?.target;
+        match (&menu.kind, target) {
+            (
+                ContextMenuKind::Workspace { .. },
+                crate::app::state::ContextMenuTarget::Workspace(id),
+            ) => self
+                .parse_workspace_id(id)
+                .map(|ws_idx| ContextMenuKind::Workspace { ws_idx }),
+            (
+                ContextMenuKind::GitWorkspace {
+                    is_linked_worktree,
+                    has_worktree_children,
+                    collapsed,
+                    ..
+                },
+                crate::app::state::ContextMenuTarget::Workspace(id),
+            ) => self
+                .parse_workspace_id(id)
+                .map(|ws_idx| ContextMenuKind::GitWorkspace {
+                    ws_idx,
+                    is_linked_worktree: *is_linked_worktree,
+                    has_worktree_children: *has_worktree_children,
+                    collapsed: *collapsed,
+                }),
+            (ContextMenuKind::Tab { .. }, crate::app::state::ContextMenuTarget::Tab(id)) => self
+                .parse_tab_id(id)
+                .map(|(ws_idx, tab_idx)| ContextMenuKind::Tab { ws_idx, tab_idx }),
+            (
+                ContextMenuKind::Pane {
+                    source_pane_id,
+                    has_manual_label,
+                    ..
+                },
+                crate::app::state::ContextMenuTarget::Pane(id),
+            ) => self.parse_pane_id(id).and_then(|(ws_idx, pane_id)| {
+                let tab_idx = self.state.workspaces[ws_idx].find_tab_index_for_pane(pane_id)?;
+                Some(ContextMenuKind::Pane {
+                    ws_idx,
+                    tab_idx,
+                    pane_id,
+                    source_pane_id: *source_pane_id,
+                    has_manual_label: *has_manual_label,
+                })
+            }),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn apply_context_menu_action_via_api(
+        &mut self,
+        mut menu: ContextMenuState,
+        idx: usize,
+    ) {
+        if let Some((snapshot, choice)) = menu.selected_plugin_choice(idx) {
+            self.invoke_context_menu_plugin_choice(menu, snapshot, choice);
+            return;
+        }
+        let entry = menu.entry(idx);
+        if !menu.entry_enabled(idx) && entry.is_some() {
+            // Loading is inert even for synthetic or stale input.
+            self.state.context_menu = Some(menu);
+            self.state.mode = Mode::ContextMenu;
+            return;
+        }
+        let item = match entry {
+            Some(crate::app::state::ContextMenuEntry::Native(label)) => Some(label),
+            _ => None,
+        };
+        let generation = menu.plugin.as_ref().map(|plugin| plugin.generation);
+        let Some(kind) = self.re_resolve_context_menu_kind(&menu) else {
+            if let Some(generation) = generation {
+                self.cancel_context_menu_plugin_generation(generation);
+            }
+            self.show_plugin_action_failure("menu target no longer exists");
+            leave_modal(&mut self.state);
+            return;
+        };
+        if let Some(generation) = generation {
+            self.cancel_context_menu_plugin_generation(generation);
+        }
+        menu.kind = kind;
         match (menu.kind, item) {
             (ContextMenuKind::GitWorkspace { ws_idx, .. }, Some("New worktree")) => {
                 self.state.request_new_linked_worktree = Some(ws_idx);
@@ -2137,6 +2236,33 @@ mod tests {
     }
 
     #[test]
+    fn context_menu_keyboard_navigation_clamps_and_escape_closes() {
+        let mut app = app_with_test_workspaces(&["test"]);
+        app.state.mode = Mode::ContextMenu;
+        app.state.context_menu = Some(ContextMenuState {
+            kind: ContextMenuKind::Workspace { ws_idx: 0 },
+            x: 0,
+            y: 0,
+            list: MenuListState::new(0),
+            scroll_offset: 0,
+            plugin: None,
+        });
+
+        let key = |code| KeyEvent::new(code, KeyModifiers::empty());
+        app.handle_context_menu_key_via_api(key(KeyCode::Up));
+        assert_eq!(app.state.context_menu.as_ref().unwrap().list.highlighted, 0);
+        app.handle_context_menu_key_via_api(key(KeyCode::Down));
+        app.handle_context_menu_key_via_api(key(KeyCode::Down));
+        assert_eq!(app.state.context_menu.as_ref().unwrap().list.highlighted, 1);
+        app.handle_context_menu_key_via_api(key(KeyCode::Up));
+        assert_eq!(app.state.context_menu.as_ref().unwrap().list.highlighted, 0);
+
+        app.handle_context_menu_key_via_api(key(KeyCode::Esc));
+        assert!(app.state.context_menu.is_none());
+        assert_eq!(app.state.mode, Mode::Terminal);
+    }
+
+    #[test]
     fn context_menu_close_group_opens_group_close_confirmation() {
         let mut state = state_with_workspaces(&["main", "issue"]);
         state.active = Some(0);
@@ -2165,6 +2291,8 @@ mod tests {
             x: 0,
             y: 0,
             list: MenuListState::new(0),
+            scroll_offset: 0,
+            plugin: None,
         };
         let mut terminal_runtimes = crate::terminal::TerminalRuntimeRegistry::new();
 
@@ -2210,6 +2338,8 @@ mod tests {
             x: 0,
             y: 0,
             list: MenuListState::new(0),
+            scroll_offset: 0,
+            plugin: None,
         };
         let idx = menu
             .items()
@@ -2241,12 +2371,17 @@ mod tests {
             x: 0,
             y: 0,
             list: MenuListState::new(0),
+            scroll_offset: 0,
+            plugin: None,
         };
         let idx = menu
             .items()
             .iter()
             .position(|item| *item == "Close")
             .expect("close tab item");
+        app.state.context_menu = Some(menu);
+        app.initialize_context_menu_plugins();
+        let menu = app.state.context_menu.take().expect("initialized menu");
 
         app.apply_context_menu_action_via_api(menu, idx);
 
@@ -2275,6 +2410,8 @@ mod tests {
             x: 0,
             y: 0,
             list: MenuListState::new(0),
+            scroll_offset: 0,
+            plugin: None,
         };
         let close_idx = menu
             .items()
@@ -2283,6 +2420,7 @@ mod tests {
             .expect("close pane item");
         menu.list.highlighted = close_idx;
         app.state.context_menu = Some(menu);
+        app.initialize_context_menu_plugins();
 
         app.handle_context_menu_key_via_api(KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()));
 

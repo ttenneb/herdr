@@ -96,6 +96,35 @@ impl PaneClickState {
     }
 }
 
+#[derive(Clone)]
+pub(crate) struct PluginChoiceProviderCancellation {
+    pub(crate) signal: Arc<AtomicBool>,
+    spawn_gate: Arc<std::sync::Mutex<()>>,
+}
+
+impl PluginChoiceProviderCancellation {
+    pub(crate) fn new() -> Self {
+        Self {
+            signal: Arc::new(AtomicBool::new(false)),
+            spawn_gate: Arc::new(std::sync::Mutex::new(())),
+        }
+    }
+
+    pub(crate) fn cancel(&self) {
+        let _gate = self
+            .spawn_gate
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        self.signal.store(true, Ordering::Release);
+    }
+
+    pub(crate) fn lock_spawn(&self) -> std::sync::MutexGuard<'_, ()> {
+        self.spawn_gate
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+}
+
 pub struct App {
     pub state: AppState,
     pub(crate) terminal_runtimes: crate::terminal::TerminalRuntimeRegistry,
@@ -138,6 +167,10 @@ pub struct App {
     pub(crate) session_save_deadline: Option<Instant>,
     pub(crate) session_save_thread: Option<std::thread::JoinHandle<()>>,
     pub(crate) detached_custom_command_children: Vec<std::process::Child>,
+    /// Runtime cancellation signals for provider processes. These stay out of
+    /// `AppState` so pure state and rendering never own process lifecycle.
+    pub(crate) plugin_choice_provider_cancellations:
+        HashMap<String, PluginChoiceProviderCancellation>,
     pub(crate) persist_pane_history: bool,
     pub(crate) last_render_at: Option<Instant>,
     pub(crate) pressed_terminal_keys:
@@ -689,6 +722,9 @@ impl App {
             plugin_command_logs: Vec::new(),
             next_plugin_command_log_id: 1,
             plugin_commands_in_flight: 0,
+            plugin_action_choices_providers_in_flight: 0,
+            plugin_action_choices_requests_in_flight: std::collections::HashSet::new(),
+            next_context_menu_generation: 1,
             global_menu: state::MenuListState::new(0),
             host_terminal_theme: crate::terminal_theme::TerminalTheme::default(),
             host_cell_size: crate::kitty_graphics::HostCellSize::default(),
@@ -766,6 +802,7 @@ impl App {
             session_save_deadline: None,
             session_save_thread: None,
             detached_custom_command_children: Vec::new(),
+            plugin_choice_provider_cancellations: HashMap::new(),
             selection_autoscroll_deadline: None,
             selection_highlight_clear_deadline: None,
             persist_pane_history: config.experimental.pane_history,
@@ -5596,8 +5633,11 @@ last_pane = "prefix+tab"
             x: 2,
             y: 2,
             list: state::MenuListState::new(1),
+            scroll_offset: 0,
+            plugin: None,
         });
         app.state.mode = Mode::ContextMenu;
+        app.initialize_context_menu_plugins();
 
         app.route_client_input(b"\r".to_vec());
 

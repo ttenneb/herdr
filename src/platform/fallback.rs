@@ -1,10 +1,46 @@
 use std::path::PathBuf;
-use std::process::Command;
+use std::process::{Child, Command};
 
-use super::{ClipboardImage, ForegroundJob, Signal};
+use super::{AvailableOutput, ClipboardImage, ForegroundJob, Signal};
 
 /// Unsupported platform stub.
 pub fn raise_server_nofile_limit() {}
+
+pub(crate) struct ProcessIsolation;
+
+pub(crate) fn spawn_isolated_process_platform(
+    _command: &mut Command,
+) -> std::io::Result<(Child, ProcessIsolation)> {
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "isolated plugin choice providers are unsupported on this platform",
+    ))
+}
+
+pub(crate) fn terminate_isolated_process_platform(
+    child: &mut Child,
+    _isolation: &mut ProcessIsolation,
+) -> std::io::Result<()> {
+    child.kill()
+}
+
+pub(crate) fn configure_isolated_output_platform(_child: &Child) -> std::io::Result<()> {
+    Ok(())
+}
+
+pub(crate) fn read_child_stdout_available_platform(
+    _child: &mut Child,
+    _buffer: &mut [u8],
+) -> std::io::Result<AvailableOutput> {
+    Ok(AvailableOutput::Open)
+}
+
+pub(crate) fn read_child_stderr_available_platform(
+    _child: &mut Child,
+    _buffer: &mut [u8],
+) -> std::io::Result<AvailableOutput> {
+    Ok(AvailableOutput::Open)
+}
 
 pub(crate) fn should_draw_host_cursor_by_default() -> bool {
     false

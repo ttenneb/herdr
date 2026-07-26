@@ -58,6 +58,8 @@ struct RawPluginManifestAction {
     #[serde(default)]
     platforms: Option<Vec<RawPlatform>>,
     command: Vec<String>,
+    #[serde(default)]
+    choices_command: Option<Vec<String>>,
 }
 
 #[derive(serde::Deserialize)]
@@ -139,40 +141,44 @@ pub(crate) fn load_plugin_manifest(
         .to_path_buf();
     let content = std::fs::read_to_string(&manifest_path)
         .map_err(|err| ("plugin_manifest_read_failed", err.to_string()))?;
-    let raw: RawPluginManifest = toml::from_str(&content)
+    let raw_manifest: RawPluginManifest = toml::from_str(&content)
         .map_err(|err| ("plugin_manifest_parse_failed", err.to_string()))?;
-    let plugin_id = normalize_plugin_id(&raw.id)
+    let plugin_id = normalize_plugin_id(&raw_manifest.id)
         .ok_or_else(|| ("invalid_plugin_id", "invalid plugin id".to_string()))?;
-    let name = non_empty_trimmed(&raw.name, "invalid_plugin_name", "plugin name is required")?;
+    let name = non_empty_trimmed(
+        &raw_manifest.name,
+        "invalid_plugin_name",
+        "plugin name is required",
+    )?;
     let version = non_empty_trimmed(
-        &raw.version,
+        &raw_manifest.version,
         "invalid_plugin_version",
         "plugin version is required",
     )?;
-    let min_herdr_version = validate_min_herdr_version(raw.min_herdr_version.as_deref())?;
-    let description = raw
+    let min_herdr_version = validate_min_herdr_version(raw_manifest.min_herdr_version.as_deref())?;
+    let description = raw_manifest
         .description
         .map(|description| description.trim().to_string())
         .filter(|description| !description.is_empty());
-    let platforms = normalize_platforms(raw.platforms)?;
-    let build = raw
+    let platforms = normalize_platforms(raw_manifest.platforms)?;
+    let build = raw_manifest
         .build
         .into_iter()
         .map(normalize_manifest_build)
         .collect::<Result<Vec<_>, _>>()?;
-    let startup = raw
+    let startup = raw_manifest
         .startup
         .into_iter()
         .map(normalize_manifest_startup)
         .collect::<Result<Vec<_>, _>>()?;
-    let mut actions = raw
+    let mut actions = raw_manifest
         .actions
         .into_iter()
         .map(normalize_manifest_action)
         .collect::<Result<Vec<_>, _>>()?;
     reject_duplicate_action_ids(&actions)?;
     actions.sort_by(|a, b| a.id.cmp(&b.id));
-    let mut events = raw
+    let mut events = raw_manifest
         .events
         .into_iter()
         .map(normalize_manifest_event)
@@ -185,14 +191,14 @@ pub(crate) fn load_plugin_manifest(
                 .cmp(b.command.iter().map(|arg| arg.trim()))
         })
     });
-    let mut panes = raw
+    let mut panes = raw_manifest
         .panes
         .into_iter()
         .map(normalize_manifest_pane)
         .collect::<Result<Vec<_>, _>>()?;
     reject_duplicate_pane_ids(&panes)?;
     panes.sort_by(|a, b| a.id.cmp(&b.id));
-    let link_handlers = raw
+    let link_handlers = raw_manifest
         .link_handlers
         .into_iter()
         .map(normalize_manifest_link_handler)
@@ -396,6 +402,7 @@ fn normalize_manifest_action(
         .filter(|description| !description.is_empty());
     let platforms = normalize_platforms(action.platforms)?;
     let command = normalize_command(action.command)?;
+    let choices_command = action.choices_command.map(normalize_command).transpose()?;
     Ok(PluginManifestAction {
         id,
         title,
@@ -403,6 +410,7 @@ fn normalize_manifest_action(
         contexts: action.contexts,
         platforms,
         command,
+        choices_command,
     })
 }
 

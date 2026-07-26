@@ -1,19 +1,98 @@
 use std::ffi::OsStr;
 use std::io::Write;
-use std::os::fd::RawFd;
+use std::os::fd::{AsRawFd, RawFd};
 use std::os::unix::ffi::OsStrExt;
+use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, Stdio};
 use std::ptr::NonNull;
 use std::sync::OnceLock;
 
 use super::{
-    read_limited_reader, ClipboardCommand, ClipboardImage, ForegroundJob, ForegroundProcess,
-    LimitedRead, Signal,
+    read_limited_reader, AvailableOutput, ClipboardCommand, ClipboardImage, ForegroundJob,
+    ForegroundProcess, LimitedRead, Signal,
 };
 
 const PROC_PGRP_ONLY: u32 = 2;
 const SERVER_NOFILE_LIMIT_TARGET: libc::rlim_t = 8192;
+
+pub(crate) struct ProcessIsolation;
+
+pub(crate) fn spawn_isolated_process_platform(
+    command: &mut Command,
+) -> std::io::Result<(Child, ProcessIsolation)> {
+    unsafe {
+        command.pre_exec(|| {
+            if libc::setpgid(0, 0) != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    command.spawn().map(|child| (child, ProcessIsolation))
+}
+
+pub(crate) fn terminate_isolated_process_platform(
+    child: &mut Child,
+    _isolation: &mut ProcessIsolation,
+) -> std::io::Result<()> {
+    let pid = child.id();
+    let result = unsafe { libc::kill(-(pid as i32), libc::SIGKILL) };
+    if result == 0 {
+        Ok(())
+    } else {
+        child.kill()
+    }
+}
+
+pub(crate) fn configure_isolated_output_platform(child: &Child) -> std::io::Result<()> {
+    if let Some(stdout) = child.stdout.as_ref() {
+        set_nonblocking(stdout.as_raw_fd())?;
+    }
+    if let Some(stderr) = child.stderr.as_ref() {
+        set_nonblocking(stderr.as_raw_fd())?;
+    }
+    Ok(())
+}
+
+fn set_nonblocking(fd: RawFd) -> std::io::Result<()> {
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+    if flags < 0 || unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0 {
+        Err(std::io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
+}
+
+pub(crate) fn read_child_stdout_available_platform(
+    child: &mut Child,
+    buffer: &mut [u8],
+) -> std::io::Result<AvailableOutput> {
+    read_available(child.stdout.as_mut(), buffer)
+}
+
+pub(crate) fn read_child_stderr_available_platform(
+    child: &mut Child,
+    buffer: &mut [u8],
+) -> std::io::Result<AvailableOutput> {
+    read_available(child.stderr.as_mut(), buffer)
+}
+
+fn read_available(
+    reader: Option<&mut impl std::io::Read>,
+    buffer: &mut [u8],
+) -> std::io::Result<AvailableOutput> {
+    let Some(reader) = reader else {
+        return Ok(AvailableOutput::Closed);
+    };
+    match reader.read(buffer) {
+        Ok(0) => Ok(AvailableOutput::Closed),
+        Ok(read) => Ok(AvailableOutput::Bytes(read)),
+        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => Ok(AvailableOutput::Open),
+        Err(error) if error.kind() == std::io::ErrorKind::Interrupted => Ok(AvailableOutput::Open),
+        Err(error) => Err(error),
+    }
+}
 
 pub(crate) fn should_draw_host_cursor_by_default() -> bool {
     false

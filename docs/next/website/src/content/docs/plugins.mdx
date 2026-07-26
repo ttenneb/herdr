@@ -283,6 +283,108 @@ while Windows clients connect to a named pipe. CLI calls through
 [CLI reference](/docs/cli-reference/) for available commands and
 [socket API](/docs/socket-api/) for raw request shapes.
 
+### Action choices
+
+An action can populate Herdr's native context menu asynchronously by declaring a
+second argv command:
+
+```toml
+[[actions]]
+id = "open-target"
+title = "Open target"
+contexts = ["workspace", "tab", "pane"]
+command = ["node", "open-target.js"]
+choices_command = ["node", "list-targets.js"]
+```
+
+`choices_command` is optional and, like `command`, must be a nonempty argv array.
+It is eligible only when a workspace, tab, or pane context menu matches one of
+the action's `contexts`; `global` and `selection` do not provide choices. The
+current choices consumer is the native TUI context menu. There is no public
+socket request for resolving action choices.
+
+The provider must write one strict UTF-8 JSON document to stdout. Version 1 has
+this exact shape; all fields are required and unknown fields are rejected:
+
+```json
+{
+  "version": 1,
+  "choices": [
+    {
+      "id": "target-1",
+      "label": "Open target 1",
+      "payload": { "target": 1 }
+    }
+  ]
+}
+```
+
+`payload` may be any JSON value. Choice ids must be nonempty and unique within
+one provider result. Provider order is preserved. The fixed version-1 limits
+are:
+
+- 2 seconds per provider, 4 providers running globally, and 8 eligible
+  providers per menu;
+- 64 choices per provider and 128 choices in the combined menu;
+- 64 KiB stdout and 16 KiB retained stderr per provider;
+- 120 Unicode characters per choice id and 256 per label;
+- 8 KiB for each payload after JSON serialization and 16 levels of array/object
+  nesting.
+
+Labels must have visible terminal width. Empty or zero-width-only labels,
+control characters (including terminal controls, newlines, and tabs), and
+Unicode bidi formatting or override characters are rejected. Output above a
+limit, a nonzero exit, a timeout, malformed JSON, a trailing JSON document,
+duplicate ids, or any invalid choice rejects that provider's entire result.
+
+Herdr captures the invocation context when the target menu opens. A workspace
+menu captures its active tab and focused pane, a tab menu captures that tab and
+its focused pane, and a pane menu captures the targeted pane. The compact
+`HERDR_PLUGIN_CONTEXT_JSON` supplied unchanged to both the provider and the
+selected action contains the available fields from this exact snapshot:
+`workspace_id`, `workspace_label`, `workspace_cwd`, `worktree` (`repo_key`,
+`repo_name`, `repo_root`, `checkout_path`, and `is_linked_worktree`), `tab_id`,
+`tab_label`, `focused_pane_id`, `focused_pane_cwd`, `focused_pane_agent`,
+`focused_pane_status`, and `selected_text`. It also contains
+`invocation_source: "context_menu"` and a `correlation_id` of the form
+`context-menu-<generation>`; unavailable optional fields, including
+`clicked_url` and `link_handler_id`, are omitted. Focus, cwd, agent state, or
+selection changes while the menu is open do not alter this captured JSON.
+
+Providers run off the UI event loop. Herdr shows one loading row until every
+eligible provider has settled, then publishes results deterministically in
+bytewise `(plugin_id, action_id)` order while preserving each provider's choice
+order. Providers beyond the concurrency limit queue. A failed provider adds no
+row and reports only through the normal provider logs; successful providers
+remain usable after partial failure. Inspect them with `herdr plugin log list`,
+which records the provider command, status, capped stdout and stderr, and error.
+
+Selecting a choice runs the action's original `command` argv unchanged and adds
+`HERDR_PLUGIN_ACTION_CHOICE_JSON`, containing the exact selected object:
+
+```json
+{"id":"target-1","label":"Open target 1","payload":{"target":1}}
+```
+
+Herdr revalidates the target and the exact linked, enabled, platform-compatible
+plugin/action manifest before starting queued providers and again before
+invocation. Closing, reopening, or retargeting the menu, duplicate or late
+completion, unlinking or disabling the plugin, or changing/relinking its
+manifest makes old results stale; stale results are ignored. Selection is
+refused with safe feedback when the target or action is no longer valid, and a
+changed action asks the user to reopen the menu instead of invoking it.
+
+Direct invocation, including `herdr plugin action invoke` and action
+keybindings, runs `command` immediately: it does not run `choices_command` and
+does not set `HERDR_PLUGIN_ACTION_CHOICE_JSON`. Herdr also scrubs inherited
+plugin-routing and choice variables before launching either command.
+
+Choices providers are trusted plugin code, just like other plugin commands.
+Herdr bounds their output and runtime and uses platform process-tree cleanup so
+timeouts and descendants do not normally leak resources, but this hygiene is
+not a sandbox or security boundary. A plugin can still run arbitrary code or
+deliberately escape that cleanup.
+
 ## Panes
 
 Manifest pane `placement` defaults to `overlay`, which opens a temporary zoomed

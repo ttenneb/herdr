@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+### Added
+- Plugin actions can now declare bounded asynchronous `choices_command` providers for workspace, tab, and pane context menus.
+
 ### Changed
 - Relicensed Herdr from AGPL-3.0-or-later to Apache-2.0.
 

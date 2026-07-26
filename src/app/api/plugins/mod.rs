@@ -1,3 +1,4 @@
+mod choices;
 mod context;
 mod env;
 mod manifest;
@@ -50,7 +51,9 @@ impl App {
         mutation: impl FnOnce(&mut crate::app::state::InstalledPluginRegistry) -> T,
     ) -> std::io::Result<T> {
         if self.no_session {
-            return Ok(mutation(&mut self.state.installed_plugins));
+            let result = mutation(&mut self.state.installed_plugins);
+            self.invalidate_context_menu_plugin_choices();
+            return Ok(result);
         }
         let (result, entries) = crate::persist::plugin_registry::update(|entries| {
             let mut registry = entries
@@ -62,7 +65,24 @@ impl App {
             result
         })?;
         self.replace_installed_plugins(entries);
+        self.invalidate_context_menu_plugin_choices();
         Ok(result)
+    }
+
+    fn invalidate_context_menu_plugin_choices(&mut self) {
+        if let Some(menu) = self.state.context_menu.as_mut() {
+            let native_len = menu.native_items().len();
+            if let Some(plugin) = menu.plugin.as_mut() {
+                for provider in &mut plugin.providers {
+                    provider.settled = true;
+                    provider.running = false;
+                    provider.choices.clear();
+                }
+                plugin.entries.clear();
+                menu.list.highlighted = menu.list.highlighted.min(native_len.saturating_sub(1));
+                menu.scroll_offset = 0;
+            }
+        }
     }
 
     pub(super) fn handle_plugin_link(&mut self, id: String, params: PluginLinkParams) -> String {
@@ -220,6 +240,499 @@ impl App {
                 log,
             },
         )
+    }
+
+    pub(crate) fn initialize_context_menu_plugins(&mut self) {
+        use crate::app::state::{
+            ContextMenuActionSnapshot, ContextMenuKind, ContextMenuPluginProvider,
+            ContextMenuPluginState, ContextMenuTarget,
+        };
+
+        if self
+            .state
+            .context_menu
+            .as_ref()
+            .is_none_or(|menu| menu.plugin.is_some())
+        {
+            return;
+        }
+        let kind = match self.state.context_menu.as_ref() {
+            Some(menu) => menu.kind.clone(),
+            None => return,
+        };
+        let generation = self.state.next_context_menu_generation;
+        let Some(next_generation) = generation.checked_add(1) else {
+            tracing::warn!("context-menu generation space exhausted");
+            return;
+        };
+        self.state.next_context_menu_generation = next_generation;
+        let correlation_id = format!("context-menu-{generation}");
+        let (mut context, target, required_context) = match kind {
+            ContextMenuKind::Workspace { ws_idx }
+            | ContextMenuKind::GitWorkspace { ws_idx, .. } => {
+                let Some(workspace_id) = self
+                    .state
+                    .workspaces
+                    .get(ws_idx)
+                    .map(|_| self.public_workspace_id(ws_idx))
+                else {
+                    return;
+                };
+                (
+                    self.plugin_context_for_workspace(ws_idx, &correlation_id),
+                    ContextMenuTarget::Workspace(workspace_id),
+                    crate::api::schema::PluginActionContext::Workspace,
+                )
+            }
+            ContextMenuKind::Tab { ws_idx, tab_idx } => {
+                let Some(tab_id) = self.public_tab_id(ws_idx, tab_idx) else {
+                    return;
+                };
+                let Some(context) = self.plugin_context_for_tab_id(&tab_id, &correlation_id) else {
+                    return;
+                };
+                (
+                    context,
+                    ContextMenuTarget::Tab(tab_id),
+                    crate::api::schema::PluginActionContext::Tab,
+                )
+            }
+            ContextMenuKind::Pane {
+                ws_idx, pane_id, ..
+            } => {
+                let Some(pane_public_id) = self.public_pane_id(ws_idx, pane_id) else {
+                    return;
+                };
+                (
+                    self.plugin_context_for_pane(ws_idx, pane_id, &correlation_id),
+                    ContextMenuTarget::Pane(pane_public_id),
+                    crate::api::schema::PluginActionContext::Pane,
+                )
+            }
+        };
+        context.invocation_source = Some("context_menu".to_string());
+
+        let plugins_available = self.refresh_installed_plugins().map_or_else(
+            |err| {
+                tracing::warn!(%err, "failed to refresh plugins for context menu");
+                false
+            },
+            |()| true,
+        );
+        let mut providers = self
+            .state
+            .installed_plugins
+            .values()
+            .filter(|plugin| {
+                plugins_available && plugin.enabled && plugin_manifest_available(plugin)
+            })
+            .flat_map(|plugin| {
+                plugin.actions.iter().filter_map(|action| {
+                    action.choices_command.as_ref()?;
+                    if !action.contexts.contains(&required_context)
+                        || ensure_platform_supported(
+                            effective_platforms(&action.platforms, &plugin.platforms),
+                            &action.id,
+                        )
+                        .is_err()
+                    {
+                        return None;
+                    }
+                    Some(ContextMenuPluginProvider {
+                        request_id: String::new(),
+                        snapshot: ContextMenuActionSnapshot {
+                            plugin: plugin.clone(),
+                            action: action.clone(),
+                        },
+                        running: false,
+                        settled: false,
+                        choices: Vec::new(),
+                    })
+                })
+            })
+            .collect::<Vec<_>>();
+        providers.sort_by(|left, right| {
+            (&left.snapshot.plugin.plugin_id, &left.snapshot.action.id)
+                .cmp(&(&right.snapshot.plugin.plugin_id, &right.snapshot.action.id))
+        });
+        providers.truncate(8);
+        for (index, provider) in providers.iter_mut().enumerate() {
+            provider.request_id = format!("context-menu-{generation}-{index}");
+        }
+        let entries = if providers.is_empty() {
+            Vec::new()
+        } else {
+            vec![crate::app::state::ContextMenuEntry::PluginLoading]
+        };
+        if let Some(menu) = self.state.context_menu.as_mut() {
+            menu.plugin = Some(ContextMenuPluginState {
+                generation,
+                context,
+                target,
+                providers,
+                entries,
+            });
+        }
+        self.start_queued_context_menu_plugin_providers();
+    }
+
+    fn revalidate_context_menu_provider(
+        &self,
+        provider: &crate::app::state::ContextMenuPluginProvider,
+        context: &crate::api::schema::PluginInvocationContext,
+    ) -> Result<(InstalledPluginInfo, PluginManifestAction), (&'static str, String)> {
+        let current = self
+            .state
+            .installed_plugins
+            .get(&provider.snapshot.plugin.plugin_id)
+            .filter(|plugin| {
+                plugin.enabled
+                    && plugin_manifest_available(plugin)
+                    && **plugin == provider.snapshot.plugin
+            })
+            .ok_or((
+                "plugin_action_choices_stale",
+                "plugin changed before choices provider start".to_string(),
+            ))?;
+        let action = current
+            .actions
+            .iter()
+            .find(|action| action.id == provider.snapshot.action.id)
+            .filter(|action| **action == provider.snapshot.action)
+            .filter(|action| action.choices_command.is_some())
+            .ok_or((
+                "plugin_action_choices_stale",
+                "plugin action changed before choices provider start".to_string(),
+            ))?;
+        let menu_plugin = self
+            .state
+            .context_menu
+            .as_ref()
+            .and_then(|menu| menu.plugin.as_ref())
+            .filter(|plugin| plugin.context == *context)
+            .filter(|plugin| context_menu_target_exists(self, &plugin.target))
+            .ok_or((
+                "plugin_action_choices_stale",
+                "context-menu target changed before choices provider start".to_string(),
+            ))?;
+        let required_context = match menu_plugin.target {
+            crate::app::state::ContextMenuTarget::Workspace(_) => {
+                crate::api::schema::PluginActionContext::Workspace
+            }
+            crate::app::state::ContextMenuTarget::Tab(_) => {
+                crate::api::schema::PluginActionContext::Tab
+            }
+            crate::app::state::ContextMenuTarget::Pane(_) => {
+                crate::api::schema::PluginActionContext::Pane
+            }
+        };
+        if !action.contexts.contains(&required_context)
+            || ensure_platform_supported(
+                effective_platforms(&action.platforms, &current.platforms),
+                &action.id,
+            )
+            .is_err()
+        {
+            return Err((
+                "plugin_action_choices_stale",
+                "plugin action is no longer eligible for this context".to_string(),
+            ));
+        }
+        Ok((current.clone(), action.clone()))
+    }
+
+    pub(crate) fn start_queued_context_menu_plugin_providers(&mut self) {
+        loop {
+            if self.state.plugin_action_choices_requests_in_flight.len()
+                >= runtime::MAX_PLUGIN_ACTION_CHOICES_PROVIDERS_IN_FLIGHT
+            {
+                break;
+            }
+            let provider = self
+                .state
+                .context_menu
+                .as_ref()
+                .and_then(|menu| menu.plugin.as_ref())
+                .and_then(|plugin| {
+                    plugin
+                        .providers
+                        .iter()
+                        .find(|provider| !provider.running && !provider.settled)
+                        .cloned()
+                        .map(|provider| (plugin.context.clone(), provider))
+                });
+            let Some((context, provider)) = provider else {
+                break;
+            };
+            let refresh = self.refresh_installed_plugins().map_err(|err| {
+                (
+                    "plugin_registry_load_failed",
+                    format!("failed to refresh plugins before choices provider: {err}"),
+                )
+            });
+            let result = refresh
+                .and_then(|()| self.revalidate_context_menu_provider(&provider, &context))
+                .and_then(|(plugin, action)| {
+                    self.start_plugin_action_choices_provider(
+                        provider.request_id.clone(),
+                        &plugin,
+                        action.id,
+                        action.choices_command.unwrap_or_default(),
+                        &context,
+                    )
+                });
+            if let Some(current) = self
+                .state
+                .context_menu
+                .as_mut()
+                .and_then(|menu| menu.plugin.as_mut())
+                .and_then(|plugin| {
+                    plugin
+                        .providers
+                        .iter_mut()
+                        .find(|current| current.request_id == provider.request_id)
+                })
+            {
+                if result.is_ok() {
+                    current.running = true;
+                } else {
+                    current.settled = true;
+                }
+            }
+        }
+        self.publish_context_menu_plugin_choices_if_settled();
+    }
+
+    pub(crate) fn cancel_context_menu_plugin_generation(&mut self, generation: u64) {
+        let prefix = format!("context-menu-{generation}-");
+        let request_ids = self
+            .state
+            .plugin_action_choices_requests_in_flight
+            .iter()
+            .filter(|request_id| request_id.starts_with(&prefix))
+            .cloned()
+            .collect::<Vec<_>>();
+        for request_id in &request_ids {
+            if let Some(cancellation) = self.plugin_choice_provider_cancellations.get(request_id) {
+                cancellation.cancel();
+            }
+        }
+        // Keep cancelled providers admitted until their completion events confirm
+        // process cleanup. Releasing these slots while workers are still exiting
+        // would let rapidly reopened menus exceed the global process limit.
+    }
+
+    pub(crate) fn cancel_open_context_menu_plugin_generation(&mut self) {
+        if let Some(generation) = self
+            .state
+            .context_menu
+            .as_ref()
+            .and_then(|menu| menu.plugin.as_ref())
+            .map(|plugin| plugin.generation)
+        {
+            self.cancel_context_menu_plugin_generation(generation);
+        }
+    }
+
+    pub(crate) fn correlate_context_menu_plugin_completion(
+        &mut self,
+        request_id: &str,
+        plugin_id: &str,
+        action_id: &str,
+        result: &Result<crate::api::schema::PluginActionChoices, String>,
+    ) {
+        let mut accepted = false;
+        if let Some(provider) = self
+            .state
+            .context_menu
+            .as_mut()
+            .and_then(|menu| menu.plugin.as_mut())
+            .and_then(|plugin| {
+                let generation_prefix = format!("context-menu-{}-", plugin.generation);
+                request_id.starts_with(&generation_prefix).then_some(plugin)
+            })
+            .and_then(|plugin| {
+                plugin.providers.iter_mut().find(|provider| {
+                    provider.request_id == request_id
+                        && provider.snapshot.plugin.plugin_id == plugin_id
+                        && provider.snapshot.action.id == action_id
+                })
+            })
+        {
+            if provider.running && !provider.settled {
+                provider.running = false;
+                provider.settled = true;
+                let snapshot_is_current = self
+                    .state
+                    .installed_plugins
+                    .get(&provider.snapshot.plugin.plugin_id)
+                    .is_some_and(|plugin| {
+                        plugin.enabled
+                            && plugin_manifest_available(plugin)
+                            && *plugin == provider.snapshot.plugin
+                    });
+                if snapshot_is_current {
+                    if let Ok(choices) = result {
+                        provider.choices = choices.choices.clone();
+                    }
+                }
+                accepted = true;
+            }
+        }
+        // Even a stale completion frees global capacity and may unblock the
+        // currently open generation. It can never publish into that menu.
+        if accepted || self.state.context_menu.is_some() {
+            self.start_queued_context_menu_plugin_providers();
+        }
+    }
+
+    fn publish_context_menu_plugin_choices_if_settled(&mut self) {
+        let Some(menu) = self.state.context_menu.as_mut() else {
+            return;
+        };
+        let native_len = menu.native_items().len();
+        let Some(plugin) = menu.plugin.as_mut() else {
+            return;
+        };
+        if plugin.providers.iter().any(|provider| !provider.settled) {
+            return;
+        }
+        if !plugin
+            .entries
+            .iter()
+            .any(|entry| matches!(entry, crate::app::state::ContextMenuEntry::PluginLoading))
+        {
+            return;
+        }
+        let loading_was_highlighted = menu.list.highlighted >= native_len;
+        let mut entries = Vec::new();
+        let mut choice_count = 0;
+        for (provider_index, provider) in plugin.providers.iter().enumerate() {
+            for choice_index in 0..provider.choices.len() {
+                if choice_count == 128 {
+                    break;
+                }
+                entries.push(crate::app::state::ContextMenuEntry::PluginChoice {
+                    provider_index,
+                    choice_index,
+                });
+                choice_count += 1;
+            }
+            if choice_count == 128 {
+                break;
+            }
+        }
+        plugin.entries = entries;
+        if loading_was_highlighted {
+            menu.list.highlighted = native_len.saturating_sub(1);
+        }
+        menu.scroll_offset = menu.scroll_offset.min(menu.len().saturating_sub(1));
+    }
+
+    pub(crate) fn invoke_context_menu_plugin_choice(
+        &mut self,
+        menu: crate::app::state::ContextMenuState,
+        snapshot: crate::app::state::ContextMenuActionSnapshot,
+        choice: crate::api::schema::PluginActionChoice,
+    ) {
+        let Some(plugin_state) = menu.plugin else {
+            return;
+        };
+        self.cancel_context_menu_plugin_generation(plugin_state.generation);
+        if let Err(err) = self.refresh_installed_plugins() {
+            tracing::warn!(%err, "failed to refresh plugin before context-menu invocation");
+            self.show_plugin_action_failure("plugin action unavailable");
+            leave_context_menu_after_plugin_choice(&mut self.state);
+            return;
+        }
+        let plugin_id = snapshot.plugin.plugin_id.clone();
+        let action_id = snapshot.action.id.clone();
+        if !context_menu_target_exists(self, &plugin_state.target) {
+            tracing::warn!(
+                plugin_id,
+                action_id,
+                "plugin context-menu target no longer exists"
+            );
+            self.show_plugin_action_failure("plugin action target no longer exists");
+            leave_context_menu_after_plugin_choice(&mut self.state);
+            return;
+        }
+        let Some(plugin) = self.state.installed_plugins.get(&plugin_id).cloned() else {
+            tracing::warn!(
+                plugin_id,
+                action_id,
+                "plugin was unlinked before context-menu invocation"
+            );
+            self.show_plugin_action_failure("plugin action unavailable");
+            leave_context_menu_after_plugin_choice(&mut self.state);
+            return;
+        };
+        let Some(action) = plugin
+            .actions
+            .iter()
+            .find(|action| action.id == action_id)
+            .cloned()
+        else {
+            tracing::warn!(
+                plugin_id,
+                action_id,
+                "plugin action was removed before context-menu invocation"
+            );
+            self.show_plugin_action_failure("plugin action unavailable");
+            leave_context_menu_after_plugin_choice(&mut self.state);
+            return;
+        };
+        let expected_context = match plugin_state.target {
+            crate::app::state::ContextMenuTarget::Workspace(_) => {
+                crate::api::schema::PluginActionContext::Workspace
+            }
+            crate::app::state::ContextMenuTarget::Tab(_) => {
+                crate::api::schema::PluginActionContext::Tab
+            }
+            crate::app::state::ContextMenuTarget::Pane(_) => {
+                crate::api::schema::PluginActionContext::Pane
+            }
+        };
+        let valid = plugin.enabled
+            && plugin_manifest_available(&plugin)
+            && action.choices_command.is_some()
+            && action.contexts.contains(&expected_context)
+            && plugin == snapshot.plugin
+            && action == snapshot.action
+            && ensure_platform_supported(
+                effective_platforms(&action.platforms, &plugin.platforms),
+                &action.id,
+            )
+            .is_ok();
+        if !valid {
+            tracing::warn!(
+                plugin_id,
+                action_id,
+                "plugin action changed or became unavailable before context-menu invocation"
+            );
+            self.show_plugin_action_failure("plugin action changed; reopen the menu");
+            leave_context_menu_after_plugin_choice(&mut self.state);
+            return;
+        }
+        if let Err((code, message)) = self.start_plugin_command_with_choice(
+            &plugin,
+            action.id,
+            action.command,
+            &plugin_state.context,
+            &choice,
+        ) {
+            tracing::warn!(code, message, "failed to invoke plugin context-menu action");
+            self.show_plugin_action_failure("could not start plugin action");
+        }
+        leave_context_menu_after_plugin_choice(&mut self.state);
+    }
+
+    pub(crate) fn show_plugin_action_failure(&mut self, message: &str) {
+        self.state.copy_feedback = Some(crate::app::state::CopyFeedback {
+            message: message.to_string(),
+        });
+        self.copy_feedback_deadline =
+            Some(std::time::Instant::now() + super::super::COPY_FEEDBACK_DURATION);
     }
 
     pub(crate) fn invoke_plugin_action_from_keybind(
@@ -643,6 +1156,28 @@ impl App {
     }
 }
 
+fn context_menu_target_exists(app: &App, target: &crate::app::state::ContextMenuTarget) -> bool {
+    match target {
+        crate::app::state::ContextMenuTarget::Workspace(id) => app
+            .state
+            .workspaces
+            .iter()
+            .enumerate()
+            .any(|(index, _)| app.public_workspace_id(index) == *id),
+        crate::app::state::ContextMenuTarget::Tab(id) => app.parse_tab_id(id).is_some(),
+        crate::app::state::ContextMenuTarget::Pane(id) => app.parse_pane_id(id).is_some(),
+    }
+}
+
+fn leave_context_menu_after_plugin_choice(state: &mut crate::app::AppState) {
+    state.context_menu = None;
+    state.mode = if state.active.is_some() {
+        crate::app::state::Mode::Terminal
+    } else {
+        crate::app::state::Mode::Navigate
+    };
+}
+
 fn invalid_plugin_id(id: String) -> String {
     encode_error(
         id,
@@ -684,6 +1219,7 @@ fn manifest_action_info(
         description: action.description.clone(),
         contexts: action.contexts.clone(),
         command: action.command.clone(),
+        choices_command: action.choices_command.clone(),
         platforms: effective_platforms(&action.platforms, plugin_platforms).clone(),
     }
 }
@@ -719,6 +1255,40 @@ mod tests {
             api_rx,
             crate::api::EventHub::default(),
         )
+    }
+
+    fn context_menu_snapshot(plugin_id: &str) -> crate::app::state::ContextMenuActionSnapshot {
+        let action = PluginManifestAction {
+            id: "choose".into(),
+            title: "Choose".into(),
+            description: None,
+            contexts: vec![crate::api::schema::PluginActionContext::Workspace],
+            platforms: None,
+            command: vec!["action".into()],
+            choices_command: Some(vec!["provider".into()]),
+        };
+        crate::app::state::ContextMenuActionSnapshot {
+            plugin: InstalledPluginInfo {
+                plugin_id: plugin_id.into(),
+                name: plugin_id.into(),
+                version: "1".into(),
+                min_herdr_version: "0.7.0".into(),
+                description: None,
+                manifest_path: format!("/{plugin_id}/herdr-plugin.toml"),
+                plugin_root: format!("/{plugin_id}"),
+                enabled: true,
+                platforms: None,
+                build: vec![],
+                startup: vec![],
+                actions: vec![action.clone()],
+                events: vec![],
+                panes: vec![],
+                link_handlers: vec![],
+                source: PluginSourceInfo::default(),
+                warnings: vec![],
+            },
+            action,
+        }
     }
 
     fn response_result(response: &str) -> ResponseResult {
@@ -784,6 +1354,7 @@ id = "bootstrap"
 title = "Bootstrap worktree"
 contexts = ["workspace"]
 command = ["bun", "run", "bootstrap.ts"]
+choices_command = ["bun", "run", "choices.ts"]
 
 [[events]]
 on = "worktree.created"
@@ -825,6 +1396,560 @@ action = "bootstrap"
             result.contains("plugin_linked"),
             "expected plugin_linked: {result}"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn context_menu_choice_uses_exact_clicked_workspace_context_and_choice_env() {
+        let mut app = test_app();
+        app.state.workspaces = vec![
+            crate::workspace::Workspace::test_new("active"),
+            crate::workspace::Workspace::test_new("clicked"),
+        ];
+        app.state.active = Some(0);
+        app.state.selected = 0;
+        let clicked_id = app.public_workspace_id(1);
+        let active_id = app.public_workspace_id(0);
+        let root = unique_temp_path("context-choice-exact");
+        let context_capture = root.join("context.json");
+        let choice_capture = root.join("choice.json");
+        write_manifest_content(
+            &root,
+            &format!(
+                r#"
+id = "example.context-choice"
+name = "Context choice"
+version = "0.1.0"
+min_herdr_version = "0.7.0"
+platforms = ["linux", "macos"]
+
+[[actions]]
+id = "choose"
+title = "Choose"
+contexts = ["workspace"]
+command = ["sh", "-c", "printf '%s' \"$HERDR_PLUGIN_CONTEXT_JSON\" > '{}'; printf '%s' \"$HERDR_PLUGIN_ACTION_CHOICE_JSON\" > '{}'"]
+choices_command = ["sh", "-c", "printf '%s' '{{\"version\":1,\"choices\":[{{\"id\":\"opaque\",\"label\":\"Opaque\",\"payload\":{{\"n\":1}}}}]}}'"]
+"#,
+                context_capture.display(),
+                choice_capture.display()
+            ),
+        );
+        let plugin = load_plugin_manifest(&root.display().to_string(), true).unwrap();
+        app.state
+            .installed_plugins
+            .insert(plugin.plugin_id.clone(), plugin);
+        app.state.context_menu = Some(crate::app::state::ContextMenuState::new(
+            crate::app::state::ContextMenuKind::Workspace { ws_idx: 1 },
+            0,
+            0,
+        ));
+        app.state.mode = crate::app::state::Mode::ContextMenu;
+
+        app.initialize_context_menu_plugins();
+        let event = app.event_rx.blocking_recv().unwrap();
+        app.handle_internal_event(event);
+        let menu = app.state.context_menu.take().unwrap();
+        let context = &menu.plugin.as_ref().unwrap().context;
+        assert_eq!(context.workspace_id.as_deref(), Some(clicked_id.as_str()));
+        assert_ne!(context.workspace_id.as_deref(), Some(active_id.as_str()));
+        assert_eq!(context.invocation_source.as_deref(), Some("context_menu"));
+        let index = menu
+            .entry_indices()
+            .find(|index| {
+                matches!(
+                    menu.entry(*index),
+                    Some(crate::app::state::ContextMenuEntry::PluginChoice { .. })
+                )
+            })
+            .unwrap();
+        app.apply_context_menu_action_via_api(menu, index);
+        let event = app.event_rx.blocking_recv().unwrap();
+        app.handle_internal_event(event);
+
+        let invoked: PluginInvocationContext =
+            serde_json::from_str(&std::fs::read_to_string(context_capture).unwrap()).unwrap();
+        assert_eq!(invoked.workspace_id.as_deref(), Some(clicked_id.as_str()));
+        assert_eq!(invoked.invocation_source.as_deref(), Some("context_menu"));
+        let choice: crate::api::schema::PluginActionChoice =
+            serde_json::from_str(&std::fs::read_to_string(choice_capture).unwrap()).unwrap();
+        assert_eq!(choice.id, "opaque");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn context_menu_aggregation_is_provider_ordered_and_rejects_stale_generation() {
+        use crate::app::state::{
+            ContextMenuEntry, ContextMenuKind, ContextMenuPluginProvider, ContextMenuPluginState,
+            ContextMenuState, ContextMenuTarget,
+        };
+        let mut app = test_app();
+        app.state.workspaces = vec![crate::workspace::Workspace::test_new("target")];
+        app.state.active = Some(0);
+        let context = app.plugin_context_for_workspace(0, "menu");
+        let target = ContextMenuTarget::Workspace(app.public_workspace_id(0));
+        for plugin_id in ["a.plugin", "b.plugin"] {
+            let snapshot = context_menu_snapshot(plugin_id);
+            app.state
+                .installed_plugins
+                .insert(plugin_id.into(), snapshot.plugin);
+        }
+        let provider = |plugin_id: &str, request_id: &str| ContextMenuPluginProvider {
+            request_id: request_id.into(),
+            snapshot: context_menu_snapshot(plugin_id),
+            running: true,
+            settled: false,
+            choices: vec![],
+        };
+        let mut menu = ContextMenuState::new(ContextMenuKind::Workspace { ws_idx: 0 }, 0, 0);
+        menu.plugin = Some(ContextMenuPluginState {
+            generation: 7,
+            context: context.clone(),
+            target: target.clone(),
+            providers: vec![
+                provider("a.plugin", "context-menu-7-a"),
+                provider("b.plugin", "context-menu-7-b"),
+            ],
+            entries: vec![ContextMenuEntry::PluginLoading],
+        });
+        app.state.context_menu = Some(menu);
+        let choices = |id: &str| {
+            Ok(crate::api::schema::PluginActionChoices {
+                version: 1,
+                choices: vec![crate::api::schema::PluginActionChoice {
+                    id: id.into(),
+                    label: id.into(),
+                    payload: serde_json::Value::Null,
+                }],
+            })
+        };
+        app.correlate_context_menu_plugin_completion(
+            "context-menu-7-b",
+            "b.plugin",
+            "choose",
+            &choices("B"),
+        );
+        assert!(matches!(
+            app.state.context_menu.as_ref().unwrap().entry(2),
+            Some(ContextMenuEntry::PluginLoading)
+        ));
+        app.correlate_context_menu_plugin_completion(
+            "context-menu-7-a",
+            "a.plugin",
+            "choose",
+            &choices("A"),
+        );
+        let menu = app.state.context_menu.as_ref().unwrap();
+        assert_eq!(menu.entry_labels(), vec!["Rename", "Close", "A", "B"]);
+        assert_eq!(
+            menu.entry(2),
+            Some(ContextMenuEntry::PluginChoice {
+                provider_index: 0,
+                choice_index: 0,
+            })
+        );
+        assert_eq!(
+            menu.entry(3),
+            Some(ContextMenuEntry::PluginChoice {
+                provider_index: 1,
+                choice_index: 0,
+            })
+        );
+
+        let mut reopened = ContextMenuState::new(ContextMenuKind::Workspace { ws_idx: 0 }, 0, 0);
+        reopened.plugin = Some(ContextMenuPluginState {
+            generation: 8,
+            context,
+            target,
+            providers: vec![provider("a.plugin", "context-menu-8-a")],
+            entries: vec![ContextMenuEntry::PluginLoading],
+        });
+        app.state.context_menu = Some(reopened);
+        app.correlate_context_menu_plugin_completion(
+            "context-menu-7-a",
+            "a.plugin",
+            "choose",
+            &choices("STALE"),
+        );
+        assert!(matches!(
+            app.state.context_menu.as_ref().unwrap().entry(2),
+            Some(ContextMenuEntry::PluginLoading)
+        ));
+    }
+
+    #[test]
+    fn queued_context_menu_provider_revalidates_exact_snapshot_before_start() {
+        use crate::app::state::{
+            ContextMenuEntry, ContextMenuKind, ContextMenuPluginProvider, ContextMenuPluginState,
+            ContextMenuState, ContextMenuTarget,
+        };
+        let mut app = test_app();
+        app.state.workspaces = vec![crate::workspace::Workspace::test_new("queued")];
+        let context = app.plugin_context_for_workspace(0, "queued");
+        let target = ContextMenuTarget::Workspace(app.public_workspace_id(0));
+        let snapshot = context_menu_snapshot("queued.plugin");
+        app.state
+            .installed_plugins
+            .insert("queued.plugin".into(), snapshot.plugin.clone());
+        let mut menu = ContextMenuState::new(ContextMenuKind::Workspace { ws_idx: 0 }, 0, 0);
+        menu.plugin = Some(ContextMenuPluginState {
+            generation: 1,
+            context,
+            target,
+            providers: vec![ContextMenuPluginProvider {
+                request_id: "context-menu-1-0".into(),
+                snapshot,
+                running: false,
+                settled: false,
+                choices: vec![],
+            }],
+            entries: vec![ContextMenuEntry::PluginLoading],
+        });
+        app.state.context_menu = Some(menu);
+        app.state
+            .installed_plugins
+            .get_mut("queued.plugin")
+            .unwrap()
+            .actions[0]
+            .command = vec!["replacement".into()];
+
+        app.start_queued_context_menu_plugin_providers();
+        let provider = &app
+            .state
+            .context_menu
+            .as_ref()
+            .unwrap()
+            .plugin
+            .as_ref()
+            .unwrap()
+            .providers[0];
+        assert!(provider.settled);
+        assert!(!provider.running);
+        assert!(app
+            .state
+            .plugin_action_choices_requests_in_flight
+            .is_empty());
+        assert!(app.state.plugin_command_logs.is_empty());
+    }
+
+    #[test]
+    fn same_path_relink_invalidates_displayed_choices_and_old_completions() {
+        let mut app = test_app();
+        app.state.workspaces = vec![crate::workspace::Workspace::test_new("relink")];
+        let context = app.plugin_context_for_workspace(0, "relink");
+        let target = crate::app::state::ContextMenuTarget::Workspace(app.public_workspace_id(0));
+        let root = unique_temp_path("same-path-relink");
+        write_manifest(&root);
+        let plugin = load_plugin_manifest(&root.display().to_string(), true).unwrap();
+        let snapshot = crate::app::state::ContextMenuActionSnapshot {
+            plugin: plugin.clone(),
+            action: plugin.actions[0].clone(),
+        };
+        app.state
+            .installed_plugins
+            .insert(plugin.plugin_id.clone(), plugin);
+        let mut menu = crate::app::state::ContextMenuState::new(
+            crate::app::state::ContextMenuKind::Workspace { ws_idx: 0 },
+            0,
+            0,
+        );
+        menu.plugin = Some(crate::app::state::ContextMenuPluginState {
+            generation: 1,
+            context,
+            target,
+            providers: vec![crate::app::state::ContextMenuPluginProvider {
+                request_id: "context-menu-1-0".into(),
+                snapshot: snapshot.clone(),
+                running: true,
+                settled: false,
+                choices: vec![crate::api::schema::PluginActionChoice {
+                    id: "old".into(),
+                    label: "Old".into(),
+                    payload: serde_json::Value::Null,
+                }],
+            }],
+            entries: vec![crate::app::state::ContextMenuEntry::PluginChoice {
+                provider_index: 0,
+                choice_index: 0,
+            }],
+        });
+        app.state.context_menu = Some(menu);
+
+        link_manifest(&mut app, &root);
+        let plugin_state = app
+            .state
+            .context_menu
+            .as_ref()
+            .unwrap()
+            .plugin
+            .as_ref()
+            .unwrap();
+        assert!(plugin_state.entries.is_empty());
+        assert!(plugin_state.providers[0].settled);
+        app.correlate_context_menu_plugin_completion(
+            "context-menu-1-0",
+            "example.worktree-bootstrap",
+            "bootstrap",
+            &Ok(crate::api::schema::PluginActionChoices {
+                version: 1,
+                choices: vec![crate::api::schema::PluginActionChoice {
+                    id: "late".into(),
+                    label: "Late".into(),
+                    payload: serde_json::Value::Null,
+                }],
+            }),
+        );
+        assert!(app
+            .state
+            .context_menu
+            .as_ref()
+            .unwrap()
+            .plugin
+            .as_ref()
+            .unwrap()
+            .entries
+            .is_empty());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn native_context_menu_action_re_resolves_reordered_workspace_target() {
+        use crate::app::state::{
+            ContextMenuKind, ContextMenuPluginState, ContextMenuState, ContextMenuTarget,
+        };
+        let mut app = test_app();
+        app.state.workspaces = vec![
+            crate::workspace::Workspace::test_new("other"),
+            crate::workspace::Workspace::test_new("target"),
+        ];
+        let target_id = app.public_workspace_id(1);
+        let context = app.plugin_context_for_workspace(1, "reorder");
+        let mut menu = ContextMenuState::new(ContextMenuKind::Workspace { ws_idx: 1 }, 0, 0);
+        menu.plugin = Some(ContextMenuPluginState {
+            generation: 41,
+            context,
+            target: ContextMenuTarget::Workspace(target_id.clone()),
+            providers: vec![],
+            entries: vec![],
+        });
+
+        app.state.workspaces.swap(0, 1);
+        app.apply_context_menu_action_via_api(menu, 0);
+
+        assert_eq!(app.state.selected, 0);
+        assert_eq!(app.public_workspace_id(0), target_id);
+        assert_eq!(app.state.name_input, "target");
+    }
+
+    #[test]
+    fn native_context_menu_action_closes_safely_when_provider_removed_target() {
+        use crate::app::state::{
+            ContextMenuKind, ContextMenuPluginState, ContextMenuState, ContextMenuTarget,
+        };
+        let mut app = test_app();
+        app.state.workspaces = vec![
+            crate::workspace::Workspace::test_new("target"),
+            crate::workspace::Workspace::test_new("survivor"),
+        ];
+        app.state.active = Some(1);
+        let target_id = app.public_workspace_id(0);
+        let survivor_id = app.public_workspace_id(1);
+        let context = app.plugin_context_for_workspace(0, "removed-by-provider");
+        let mut menu = ContextMenuState::new(ContextMenuKind::Workspace { ws_idx: 0 }, 0, 0);
+        menu.plugin = Some(ContextMenuPluginState {
+            generation: 42,
+            context,
+            target: ContextMenuTarget::Workspace(target_id),
+            providers: vec![],
+            entries: vec![],
+        });
+
+        app.state.workspaces.remove(0);
+        app.apply_context_menu_action_via_api(menu, 1);
+
+        assert_eq!(app.state.workspaces.len(), 1);
+        assert_eq!(app.public_workspace_id(0), survivor_id);
+        assert!(app.state.context_menu.is_none());
+        assert_eq!(
+            app.state
+                .copy_feedback
+                .as_ref()
+                .map(|feedback| feedback.message.as_str()),
+            Some("menu target no longer exists")
+        );
+    }
+
+    #[test]
+    fn context_menu_choice_rejects_removed_target() {
+        let root = unique_temp_path("choice-target-removed");
+        write_manifest_content(
+            &root,
+            r#"
+id = "example.removed-target"
+name = "Removed target"
+version = "0.1.0"
+min_herdr_version = "0.7.0"
+platforms = ["linux", "macos", "windows"]
+[[actions]]
+id = "choose"
+title = "Choose"
+contexts = ["workspace"]
+command = ["unused"]
+choices_command = ["unused"]
+"#,
+        );
+        let plugin = load_plugin_manifest(&root.display().to_string(), true).unwrap();
+        let action = plugin.actions[0].clone();
+        let snapshot = crate::app::state::ContextMenuActionSnapshot {
+            plugin: plugin.clone(),
+            action,
+        };
+        let mut app = test_app();
+        app.state.workspaces = vec![crate::workspace::Workspace::test_new("removed")];
+        let context = app.plugin_context_for_workspace(0, "removed");
+        let target = crate::app::state::ContextMenuTarget::Workspace(app.public_workspace_id(0));
+        app.state
+            .installed_plugins
+            .insert(plugin.plugin_id.clone(), plugin);
+        let mut menu = crate::app::state::ContextMenuState::new(
+            crate::app::state::ContextMenuKind::Workspace { ws_idx: 0 },
+            0,
+            0,
+        );
+        menu.plugin = Some(crate::app::state::ContextMenuPluginState {
+            generation: 1,
+            context,
+            target,
+            providers: vec![crate::app::state::ContextMenuPluginProvider {
+                request_id: "selected".into(),
+                snapshot,
+                running: false,
+                settled: true,
+                choices: vec![crate::api::schema::PluginActionChoice {
+                    id: "one".into(),
+                    label: "One".into(),
+                    payload: serde_json::Value::Null,
+                }],
+            }],
+            entries: vec![crate::app::state::ContextMenuEntry::PluginChoice {
+                provider_index: 0,
+                choice_index: 0,
+            }],
+        });
+        app.state.workspaces.clear();
+        app.state.toast = Some(crate::app::state::ToastNotification {
+            kind: crate::app::state::ToastKind::NeedsAttention,
+            title: "important".into(),
+            context: "keep me".into(),
+            position: None,
+            target: None,
+        });
+        let original_toast = app.state.toast.clone();
+        app.apply_context_menu_action_via_api(menu, 2);
+        assert!(app.state.plugin_command_logs.is_empty());
+        assert_eq!(app.state.toast, original_toast);
+        assert_eq!(
+            app.state
+                .copy_feedback
+                .as_ref()
+                .map(|feedback| feedback.message.as_str()),
+            Some("plugin action target no longer exists")
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn context_menu_choice_rejects_disable_and_exact_snapshot_change() {
+        for changed in ["disabled", "relinked"] {
+            let root = unique_temp_path(changed);
+            write_manifest_content(
+                &root,
+                r#"
+id = "example.revalidate"
+name = "Revalidate"
+version = "0.1.0"
+min_herdr_version = "0.7.0"
+platforms = ["linux", "macos", "windows"]
+[[actions]]
+id = "choose"
+title = "Choose"
+contexts = ["workspace"]
+command = ["original"]
+choices_command = ["provider"]
+"#,
+            );
+            let plugin = load_plugin_manifest(&root.display().to_string(), true).unwrap();
+            let snapshot = crate::app::state::ContextMenuActionSnapshot {
+                plugin: plugin.clone(),
+                action: plugin.actions[0].clone(),
+            };
+            let mut app = test_app();
+            app.state.workspaces = vec![crate::workspace::Workspace::test_new("target")];
+            let context = app.plugin_context_for_workspace(0, changed);
+            let target =
+                crate::app::state::ContextMenuTarget::Workspace(app.public_workspace_id(0));
+            app.state
+                .installed_plugins
+                .insert(plugin.plugin_id.clone(), plugin);
+            let mut menu = crate::app::state::ContextMenuState::new(
+                crate::app::state::ContextMenuKind::Workspace { ws_idx: 0 },
+                0,
+                0,
+            );
+            menu.plugin = Some(crate::app::state::ContextMenuPluginState {
+                generation: 1,
+                context,
+                target,
+                providers: vec![crate::app::state::ContextMenuPluginProvider {
+                    request_id: "selected".into(),
+                    snapshot,
+                    running: false,
+                    settled: true,
+                    choices: vec![crate::api::schema::PluginActionChoice {
+                        id: "one".into(),
+                        label: "One".into(),
+                        payload: serde_json::Value::Null,
+                    }],
+                }],
+                entries: vec![crate::app::state::ContextMenuEntry::PluginChoice {
+                    provider_index: 0,
+                    choice_index: 0,
+                }],
+            });
+            let current = app
+                .state
+                .installed_plugins
+                .get_mut("example.revalidate")
+                .unwrap();
+            if changed == "disabled" {
+                current.enabled = false;
+            } else {
+                current.actions[0].command = vec!["replacement".into()];
+            }
+            app.apply_context_menu_action_via_api(menu, 2);
+            assert!(app.state.plugin_command_logs.is_empty(), "case {changed}");
+            let _ = std::fs::remove_dir_all(root);
+        }
+    }
+
+    #[test]
+    fn loading_entry_is_disabled_and_cannot_replace_native_highlight() {
+        use crate::app::state::{ContextMenuEntry, ContextMenuKind, ContextMenuState};
+        let mut app = test_app();
+        app.state.workspaces = vec![crate::workspace::Workspace::test_new("loading")];
+        let context = app.plugin_context_for_workspace(0, "loading");
+        let target = crate::app::state::ContextMenuTarget::Workspace(app.public_workspace_id(0));
+        let mut menu = ContextMenuState::new(ContextMenuKind::Workspace { ws_idx: 0 }, 0, 0);
+        menu.plugin = Some(crate::app::state::ContextMenuPluginState {
+            generation: 1,
+            context,
+            target,
+            providers: vec![],
+            entries: vec![ContextMenuEntry::PluginLoading],
+        });
+        menu.move_next();
+        menu.move_next();
+        assert_eq!(menu.list.highlighted, 1);
+        assert!(!menu.entry_enabled(2));
     }
 
     #[test]
@@ -921,6 +2046,13 @@ platforms = ["linux", "macos", "windows"]
         assert_eq!(plugin.actions.len(), 1);
         assert_eq!(plugin.actions[0].id, "bootstrap");
         assert_eq!(plugin.actions[0].command, ["bun", "run", "bootstrap.ts"]);
+        assert_eq!(
+            plugin.actions[0]
+                .choices_command
+                .as_ref()
+                .map(|command| command.iter().map(String::as_str).collect::<Vec<_>>()),
+            Some(vec!["bun", "run", "choices.ts"])
+        );
         assert_eq!(plugin.events.len(), 1);
         assert_eq!(plugin.events[0].on, "worktree.created");
         assert_eq!(plugin.panes.len(), 1);
@@ -1184,6 +2316,31 @@ command = ["echo", "b"]
 
         let result = load_plugin_manifest(&root.display().to_string(), true);
         assert!(matches!(result, Err(("duplicate_plugin_action_id", _))));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn link_rejects_empty_choices_command() {
+        let root = unique_temp_path("plugin-empty-choices-command");
+        write_manifest_content(
+            &root,
+            r#"
+id = "example.empty-choices"
+name = "Empty Choices"
+version = "0.1.0"
+min_herdr_version = "0.6.10"
+platforms = ["linux", "macos", "windows"]
+
+[[actions]]
+id = "run"
+title = "Run"
+command = ["echo", "run"]
+choices_command = []
+"#,
+        );
+
+        let result = load_plugin_manifest(&root.display().to_string(), true);
+        assert!(matches!(result, Err(("invalid_plugin_command", _))));
         let _ = std::fs::remove_dir_all(root);
     }
 
