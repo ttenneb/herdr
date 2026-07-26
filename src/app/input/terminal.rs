@@ -135,9 +135,14 @@ impl App {
         }
 
         let ws_idx = self.state.active?;
-        let ws = self.state.workspaces.get(ws_idx)?;
-        let pane_id = ws.focused_pane_id()?;
-        let terminal_id = ws.terminal_id(pane_id)?.clone();
+        let (pane_id, terminal_id) = {
+            let ws = self.state.workspaces.get(ws_idx)?;
+            let pane_id = ws.focused_pane_id()?;
+            (pane_id, ws.terminal_id(pane_id)?.clone())
+        };
+        // Every terminal delivery path performs this immediately before obtaining the runtime.
+        // The server event loop serializes this state mutation and the following write.
+        self.restore_archived_member_for_input(ws_idx, pane_id);
         let rt =
             self.state
                 .runtime_for_pane_in_workspace(&self.terminal_runtimes, ws_idx, pane_id)?;
@@ -303,10 +308,26 @@ impl App {
     }
 
     pub(crate) fn forward_terminal_key_to_target_headless(
-        &self,
+        &mut self,
         target: &TerminalInputTarget,
         key: TerminalKey,
     ) -> bool {
+        if let Some((ws_idx, pane_id)) =
+            self.state
+                .workspaces
+                .iter()
+                .enumerate()
+                .find_map(|(ws_idx, workspace)| {
+                    workspace.tabs.iter().find_map(|tab| {
+                        tab.panes.iter().find_map(|(&pane_id, pane)| {
+                            (pane.attached_terminal_id == target.terminal_id)
+                                .then_some((ws_idx, pane_id))
+                        })
+                    })
+                })
+        {
+            self.restore_archived_member_for_input(ws_idx, pane_id);
+        }
         let Some(runtime) = self.terminal_input_runtime(target) else {
             return false;
         };
@@ -315,10 +336,26 @@ impl App {
     }
 
     pub(crate) async fn forward_terminal_key_to_target(
-        &self,
+        &mut self,
         target: &TerminalInputTarget,
         key: TerminalKey,
     ) -> bool {
+        if let Some((ws_idx, pane_id)) =
+            self.state
+                .workspaces
+                .iter()
+                .enumerate()
+                .find_map(|(ws_idx, workspace)| {
+                    workspace.tabs.iter().find_map(|tab| {
+                        tab.panes.iter().find_map(|(&pane_id, pane)| {
+                            (pane.attached_terminal_id == target.terminal_id)
+                                .then_some((ws_idx, pane_id))
+                        })
+                    })
+                })
+        {
+            self.restore_archived_member_for_input(ws_idx, pane_id);
+        }
         let Some(runtime) = self.terminal_input_runtime(target) else {
             return false;
         };
@@ -444,7 +481,7 @@ mod tests {
     fn app_with_screen_bytes(bytes: &[u8]) -> (App, crate::layout::PaneInfo) {
         let mut app = app_for_mouse_test();
         let mut ws = Workspace::test_new("test");
-        let pane_id = ws.tabs[0].root_pane;
+        let pane_id = ws.tabs[0].root_pane.expect("test tab has root pane");
         let pane_infos = ws.tabs[0].layout.panes(Rect::new(26, 2, 80, 18));
         let info = pane_infos[0].clone();
         ws.insert_test_runtime(
@@ -543,7 +580,7 @@ mod tests {
     async fn dragging_selection_above_pane_autoscrolls_and_extends_into_scrollback() {
         let mut app = app_for_mouse_test();
         let mut ws = Workspace::test_new("test");
-        let pane_id = ws.tabs[0].root_pane;
+        let pane_id = ws.tabs[0].root_pane.expect("test tab has root pane");
         let pane_infos = ws.tabs[0].layout.panes(Rect::new(26, 2, 80, 18));
         let info = pane_infos[0].clone();
         ws.insert_test_runtime(
@@ -609,7 +646,7 @@ mod tests {
     async fn releasing_dragged_selection_clears_highlight_after_copy() {
         let mut app = app_for_mouse_test();
         let mut ws = Workspace::test_new("test");
-        let pane_id = ws.tabs[0].root_pane;
+        let pane_id = ws.tabs[0].root_pane.expect("test tab has root pane");
         let pane_infos = ws.tabs[0].layout.panes(Rect::new(26, 2, 80, 18));
         let info = pane_infos[0].clone();
         ws.insert_test_runtime(
@@ -875,7 +912,9 @@ mod tests {
         let line = "see https://github.com/ogulcancelik/herdr/issues/1761";
         let col = line.find("github").expect("url host") as u16;
         let (mut app, info) = app_with_screen_bytes(b"");
-        let pane_id = app.state.workspaces[0].tabs[0].root_pane;
+        let pane_id = app.state.workspaces[0].tabs[0]
+            .root_pane
+            .expect("test tab has root pane");
         let screen = format!("\x1b[?1049h\x1b[?1000h\x1b[?1006h{line}");
         let (runtime, mut input_rx) =
             crate::terminal::TerminalRuntime::test_with_channel_and_scrollback_bytes(
@@ -956,7 +995,9 @@ mod tests {
     async fn pane_cell_url_resolver_finds_visible_url() {
         let line = "see https://example.com/pr/307.";
         let (app, info) = app_with_screen_bytes(line.as_bytes());
-        let pane_id = app.state.workspaces[0].tabs[0].root_pane;
+        let pane_id = app.state.workspaces[0].tabs[0]
+            .root_pane
+            .expect("test tab has root pane");
         let col = line.find("example").expect("url host") as u16;
 
         assert_eq!(
@@ -983,7 +1024,9 @@ mod tests {
         let padding = "a".repeat(info.inner_rect.width as usize - prefix.len());
         let url = format!("{prefix}{padding}tail");
         let (app, _info) = app_with_screen_bytes(url.as_bytes());
-        let pane_id = app.state.workspaces[0].tabs[0].root_pane;
+        let pane_id = app.state.workspaces[0].tabs[0]
+            .root_pane
+            .expect("test tab has root pane");
 
         assert_eq!(
             app.state
@@ -998,7 +1041,9 @@ mod tests {
         let url = "https://example.com/mark";
         let screen = format!("e\u{301} {url}");
         let (app, _info) = app_with_screen_bytes(screen.as_bytes());
-        let pane_id = app.state.workspaces[0].tabs[0].root_pane;
+        let pane_id = app.state.workspaces[0].tabs[0]
+            .root_pane
+            .expect("test tab has root pane");
 
         assert_eq!(
             app.state
@@ -1015,7 +1060,9 @@ mod tests {
         let url = "https://example.com/next";
         let screen = format!("{full_row}\n{url}");
         let (app, _info) = app_with_screen_bytes(screen.as_bytes());
-        let pane_id = app.state.workspaces[0].tabs[0].root_pane;
+        let pane_id = app.state.workspaces[0].tabs[0]
+            .root_pane
+            .expect("test tab has root pane");
 
         assert_eq!(
             app.state
@@ -1103,7 +1150,9 @@ mod tests {
         let (app, _info) = app_with_screen_bytes(
             b"\x1b]8;;https://example.com/hidden-target\x1b\\label\x1b]8;;\x1b\\",
         );
-        let pane_id = app.state.workspaces[0].tabs[0].root_pane;
+        let pane_id = app.state.workspaces[0].tabs[0]
+            .root_pane
+            .expect("test tab has root pane");
 
         assert_eq!(
             app.state
@@ -1136,7 +1185,7 @@ mod tests {
     async fn copy_on_select_disabled_still_forwards_mouse_reporting_gestures() {
         let mut app = app_for_mouse_test();
         let mut ws = Workspace::test_new("test");
-        let pane_id = ws.tabs[0].root_pane;
+        let pane_id = ws.tabs[0].root_pane.expect("test tab has root pane");
         let pane_infos = ws.tabs[0].layout.panes(Rect::new(26, 2, 80, 18));
         let info = pane_infos[0].clone();
         let (runtime, mut input_rx) =
@@ -1191,7 +1240,7 @@ mod tests {
     async fn wheel_scroll_keeps_in_progress_selection_and_extends_it() {
         let mut app = app_for_mouse_test();
         let mut ws = Workspace::test_new("test");
-        let pane_id = ws.tabs[0].root_pane;
+        let pane_id = ws.tabs[0].root_pane.expect("test tab has root pane");
         let pane_infos = ws.tabs[0].layout.panes(Rect::new(26, 2, 80, 18));
         let info = pane_infos[0].clone();
         ws.insert_test_runtime(
@@ -1287,7 +1336,7 @@ mod tests {
             crate::api::EventHub::default(),
         );
         let mut workspace = Workspace::test_new("test");
-        let root_pane = workspace.tabs[0].root_pane;
+        let root_pane = workspace.tabs[0].root_pane.expect("test tab has root pane");
         workspace.tabs[0].runtimes.insert(
             root_pane,
             crate::terminal::TerminalRuntime::test_with_scrollback_bytes(
@@ -1427,6 +1476,8 @@ mod tests {
         assert_eq!(app.state.mode, Mode::Terminal);
         let snapshot = crate::persist::capture(
             &app.state.workspaces,
+            &app.state.delegations,
+            &app.state.collection_archive_times,
             &app.state.terminals,
             &app.terminal_runtimes,
             app.state.active,
@@ -1550,7 +1601,7 @@ mod tests {
     async fn alt_backspace_is_forwarded_to_focused_pane() {
         let mut app = app_for_mouse_test();
         let mut ws = Workspace::test_new("test");
-        let pane_id = ws.tabs[0].root_pane;
+        let pane_id = ws.tabs[0].root_pane.expect("test tab has root pane");
         let pane_infos = ws.tabs[0].layout.panes(Rect::new(0, 0, 80, 24));
         let info = pane_infos[0].clone();
         let (runtime, mut rx) = crate::terminal::TerminalRuntime::test_with_channel(
@@ -1577,7 +1628,7 @@ mod tests {
     async fn page_up_scrolls_plain_shell_pane() {
         let mut app = app_for_mouse_test();
         let mut ws = Workspace::test_new("test");
-        let pane_id = ws.tabs[0].root_pane;
+        let pane_id = ws.tabs[0].root_pane.expect("test tab has root pane");
         let pane_infos = ws.tabs[0].layout.panes(Rect::new(26, 2, 80, 18));
         let info = pane_infos[0].clone();
         ws.tabs[0].runtimes.insert(
@@ -1620,7 +1671,7 @@ mod tests {
     async fn page_down_returns_to_bottom_after_page_up() {
         let mut app = app_for_mouse_test();
         let mut ws = Workspace::test_new("test");
-        let pane_id = ws.tabs[0].root_pane;
+        let pane_id = ws.tabs[0].root_pane.expect("test tab has root pane");
         let pane_infos = ws.tabs[0].layout.panes(Rect::new(26, 2, 80, 18));
         let info = pane_infos[0].clone();
         ws.tabs[0].runtimes.insert(
@@ -1663,7 +1714,7 @@ mod tests {
     async fn page_up_release_does_not_scroll_plain_shell_pane_again() {
         let mut app = app_for_mouse_test();
         let mut ws = Workspace::test_new("test");
-        let pane_id = ws.tabs[0].root_pane;
+        let pane_id = ws.tabs[0].root_pane.expect("test tab has root pane");
         let pane_infos = ws.tabs[0].layout.panes(Rect::new(26, 2, 80, 18));
         let info = pane_infos[0].clone();
         ws.tabs[0].runtimes.insert(
@@ -1713,7 +1764,7 @@ mod tests {
     async fn modified_page_up_does_not_host_scroll_plain_shell_pane() {
         let mut app = app_for_mouse_test();
         let mut ws = Workspace::test_new("test");
-        let pane_id = ws.tabs[0].root_pane;
+        let pane_id = ws.tabs[0].root_pane.expect("test tab has root pane");
         let pane_infos = ws.tabs[0].layout.panes(Rect::new(26, 2, 80, 18));
         let info = pane_infos[0].clone();
         ws.tabs[0].runtimes.insert(
@@ -1746,7 +1797,7 @@ mod tests {
     async fn page_up_forwarded_to_mouse_reporting_pane() {
         let mut app = app_for_mouse_test();
         let mut ws = Workspace::test_new("test");
-        let pane_id = ws.tabs[0].root_pane;
+        let pane_id = ws.tabs[0].root_pane.expect("test tab has root pane");
         let pane_infos = ws.tabs[0].layout.panes(Rect::new(26, 2, 80, 18));
         let info = pane_infos[0].clone();
         let mut bytes = b"\x1b[?1002h".to_vec();
@@ -1789,7 +1840,7 @@ mod tests {
     async fn page_up_forwarded_to_primary_screen_application_cursor_pane() {
         let mut app = app_for_mouse_test();
         let mut ws = Workspace::test_new("test");
-        let pane_id = ws.tabs[0].root_pane;
+        let pane_id = ws.tabs[0].root_pane.expect("test tab has root pane");
         let pane_infos = ws.tabs[0].layout.panes(Rect::new(26, 2, 80, 18));
         let info = pane_infos[0].clone();
         let mut bytes = b"\x1b[?1h".to_vec();

@@ -252,6 +252,17 @@ yellow = "#f9e2af"
 
 侧边栏是 Herdr 的主仪表盘。在[配置参考](/docs/config-reference/)中搜索 `ui.`，可查看尺寸、折叠模式、Agent 面板排序、鼠标行为、窗格边框和其他显示设置。
 
+### 集合生命周期警告
+
+```toml
+[ui.collections]
+archive_age_days = 7
+archive_count = 20
+concurrency = 8
+```
+
+它们依次警告归档达到指定天数、归档数量超过配置值、`working` + `blocked` 数量超过配置值。`0` 禁用单项警告。这些设置不会自动归档、停止或关闭窗格。清理与级联关闭仍需显式确认;输入或 `working` / `blocked` 状态会恢复已归档成员。
+
 ### 侧边栏行布局
 
 展开的桌面侧边栏会将 `rows` 中的每个内层数组渲染为一行。以下是完整的默认布局：

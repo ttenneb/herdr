@@ -81,6 +81,7 @@ impl App {
         if terminal.managed_agent_launch_pending() {
             return agent_not_ready(id, &params.target);
         }
+        self.restore_archived_member_for_input(resolved.ws_idx, resolved.pane_id);
         let Some(runtime) = self.lookup_runtime_sender(resolved.ws_idx, resolved.pane_id) else {
             return agent_not_found(id, &params.target);
         };
@@ -241,6 +242,7 @@ impl App {
         else {
             return agent_not_ready(id, &params.target);
         };
+        self.restore_archived_member_for_input(resolved.ws_idx, resolved.pane_id);
         let Some(runtime) = self.lookup_runtime_sender(resolved.ws_idx, resolved.pane_id) else {
             return agent_not_found(id, &params.target);
         };
@@ -309,7 +311,9 @@ mod tests {
     #[tokio::test]
     async fn agent_prompt_accepts_pane_ids_and_working_agents_atomically() {
         let mut app = app_with_agent();
-        let pane_id = app.state.workspaces[0].tabs[0].root_pane;
+        let pane_id = app.state.workspaces[0].tabs[0]
+            .root_pane
+            .expect("test tab has root pane");
         let terminal_id = app.state.workspaces[0].tabs[0].panes[&pane_id]
             .attached_terminal_id
             .clone();
@@ -375,7 +379,9 @@ mod tests {
     #[tokio::test]
     async fn agent_send_keys_validates_every_key_before_writing() {
         let mut app = app_with_agent();
-        let pane_id = app.state.workspaces[0].tabs[0].root_pane;
+        let pane_id = app.state.workspaces[0].tabs[0]
+            .root_pane
+            .expect("test tab has root pane");
         let terminal_id = app.state.workspaces[0].tabs[0].panes[&pane_id]
             .attached_terminal_id
             .clone();
@@ -412,7 +418,9 @@ mod tests {
     #[tokio::test]
     async fn agent_prompt_rejects_managed_agent_while_startup_is_pending() {
         let mut app = app_with_agent();
-        let pane_id = app.state.workspaces[0].tabs[0].root_pane;
+        let pane_id = app.state.workspaces[0].tabs[0]
+            .root_pane
+            .expect("test tab has root pane");
         let terminal_id = app.state.workspaces[0].tabs[0].panes[&pane_id]
             .attached_terminal_id
             .clone();
@@ -447,7 +455,9 @@ mod tests {
         let mut app = app_with_agent();
         app.state.outer_terminal_focus = Some(false);
 
-        let pane_id = app.state.workspaces[0].tabs[0].root_pane;
+        let pane_id = app.state.workspaces[0].tabs[0]
+            .root_pane
+            .expect("test tab has root pane");
         let terminal_id = app.state.workspaces[0].tabs[0].panes[&pane_id]
             .attached_terminal_id
             .clone();
@@ -480,7 +490,9 @@ mod tests {
     #[test]
     fn agent_rename_does_not_replace_the_pane_label() {
         let mut app = app_with_agent();
-        let pane_id = app.state.workspaces[0].tabs[0].root_pane;
+        let pane_id = app.state.workspaces[0].tabs[0]
+            .root_pane
+            .expect("test tab has root pane");
         let terminal_id = app.state.workspaces[0].tabs[0].panes[&pane_id]
             .attached_terminal_id
             .clone();

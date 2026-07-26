@@ -438,7 +438,9 @@ mod tests {
         state.active = Some(0);
         state.selected = 0;
         for (ws_idx, agent_state) in [(0, AgentState::Idle), (1, AgentState::Working)] {
-            let pane_id = state.workspaces[ws_idx].tabs[0].root_pane;
+            let pane_id = state.workspaces[ws_idx].tabs[0]
+                .root_pane
+                .expect("test tab has root pane");
             let terminal_id = state.workspaces[ws_idx].tabs[0].panes[&pane_id]
                 .attached_terminal_id
                 .clone();
@@ -485,7 +487,9 @@ mod tests {
     #[test]
     fn boolean_filter_and_custom_sort_define_canonical_entries() {
         let mut state = state_with_agents();
-        let first_pane = state.workspaces[0].tabs[0].root_pane;
+        let first_pane = state.workspaces[0].tabs[0]
+            .root_pane
+            .expect("test tab has root pane");
         let first_terminal = state.workspaces[0].tabs[0].panes[&first_pane]
             .attached_terminal_id
             .clone();
@@ -522,7 +526,9 @@ mod tests {
     #[test]
     fn agent_filter_matches_custom_lifecycle_agent_label() {
         let mut state = state_with_agents();
-        let pane_id = state.workspaces[0].tabs[0].root_pane;
+        let pane_id = state.workspaces[0].tabs[0]
+            .root_pane
+            .expect("test tab has root pane");
         let terminal_id = state.workspaces[0].tabs[0].panes[&pane_id]
             .attached_terminal_id
             .clone();

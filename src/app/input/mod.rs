@@ -37,6 +37,7 @@ fn modified_url_click_modifier_matches_terminal_mouse_reporting() {
 }
 
 mod clipboard;
+mod collection;
 mod copy_mode;
 mod modal;
 mod mouse;
@@ -89,7 +90,12 @@ impl App {
         }
 
         match self.state.mode {
-            Mode::Terminal => return self.handle_terminal_key(key).await,
+            Mode::Terminal => {
+                if self.handle_collection_key(key) {
+                    return None;
+                }
+                return self.handle_terminal_key(key).await;
+            }
             Mode::Prefix => self.handle_prefix_key(key),
             Mode::Navigate => self.handle_navigate_key(key),
             Mode::Copy => self.handle_copy_mode_key(key),
@@ -106,6 +112,7 @@ impl App {
                 Mode::ConfirmRemoveWorktree => self.handle_worktree_remove_key(key_event),
                 Mode::Resize => self.handle_resize_key_via_api(key),
                 Mode::ConfirmClose => self.handle_confirm_close_key_via_api(key_event),
+                Mode::CollectionClose => self.handle_collection_close_key(key_event),
                 Mode::ContextMenu => {
                     self.handle_context_menu_key_via_api(key_event);
                 }
@@ -134,13 +141,25 @@ impl App {
             self.paste_into_active_text_input(&text);
             return;
         }
+        if !self.collection_accepts_terminal_input() {
+            return;
+        }
 
         if let Some(ws_idx) = self.state.active {
-            if let Some(rt) = self
+            let pane_id = self
                 .state
-                .focused_runtime_in_workspace(&self.terminal_runtimes, ws_idx)
-            {
-                let _ = rt.send_paste(text).await;
+                .workspaces
+                .get(ws_idx)
+                .and_then(|ws| ws.focused_pane_id());
+            if let Some(pane_id) = pane_id {
+                self.restore_archived_member_for_input(ws_idx, pane_id);
+                if let Some(rt) = self.state.runtime_for_pane_in_workspace(
+                    &self.terminal_runtimes,
+                    ws_idx,
+                    pane_id,
+                ) {
+                    let _ = rt.send_paste(text).await;
+                }
             }
         }
     }
@@ -318,6 +337,10 @@ impl App {
             }
         }
 
+        if self.handle_collection_mouse(mouse) {
+            return;
+        }
+
         if self.handle_modified_url_click(source_id, mouse) {
             return;
         }
@@ -378,6 +401,18 @@ impl App {
                         self.apply_rename_mouse_action_via_api(action)
                     }
                     MouseAction::ConfirmCloseAccept => self.confirm_close_accept_via_api(),
+                    MouseAction::CollectionClosePromote => {
+                        self.handle_collection_close_key(crossterm::event::KeyEvent::new(
+                            crossterm::event::KeyCode::Char('p'),
+                            crossterm::event::KeyModifiers::NONE,
+                        ))
+                    }
+                    MouseAction::CollectionCloseCascade => {
+                        self.handle_collection_close_key(crossterm::event::KeyEvent::new(
+                            crossterm::event::KeyCode::Char('c'),
+                            crossterm::event::KeyModifiers::NONE,
+                        ))
+                    }
                     MouseAction::ContextMenu { menu, idx } => {
                         self.apply_context_menu_action_via_api(menu, idx)
                     }
@@ -787,6 +822,8 @@ fn capture_snapshot(state: &AppState) -> crate::persist::SessionSnapshot {
     let terminal_runtimes = crate::terminal::TerminalRuntimeRegistry::new();
     crate::persist::capture(
         &state.workspaces,
+        &state.delegations,
+        &state.collection_archive_times,
         &state.terminals,
         &terminal_runtimes,
         state.active,
@@ -801,7 +838,9 @@ fn capture_snapshot(state: &AppState) -> crate::persist::SessionSnapshot {
 fn root_layout_ratio(snapshot: &crate::persist::SessionSnapshot) -> Option<f32> {
     match &snapshot.workspaces.first()?.tabs.first()?.layout {
         crate::persist::LayoutSnapshot::Split { ratio, .. } => Some(*ratio),
-        crate::persist::LayoutSnapshot::Pane(_) => None,
+        crate::persist::LayoutSnapshot::Pane(_) | crate::persist::LayoutSnapshot::Collection(_) => {
+            None
+        }
     }
 }
 

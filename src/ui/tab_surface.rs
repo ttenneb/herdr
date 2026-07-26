@@ -1,20 +1,26 @@
 use ratatui::{layout::Rect, Frame};
 
+use super::collections::{
+    collection_preview_infos, collection_preview_region, collection_terminal_entered,
+    compute_collection_layouts, render_collections,
+};
 use super::panes::{compute_pane_infos, render_panes, resize_tab_panes};
 use crate::app::state::ViewState;
 use crate::app::{AppState, Mode};
-use crate::layout::{PaneInfo, SplitBorder};
+use crate::layout::{LayoutLeaf, PaneInfo, SplitBorder};
 use crate::protocol::CursorState;
 use crate::terminal::TerminalRuntimeRegistry;
 
 pub(crate) struct TabSurfaceLayout {
     pub(crate) pane_infos: Vec<PaneInfo>,
+    pub(crate) collection_layouts: Vec<crate::app::collection_view::CollectionLayout>,
     pub(crate) split_borders: Vec<SplitBorder>,
 }
 
 #[derive(Clone, Copy)]
 pub(crate) struct TabSurfaceView<'a> {
     pub(crate) pane_infos: &'a [PaneInfo],
+    pub(crate) collection_layouts: &'a [crate::app::collection_view::CollectionLayout],
     pub(crate) split_borders: &'a [SplitBorder],
 }
 
@@ -22,13 +28,14 @@ impl ViewState {
     pub(crate) fn tab_surface(&self) -> TabSurfaceView<'_> {
         TabSurfaceView {
             pane_infos: &self.pane_infos,
+            collection_layouts: &self.collection_layouts,
             split_borders: &self.split_borders,
         }
     }
 }
 
 pub(crate) fn compute_tab_surface(
-    app: &AppState,
+    app: &mut AppState,
     terminal_runtimes: &TerminalRuntimeRegistry,
     area: Rect,
     resize_panes: bool,
@@ -46,9 +53,12 @@ pub(crate) fn compute_tab_surface(
         })
         .unwrap_or_default();
     let pane_infos = compute_pane_infos(app, terminal_runtimes, area, resize_panes, cell_size);
+    let collection_layouts =
+        compute_collection_layouts(app, terminal_runtimes, area, resize_panes, cell_size);
 
     TabSurfaceLayout {
         pane_infos,
+        collection_layouts,
         split_borders,
     }
 }
@@ -76,6 +86,7 @@ pub(crate) fn render_tab_surface(
         surface.pane_infos,
         surface.split_borders,
     );
+    render_collections(app, terminal_runtimes, surface.collection_layouts, frame);
 }
 
 pub(crate) fn tab_surface_hyperlinks(
@@ -97,6 +108,12 @@ pub(crate) fn tab_surface_hyperlinks(
             links.extend(runtime.visible_hyperlinks(info.inner_rect));
         }
     }
+    for (pane_id, rect) in collection_preview_infos(surface.collection_layouts) {
+        if let Some(runtime) = app.runtime_for_pane_in_workspace(terminal_runtimes, ws_idx, pane_id)
+        {
+            links.extend(runtime.visible_hyperlinks(rect));
+        }
+    }
     links
 }
 
@@ -110,6 +127,32 @@ pub(crate) fn tab_surface_cursor(
     }
 
     let ws_idx = app.active?;
+    if let Some(ws) = app.workspaces.get(ws_idx) {
+        if let LayoutLeaf::Collection(collection_id) = ws.layout.focused_leaf() {
+            if !collection_terminal_entered(app, collection_id) {
+                return None;
+            }
+            let pane_id = ws.focused_pane_id()?;
+            let (rect, source_row, logical_rows, logical_cols) =
+                collection_preview_region(surface.collection_layouts, pane_id)?;
+            let runtime = app.runtime_for_pane_in_workspace(terminal_runtimes, ws_idx, pane_id)?;
+            if runtime.synchronized_output_active() {
+                return None;
+            }
+            return runtime
+                .cursor_state(Rect::new(0, 0, logical_cols, logical_rows), true)
+                .map(|cursor| CursorState {
+                    x: rect.x.saturating_add(cursor.x),
+                    y: rect.y.saturating_add(cursor.y.saturating_sub(source_row)),
+                    visible: cursor.visible
+                        && cursor.y >= source_row
+                        && cursor.y < source_row.saturating_add(rect.height)
+                        && cursor.x < rect.width
+                        && !super::panes::pane_is_scrolled_back(runtime),
+                    shape: cursor.shape,
+                });
+        }
+    }
     let info = surface.pane_infos.iter().find(|info| info.is_focused)?;
     if !app.pane_exposes_host_cursor(ws_idx, info.id) {
         return None;
@@ -170,7 +213,7 @@ mod tests {
     async fn explicit_surface_layout_drives_render_cursor_and_hyperlinks() {
         let uri = "https://example.com/surface";
         let mut workspace = Workspace::test_new("shell-workspace");
-        let left = workspace.tabs[0].root_pane;
+        let left = workspace.tabs[0].root_pane.expect("test tab has root pane");
         let right = workspace.test_split(Direction::Horizontal);
         workspace.insert_test_runtime(
             left,
@@ -196,7 +239,7 @@ mod tests {
         let area = app.view.terminal_area;
         assert_eq!(area, Rect::new(26, 1, 80, 19));
         let surface = compute_tab_surface(
-            &app,
+            &mut app,
             &TerminalRuntimeRegistry::new(),
             area,
             false,
@@ -211,6 +254,7 @@ mod tests {
 
         let surface_view = TabSurfaceView {
             pane_infos: &surface.pane_infos,
+            collection_layouts: &surface.collection_layouts,
             split_borders: &surface.split_borders,
         };
         let mut terminal =
@@ -265,7 +309,7 @@ mod tests {
         workspace.cached_git_space = None;
         workspace.test_add_tab(Some("logs"));
         workspace.switch_tab(0);
-        let left = workspace.tabs[0].root_pane;
+        let left = workspace.tabs[0].root_pane.expect("test tab has root pane");
         let right = workspace.test_split(Direction::Horizontal);
         workspace.insert_test_runtime(
             left,

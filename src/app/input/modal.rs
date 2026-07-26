@@ -1266,6 +1266,56 @@ impl App {
                     leave_modal(&mut self.state);
                 }
             }
+            (
+                ContextMenuKind::CollectionMember {
+                    ws_idx,
+                    collection_id,
+                    pane_id,
+                    ..
+                },
+                Some("Maximize"),
+            ) => {
+                self.select_collection_member_via_runtime(ws_idx, collection_id, pane_id, true);
+                self.toggle_collection_maximize(collection_id);
+                self.state.mode = Mode::Terminal;
+            }
+            (
+                ContextMenuKind::CollectionMember {
+                    ws_idx,
+                    collection_id,
+                    pane_id,
+                    ..
+                },
+                Some("Archive" | "Restore"),
+            ) => {
+                self.select_collection_member_via_runtime(ws_idx, collection_id, pane_id, true);
+                self.toggle_selected_archive(ws_idx, collection_id);
+                self.state.mode = Mode::Terminal;
+            }
+            (
+                ContextMenuKind::CollectionMember {
+                    ws_idx,
+                    collection_id,
+                    pane_id,
+                    ..
+                },
+                Some("Move out"),
+            ) => {
+                self.select_collection_member_via_runtime(ws_idx, collection_id, pane_id, true);
+                self.promote_selected(ws_idx, collection_id);
+                self.state.mode = Mode::Terminal;
+            }
+            (
+                ContextMenuKind::CollectionMember {
+                    ws_idx, pane_id, ..
+                },
+                Some("Close pane"),
+            ) => {
+                self.focus_pane_internal_via_api(ws_idx, pane_id);
+                if !self.close_focused_pane_via_api_requires_confirmation() {
+                    self.state.mode = Mode::Terminal;
+                }
+            }
             (ContextMenuKind::Pane { pane_id, .. }, Some("Rename pane")) => {
                 open_rename_pane(&mut self.state, pane_id);
             }
@@ -2198,7 +2248,9 @@ mod tests {
             checkout_path: "/repo/herdr-issue".into(),
             is_linked_worktree: true,
         });
-        let pane_id = state.workspaces[0].tabs[0].root_pane;
+        let pane_id = state.workspaces[0].tabs[0]
+            .root_pane
+            .expect("test tab has root pane");
         let menu = ContextMenuState {
             kind: ContextMenuKind::Pane {
                 ws_idx: 0,
@@ -2263,7 +2315,9 @@ mod tests {
         app.state.active = Some(0);
         app.state.selected = 1;
         app.state.mode = Mode::ContextMenu;
-        let pane_id = app.state.workspaces[0].tabs[0].root_pane;
+        let pane_id = app.state.workspaces[0].tabs[0]
+            .root_pane
+            .expect("test tab has root pane");
         let mut menu = ContextMenuState {
             kind: ContextMenuKind::Pane {
                 ws_idx: 0,

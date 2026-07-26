@@ -42,6 +42,7 @@ use crate::ipc::{
     bind_local_listener, remove_socket_file_if_owned, socket_file_identity, LocalListener,
     SocketFileIdentity,
 };
+use crate::layout::PaneId;
 use crate::protocol::{
     self, AttachScrollDirection, AttachScrollSource, FrameData, ServerMessage, MAX_FRAME_SIZE,
     MAX_GRAPHICS_FRAME_SIZE,
@@ -264,6 +265,8 @@ pub struct HeadlessServer {
     server_config_diagnostic_without_keybindings: Option<String>,
     /// Writable direct attach owner per terminal id string.
     terminal_attach_owners: HashMap<String, u64>,
+    /// Foreground app preview geometry, arbitrated independently per terminal.
+    geometry_claims: crate::server::geometry::GeometryClaims,
     /// Monotonic activity counter used to pick the most recently active client.
     next_activity_stamp: u64,
     /// Shared pane runtime size derived from the foreground client,
@@ -410,7 +413,7 @@ impl HeadlessServer {
     /// 2. Binds the client socket listener
     /// 3. Returns the server ready to run
     pub fn new(
-        app: app::App,
+        mut app: app::App,
         config_diagnostics: &[String],
         api_tx: Option<api::ApiRequestSender>,
         api_server: Option<api::ServerHandle>,
@@ -434,6 +437,7 @@ impl HeadlessServer {
         #[cfg(windows)]
         spawn_windows_client_accept_thread(listener, should_quit.clone(), server_event_tx.clone());
 
+        app.state.defer_collection_geometry_claims = true;
         let server_keybindings = app_keybindings(&app);
         let (server_config_diagnostic, server_config_diagnostic_without_keybindings) =
             server_config_diagnostic_summaries(config_diagnostics);
@@ -456,6 +460,7 @@ impl HeadlessServer {
             server_config_diagnostic,
             server_config_diagnostic_without_keybindings,
             terminal_attach_owners: HashMap::new(),
+            geometry_claims: Default::default(),
             next_activity_stamp: 1,
             effective_size: (MIN_COLS, MIN_ROWS),
             shutting_down: false,
@@ -967,6 +972,8 @@ impl HeadlessServer {
             );
         }
 
+        self.sync_foreground_geometry_claims(client_id);
+
         // Shared runtime size changes affect pane wrapping and foreground-driven
         // rendering semantics. Force one fresh frame to every remaining client
         // even if the next rendered buffer compares equal to its cached frame.
@@ -985,6 +992,35 @@ impl HeadlessServer {
         {
             for client in self.clients.values_mut() {
                 client.request_repaint();
+            }
+        }
+    }
+
+    fn sync_foreground_geometry_claims(&mut self, client_id: u64) {
+        let dragging = self
+            .app
+            .state
+            .collection_views
+            .values()
+            .any(|view| view.resize_drag.is_some());
+        self.geometry_claims.submit_foreground(
+            client_id,
+            &self.app.state.collection_geometry,
+            dragging,
+            Instant::now(),
+        );
+        for (terminal_id, geometry, revision) in self
+            .geometry_claims
+            .ready(&self.app.state.direct_attach_resize_locks, Instant::now())
+        {
+            if let Some(runtime) = self.app.terminal_runtimes.get(&terminal_id) {
+                runtime.resize(
+                    geometry.rows,
+                    geometry.cols,
+                    geometry.cell_width_px,
+                    geometry.cell_height_px,
+                );
+                debug!(terminal_id = %terminal_id, revision, "accepted foreground geometry claim");
             }
         }
     }
@@ -1103,6 +1139,8 @@ impl HeadlessServer {
 
         let snapshot = crate::persist::capture(
             &self.app.state.workspaces,
+            &self.app.state.delegations,
+            &self.app.state.collection_archive_times,
             &self.app.state.terminals,
             &self.app.terminal_runtimes,
             self.app.state.active,
@@ -1357,11 +1395,55 @@ impl HeadlessServer {
         self.clients.get(&client_id)?.outer_terminal_focus
     }
 
-    fn active_tab_suppresses_notifications(&self, is_active_tab: bool) -> bool {
+    fn pane_suppresses_notifications(&self, ws_idx: usize, pane_id: PaneId) -> bool {
         crate::app::actions::active_tab_suppresses_notifications(
-            is_active_tab,
+            self.app.state.pane_is_foreground_visible(ws_idx, pane_id),
             self.foreground_client_outer_focus(),
         )
+    }
+
+    fn set_foreground_client(&mut self, next: Option<u64>) -> bool {
+        if self.foreground_client_id == next {
+            self.sync_foreground_client_state();
+            return false;
+        }
+        if let Some(previous) = self.foreground_client_id {
+            if let Some(client) = self.clients.get_mut(&previous) {
+                client.collection_views = std::mem::take(&mut self.app.state.collection_views);
+            }
+            self.geometry_claims.withdraw_client(previous);
+        }
+        self.foreground_client_id = next;
+        if let Some(next) = next {
+            if let Some(client) = self.clients.get_mut(&next) {
+                self.app.state.collection_views = std::mem::take(&mut client.collection_views);
+            }
+        }
+        self.sync_foreground_client_state();
+        true
+    }
+
+    /// Collection presentation is client-local, but collection lifetime is global. Prune every
+    /// client map after API mutations so close/promotion cannot resurrect stale state when
+    /// foreground ownership changes.
+    fn prune_closed_collection_views(&mut self) {
+        let live_collections: std::collections::HashSet<_> = self
+            .app
+            .state
+            .workspaces
+            .iter()
+            .flat_map(|workspace| workspace.tabs.iter())
+            .flat_map(|tab| tab.layout.collections().map(|collection| collection.id))
+            .collect();
+        self.app
+            .state
+            .collection_views
+            .retain(|collection_id, _| live_collections.contains(collection_id));
+        for client in self.clients.values_mut() {
+            client
+                .collection_views
+                .retain(|collection_id, _| live_collections.contains(collection_id));
+        }
     }
 
     fn promote_client_to_foreground(&mut self, client_id: u64) -> bool {
@@ -1370,19 +1452,11 @@ impl HeadlessServer {
             return false;
         };
         client.last_activity = stamp;
-
-        let changed = self.foreground_client_id != Some(client_id);
-        self.foreground_client_id = Some(client_id);
-        self.sync_foreground_client_state();
-        changed
+        self.set_foreground_client(Some(client_id))
     }
 
     fn promote_latest_remaining_client(&mut self) -> bool {
-        let next_foreground = latest_app_client(&self.clients);
-        let changed = next_foreground != self.foreground_client_id;
-        self.foreground_client_id = next_foreground;
-        self.sync_foreground_client_state();
-        changed
+        self.set_foreground_client(latest_app_client(&self.clients))
     }
 
     fn app_client_count(&self) -> usize {
@@ -1398,6 +1472,12 @@ impl HeadlessServer {
 
     fn remove_client(&mut self, client_id: u64) -> bool {
         let was_foreground = self.foreground_client_id == Some(client_id);
+        if was_foreground {
+            if let Some(client) = self.clients.get_mut(&client_id) {
+                client.collection_views = std::mem::take(&mut self.app.state.collection_views);
+            }
+            self.foreground_client_id = None;
+        }
         self.app.clear_input_source(client_id);
         self.send_client_graphics_cleanup(client_id);
         let removed = self.clients.remove(&client_id);
@@ -1410,9 +1490,23 @@ impl HeadlessServer {
                         .state
                         .direct_attach_resize_locks
                         .remove(&terminal_id);
+                    if let Some(geometry) = self
+                        .geometry_claims
+                        .recover_after_direct_attach(&terminal_id)
+                    {
+                        if let Some(runtime) = self.app.terminal_runtimes.get(&terminal_id) {
+                            runtime.resize(
+                                geometry.rows,
+                                geometry.cols,
+                                geometry.cell_width_px,
+                                geometry.cell_height_px,
+                            );
+                        }
+                    }
                 }
             }
         }
+        self.geometry_claims.withdraw_client(client_id);
         if was_foreground {
             self.promote_latest_remaining_client()
         } else {
@@ -1764,12 +1858,8 @@ impl HeadlessServer {
             return;
         }
 
-        let is_active_tab = self
-            .app
-            .state
-            .pane_is_in_active_tab(update.ws_idx, update.pane_id);
         let suppress_active_tab_notifications =
-            self.active_tab_suppresses_notifications(is_active_tab);
+            self.pane_suppresses_notifications(update.ws_idx, update.pane_id);
 
         if self.app.state.sound.allows(update.known_agent) {
             if let Some(sound) =
@@ -2041,18 +2131,13 @@ impl HeadlessServer {
                 self.app.handle_internal_event(ev);
 
                 // Forward sound notification to clients when server-side sound policy allows it.
-                let is_active_tab = self
+                let suppress_active_tab_notifications = self
                     .app
                     .state
-                    .active
-                    .and_then(|ws_idx| self.app.state.workspaces.get(ws_idx))
-                    .is_some_and(|ws| {
-                        ws.find_tab_index_for_pane(pane_id_val)
-                            .is_some_and(|tab_idx| ws.active_tab_index() == tab_idx)
-                    });
-
-                let suppress_active_tab_notifications =
-                    self.active_tab_suppresses_notifications(is_active_tab);
+                    .workspaces
+                    .iter()
+                    .position(|ws| ws.pane_state(pane_id_val).is_some())
+                    .is_some_and(|ws_idx| self.pane_suppresses_notifications(ws_idx, pane_id_val));
 
                 let next_state = self.pane_effective_state(pane_id_val);
                 let next_agent_label = self.pane_effective_agent_label(pane_id_val);
@@ -2133,18 +2218,13 @@ impl HeadlessServer {
 
                 // Forward sound notification based on the effective transition when
                 // server-side sound policy allows it.
-                let is_active_tab = self
+                let suppress_active_tab_notifications = self
                     .app
                     .state
-                    .active
-                    .and_then(|ws_idx| self.app.state.workspaces.get(ws_idx))
-                    .is_some_and(|ws| {
-                        ws.find_tab_index_for_pane(pane_id_val)
-                            .is_some_and(|tab_idx| ws.active_tab_index() == tab_idx)
-                    });
-
-                let suppress_active_tab_notifications =
-                    self.active_tab_suppresses_notifications(is_active_tab);
+                    .workspaces
+                    .iter()
+                    .position(|ws| ws.pane_state(pane_id_val).is_some())
+                    .is_some_and(|ws_idx| self.pane_suppresses_notifications(ws_idx, pane_id_val));
 
                 let next_state = self.pane_effective_state(pane_id_val);
                 let next_agent_label = self.pane_effective_agent_label(pane_id_val);
@@ -2703,7 +2783,7 @@ impl HeadlessServer {
                     ),
                 );
                 if !direct_attach_requested {
-                    self.foreground_client_id = Some(client_id);
+                    self.set_foreground_client(Some(client_id));
                 }
                 if first_app_client {
                     self.app.mark_git_status_refresh_due(Instant::now());
@@ -3166,6 +3246,7 @@ impl HeadlessServer {
             self.app
                 .handle_api_request_after_internal_events_drained(msg.request)
         };
+        self.prune_closed_collection_views();
         let _ = msg.respond_to.send(response);
 
         if let Some(revision_before) = pane_graphics_revision_before {
@@ -3226,9 +3307,8 @@ impl HeadlessServer {
                 continue;
             }
 
-            let is_active_tab = self.app.state.pane_is_in_active_tab(*ws_idx, *pane_id);
             let suppress_active_tab_notifications =
-                self.active_tab_suppresses_notifications(is_active_tab);
+                self.pane_suppresses_notifications(*ws_idx, *pane_id);
 
             let agent = terminal_after.effective_known_agent();
             let agent_label = terminal_after.effective_agent_label().map(str::to_string);
@@ -3640,6 +3720,19 @@ impl HeadlessServer {
         for (client_id, (cols, rows), cell_size, is_foreground, mode) in render_targets {
             let area = Rect::new(0, 0, cols, rows);
             let is_app_client = matches!(mode, ClientConnectionMode::App);
+            let foreground_collection_views = if is_app_client && !is_foreground {
+                let local = self
+                    .clients
+                    .get_mut(&client_id)
+                    .map(|client| std::mem::take(&mut client.collection_views))
+                    .unwrap_or_default();
+                Some(std::mem::replace(
+                    &mut self.app.state.collection_views,
+                    local,
+                ))
+            } else {
+                None
+            };
             let mut frame = match mode {
                 ClientConnectionMode::App => {
                     let render_started = crate::render_prof::timer();
@@ -3716,6 +3809,9 @@ impl HeadlessServer {
                     frame
                 }
             };
+            if is_app_client && is_foreground {
+                self.sync_foreground_geometry_claims(client_id);
+            }
 
             let Some(client) = self.clients.get_mut(&client_id) else {
                 continue;
@@ -3739,6 +3835,12 @@ impl HeadlessServer {
                 crate::render_prof::duration_since("full_render.graphics_encode", graphics_started);
             } else {
                 frame.graphics = next_graphics_cache.clear_bytes();
+            }
+            if let Some(foreground_views) = foreground_collection_views {
+                client.collection_views =
+                    std::mem::replace(&mut self.app.state.collection_views, foreground_views);
+            } else if is_app_client && is_foreground {
+                client.collection_views = self.app.state.collection_views.clone();
             }
 
             let Some(writer) = client.writer.as_ref().cloned() else {
@@ -4530,6 +4632,7 @@ mod tests {
             server_config_diagnostic: None,
             server_config_diagnostic_without_keybindings: None,
             terminal_attach_owners: HashMap::new(),
+            geometry_claims: Default::default(),
             next_activity_stamp: 1,
             effective_size: (MIN_COLS, MIN_ROWS),
             shutting_down: false,
@@ -4595,7 +4698,9 @@ mod tests {
         server.app.state.sidebar_agents.rows = vec![vec![
             crate::config::AgentSidebarToken::TerminalTitleStripped,
         ]];
-        let pane_id = server.app.state.workspaces[0].tabs[0].root_pane;
+        let pane_id = server.app.state.workspaces[0].tabs[0]
+            .root_pane
+            .expect("test tab has root pane");
         let terminal_id = server.app.state.workspaces[0].tabs[0].panes[&pane_id]
             .attached_terminal_id
             .clone();
@@ -5153,7 +5258,7 @@ next_tab = ""
         let _runtime_guard = rt.enter();
         let mut server = test_headless_server();
         let workspace = crate::workspace::Workspace::test_new("test");
-        let pane_id = workspace.tabs[0].root_pane;
+        let pane_id = workspace.tabs[0].root_pane.expect("test tab has root pane");
         let terminal_id = workspace.terminal_id(pane_id).expect("terminal id").clone();
         let terminal_id_string = terminal_id.to_string();
         let public_pane_id = format!("{}:p1", workspace.id);
@@ -5639,7 +5744,7 @@ next_tab = ""
     fn terminal_attach_client_exits_when_attached_pane_dies() {
         let mut server = test_headless_server();
         let workspace = crate::workspace::Workspace::test_new("attached");
-        let pane_id = workspace.tabs[0].root_pane;
+        let pane_id = workspace.tabs[0].root_pane.expect("test tab has root pane");
         server.app.state.workspaces = vec![workspace];
         server.app.state.ensure_test_terminals();
         let terminal_id = server.app.state.workspaces[0]
@@ -5885,7 +5990,7 @@ next_tab = ""
     fn headless_scheduled_tasks_expire_agent_metadata() {
         let mut server = test_headless_server();
         let workspace = crate::workspace::Workspace::test_new("metadata");
-        let pane_id = workspace.tabs[0].root_pane;
+        let pane_id = workspace.tabs[0].root_pane.expect("test tab has root pane");
         server.app.state.workspaces = vec![workspace];
         server.app.state.ensure_test_terminals();
 
@@ -5982,7 +6087,7 @@ next_tab = ""
     async fn headless_scheduled_tasks_do_not_start_pending_agent_resume_when_geometry_dirty() {
         let mut server = test_headless_server();
         let workspace = crate::workspace::Workspace::test_new("restored");
-        let pane_id = workspace.tabs[0].root_pane;
+        let pane_id = workspace.tabs[0].root_pane.expect("test tab has root pane");
         let terminal_id = workspace.terminal_id(pane_id).cloned().unwrap();
         server.app.state.view.pane_infos = workspace.tabs[0]
             .layout
@@ -6048,7 +6153,7 @@ next_tab = ""
     {
         let mut server = test_headless_server();
         let workspace = crate::workspace::Workspace::test_new("restored");
-        let pane_id = workspace.tabs[0].root_pane;
+        let pane_id = workspace.tabs[0].root_pane.expect("test tab has root pane");
         let terminal_id = workspace.terminal_id(pane_id).cloned().unwrap();
         server.app.state.view.pane_infos = workspace.tabs[0]
             .layout
@@ -6101,7 +6206,7 @@ next_tab = ""
     async fn headless_pre_input_resize_does_not_start_pending_agent_resume() {
         let mut server = test_headless_server();
         let workspace = crate::workspace::Workspace::test_new("restored");
-        let pane_id = workspace.tabs[0].root_pane;
+        let pane_id = workspace.tabs[0].root_pane.expect("test tab has root pane");
         let terminal_id = workspace.terminal_id(pane_id).cloned().unwrap();
         server.app.state.view.pane_infos = workspace.tabs[0]
             .layout
@@ -6187,7 +6292,7 @@ next_tab = ""
     async fn virtual_render_preserves_explicit_frame_cursor_position() {
         let mut state = AppState::test_new();
         let mut ws = crate::workspace::Workspace::test_new("test");
-        let pane_id = ws.tabs[0].root_pane;
+        let pane_id = ws.tabs[0].root_pane.expect("test tab has root pane");
         ws.insert_test_runtime(
             pane_id,
             crate::terminal::TerminalRuntime::test_with_screen_bytes(20, 5, b"left"),
@@ -6223,7 +6328,7 @@ next_tab = ""
     async fn virtual_render_preserves_hidden_focused_pane_cursor_position() {
         let mut state = AppState::test_new();
         let mut ws = crate::workspace::Workspace::test_new("test");
-        let pane_id = ws.tabs[0].root_pane;
+        let pane_id = ws.tabs[0].root_pane.expect("test tab has root pane");
         ws.insert_test_runtime(
             pane_id,
             crate::terminal::TerminalRuntime::test_with_screen_bytes(20, 5, b"left\x1b[?25l"),
@@ -6260,7 +6365,7 @@ next_tab = ""
         let mut state = AppState::test_new();
         state.reveal_hidden_cursor_for_cjk_ime = true;
         let mut ws = crate::workspace::Workspace::test_new("test");
-        let pane_id = ws.tabs[0].root_pane;
+        let pane_id = ws.tabs[0].root_pane.expect("test tab has root pane");
         let runtime = crate::terminal::TerminalRuntime::test_with_screen_bytes(20, 5, b"left");
         ws.insert_test_runtime(pane_id, runtime);
 
@@ -6291,7 +6396,7 @@ next_tab = ""
     async fn virtual_render_hides_focused_pane_cursor_during_synchronized_output_resize() {
         let mut state = AppState::test_new();
         let mut ws = crate::workspace::Workspace::test_new("test");
-        let pane_id = ws.tabs[0].root_pane;
+        let pane_id = ws.tabs[0].root_pane.expect("test tab has root pane");
         let runtime = crate::terminal::TerminalRuntime::test_with_screen_bytes(20, 5, b"left");
         ws.insert_test_runtime(pane_id, runtime);
 
@@ -6324,7 +6429,7 @@ next_tab = ""
         let mut state = AppState::test_new();
         state.reveal_hidden_cursor_for_cjk_ime = true;
         let mut ws = crate::workspace::Workspace::test_new("test");
-        let pane_id = ws.tabs[0].root_pane;
+        let pane_id = ws.tabs[0].root_pane.expect("test tab has root pane");
         ws.insert_test_runtime(
             pane_id,
             crate::terminal::TerminalRuntime::test_with_screen_bytes(20, 5, b"left\x1b[?25l"),
@@ -6362,7 +6467,7 @@ next_tab = ""
         let mut state = AppState::test_new();
         state.reveal_hidden_cursor_for_cjk_ime = true;
         let mut ws = crate::workspace::Workspace::test_new("test");
-        let pane_id = ws.tabs[0].root_pane;
+        let pane_id = ws.tabs[0].root_pane.expect("test tab has root pane");
         let mut bytes = Vec::new();
         for line in 0..80 {
             bytes.extend_from_slice(format!("line {line:02}\r\n").as_bytes());
@@ -6399,7 +6504,7 @@ next_tab = ""
         let mut state = AppState::test_new();
         state.reveal_hidden_cursor_for_cjk_ime = true;
         let mut ws = crate::workspace::Workspace::test_new("test");
-        let pane_id = ws.tabs[0].root_pane;
+        let pane_id = ws.tabs[0].root_pane.expect("test tab has root pane");
         // Feed only ?25l with no prior cursor movement — exercises the fallback
         // path for TUIs whose viewport has no cursor position.
         ws.insert_test_runtime(
@@ -6443,7 +6548,7 @@ next_tab = ""
         state.cjk_ime_agent_filter_configured = true;
         state.cjk_ime_agents = vec![crate::detect::Agent::Claude];
         let mut ws = crate::workspace::Workspace::test_new("test");
-        let pane_id = ws.tabs[0].root_pane;
+        let pane_id = ws.tabs[0].root_pane.expect("test tab has root pane");
         ws.insert_test_runtime(
             pane_id,
             crate::terminal::TerminalRuntime::test_with_screen_bytes(20, 5, b"left\x1b[?25l"),
@@ -6471,7 +6576,7 @@ next_tab = ""
         state.cjk_ime_agent_filter_configured = true;
         state.cjk_ime_agents = Vec::new();
         let mut ws = crate::workspace::Workspace::test_new("test");
-        let pane_id = ws.tabs[0].root_pane;
+        let pane_id = ws.tabs[0].root_pane.expect("test tab has root pane");
         ws.insert_test_runtime(
             pane_id,
             crate::terminal::TerminalRuntime::test_with_screen_bytes(20, 5, b"left\x1b[?25l"),
@@ -6496,7 +6601,7 @@ next_tab = ""
     async fn virtual_render_omits_focused_pane_cursor_while_mobile_switcher_open() {
         let mut state = AppState::test_new();
         let mut ws = crate::workspace::Workspace::test_new("test");
-        let pane_id = ws.tabs[0].root_pane;
+        let pane_id = ws.tabs[0].root_pane.expect("test tab has root pane");
         ws.insert_test_runtime(
             pane_id,
             crate::terminal::TerminalRuntime::test_with_screen_bytes(20, 5, b"left"),
@@ -6518,7 +6623,7 @@ next_tab = ""
     async fn virtual_render_hides_focused_pane_cursor_while_scrolled_back() {
         let mut state = AppState::test_new();
         let mut ws = crate::workspace::Workspace::test_new("test");
-        let pane_id = ws.tabs[0].root_pane;
+        let pane_id = ws.tabs[0].root_pane.expect("test tab has root pane");
         let mut bytes = Vec::new();
         for line in 0..80 {
             bytes.extend_from_slice(format!("line {line:02}\r\n").as_bytes());
@@ -7065,7 +7170,7 @@ next_tab = ""
         terminal_bytes: &[u8],
     ) -> tokio::sync::mpsc::Receiver<Bytes> {
         let mut workspace = crate::workspace::Workspace::test_new("focus-reporting");
-        let pane_id = workspace.tabs[0].root_pane;
+        let pane_id = workspace.tabs[0].root_pane.expect("test tab has root pane");
         let (runtime, input_rx) =
             crate::terminal::TerminalRuntime::test_with_channel_and_scrollback_bytes(
                 80,
@@ -7080,6 +7185,67 @@ next_tab = ""
         server.app.state.selected = 0;
         server.app.state.mode = crate::app::Mode::Terminal;
         input_rx
+    }
+
+    #[test]
+    fn foreground_clients_keep_independent_collection_presentation() {
+        let mut server = test_headless_server();
+        let collection = crate::layout::CollectionId::from_raw(42).expect("collection id");
+        let first_pane = crate::layout::PaneId::from_raw(1);
+        let second_pane = crate::layout::PaneId::from_raw(2);
+        let mut first = test_app_client(Some(true), 1);
+        first
+            .collection_views
+            .entry(collection)
+            .or_default()
+            .expanded
+            .insert(first_pane);
+        let mut second = test_app_client(Some(true), 2);
+        second
+            .collection_views
+            .entry(collection)
+            .or_default()
+            .expanded
+            .insert(second_pane);
+        server.clients.insert(1, first);
+        server.clients.insert(2, second);
+
+        assert!(server.set_foreground_client(Some(1)));
+        assert!(server.app.state.collection_views[&collection]
+            .expanded
+            .contains(&first_pane));
+        assert!(server.promote_client_to_foreground(2));
+        assert!(server.app.state.collection_views[&collection]
+            .expanded
+            .contains(&second_pane));
+        assert!(server.clients[&1].collection_views[&collection]
+            .expanded
+            .contains(&first_pane));
+    }
+
+    #[test]
+    fn closed_collection_view_is_pruned_from_global_and_all_client_maps() {
+        let mut server = test_headless_server();
+        let collection = crate::layout::CollectionId::from_raw(4242).expect("collection id");
+        server
+            .app
+            .state
+            .collection_views
+            .entry(collection)
+            .or_default();
+        for client_id in [1, 2] {
+            let mut client = test_app_client(Some(true), client_id);
+            client.collection_views.entry(collection).or_default();
+            server.clients.insert(client_id, client);
+        }
+
+        server.prune_closed_collection_views();
+
+        assert!(!server.app.state.collection_views.contains_key(&collection));
+        assert!(server
+            .clients
+            .values()
+            .all(|client| !client.collection_views.contains_key(&collection)));
     }
 
     fn test_app_client(outer_terminal_focus: Option<bool>, last_activity: u64) -> ClientConnection {
@@ -7315,9 +7481,11 @@ next_tab = ""
     async fn render_and_stream_uses_each_client_terminal_size() {
         let mut server = test_headless_server();
         let mut workspace = crate::workspace::Workspace::test_new("test");
-        let active_pane = workspace.tabs[0].root_pane;
+        let active_pane = workspace.tabs[0].root_pane.expect("test tab has root pane");
         let background_tab = workspace.test_add_tab(Some("background"));
-        let background_pane = workspace.tabs[background_tab].root_pane;
+        let background_pane = workspace.tabs[background_tab]
+            .root_pane
+            .expect("test tab has root pane");
         workspace.tabs[0].runtimes.insert(
             active_pane,
             crate::terminal::TerminalRuntime::test_with_screen_bytes(80, 24, b"active"),
@@ -7410,8 +7578,10 @@ next_tab = ""
         let mut server = test_headless_server();
         let mut workspace = crate::workspace::Workspace::test_new("test");
         let background_tab = workspace.test_add_tab(Some("background"));
-        let active_pane = workspace.tabs[0].root_pane;
-        let background_pane = workspace.tabs[background_tab].root_pane;
+        let active_pane = workspace.tabs[0].root_pane.expect("test tab has root pane");
+        let background_pane = workspace.tabs[background_tab]
+            .root_pane
+            .expect("test tab has root pane");
         workspace.tabs[0].runtimes.insert(
             active_pane,
             crate::terminal::TerminalRuntime::test_with_screen_bytes(80, 24, b""),
@@ -7472,7 +7642,7 @@ next_tab = ""
         let _runtime_guard = rt.enter();
         let mut server = test_headless_server();
         let workspace = crate::workspace::Workspace::test_new("test");
-        let pane_id = workspace.tabs[0].root_pane;
+        let pane_id = workspace.tabs[0].root_pane.expect("test tab has root pane");
         let terminal_id = workspace.terminal_id(pane_id).expect("terminal id").clone();
         let terminal_id_string = terminal_id.to_string();
         server.app.state.workspaces = vec![workspace];
@@ -9388,7 +9558,9 @@ next_tab = ""
     fn delayed_agent_notification_forwards_after_deadline() {
         let mut server = test_headless_server();
         let background = crate::workspace::Workspace::test_new("background");
-        let pane_id = background.tabs[0].root_pane;
+        let pane_id = background.tabs[0]
+            .root_pane
+            .expect("test tab has root pane");
         let foreground = crate::workspace::Workspace::test_new("foreground");
         server.app.state.workspaces = vec![background, foreground];
         server.app.state.ensure_test_terminals();
@@ -9477,7 +9649,7 @@ next_tab = ""
     fn delayed_active_tab_unfocused_agent_notification_forwards_after_deadline() {
         let mut server = test_headless_server();
         let workspace = crate::workspace::Workspace::test_new("active");
-        let pane_id = workspace.tabs[0].root_pane;
+        let pane_id = workspace.tabs[0].root_pane.expect("test tab has root pane");
         server.app.state.workspaces = vec![workspace];
         server.app.state.ensure_test_terminals();
         server.app.state.active = Some(0);
@@ -9564,7 +9736,9 @@ next_tab = ""
     fn stale_api_agent_report_does_not_forward_done_sound() {
         let mut server = test_headless_server();
         let background = crate::workspace::Workspace::test_new("background");
-        let pane_id = background.tabs[0].root_pane;
+        let pane_id = background.tabs[0]
+            .root_pane
+            .expect("test tab has root pane");
         let public_pane_id = format!("{}:p1", background.id);
         let foreground = crate::workspace::Workspace::test_new("foreground");
         server.app.state.workspaces = vec![background, foreground];

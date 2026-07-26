@@ -17,7 +17,7 @@ use crate::app::actions::{PaneZoomCommand, PaneZoomNoopReason};
 use crate::app::App;
 #[cfg(test)]
 use crate::app::Mode;
-use crate::layout::{find_in_direction, NavDirection, PaneId};
+use crate::layout::{find_in_direction, NavDirection, PaneId, PanePlacement};
 
 use super::super::api_helpers::{
     detect_state_from_api, encode_api_keys, normalize_metadata_source, normalize_metadata_tokens,
@@ -163,8 +163,8 @@ impl App {
             return pane_not_found(id, &target.pane_id);
         };
 
+        // API focus changes typed placement/selection but is not a human acknowledgment.
         self.state.focus_pane_in_workspace(ws_idx, pane_id);
-        self.state.mark_active_tab_seen();
         self.state.settle_terminal_mode_after_focus();
 
         let Some(pane) = self.pane_info(ws_idx, pane_id) else {
@@ -642,6 +642,12 @@ impl App {
         else {
             return encode_error(id, "pane_not_found", "source pane not found");
         };
+        let source_collection_id = match self.state.workspaces[source_ws_idx].tabs[source_tab_idx]
+            .pane_placement(source_pane_id)
+        {
+            Some(PanePlacement::Collection(collection_id)) => Some(collection_id),
+            _ => None,
+        };
         let recovery_context = PaneMoveRecoveryContext {
             source_ws_idx,
             previous_workspace_id: previous_workspace_id.clone(),
@@ -673,6 +679,66 @@ impl App {
         }
 
         let resolved = match destination {
+            PaneMoveDestination::Collection { collection_id } => {
+                let Some((target_ws_idx, target_tab_idx, target_collection_id)) =
+                    self.resolve_collection(&collection_id)
+                else {
+                    return encode_error(
+                        id,
+                        "collection_not_found",
+                        format!("collection {collection_id} not found"),
+                    );
+                };
+                if self.state.workspaces[target_ws_idx].tabs[target_tab_idx].zoomed {
+                    return encode_error(id, "pane_move_failed", "target collection tab is zoomed");
+                }
+                if source_ws_idx == target_ws_idx
+                    && source_tab_idx == target_tab_idx
+                    && source_collection_id != Some(target_collection_id)
+                {
+                    // Same-tab collection mutations use one cloned layout below and are
+                    // therefore atomic without detaching pane state.
+                } else if self.state.workspaces[target_ws_idx].tabs[target_tab_idx]
+                    .validate_collection_insert(target_collection_id, source_pane_id)
+                    .is_err()
+                {
+                    return encode_error(
+                        id,
+                        "pane_move_failed",
+                        "target collection cannot accept pane",
+                    );
+                }
+                if source_ws_idx == target_ws_idx
+                    && source_tab_idx == target_tab_idx
+                    && source_collection_id == Some(target_collection_id)
+                {
+                    let Some(layout) = self.pane_layout_snapshot(source_ws_idx, source_tab_idx)
+                    else {
+                        return encode_error(
+                            id,
+                            "pane_layout_unavailable",
+                            "pane layout unavailable",
+                        );
+                    };
+                    let Some(pane) = self.pane_info(source_ws_idx, source_pane_id) else {
+                        return encode_error(id, "pane_not_found", "source pane not found");
+                    };
+                    return encode_unchanged_pane_move(
+                        id,
+                        PaneMoveReason::SameTab,
+                        previous_pane_id,
+                        previous_workspace_id,
+                        previous_tab_id,
+                        pane,
+                        Some(layout.clone()),
+                        layout,
+                    );
+                }
+                ResolvedPaneMoveDestination::Collection {
+                    collection_id,
+                    cross_workspace: source_ws_idx != target_ws_idx,
+                }
+            }
             PaneMoveDestination::Tab {
                 tab_id,
                 target_pane_id,
@@ -813,7 +879,10 @@ impl App {
         let source_workspace_empty = taken.workspace_empty;
         let moved = taken.moved;
         let cross_workspace = match &resolved {
-            ResolvedPaneMoveDestination::ExistingTab {
+            ResolvedPaneMoveDestination::Collection {
+                cross_workspace, ..
+            }
+            | ResolvedPaneMoveDestination::ExistingTab {
                 cross_workspace, ..
             } => *cross_workspace,
             ResolvedPaneMoveDestination::NewTab { workspace_id, .. } => {
@@ -857,6 +926,40 @@ impl App {
         let mut created_workspace = false;
         let mut created_tab = false;
         let (target_ws_idx, target_tab_idx, moved_pane_id) = match resolved {
+            ResolvedPaneMoveDestination::Collection {
+                collection_id,
+                cross_workspace: _,
+            } => {
+                let Some((target_ws_idx, target_tab_idx, target_collection_id)) =
+                    self.resolve_collection(&collection_id)
+                else {
+                    self.recover_failed_pane_move(recovery_context, moved);
+                    return encode_error(id, "pane_move_failed", "target collection disappeared");
+                };
+                let previous_target_focus = self.state.workspaces[target_ws_idx].tabs
+                    [target_tab_idx]
+                    .layout
+                    .focused_leaf();
+                let moved_pane_id = match self.state.workspaces[target_ws_idx]
+                    .insert_moved_pane_into_collection(target_tab_idx, target_collection_id, moved)
+                {
+                    Ok(pane_id) => pane_id,
+                    Err((_error, moved)) => {
+                        self.recover_failed_pane_move(recovery_context, moved);
+                        return encode_error(
+                            id,
+                            "pane_move_failed",
+                            "pane could not be added to target collection",
+                        );
+                    }
+                };
+                if !focus {
+                    let _ = self.state.workspaces[target_ws_idx].tabs[target_tab_idx]
+                        .layout
+                        .focus_leaf(previous_target_focus);
+                }
+                (target_ws_idx, target_tab_idx, moved_pane_id)
+            }
             ResolvedPaneMoveDestination::ExistingTab {
                 tab_id,
                 target_pane_id,
@@ -973,6 +1076,20 @@ impl App {
             return encode_error(id, "pane_layout_unavailable", "pane layout unavailable");
         };
         let focused_pane_id = target_layout.focused_pane_id.clone();
+        let target_collection_id = match self.state.workspaces[target_ws_idx].tabs[target_tab_idx]
+            .pane_placement(moved_pane_id)
+        {
+            Some(PanePlacement::Collection(collection_id)) => Some(collection_id),
+            _ => None,
+        };
+        let remains_archived = target_collection_id.is_some_and(|collection_id| {
+            self.state.workspaces[target_ws_idx].tabs[target_tab_idx]
+                .collection(collection_id)
+                .is_some_and(|collection| collection.is_archived(moved_pane_id))
+        });
+        if !remains_archived {
+            self.state.collection_archive_times.remove(&moved_pane_id);
+        }
         let move_result = PaneMoveResult {
             changed: true,
             reason: None,
@@ -988,6 +1105,49 @@ impl App {
             closed_tab_id: source_removed_tab_id.clone(),
             focused_pane_id,
         };
+        match (source_collection_id, target_collection_id) {
+            (Some(previous_collection_id), Some(collection_id))
+                if previous_collection_id != collection_id =>
+            {
+                if let Some(collection) =
+                    self.collection_info(target_ws_idx, target_tab_idx, collection_id)
+                {
+                    self.emit_event(EventEnvelope {
+                        event: EventKind::CollectionMemberMoved,
+                        data: EventData::CollectionMemberMoved {
+                            previous_collection_id: super::collections::collection_id_string(
+                                previous_collection_id,
+                            ),
+                            collection,
+                            pane: pane.clone(),
+                        },
+                    });
+                }
+            }
+            (None, Some(collection_id)) => {
+                if let Some(collection) =
+                    self.collection_info(target_ws_idx, target_tab_idx, collection_id)
+                {
+                    self.emit_event(EventEnvelope {
+                        event: EventKind::CollectionMemberAdded,
+                        data: EventData::CollectionMemberAdded {
+                            collection,
+                            pane: pane.clone(),
+                        },
+                    });
+                }
+            }
+            (Some(collection_id), None) => {
+                self.emit_event(EventEnvelope {
+                    event: EventKind::CollectionMemberPromoted,
+                    data: EventData::CollectionMemberPromoted {
+                        collection_id: super::collections::collection_id_string(collection_id),
+                        pane: pane.clone(),
+                    },
+                });
+            }
+            _ => {}
+        }
         if let Some(closed_tab_id) = &source_removed_tab_id {
             self.emit_event(EventEnvelope {
                 event: EventKind::TabClosed,
@@ -1481,6 +1641,7 @@ impl App {
         let Some((ws_idx, pane_id)) = self.parse_pane_id(&params.pane_id) else {
             return pane_not_found(id, &params.pane_id);
         };
+        self.restore_archived_member_for_input(ws_idx, pane_id);
         let Some(runtime) = self.lookup_runtime_sender(ws_idx, pane_id) else {
             return pane_not_found(id, &params.pane_id);
         };
@@ -1499,6 +1660,7 @@ impl App {
         let Some((ws_idx, pane_id)) = self.parse_pane_id(&params.pane_id) else {
             return pane_not_found(id, &params.pane_id);
         };
+        self.restore_archived_member_for_input(ws_idx, pane_id);
         let Some(runtime) = self.lookup_runtime_sender(ws_idx, pane_id) else {
             return pane_not_found(id, &params.pane_id);
         };
@@ -1544,6 +1706,14 @@ impl App {
             ));
         }
         let workspace_snapshot = self.workspace_info(ws_idx);
+        let source_collection_id = self.state.workspaces[ws_idx]
+            .find_tab_index_for_pane(pane_id)
+            .and_then(|tab_idx| {
+                match self.state.workspaces[ws_idx].tabs[tab_idx].pane_placement(pane_id) {
+                    Some(PanePlacement::Collection(collection_id)) => Some(collection_id),
+                    _ => None,
+                }
+            });
         let terminal_id = self.state.terminal_id_for_pane(ws_idx, pane_id);
         let should_close_workspace = {
             let Some(ws) = self.state.workspaces.get_mut(ws_idx) else {
@@ -1551,7 +1721,7 @@ impl App {
             };
             ws.close_pane(pane_id)
         };
-        self.state.remove_plugin_pane_records([pane_id]);
+        let destruction = self.state.finalize_pane_destruction([pane_id]);
         if should_close_workspace {
             self.state.selected = ws_idx;
             self.state.close_selected_workspace();
@@ -1586,7 +1756,45 @@ impl App {
             }
         }
 
+        if let Some(collection_id) = source_collection_id {
+            self.emit_event(EventEnvelope {
+                event: EventKind::CollectionMemberRemoved,
+                data: EventData::CollectionMemberRemoved {
+                    collection_id: super::collections::collection_id_string(collection_id),
+                    pane_id: target.pane_id.clone(),
+                },
+            });
+        }
+        self.emit_pane_destruction_events(destruction, &[(pane_id, target.pane_id.clone())]);
+
         Ok(())
+    }
+
+    pub(super) fn emit_pane_destruction_events(
+        &mut self,
+        destruction: crate::app::actions::PaneDestructionSummary,
+        public_panes: &[(PaneId, String)],
+    ) {
+        for (delegation_id, pane_id) in destruction.tombstoned_delegations {
+            self.emit_event(EventEnvelope {
+                event: EventKind::DelegationTombstoned,
+                data: EventData::DelegationTombstoned {
+                    delegation_id: delegation_id.to_string(),
+                    pane_id: public_panes
+                        .iter()
+                        .find_map(|(id, public)| (*id == pane_id).then(|| public.clone()))
+                        .unwrap_or_default(),
+                },
+            });
+        }
+        for delegation_id in destruction.garbage_collected_delegations {
+            self.emit_event(EventEnvelope {
+                event: EventKind::DelegationGarbageCollected,
+                data: EventData::DelegationGarbageCollected {
+                    delegation_id: delegation_id.to_string(),
+                },
+            });
+        }
     }
 
     pub(super) fn handle_pane_send_keys(
@@ -1597,6 +1805,7 @@ impl App {
         let Some((ws_idx, pane_id)) = self.parse_pane_id(&params.pane_id) else {
             return pane_not_found(id, &params.pane_id);
         };
+        self.restore_archived_member_for_input(ws_idx, pane_id);
         let Some(runtime) = self.lookup_runtime_sender(ws_idx, pane_id) else {
             return pane_not_found(id, &params.pane_id);
         };
@@ -1684,7 +1893,13 @@ impl App {
         let ws = self.state.workspaces.get(ws_idx)?;
         let tab = ws.tabs.get(tab_idx)?;
         let area = self.state.view.terminal_area;
-        let focused_pane_id = self.public_pane_id(ws_idx, tab.layout.focused())?;
+        let focused = self.layout_focus_info(ws_idx, tab_idx)?;
+        let focused_pane_id = match &focused {
+            crate::api::schema::LayoutFocusInfo::Pane { pane_id } => Some(pane_id.clone()),
+            crate::api::schema::LayoutFocusInfo::Collection {
+                selected_pane_id, ..
+            } => selected_pane_id.clone(),
+        };
         let panes = crate::ui::apply_pane_chrome(
             tab.layout.panes(area),
             self.state.pane_borders,
@@ -1695,6 +1910,7 @@ impl App {
             Some(PaneLayoutPane {
                 pane_id: self.public_pane_id(ws_idx, pane.id)?,
                 focused: pane.is_focused,
+                placement: self.pane_placement_info(ws_idx, tab_idx, pane.id)?,
                 rect: pane.rect.into(),
             })
         })
@@ -1725,7 +1941,13 @@ impl App {
             zoomed: tab.zoomed,
             area: area.into(),
             focused_pane_id,
+            focused,
             panes,
+            collections: tab
+                .layout
+                .collections()
+                .filter_map(|collection| self.collection_info(ws_idx, tab_idx, collection.id))
+                .collect(),
             splits,
         })
     }
@@ -1777,6 +1999,10 @@ impl From<PaneDirection> for NavDirection {
 }
 
 enum ResolvedPaneMoveDestination {
+    Collection {
+        collection_id: String,
+        cross_workspace: bool,
+    },
     ExistingTab {
         tab_id: String,
         target_pane_id: PaneId,
@@ -1893,7 +2119,9 @@ mod tests {
         );
         app.state.workspaces = vec![Workspace::test_new("metadata")];
         app.state.ensure_test_terminals();
-        let pane_id = app.state.workspaces[0].tabs[0].root_pane;
+        let pane_id = app.state.workspaces[0].tabs[0]
+            .root_pane
+            .expect("test tab has root pane");
         let public_pane_id = app.public_pane_id(0, pane_id).unwrap();
         (app, public_pane_id)
     }
@@ -1902,7 +2130,9 @@ mod tests {
         capacity: usize,
     ) -> (App, String, tokio::sync::mpsc::Receiver<bytes::Bytes>) {
         let (mut app, public_pane_id) = app_with_test_workspace();
-        let pane_id = app.state.workspaces[0].tabs[0].root_pane;
+        let pane_id = app.state.workspaces[0].tabs[0]
+            .root_pane
+            .expect("test tab has root pane");
         let (runtime, rx) =
             crate::terminal::TerminalRuntime::test_with_channel_capacity(80, 24, capacity);
         app.state.insert_test_runtime(pane_id, runtime);
@@ -1911,7 +2141,9 @@ mod tests {
 
     fn app_with_scrollback_runtime() -> (App, String, PaneId) {
         let (mut app, public_pane_id) = app_with_test_workspace();
-        let pane_id = app.state.workspaces[0].tabs[0].root_pane;
+        let pane_id = app.state.workspaces[0].tabs[0]
+            .root_pane
+            .expect("test tab has root pane");
         let lines = (0..20)
             .map(|line| format!("line {line:02}\n"))
             .collect::<String>();
@@ -2066,7 +2298,9 @@ mod tests {
     #[tokio::test]
     async fn api_pane_send_keys_sends_shifted_punctuation_as_text_in_kitty_mode() {
         let (mut app, pane_id) = app_with_test_workspace();
-        let internal_pane_id = app.state.workspaces[0].tabs[0].root_pane;
+        let internal_pane_id = app.state.workspaces[0].tabs[0]
+            .root_pane
+            .expect("test tab has root pane");
         let (runtime, mut rx) =
             crate::terminal::TerminalRuntime::test_with_channel_and_scrollback_bytes(
                 80,
@@ -2095,7 +2329,9 @@ mod tests {
     #[tokio::test]
     async fn api_pane_send_input_brackets_text_and_enter_atomically() {
         let (mut app, pane_id, mut rx) = app_with_send_key_runtime(1);
-        let internal_pane_id = app.state.workspaces[0].tabs[0].root_pane;
+        let internal_pane_id = app.state.workspaces[0].tabs[0]
+            .root_pane
+            .expect("test tab has root pane");
         app.lookup_runtime_sender(0, internal_pane_id)
             .unwrap()
             .test_process_pty_bytes(b"\x1b[?2004h");
@@ -2218,7 +2454,9 @@ mod tests {
     #[test]
     fn api_pane_close_closes_linked_worktree_workspace_only() {
         let mut app = app_with_linked_worktree();
-        let pane_id = app.state.workspaces[0].tabs[0].root_pane;
+        let pane_id = app.state.workspaces[0].tabs[0]
+            .root_pane
+            .expect("test tab has root pane");
         let public_pane_id = app.public_pane_id(0, pane_id).unwrap();
 
         let response = app.handle_pane_close(
@@ -2239,7 +2477,9 @@ mod tests {
         let mut app = app_with_linked_worktree();
         app.state.active = Some(0);
         app.state.selected = 0;
-        let root = app.state.workspaces[0].tabs[0].root_pane;
+        let root = app.state.workspaces[0].tabs[0]
+            .root_pane
+            .expect("test tab has root pane");
         let right = app.state.workspaces[0].test_split(ratatui::layout::Direction::Horizontal);
         app.state.ensure_test_terminals();
         app.state.workspaces[0].tabs[0].layout.focus_pane(root);
@@ -2268,7 +2508,9 @@ mod tests {
         let mut app = app_with_linked_worktree();
         app.state.active = Some(0);
         app.state.selected = 0;
-        let root = app.state.workspaces[0].tabs[0].root_pane;
+        let root = app.state.workspaces[0].tabs[0]
+            .root_pane
+            .expect("test tab has root pane");
         app.state.workspaces[0].tabs[0].layout.focus_pane(root);
         let root_public = app.public_pane_id(0, root).unwrap();
 
@@ -2290,7 +2532,9 @@ mod tests {
         let mut app = app_with_linked_worktree();
         app.state.active = Some(0);
         app.state.selected = 0;
-        let root = app.state.workspaces[0].tabs[0].root_pane;
+        let root = app.state.workspaces[0].tabs[0]
+            .root_pane
+            .expect("test tab has root pane");
         let root_public = app.public_pane_id(0, root).unwrap();
 
         let response = app.handle_api_request(crate::api::schema::Request {
@@ -2337,7 +2581,9 @@ mod tests {
     #[test]
     fn api_pane_swap_explicit_source_and_target_preserves_focus_and_returns_layout() {
         let mut app = app_with_linked_worktree();
-        let source = app.state.workspaces[0].tabs[0].root_pane;
+        let source = app.state.workspaces[0].tabs[0]
+            .root_pane
+            .expect("test tab has root pane");
         let target = app.state.workspaces[0].test_split(ratatui::layout::Direction::Horizontal);
         app.state.workspaces[0].tabs[0].layout.focus_pane(source);
         crate::ui::compute_view(&mut app.state, ratatui::layout::Rect::new(0, 0, 100, 20));
@@ -2361,8 +2607,8 @@ mod tests {
         assert_eq!(swap.reason, None);
         assert_eq!(swap.source_pane_id, source_public);
         assert_eq!(swap.target_pane_id, Some(target_public));
-        assert_eq!(swap.focused_pane_id, swap.source_pane_id);
-        assert_eq!(swap.layout.focused_pane_id, swap.source_pane_id);
+        assert_eq!(swap.focused_pane_id, Some(swap.source_pane_id.clone()));
+        assert_eq!(swap.layout.focused_pane_id, Some(swap.source_pane_id));
         assert_eq!(swap.layout.panes.len(), 2);
         assert_eq!(app.state.workspaces[0].focused_pane_id(), Some(source));
     }
@@ -2370,7 +2616,9 @@ mod tests {
     #[test]
     fn api_pane_swap_unfocused_source_updates_last_pane_history() {
         let mut app = app_with_linked_worktree();
-        let source = app.state.workspaces[0].tabs[0].root_pane;
+        let source = app.state.workspaces[0].tabs[0]
+            .root_pane
+            .expect("test tab has root pane");
         let focused = app.state.workspaces[0].test_split(ratatui::layout::Direction::Horizontal);
         let target = app.state.workspaces[0].test_split(ratatui::layout::Direction::Vertical);
         app.state.active = Some(0);
@@ -2404,7 +2652,9 @@ mod tests {
     #[test]
     fn api_pane_swap_direction_no_neighbor_returns_unchanged_layout() {
         let mut app = app_with_linked_worktree();
-        let source = app.state.workspaces[0].tabs[0].root_pane;
+        let source = app.state.workspaces[0].tabs[0]
+            .root_pane
+            .expect("test tab has root pane");
         app.state.workspaces[0].tabs[0].layout.focus_pane(source);
         crate::ui::compute_view(&mut app.state, ratatui::layout::Rect::new(0, 0, 100, 20));
         let source_public = app.public_pane_id(0, source).unwrap();
@@ -2433,7 +2683,9 @@ mod tests {
     #[test]
     fn api_pane_swap_explicit_missing_target_returns_not_found_noop() {
         let mut app = app_with_linked_worktree();
-        let source = app.state.workspaces[0].tabs[0].root_pane;
+        let source = app.state.workspaces[0].tabs[0]
+            .root_pane
+            .expect("test tab has root pane");
         let source_public = app.public_pane_id(0, source).unwrap();
 
         let response = app.handle_pane_swap(
@@ -2459,7 +2711,9 @@ mod tests {
     #[test]
     fn api_pane_swap_explicit_missing_source_returns_not_found_noop() {
         let mut app = app_with_linked_worktree();
-        let target = app.state.workspaces[0].tabs[0].root_pane;
+        let target = app.state.workspaces[0].tabs[0]
+            .root_pane
+            .expect("test tab has root pane");
         let target_public = app.public_pane_id(0, target).unwrap();
 
         let response = app.handle_pane_swap(
@@ -2486,8 +2740,12 @@ mod tests {
     fn api_pane_swap_explicit_cross_workspace_preserves_target_id() {
         let mut app = app_with_linked_worktree();
         app.state.workspaces.push(Workspace::test_new("other"));
-        let source = app.state.workspaces[0].tabs[0].root_pane;
-        let target = app.state.workspaces[1].tabs[0].root_pane;
+        let source = app.state.workspaces[0].tabs[0]
+            .root_pane
+            .expect("test tab has root pane");
+        let target = app.state.workspaces[1].tabs[0]
+            .root_pane
+            .expect("test tab has root pane");
         let source_public = app.public_pane_id(0, source).unwrap();
         let target_public = app.public_pane_id(1, target).unwrap();
 
@@ -2514,13 +2772,17 @@ mod tests {
     #[test]
     fn api_pane_move_to_existing_tab_preserves_internal_pane_and_terminal() {
         let mut app = app_with_linked_worktree();
-        let source = app.state.workspaces[0].tabs[0].root_pane;
+        let source = app.state.workspaces[0].tabs[0]
+            .root_pane
+            .expect("test tab has root pane");
         let source_terminal = app.state.workspaces[0].tabs[0]
             .terminal_id(source)
             .unwrap()
             .clone();
         let target_tab = app.state.workspaces[0].test_add_tab(Some("target"));
-        let target = app.state.workspaces[0].tabs[target_tab].root_pane;
+        let target = app.state.workspaces[0].tabs[target_tab]
+            .root_pane
+            .expect("test tab has root pane");
         seed_terminal_states(&mut app);
         let source_public = app.public_pane_id(0, source).unwrap();
         let source_tab_public = app.public_tab_id(0, 0).unwrap();
@@ -2566,9 +2828,13 @@ mod tests {
     #[test]
     fn api_pane_move_focuses_copy_mode_pane_back_into_copy_mode() {
         let mut app = app_with_linked_worktree();
-        let source = app.state.workspaces[0].tabs[0].root_pane;
+        let source = app.state.workspaces[0].tabs[0]
+            .root_pane
+            .expect("test tab has root pane");
         let target_tab = app.state.workspaces[0].test_add_tab(Some("target"));
-        let target = app.state.workspaces[0].tabs[target_tab].root_pane;
+        let target = app.state.workspaces[0].tabs[target_tab]
+            .root_pane
+            .expect("test tab has root pane");
         seed_terminal_states(&mut app);
         app.state.copy_mode = Some(crate::app::state::CopyModeState {
             pane_id: source,
@@ -2609,7 +2875,9 @@ mod tests {
     #[tokio::test]
     async fn key_release_follows_pane_moved_across_workspaces() {
         let mut app = app_with_linked_worktree();
-        let source = app.state.workspaces[0].tabs[0].root_pane;
+        let source = app.state.workspaces[0].tabs[0]
+            .root_pane
+            .expect("test tab has root pane");
         let source_terminal_id = app.state.workspaces[0].tabs[0]
             .terminal_id(source)
             .unwrap()
@@ -2628,7 +2896,9 @@ mod tests {
         app.state.selected = 0;
         app.state.mode = Mode::Terminal;
         let source_public = app.public_pane_id(0, source).unwrap();
-        let target = app.state.workspaces[1].tabs[0].root_pane;
+        let target = app.state.workspaces[1].tabs[0]
+            .root_pane
+            .expect("test tab has root pane");
         let target_tab_id = app.public_tab_id(1, 0).unwrap();
         let target_pane_id = app.public_pane_id(1, target).unwrap();
 
@@ -2684,12 +2954,16 @@ mod tests {
     fn api_pane_move_to_existing_tab_across_workspace_reassigns_public_pane_id() {
         let mut app = app_with_linked_worktree();
         app.state.workspaces.push(Workspace::test_new("other"));
-        let source = app.state.workspaces[0].tabs[0].root_pane;
+        let source = app.state.workspaces[0].tabs[0]
+            .root_pane
+            .expect("test tab has root pane");
         let source_terminal = app.state.workspaces[0].tabs[0]
             .terminal_id(source)
             .unwrap()
             .clone();
-        let target = app.state.workspaces[1].tabs[0].root_pane;
+        let target = app.state.workspaces[1].tabs[0]
+            .root_pane
+            .expect("test tab has root pane");
         seed_terminal_states(&mut app);
         app.state
             .terminals
@@ -2749,12 +3023,16 @@ mod tests {
     fn api_pane_move_legacy_target_tab_id_survives_source_workspace_removal() {
         let mut app = app_with_linked_worktree();
         app.state.workspaces.push(Workspace::test_new("other"));
-        let source = app.state.workspaces[0].tabs[0].root_pane;
+        let source = app.state.workspaces[0].tabs[0]
+            .root_pane
+            .expect("test tab has root pane");
         let source_terminal = app.state.workspaces[0].tabs[0]
             .terminal_id(source)
             .unwrap()
             .clone();
-        let target = app.state.workspaces[1].tabs[0].root_pane;
+        let target = app.state.workspaces[1].tabs[0]
+            .root_pane
+            .expect("test tab has root pane");
         seed_terminal_states(&mut app);
         let source_workspace_id = app.public_workspace_id(0);
         let target_workspace_id = app.public_workspace_id(1);
@@ -2795,7 +3073,9 @@ mod tests {
     #[test]
     fn api_pane_move_to_new_tab_creates_tab_without_spawning_terminal() {
         let mut app = app_with_linked_worktree();
-        let source = app.state.workspaces[0].tabs[0].root_pane;
+        let source = app.state.workspaces[0].tabs[0]
+            .root_pane
+            .expect("test tab has root pane");
         let right = app.state.workspaces[0].test_split(ratatui::layout::Direction::Horizontal);
         let source_terminal = app.state.workspaces[0].tabs[0]
             .terminal_id(source)
@@ -2874,7 +3154,9 @@ mod tests {
     #[test]
     fn api_pane_move_only_pane_to_new_tab_uses_app_render_handles() {
         let mut app = app_with_linked_worktree();
-        let source = app.state.workspaces[0].tabs[0].root_pane;
+        let source = app.state.workspaces[0].tabs[0]
+            .root_pane
+            .expect("test tab has root pane");
         seed_terminal_states(&mut app);
         let source_public = app.public_pane_id(0, source).unwrap();
 
@@ -2908,7 +3190,9 @@ mod tests {
     #[test]
     fn api_pane_move_to_new_workspace_closes_empty_source_workspace() {
         let mut app = app_with_linked_worktree();
-        let source = app.state.workspaces[0].tabs[0].root_pane;
+        let source = app.state.workspaces[0].tabs[0]
+            .root_pane
+            .expect("test tab has root pane");
         let source_terminal = app.state.workspaces[0].tabs[0]
             .terminal_id(source)
             .unwrap()
@@ -3009,7 +3293,9 @@ mod tests {
     #[test]
     fn api_pane_move_same_tab_returns_same_tab_noop() {
         let mut app = app_with_linked_worktree();
-        let source = app.state.workspaces[0].tabs[0].root_pane;
+        let source = app.state.workspaces[0].tabs[0]
+            .root_pane
+            .expect("test tab has root pane");
         seed_terminal_states(&mut app);
         let source_public = app.public_pane_id(0, source).unwrap();
         let source_tab = app.public_tab_id(0, 0).unwrap();
@@ -3040,14 +3326,21 @@ mod tests {
     #[test]
     fn api_pane_move_rejects_target_pane_outside_target_tab() {
         let mut app = app_with_linked_worktree();
-        let source = app.state.workspaces[0].tabs[0].root_pane;
+        let source = app.state.workspaces[0].tabs[0]
+            .root_pane
+            .expect("test tab has root pane");
         let target_tab = app.state.workspaces[0].test_add_tab(Some("target"));
         let other_tab = app.state.workspaces[0].test_add_tab(Some("other"));
         seed_terminal_states(&mut app);
         let source_public = app.public_pane_id(0, source).unwrap();
         let target_tab_public = app.public_tab_id(0, target_tab).unwrap();
         let wrong_target = app
-            .public_pane_id(0, app.state.workspaces[0].tabs[other_tab].root_pane)
+            .public_pane_id(
+                0,
+                app.state.workspaces[0].tabs[other_tab]
+                    .root_pane
+                    .expect("test tab has root pane"),
+            )
             .unwrap();
 
         let response = app.handle_pane_move(
@@ -3072,9 +3365,13 @@ mod tests {
     #[test]
     fn api_pane_move_existing_tab_no_focus_preserves_previous_target_focus() {
         let mut app = app_with_linked_worktree();
-        let source = app.state.workspaces[0].tabs[0].root_pane;
+        let source = app.state.workspaces[0].tabs[0]
+            .root_pane
+            .expect("test tab has root pane");
         let target_tab = app.state.workspaces[0].test_add_tab(Some("target"));
-        let previously_focused = app.state.workspaces[0].tabs[target_tab].root_pane;
+        let previously_focused = app.state.workspaces[0].tabs[target_tab]
+            .root_pane
+            .expect("test tab has root pane");
         app.state.workspaces[0].active_tab = target_tab;
         let explicit_target =
             app.state.workspaces[0].test_split(ratatui::layout::Direction::Horizontal);
@@ -3106,7 +3403,7 @@ mod tests {
             panic!("expected pane move response");
         };
         assert!(move_result.changed);
-        assert_eq!(move_result.focused_pane_id, previously_focused_public);
+        assert_eq!(move_result.focused_pane_id, Some(previously_focused_public));
         assert_eq!(
             app.state.workspaces[0].tabs[0].layout.focused(),
             previously_focused
@@ -3116,7 +3413,9 @@ mod tests {
     #[test]
     fn api_pane_move_recovery_restores_removed_source_workspace() {
         let mut app = app_with_linked_worktree();
-        let source = app.state.workspaces[0].tabs[0].root_pane;
+        let source = app.state.workspaces[0].tabs[0]
+            .root_pane
+            .expect("test tab has root pane");
         let source_terminal = app.state.workspaces[0].tabs[0]
             .terminal_id(source)
             .unwrap()
@@ -3154,9 +3453,13 @@ mod tests {
     #[test]
     fn api_pane_move_to_zoomed_target_returns_target_layout() {
         let mut app = app_with_linked_worktree();
-        let source = app.state.workspaces[0].tabs[0].root_pane;
+        let source = app.state.workspaces[0].tabs[0]
+            .root_pane
+            .expect("test tab has root pane");
         let target_tab = app.state.workspaces[0].test_add_tab(Some("target"));
-        let target = app.state.workspaces[0].tabs[target_tab].root_pane;
+        let target = app.state.workspaces[0].tabs[target_tab]
+            .root_pane
+            .expect("test tab has root pane");
         app.state.workspaces[0].tabs[target_tab].zoomed = true;
         seed_terminal_states(&mut app);
         let source_public = app.public_pane_id(0, source).unwrap();
@@ -3198,7 +3501,9 @@ mod tests {
         let mut app = app_with_linked_worktree();
         app.state.active = Some(0);
         app.state.selected = 0;
-        let root = app.state.workspaces[0].tabs[0].root_pane;
+        let root = app.state.workspaces[0].tabs[0]
+            .root_pane
+            .expect("test tab has root pane");
         let _right = app.state.workspaces[0].test_split(ratatui::layout::Direction::Horizontal);
         app.state.workspaces[0].tabs[0].layout.focus_pane(root);
         let root_public = app.public_pane_id(0, root).unwrap();
@@ -3214,7 +3519,7 @@ mod tests {
         assert!(!zoom.focus_changed);
         assert_eq!(zoom.reason, None);
         assert_eq!(zoom.pane_id, root_public);
-        assert_eq!(zoom.focused_pane_id, zoom.pane_id);
+        assert_eq!(zoom.focused_pane_id, Some(zoom.pane_id));
         assert!(zoom.zoomed);
         assert!(zoom.layout.zoomed);
         assert!(matches!(
@@ -3244,8 +3549,12 @@ mod tests {
     fn api_pane_zoom_explicit_background_pane_updates_focus_history() {
         let mut app = app_with_linked_worktree();
         app.state.workspaces.push(Workspace::test_new("other"));
-        let first = app.state.workspaces[0].tabs[0].root_pane;
-        let target = app.state.workspaces[1].tabs[0].root_pane;
+        let first = app.state.workspaces[0].tabs[0]
+            .root_pane
+            .expect("test tab has root pane");
+        let target = app.state.workspaces[1].tabs[0]
+            .root_pane
+            .expect("test tab has root pane");
         let _other = app.state.workspaces[1].test_split(ratatui::layout::Direction::Horizontal);
         app.state.active = Some(0);
         app.state.selected = 0;
@@ -3282,8 +3591,12 @@ mod tests {
     fn api_pane_zoom_focuses_copy_mode_pane_back_into_copy_mode() {
         let mut app = app_with_linked_worktree();
         app.state.workspaces.push(Workspace::test_new("other"));
-        let source = app.state.workspaces[0].tabs[0].root_pane;
-        let target = app.state.workspaces[1].tabs[0].root_pane;
+        let source = app.state.workspaces[0].tabs[0]
+            .root_pane
+            .expect("test tab has root pane");
+        let target = app.state.workspaces[1].tabs[0]
+            .root_pane
+            .expect("test tab has root pane");
         let _other = app.state.workspaces[0].test_split(ratatui::layout::Direction::Horizontal);
         let _target_other =
             app.state.workspaces[1].test_split(ratatui::layout::Direction::Horizontal);
@@ -3325,7 +3638,9 @@ mod tests {
         let mut app = app_with_linked_worktree();
         app.state.active = Some(0);
         app.state.selected = 0;
-        let root = app.state.workspaces[0].tabs[0].root_pane;
+        let root = app.state.workspaces[0].tabs[0]
+            .root_pane
+            .expect("test tab has root pane");
         let root_public = app.public_pane_id(0, root).unwrap();
 
         let response = app.handle_pane_zoom(
@@ -3354,7 +3669,9 @@ mod tests {
         let mut app = app_with_linked_worktree();
         app.state.active = Some(0);
         app.state.selected = 0;
-        let root = app.state.workspaces[0].tabs[0].root_pane;
+        let root = app.state.workspaces[0].tabs[0]
+            .root_pane
+            .expect("test tab has root pane");
         let _right = app.state.workspaces[0].test_split(ratatui::layout::Direction::Horizontal);
         app.state.workspaces[0].tabs[0].layout.focus_pane(root);
         let root_public = app.public_pane_id(0, root).unwrap();
@@ -3431,7 +3748,9 @@ mod tests {
         let mut app = app_with_linked_worktree();
         app.state.active = Some(0);
         app.state.selected = 0;
-        let root = app.state.workspaces[0].tabs[0].root_pane;
+        let root = app.state.workspaces[0].tabs[0]
+            .root_pane
+            .expect("test tab has root pane");
         let right = app.state.workspaces[0].test_split(ratatui::layout::Direction::Horizontal);
         app.state.workspaces[0].tabs[0].layout.focus_pane(root);
         app.state.workspaces[0].tabs[0].zoomed = true;
@@ -3458,7 +3777,7 @@ mod tests {
         assert!(matches!(
             &app.event_hub.events_after(0).last().expect("layout event").1.data,
             EventData::LayoutUpdated { layout }
-                if layout.focused_pane_id == app.public_pane_id(0, right).unwrap()
+                if layout.focused_pane_id == app.public_pane_id(0, right)
         ));
     }
 
@@ -3487,7 +3806,9 @@ mod tests {
     #[test]
     fn api_pane_layout_returns_public_ids_rects_and_splits() {
         let mut app = app_with_linked_worktree();
-        let root = app.state.workspaces[0].tabs[0].root_pane;
+        let root = app.state.workspaces[0].tabs[0]
+            .root_pane
+            .expect("test tab has root pane");
         let right = app.state.workspaces[0].test_split(ratatui::layout::Direction::Horizontal);
         app.state.workspaces[0].tabs[0].layout.focus_pane(root);
         crate::ui::compute_view(&mut app.state, ratatui::layout::Rect::new(0, 0, 100, 20));
@@ -3505,7 +3826,7 @@ mod tests {
         let ResponseResult::PaneLayout { layout } = success.result else {
             panic!("expected pane layout response");
         };
-        assert_eq!(layout.focused_pane_id, root_public);
+        assert_eq!(layout.focused_pane_id, Some(root_public.clone()));
         assert!(layout.panes.iter().any(|pane| pane.pane_id == root_public));
         assert!(layout.panes.iter().any(|pane| pane.pane_id == right_public));
         assert_eq!(layout.splits.len(), 1);
@@ -3518,7 +3839,9 @@ mod tests {
     #[test]
     fn api_pane_neighbor_returns_directional_neighbor_public_id() {
         let mut app = app_with_linked_worktree();
-        let root = app.state.workspaces[0].tabs[0].root_pane;
+        let root = app.state.workspaces[0].tabs[0]
+            .root_pane
+            .expect("test tab has root pane");
         let right = app.state.workspaces[0].test_split(ratatui::layout::Direction::Horizontal);
         app.state.workspaces[0].tabs[0].layout.focus_pane(root);
         crate::ui::compute_view(&mut app.state, ratatui::layout::Rect::new(0, 0, 100, 20));
@@ -3545,7 +3868,9 @@ mod tests {
     #[test]
     fn api_pane_edges_reports_physical_layout_edges() {
         let mut app = app_with_linked_worktree();
-        let root = app.state.workspaces[0].tabs[0].root_pane;
+        let root = app.state.workspaces[0].tabs[0]
+            .root_pane
+            .expect("test tab has root pane");
         let right = app.state.workspaces[0].test_split(ratatui::layout::Direction::Horizontal);
         app.state.workspaces[0].tabs[0].layout.focus_pane(root);
         crate::ui::compute_view(&mut app.state, ratatui::layout::Rect::new(0, 0, 100, 20));
@@ -3572,7 +3897,9 @@ mod tests {
     #[test]
     fn api_pane_resize_changes_target_ratio_without_changing_focus() {
         let mut app = app_with_linked_worktree();
-        let root = app.state.workspaces[0].tabs[0].root_pane;
+        let root = app.state.workspaces[0].tabs[0]
+            .root_pane
+            .expect("test tab has root pane");
         let right = app.state.workspaces[0].test_split(ratatui::layout::Direction::Horizontal);
         app.state.workspaces[0].tabs[0].layout.focus_pane(right);
         crate::ui::compute_view(&mut app.state, ratatui::layout::Rect::new(0, 0, 100, 20));
@@ -3595,8 +3922,8 @@ mod tests {
         assert!(resize.changed);
         assert_eq!(resize.reason, None);
         assert_eq!(resize.pane_id, root_public);
-        assert_eq!(resize.focused_pane_id, right_public);
-        assert_eq!(resize.layout.focused_pane_id, right_public);
+        assert_eq!(resize.focused_pane_id, Some(right_public.clone()));
+        assert_eq!(resize.layout.focused_pane_id, Some(right_public));
         assert!((resize.layout.splits[0].ratio - 0.6).abs() < f32::EPSILON);
         assert_eq!(app.state.workspaces[0].focused_pane_id(), Some(right));
         assert!(matches!(
@@ -3610,7 +3937,9 @@ mod tests {
     #[test]
     fn api_pane_focus_direction_focuses_neighbor() {
         let mut app = app_with_linked_worktree();
-        let root = app.state.workspaces[0].tabs[0].root_pane;
+        let root = app.state.workspaces[0].tabs[0]
+            .root_pane
+            .expect("test tab has root pane");
         let right = app.state.workspaces[0].test_split(ratatui::layout::Direction::Horizontal);
         app.state.workspaces[0].tabs[0].layout.focus_pane(root);
         crate::ui::compute_view(&mut app.state, ratatui::layout::Rect::new(0, 0, 100, 20));
@@ -3633,7 +3962,7 @@ mod tests {
         assert_eq!(focus.reason, None);
         assert_eq!(focus.source_pane_id, root_public);
         assert_eq!(focus.focused_pane_id, Some(right_public.clone()));
-        assert_eq!(focus.layout.focused_pane_id, right_public);
+        assert_eq!(focus.layout.focused_pane_id, Some(right_public));
         assert_eq!(app.state.workspaces[0].focused_pane_id(), Some(right));
     }
 
@@ -3643,7 +3972,9 @@ mod tests {
         app.state.workspaces.push(Workspace::test_new("other"));
         let target_tab_idx = app.state.workspaces[1].test_add_tab(Some("target"));
         app.state.workspaces[1].switch_tab(target_tab_idx);
-        let target_pane = app.state.workspaces[1].tabs[target_tab_idx].root_pane;
+        let target_pane = app.state.workspaces[1].tabs[target_tab_idx]
+            .root_pane
+            .expect("test tab has root pane");
         app.state.ensure_test_terminals();
         let target_public = app.public_pane_id(1, target_pane).unwrap();
         app.state.switch_workspace(0);
@@ -3668,13 +3999,15 @@ mod tests {
     }
 
     #[test]
-    fn api_pane_focus_marks_already_focused_done_pane_seen() {
+    fn api_pane_focus_does_not_mark_already_focused_done_pane_seen() {
         let mut app = app_with_linked_worktree();
         app.state.active = Some(0);
         app.state.selected = 0;
         app.state.outer_terminal_focus = Some(false);
 
-        let pane_id = app.state.workspaces[0].tabs[0].root_pane;
+        let pane_id = app.state.workspaces[0].tabs[0]
+            .root_pane
+            .expect("test tab has root pane");
         let terminal_id = app.state.workspaces[0].tabs[0].panes[&pane_id]
             .attached_terminal_id
             .clone();
@@ -3698,7 +4031,8 @@ mod tests {
         let ResponseResult::PaneInfo { pane } = success.result else {
             panic!("expected pane info response");
         };
-        assert_eq!(pane.agent_status, crate::api::schema::AgentStatus::Idle);
+        assert_eq!(pane.agent_status, crate::api::schema::AgentStatus::Done);
+        assert!(!app.state.workspaces[0].tabs[0].panes[&pane_id].seen);
     }
 
     #[test]
@@ -3719,7 +4053,9 @@ mod tests {
     #[test]
     fn api_pane_focus_direction_no_neighbor_is_noop() {
         let mut app = app_with_linked_worktree();
-        let root = app.state.workspaces[0].tabs[0].root_pane;
+        let root = app.state.workspaces[0].tabs[0]
+            .root_pane
+            .expect("test tab has root pane");
         app.state.workspaces[0].tabs[0].layout.focus_pane(root);
         crate::ui::compute_view(&mut app.state, ratatui::layout::Rect::new(0, 0, 100, 20));
         let root_public = app.public_pane_id(0, root).unwrap();

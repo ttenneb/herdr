@@ -52,6 +52,11 @@ pub(crate) struct ClientConnection {
     pub(crate) raw_input: crate::raw_input::RawInputFramer,
     /// Monotonic activity stamp used to choose the fallback foreground client.
     pub(crate) last_activity: u64,
+    /// Full-app presentation state local to this attached client.
+    pub(crate) collection_views: std::collections::HashMap<
+        crate::layout::CollectionId,
+        crate::app::collection_view::CollectionViewState,
+    >,
     /// Render baseline for the negotiated client encoding.
     pub(crate) render_state: ClientRenderState,
     /// Client-local host Kitty graphics cache.
@@ -123,6 +128,7 @@ impl ClientConnection {
             outer_terminal_focus,
             raw_input: crate::raw_input::RawInputFramer::default(),
             last_activity,
+            collection_views: Default::default(),
             render_state: ClientRenderState::new(render_encoding),
             graphics_cache: crate::kitty_graphics::HostGraphicsCache::default(),
             graphics_surface_reset_pending: false,

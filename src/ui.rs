@@ -5,6 +5,7 @@ use ratatui::{
     Frame,
 };
 
+mod collections;
 mod dialogs;
 mod keybind_help;
 mod menus;
@@ -23,8 +24,9 @@ mod text;
 mod widgets;
 
 use self::dialogs::{
-    render_confirm_close_overlay, render_new_linked_worktree_overlay,
-    render_open_existing_worktree_overlay, render_remove_worktree_overlay, render_rename_overlay,
+    render_collection_close_overlay, render_confirm_close_overlay,
+    render_new_linked_worktree_overlay, render_open_existing_worktree_overlay,
+    render_remove_worktree_overlay, render_rename_overlay,
 };
 use self::keybind_help::render_keybind_help_overlay;
 use self::menus::{
@@ -63,11 +65,11 @@ pub(crate) use self::tab_surface::{
 use self::tabs::render_tab_bar;
 pub(crate) use self::{
     dialogs::{
-        confirm_close_button_rects, confirm_close_popup_rect, new_linked_worktree_button_rects,
-        new_linked_worktree_inner_rect, open_existing_worktree_button_rects,
-        open_existing_worktree_inner_rect, open_existing_worktree_max_visible_rows,
-        open_existing_worktree_visible_start, remove_worktree_button_rects,
-        remove_worktree_popup_rect, rename_button_rects,
+        collection_close_button_rects, collection_close_popup_rect, confirm_close_button_rects,
+        confirm_close_popup_rect, new_linked_worktree_button_rects, new_linked_worktree_inner_rect,
+        open_existing_worktree_button_rects, open_existing_worktree_inner_rect,
+        open_existing_worktree_max_visible_rows, open_existing_worktree_visible_start,
+        remove_worktree_button_rects, remove_worktree_popup_rect, rename_button_rects,
     },
     settings::{
         settings_button_rects, settings_popup_height, settings_show_primary_action,
@@ -215,6 +217,9 @@ fn compute_view_internal(
     resize_panes: bool,
     cell_size: crate::kitty_graphics::HostCellSize,
 ) {
+    if resize_panes {
+        app.collection_geometry.clear();
+    }
     if is_mobile_width(area, app.mobile_width_threshold) {
         compute_mobile_view(app, terminal_runtimes, area, resize_panes, cell_size);
         return;
@@ -274,6 +279,7 @@ fn compute_view_internal(
 
     let TabSurfaceLayout {
         pane_infos,
+        collection_layouts,
         split_borders,
     } = compute_tab_surface(
         app,
@@ -314,6 +320,7 @@ fn compute_view_internal(
         mobile_menu_hit_area: Rect::default(),
         toast_hit_area,
         pane_infos,
+        collection_layouts,
         split_borders,
     };
     app.sync_copy_mode_search_geometry();
@@ -343,6 +350,7 @@ fn compute_mobile_view(
 
     let TabSurfaceLayout {
         pane_infos,
+        collection_layouts,
         split_borders,
     } = compute_tab_surface(
         app,
@@ -377,6 +385,7 @@ fn compute_mobile_view(
         mobile_menu_hit_area: header_hits.menu,
         toast_hit_area,
         pane_infos,
+        collection_layouts,
         split_borders,
     };
     app.sync_copy_mode_search_geometry();
@@ -438,6 +447,7 @@ pub fn render_with_runtime_registry(
         Mode::ConfirmClose => {
             render_confirm_close_overlay(app, terminal_runtimes, frame, terminal_area)
         }
+        Mode::CollectionClose => render_collection_close_overlay(app, frame, terminal_area),
         Mode::ContextMenu => {
             render_context_menu(app, frame);
         }
@@ -650,7 +660,7 @@ mod tests {
     async fn focused_pane_cursor_wins_during_terminal_render() {
         let mut app = crate::app::state::AppState::test_new();
         let mut ws = Workspace::test_new("test");
-        let first_pane = ws.tabs[0].root_pane;
+        let first_pane = ws.tabs[0].root_pane.expect("test tab has root pane");
         let second_pane = ws.test_split(ratatui::layout::Direction::Horizontal);
 
         ws.insert_test_runtime(
@@ -831,7 +841,9 @@ mod tests {
         app.hide_tab_bar_when_single_tab = true;
 
         let mut one_tab_workspace = Workspace::test_new("one");
-        let one_tab_pane = one_tab_workspace.tabs[0].root_pane;
+        let one_tab_pane = one_tab_workspace.tabs[0]
+            .root_pane
+            .expect("test tab has root pane");
         let one_tab_runtime = crate::terminal::TerminalRuntime::test_with_screen_bytes(10, 5, b"");
         one_tab_workspace.tabs[0]
             .runtimes
@@ -839,7 +851,9 @@ mod tests {
 
         let mut two_tab_workspace = Workspace::test_new("two");
         let background_tab = two_tab_workspace.test_add_tab(Some("logs"));
-        let two_tab_pane = two_tab_workspace.tabs[background_tab].root_pane;
+        let two_tab_pane = two_tab_workspace.tabs[background_tab]
+            .root_pane
+            .expect("test tab has root pane");
         let two_tab_runtime = crate::terminal::TerminalRuntime::test_with_screen_bytes(10, 5, b"");
         two_tab_workspace.tabs[background_tab]
             .runtimes
@@ -865,7 +879,9 @@ mod tests {
 
         let mut workspace = Workspace::test_new("mobile");
         let background_tab = workspace.test_add_tab(Some("logs"));
-        let background_pane = workspace.tabs[background_tab].root_pane;
+        let background_pane = workspace.tabs[background_tab]
+            .root_pane
+            .expect("test tab has root pane");
         let runtime = crate::terminal::TerminalRuntime::test_with_screen_bytes(10, 5, b"");
         workspace.tabs[background_tab]
             .runtimes
@@ -1008,7 +1024,7 @@ mod tests {
         let mut ws = Workspace::test_new("one");
         let repo = temp_git_repo("main");
         ws.identity_cwd = repo.clone();
-        let root_pane = ws.tabs[0].root_pane;
+        let root_pane = ws.tabs[0].root_pane.expect("test tab has root pane");
         ws.refresh_git_ahead_behind();
 
         app.workspaces = vec![ws];
@@ -1214,7 +1230,7 @@ mod tests {
     async fn compute_view_reserves_terminal_column_when_pane_scrollbar_is_visible() {
         let mut app = crate::app::state::AppState::test_new();
         let mut ws = Workspace::test_new("test");
-        let pane_id = ws.tabs[0].root_pane;
+        let pane_id = ws.tabs[0].root_pane.expect("test tab has root pane");
         ws.insert_test_runtime(
             pane_id,
             crate::terminal::TerminalRuntime::test_with_scrollback_bytes(

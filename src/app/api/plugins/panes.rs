@@ -206,7 +206,9 @@ impl App {
             Ok(result) => result,
             Err(err) => return encode_error(id, "plugin_pane_open_failed", err.to_string()),
         };
-        let pane_id = ws.tabs[tab_idx].root_pane;
+        let Some(pane_id) = ws.tabs[tab_idx].root_pane else {
+            return encode_error(id, "plugin_pane_open_failed", "new tab has no root pane");
+        };
         if params.focus {
             self.state.switch_workspace_tab(ws_idx, tab_idx);
             self.state.mode = crate::app::Mode::Terminal;

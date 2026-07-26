@@ -63,6 +63,7 @@ mod checksum;
 mod cli;
 mod client;
 mod config;
+pub mod delegation;
 mod detect;
 mod events;
 mod ghostty;

@@ -244,10 +244,55 @@ impl App {
                     .collect::<Vec<_>>()
             })
             .unwrap_or_default();
+        let public_panes = pane_ids
+            .iter()
+            .filter_map(|pane_id| {
+                self.public_pane_id(index, *pane_id)
+                    .map(|id| (*pane_id, id))
+            })
+            .collect::<Vec<_>>();
+        let closed_collections = self.state.workspaces[index]
+            .tabs
+            .iter()
+            .enumerate()
+            .flat_map(|(tab_idx, tab)| {
+                let tab_id = self.public_tab_id(index, tab_idx).unwrap_or_default();
+                tab.layout
+                    .collection_ids()
+                    .into_iter()
+                    .filter_map(move |collection_id| {
+                        tab.collection(collection_id).map(|collection| {
+                            (tab_id.clone(), collection_id, collection.members().to_vec())
+                        })
+                    })
+            })
+            .collect::<Vec<_>>();
         self.state.selected = index;
         self.state.close_selected_workspace();
-        self.state.remove_plugin_pane_records(pane_ids);
+        let destruction = self.state.finalize_pane_destruction(pane_ids);
         self.shutdown_detached_terminal_runtimes();
+        for (tab_id, collection_id, members) in closed_collections {
+            for pane_id in members {
+                if let Some((_, public)) = public_panes.iter().find(|(id, _)| *id == pane_id) {
+                    self.emit_event(EventEnvelope {
+                        event: EventKind::CollectionMemberRemoved,
+                        data: EventData::CollectionMemberRemoved {
+                            collection_id: super::collections::collection_id_string(collection_id),
+                            pane_id: public.clone(),
+                        },
+                    });
+                }
+            }
+            self.emit_event(EventEnvelope {
+                event: EventKind::CollectionClosed,
+                data: EventData::CollectionClosed {
+                    collection_id: super::collections::collection_id_string(collection_id),
+                    workspace_id: workspace_id.clone(),
+                    tab_id,
+                },
+            });
+        }
+        self.emit_pane_destruction_events(destruction, &public_panes);
         self.emit_event(EventEnvelope {
             event: EventKind::WorkspaceClosed,
             data: EventData::WorkspaceClosed {
@@ -332,7 +377,10 @@ mod tests {
         let ws = &app.state.workspaces[0];
         let root_cwd = ws.identity_cwd.clone();
         let focused_pane = ws.focused_pane_id().unwrap();
-        assert_ne!(focused_pane, ws.tabs[0].root_pane);
+        assert_ne!(
+            focused_pane,
+            ws.tabs[0].root_pane.expect("test tab has root pane")
+        );
         let terminal_id = ws.terminal_id(focused_pane).cloned().unwrap();
         app.state.terminals.get_mut(&terminal_id).unwrap().cwd = focused_cwd.clone();
 

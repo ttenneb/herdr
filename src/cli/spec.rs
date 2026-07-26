@@ -35,6 +35,8 @@ pub(super) fn command() -> Command {
         .subcommand(workspace_command())
         .subcommand(worktree_command())
         .subcommand(tab_command())
+        .subcommand(collection_command())
+        .subcommand(delegation_command())
         .subcommand(notification_command())
         .subcommand(agent_command())
         .subcommand(pane_command())
@@ -292,6 +294,150 @@ fn tab_command() -> Command {
                 .arg(required("label", "LABEL").num_args(1..)),
         )
         .subcommand(id_command("close", "tab_id", "Close a tab"))
+}
+
+fn collection_command() -> Command {
+    Command::new("collection")
+        .about("Manage pane collections over the socket API")
+        .subcommand(
+            Command::new("list")
+                .about("List pane collections")
+                .arg(option("workspace", "WORKSPACE_ID"))
+                .arg(option("tab", "TAB_ID")),
+        )
+        .subcommand(id_command("get", "collection_id", "Show a collection"))
+        .subcommand(
+            Command::new("create")
+                .about("Create a pane collection")
+                .arg(option("target-pane", "PANE_ID").required(true))
+                .arg(split_direction_option().required(true))
+                .arg(option("ratio", "FLOAT"))
+                .arg(option("label", "TEXT"))
+                .arg(flag("focus"))
+                .arg(flag("no-focus")),
+        )
+        .subcommand(
+            Command::new("add")
+                .about("Add a tiled pane to a collection")
+                .arg(required("collection_id", "COLLECTION_ID"))
+                .arg(required("pane_id", "PANE_ID")),
+        )
+        .subcommand(
+            Command::new("move")
+                .about("Move a member to another collection")
+                .arg(required("pane_id", "PANE_ID"))
+                .arg(required("collection_id", "COLLECTION_ID")),
+        )
+        .subcommand(
+            Command::new("promote")
+                .about("Promote a collection member to tiled placement")
+                .arg(required("pane_id", "PANE_ID"))
+                .arg(option("target-pane", "PANE_ID").required(true))
+                .arg(split_direction_option().required(true))
+                .arg(option("ratio", "FLOAT"))
+                .arg(flag("focus"))
+                .arg(flag("no-focus")),
+        )
+        .subcommand(
+            Command::new("select")
+                .about("Select a collection member")
+                .arg(required("collection_id", "COLLECTION_ID"))
+                .arg(required("pane_id", "PANE_ID"))
+                .arg(flag("focus"))
+                .arg(flag("no-focus")),
+        )
+        .subcommand(
+            Command::new("reorder")
+                .about("Reorder a collection member")
+                .arg(required("collection_id", "COLLECTION_ID"))
+                .arg(required("pane_id", "PANE_ID"))
+                .arg(option("index", "N").required(true)),
+        )
+        .subcommand(
+            Command::new("archive")
+                .about("Archive a collection member")
+                .arg(required("collection_id", "COLLECTION_ID"))
+                .arg(required("pane_id", "PANE_ID")),
+        )
+        .subcommand(
+            Command::new("restore")
+                .about("Restore an archived collection member")
+                .arg(required("collection_id", "COLLECTION_ID"))
+                .arg(required("pane_id", "PANE_ID")),
+        )
+        .subcommand(
+            Command::new("member-create")
+                .about("Create a no-focus child pane in a collection")
+                .arg(required("collection_id", "COLLECTION_ID"))
+                .arg(path_option("cwd", "PATH"))
+                .arg(env_option())
+                .arg(option("parent", "DELEGATION_ID"))
+                .arg(option("purpose", "TEXT")),
+        )
+        .subcommand(
+            Command::new("close")
+                .about("Close a collection with an explicit member disposition")
+                .arg(required("collection_id", "COLLECTION_ID"))
+                .arg(flag("cascade-close"))
+                .arg(flag("promote-members"))
+                .arg(option("target-pane", "PANE_ID"))
+                .arg(flag("focus-promoted"))
+                .group(
+                    ArgGroup::new("disposition")
+                        .args(["cascade-close", "promote-members"])
+                        .multiple(false),
+                ),
+        )
+}
+
+fn delegation_command() -> Command {
+    Command::new("delegation")
+        .about("Manage delegation provenance over the socket API")
+        .subcommand(
+            Command::new("create")
+                .about("Create a delegation record")
+                .arg(option("pane", "PANE_ID"))
+                .arg(option("parent", "DELEGATION_ID"))
+                .arg(option("purpose", "TEXT")),
+        )
+        .subcommand(id_command("get", "delegation_id", "Show a delegation"))
+        .subcommand(Command::new("tree").about("Show the delegation forest"))
+        .subcommand(id_command(
+            "root",
+            "delegation_id",
+            "Show a delegation root",
+        ))
+        .subcommand(id_command(
+            "descendants",
+            "delegation_id",
+            "Show delegation descendants",
+        ))
+        .subcommand(
+            Command::new("reparent")
+                .about("Change a delegation parent")
+                .arg(required("delegation_id", "DELEGATION_ID"))
+                .arg(option("parent", "DELEGATION_ID"))
+                .arg(flag("root"))
+                .group(
+                    ArgGroup::new("parentage")
+                        .args(["parent", "root"])
+                        .required(true),
+                ),
+        )
+        .subcommand(
+            Command::new("reorder")
+                .about("Reorder a delegation among its siblings")
+                .arg(required("delegation_id", "DELEGATION_ID"))
+                .arg(flag("first"))
+                .arg(flag("last"))
+                .arg(option("before", "DELEGATION_ID"))
+                .arg(option("after", "DELEGATION_ID"))
+                .group(
+                    ArgGroup::new("position")
+                        .args(["first", "last", "before", "after"])
+                        .required(true),
+                ),
+        )
 }
 
 fn notification_command() -> Command {
@@ -1267,6 +1413,50 @@ mod tests {
         assert!(agent_start
             .get_arguments()
             .any(|arg| arg.get_id() == "agent_args"));
+    }
+
+    #[test]
+    fn spec_exposes_collection_and_delegation_orchestration_commands() {
+        let cmd = super::command();
+        for name in [
+            "list",
+            "get",
+            "create",
+            "add",
+            "move",
+            "promote",
+            "select",
+            "reorder",
+            "archive",
+            "restore",
+            "member-create",
+            "close",
+        ] {
+            command_path(&cmd, &["collection", name]);
+        }
+        for name in [
+            "create",
+            "get",
+            "tree",
+            "root",
+            "descendants",
+            "reparent",
+            "reorder",
+        ] {
+            command_path(&cmd, &["delegation", name]);
+        }
+        assert_eq!(
+            option_values(command_path(&cmd, &["collection", "create"]), "direction"),
+            ["right", "down"]
+        );
+        assert!(has_option(
+            command_path(&cmd, &["collection", "close"]),
+            "cascade-close"
+        ));
+        assert!(has_option(
+            command_path(&cmd, &["collection", "close"]),
+            "promote-members"
+        ));
     }
 
     #[test]

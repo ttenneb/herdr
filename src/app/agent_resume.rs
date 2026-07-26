@@ -375,7 +375,7 @@ mod tests {
     async fn pending_agent_resume_waits_for_host_theme_before_launch() {
         let mut app = test_app();
         let workspace = crate::workspace::Workspace::test_new("restored");
-        let pane_id = workspace.tabs[0].root_pane;
+        let pane_id = workspace.tabs[0].root_pane.expect("test tab has root pane");
         let terminal_id = workspace.terminal_id(pane_id).cloned().unwrap();
         let pane_infos = workspace.tabs[0]
             .layout
@@ -455,7 +455,7 @@ mod tests {
     async fn pending_agent_resume_can_launch_after_theme_wait_expires() {
         let mut app = test_app();
         let workspace = crate::workspace::Workspace::test_new("restored");
-        let pane_id = workspace.tabs[0].root_pane;
+        let pane_id = workspace.tabs[0].root_pane.expect("test tab has root pane");
         let terminal_id = workspace.terminal_id(pane_id).cloned().unwrap();
         app.state.view.pane_infos = workspace.tabs[0]
             .layout
@@ -489,10 +489,14 @@ mod tests {
     async fn pending_agent_resume_launches_hidden_panes_with_current_terminal_area() {
         let mut app = test_app();
         let active_workspace = crate::workspace::Workspace::test_new("active");
-        let active_pane = active_workspace.tabs[0].root_pane;
+        let active_pane = active_workspace.tabs[0]
+            .root_pane
+            .expect("test tab has root pane");
         let active_terminal = active_workspace.terminal_id(active_pane).cloned().unwrap();
         let hidden_workspace = crate::workspace::Workspace::test_new("hidden");
-        let hidden_pane = hidden_workspace.tabs[0].root_pane;
+        let hidden_pane = hidden_workspace.tabs[0]
+            .root_pane
+            .expect("test tab has root pane");
         let hidden_terminal = hidden_workspace.terminal_id(hidden_pane).cloned().unwrap();
         app.state.view.pane_infos = active_workspace.tabs[0]
             .layout
@@ -546,9 +550,11 @@ mod tests {
     async fn pending_agent_resume_launches_inactive_tab_panes_with_current_terminal_area() {
         let mut app = test_app();
         let mut workspace = crate::workspace::Workspace::test_new("tabs");
-        let active_pane = workspace.tabs[0].root_pane;
+        let active_pane = workspace.tabs[0].root_pane.expect("test tab has root pane");
         let inactive_tab = workspace.test_add_tab(Some("agents"));
-        let inactive_pane = workspace.tabs[inactive_tab].root_pane;
+        let inactive_pane = workspace.tabs[inactive_tab]
+            .root_pane
+            .expect("test tab has root pane");
         let inactive_terminal = workspace.tabs[inactive_tab]
             .terminal_id(inactive_pane)
             .cloned()
@@ -611,7 +617,7 @@ mod tests {
     async fn pending_agent_resume_launches_zoom_hidden_active_tab_panes() {
         let mut app = test_app();
         let mut workspace = crate::workspace::Workspace::test_new("zoomed");
-        let hidden_pane = workspace.tabs[0].root_pane;
+        let hidden_pane = workspace.tabs[0].root_pane.expect("test tab has root pane");
         let visible_pane = workspace.test_split(ratatui::layout::Direction::Horizontal);
         workspace.tabs[0].zoomed = true;
         let hidden_terminal = workspace.terminal_id(hidden_pane).cloned().unwrap();
@@ -672,7 +678,9 @@ mod tests {
     async fn pending_agent_resume_uses_current_terminal_area_for_background_panes() {
         let mut app = test_app();
         let previous_workspace = crate::workspace::Workspace::test_new("previous");
-        let previous_pane = previous_workspace.tabs[0].root_pane;
+        let previous_pane = previous_workspace.tabs[0]
+            .root_pane
+            .expect("test tab has root pane");
         let previous_terminal = previous_workspace
             .terminal_id(previous_pane)
             .cloned()

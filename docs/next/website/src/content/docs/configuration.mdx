@@ -256,6 +256,19 @@ Color values accept hex, named colors, `rgb(r,g,b)`, or reset aliases like `rese
 
 The sidebar is the main Herdr dashboard. Search `ui.` in the [Config reference](/docs/config-reference/) for sizing, collapsed mode, Agent panel ordering, mouse behavior, pane borders, and other presentation settings.
 
+### Collection lifecycle warnings
+
+```toml
+[ui.collections]
+archive_age_days = 7
+archive_count = 20
+concurrency = 8
+```
+
+These warn when an archive member reaches the configured age, archived membership exceeds the configured count, or combined `working` and `blocked` membership exceeds the configured concurrency. Set an individual value to `0` to disable that warning.
+
+The thresholds are advisory. They never archive, stop, close, or reject input. Archive cleanup and cascade-close remain explicit confirmed actions; input or renewed `working`/`blocked` state restores an archived member.
+
 ### Sidebar row layouts
 
 The expanded desktop sidebar renders each inner array in `rows` as one line. These are the complete default layouts:

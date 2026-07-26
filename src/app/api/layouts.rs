@@ -133,7 +133,9 @@ impl App {
             Ok(result) => result,
             Err(err) => return encode_error(id, "layout_apply_failed", err.to_string()),
         };
-        let new_root_pane = self.state.workspaces[ws_idx].tabs[new_tab_idx].root_pane;
+        let Some(new_root_pane) = self.state.workspaces[ws_idx].tabs[new_tab_idx].root_pane else {
+            return encode_error(id, "layout_apply_failed", "new tab has no root pane");
+        };
         self.terminal_runtimes.insert(terminal.id.clone(), runtime);
         self.state.remove_alias_shadowed_by_new_pane(new_root_pane);
         self.state.terminals.insert(terminal.id.clone(), terminal);
@@ -160,18 +162,62 @@ impl App {
                 .state
                 .terminal_ids_for_tab(target_ws_idx, target_tab_idx);
             let plugin_pane_ids = self.state.pane_ids_for_tab(target_ws_idx, target_tab_idx);
+            let public_panes = plugin_pane_ids
+                .iter()
+                .filter_map(|pane_id| {
+                    self.public_pane_id(target_ws_idx, *pane_id)
+                        .map(|public| (*pane_id, public))
+                })
+                .collect::<Vec<_>>();
+            let closed_collections = self.state.workspaces[target_ws_idx].tabs[target_tab_idx]
+                .layout
+                .collection_ids()
+                .into_iter()
+                .filter_map(|collection_id| {
+                    self.state.workspaces[target_ws_idx].tabs[target_tab_idx]
+                        .collection(collection_id)
+                        .map(|collection| (collection_id, collection.members().to_vec()))
+                })
+                .collect::<Vec<_>>();
             let Some(ws) = self.state.workspaces.get_mut(target_ws_idx) else {
                 return encode_error(id, "tab_not_found", "tab not found");
             };
             if ws.close_tab(target_tab_idx) {
-                self.state.remove_plugin_pane_records(plugin_pane_ids);
+                let destruction = self.state.finalize_pane_destruction(plugin_pane_ids);
                 self.state.remove_unattached_terminal_ids(terminal_ids);
                 self.shutdown_detached_terminal_runtimes();
+                let workspace_id = self.public_workspace_id(target_ws_idx);
+                for (collection_id, members) in closed_collections {
+                    for pane_id in members {
+                        if let Some((_, public)) =
+                            public_panes.iter().find(|(id, _)| *id == pane_id)
+                        {
+                            self.emit_event(EventEnvelope {
+                                event: EventKind::CollectionMemberRemoved,
+                                data: EventData::CollectionMemberRemoved {
+                                    collection_id: super::collections::collection_id_string(
+                                        collection_id,
+                                    ),
+                                    pane_id: public.clone(),
+                                },
+                            });
+                        }
+                    }
+                    self.emit_event(EventEnvelope {
+                        event: EventKind::CollectionClosed,
+                        data: EventData::CollectionClosed {
+                            collection_id: super::collections::collection_id_string(collection_id),
+                            workspace_id: workspace_id.clone(),
+                            tab_id: closed_tab_id.clone(),
+                        },
+                    });
+                }
+                self.emit_pane_destruction_events(destruction, &public_panes);
                 self.emit_event(EventEnvelope {
                     event: EventKind::TabClosed,
                     data: EventData::TabClosed {
                         tab_id: closed_tab_id,
-                        workspace_id: self.public_workspace_id(target_ws_idx),
+                        workspace_id,
                     },
                 });
             }
@@ -180,7 +226,7 @@ impl App {
         let Some(new_tab_idx) = self.state.workspaces[ws_idx]
             .tabs
             .iter()
-            .position(|tab| tab.root_pane == new_root_pane)
+            .position(|tab| tab.root_pane == Some(new_root_pane))
         else {
             return encode_error(id, "layout_apply_failed", "new layout tab disappeared");
         };
@@ -276,7 +322,13 @@ impl App {
             workspace_id: self.public_workspace_id(ws_idx),
             tab_id: self.public_tab_id(ws_idx, tab_idx)?,
             zoomed: tab.zoomed,
-            focused_pane_id: self.public_pane_id(ws_idx, tab.layout.focused())?,
+            focused_pane_id: match self.layout_focus_info(ws_idx, tab_idx)? {
+                crate::api::schema::LayoutFocusInfo::Pane { pane_id } => Some(pane_id),
+                crate::api::schema::LayoutFocusInfo::Collection {
+                    selected_pane_id, ..
+                } => selected_pane_id,
+            },
+            focused: self.layout_focus_info(ws_idx, tab_idx)?,
             root: self.layout_node_description(ws_idx, tab_idx, tab.layout.root())?,
         })
     }
@@ -486,12 +538,11 @@ impl App {
     }
 
     fn rollback_layout_tab(&mut self, ws_idx: usize, root_pane: PaneId) {
-        let Some(tab_idx) = self
-            .state
-            .workspaces
-            .get(ws_idx)
-            .and_then(|ws| ws.tabs.iter().position(|tab| tab.root_pane == root_pane))
-        else {
+        let Some(tab_idx) = self.state.workspaces.get(ws_idx).and_then(|ws| {
+            ws.tabs
+                .iter()
+                .position(|tab| tab.root_pane == Some(root_pane))
+        }) else {
             return;
         };
         let terminal_ids = self.state.terminal_ids_for_tab(ws_idx, tab_idx);
@@ -502,7 +553,7 @@ impl App {
             .get_mut(ws_idx)
             .is_some_and(|ws| ws.close_tab(tab_idx))
         {
-            self.state.remove_plugin_pane_records(plugin_pane_ids);
+            self.state.finalize_pane_destruction(plugin_pane_ids);
             self.state.remove_unattached_terminal_ids(terminal_ids);
             self.shutdown_detached_terminal_runtimes();
         }
@@ -619,7 +670,9 @@ mod tests {
     #[test]
     fn layout_export_returns_portable_tree() {
         let mut app = app_with_workspace();
-        let root = app.state.workspaces[0].tabs[0].root_pane;
+        let root = app.state.workspaces[0].tabs[0]
+            .root_pane
+            .expect("test tab has root pane");
         let right = app.state.workspaces[0].test_split(Direction::Horizontal);
         app.state.ensure_test_terminals();
         app.state.workspaces[0].tabs[0].layout.focus_pane(root);
@@ -649,7 +702,7 @@ mod tests {
             panic!("expected layout export response");
         };
         assert_eq!(layout.workspace_id, app.public_workspace_id(0));
-        assert_eq!(layout.focused_pane_id, app.public_pane_id(0, root).unwrap());
+        assert_eq!(layout.focused_pane_id, app.public_pane_id(0, root));
         let LayoutNode::Split {
             direction,
             ratio,
@@ -797,7 +850,9 @@ mod tests {
     #[tokio::test]
     async fn layout_apply_new_tab_follows_cached_focused_pane_cwd_without_runtime() {
         let mut app = app_with_workspace();
-        let focused_pane = app.state.workspaces[0].tabs[0].root_pane;
+        let focused_pane = app.state.workspaces[0].tabs[0]
+            .root_pane
+            .expect("test tab has root pane");
         let cached_cwd = std::env::temp_dir();
         let terminal_id = app.state.workspaces[0]
             .terminal_id(focused_pane)
@@ -821,7 +876,9 @@ mod tests {
         let success: SuccessResponse = serde_json::from_str(&response).unwrap();
         assert!(matches!(success.result, ResponseResult::LayoutApply { .. }));
         let created = &app.state.workspaces[0].tabs[1];
-        let created_terminal_id = created.terminal_id(created.root_pane).unwrap();
+        let created_terminal_id = created
+            .terminal_id(created.root_pane.expect("test tab has root pane"))
+            .unwrap();
         let created_cwd = &app.state.terminals.get(created_terminal_id).unwrap().cwd;
         assert_eq!(
             crate::worktree::canonical_or_original(created_cwd),
@@ -834,7 +891,9 @@ mod tests {
     async fn layout_apply_replace_drops_plugin_pane_records_of_replaced_tab() {
         let mut app = app_with_workspace();
         let original_tab_id = app.public_tab_id(0, 0).unwrap();
-        let replaced_pane = app.state.workspaces[0].tabs[0].root_pane;
+        let replaced_pane = app.state.workspaces[0].tabs[0]
+            .root_pane
+            .expect("test tab has root pane");
         app.state.plugin_panes.insert(
             replaced_pane,
             crate::app::state::PluginPaneRecord {

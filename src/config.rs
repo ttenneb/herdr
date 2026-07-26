@@ -19,10 +19,10 @@ pub use self::{
         IndexedKeybind, Keybinds, LiveKeybindConfig,
     },
     model::{
-        validated_sidebar_bounds, AgentPanelSortConfig, Config, ConfigReloadReport,
-        ConfigReloadStatus, HostCursorModeConfig, NewTerminalCwdConfig, ShellModeConfig,
-        SidebarCollapsedModeConfig, ToastClipboardPosition, ToastConfig, ToastDelivery,
-        ToastHerdrPosition, UpdateChannelConfig, MAX_TOAST_DELAY_SECONDS,
+        validated_sidebar_bounds, AgentPanelSortConfig, CollectionLifecycleConfig, Config,
+        ConfigReloadReport, ConfigReloadStatus, HostCursorModeConfig, NewTerminalCwdConfig,
+        ShellModeConfig, SidebarCollapsedModeConfig, ToastClipboardPosition, ToastConfig,
+        ToastDelivery, ToastHerdrPosition, UpdateChannelConfig, MAX_TOAST_DELAY_SECONDS,
     },
     sidebar::{
         AgentSidebarToken, AgentsSidebarConfig, SidebarConfig, SidebarTokenStyle,
@@ -129,6 +129,22 @@ impl Config {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn collection_lifecycle_thresholds_are_advisory_config() {
+        let config: Config = toml::from_str(
+            r#"
+[ui.collections]
+archive_age_days = 3
+archive_count = 12
+concurrency = 5
+"#,
+        )
+        .expect("valid config");
+        assert_eq!(config.ui.collections.archive_age_days, 3);
+        assert_eq!(config.ui.collections.archive_count, 12);
+        assert_eq!(config.ui.collections.concurrency, 5);
+    }
 
     #[test]
     fn local_keybindings_profile_includes_defaults_and_excludes_commands() {

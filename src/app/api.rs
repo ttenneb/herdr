@@ -3,6 +3,8 @@ use std::time::{Duration, Instant};
 
 mod agent_view;
 mod agents;
+mod collections;
+mod delegations;
 mod env;
 mod integrations;
 mod layouts;
@@ -297,6 +299,12 @@ impl App {
             self.render_notify.notify_one();
         }
         for update in &pane_updates {
+            if matches!(
+                update.state,
+                crate::detect::AgentState::Working | crate::detect::AgentState::Blocked
+            ) {
+                self.restore_archived_member_for_input(update.ws_idx, update.pane_id);
+            }
             self.refresh_new_herdr_toast_context_for_update(update, &previous_toast);
             self.emit_pane_state_update(update);
         }
@@ -645,14 +653,9 @@ impl App {
         };
 
         for update in pane_updates {
-            let is_active_tab = self
+            let suppress_active_tab_notifications = self
                 .state
-                .pane_is_in_active_tab(update.ws_idx, update.pane_id);
-            let suppress_active_tab_notifications =
-                crate::app::actions::active_tab_suppresses_notifications(
-                    is_active_tab,
-                    self.state.outer_terminal_focus,
-                );
+                .pane_suppresses_notifications(update.ws_idx, update.pane_id);
             let Some(kind) = crate::app::actions::notification_toast_for_pane_state_update(
                 suppress_active_tab_notifications,
                 update,
@@ -1041,6 +1044,55 @@ impl App {
             Method::AgentSendKeys(params) => {
                 return self.handle_agent_send_keys(request.id, params)
             }
+            Method::CollectionList(params) => {
+                return self.handle_collection_list(request.id, params)
+            }
+            Method::CollectionGet(target) => return self.handle_collection_get(request.id, target),
+            Method::CollectionCreate(params) => {
+                return self.handle_collection_create(request.id, params)
+            }
+            Method::CollectionAdd(params) => return self.handle_collection_add(request.id, params),
+            Method::CollectionMove(params) => {
+                return self.handle_collection_move(request.id, params)
+            }
+            Method::CollectionPromote(params) => {
+                return self.handle_collection_promote(request.id, params)
+            }
+            Method::CollectionSelect(params) => {
+                return self.handle_collection_select(request.id, params)
+            }
+            Method::CollectionReorder(params) => {
+                return self.handle_collection_reorder(request.id, params)
+            }
+            Method::CollectionArchive(target) => {
+                return self.handle_collection_archive(request.id, target, true)
+            }
+            Method::CollectionRestore(target) => {
+                return self.handle_collection_archive(request.id, target, false)
+            }
+            Method::CollectionCreateMember(params) => {
+                return self.handle_collection_create_member(request.id, params)
+            }
+            Method::CollectionClose(params) => {
+                return self.handle_collection_close(request.id, params)
+            }
+            Method::DelegationCreate(params) => {
+                return self.handle_delegation_create(request.id, params)
+            }
+            Method::DelegationGet(target) => return self.handle_delegation_get(request.id, target),
+            Method::DelegationTree(_) => return self.handle_delegation_tree(request.id),
+            Method::DelegationRoot(target) => {
+                return self.handle_delegation_root(request.id, target)
+            }
+            Method::DelegationDescendants(target) => {
+                return self.handle_delegation_descendants(request.id, target)
+            }
+            Method::DelegationReparent(params) => {
+                return self.handle_delegation_reparent(request.id, params)
+            }
+            Method::DelegationReorder(params) => {
+                return self.handle_delegation_reorder(request.id, params)
+            }
             Method::PaneSplit(params) => return self.handle_pane_split(request.id, params),
             Method::PaneSwap(params) => return self.handle_pane_swap(request.id, params),
             Method::PaneMove(params) => return self.handle_pane_move(request.id, params),
@@ -1391,7 +1443,9 @@ mod tests {
         );
         app.state.workspaces = vec![crate::workspace::Workspace::test_new("manifest-reset")];
         app.state.ensure_test_terminals();
-        let pane_id = app.state.workspaces[0].tabs[0].root_pane;
+        let pane_id = app.state.workspaces[0].tabs[0]
+            .root_pane
+            .expect("test tab has root pane");
         let terminal_id = app.state.workspaces[0].tabs[0].panes[&pane_id]
             .attached_terminal_id
             .clone();
@@ -1433,7 +1487,9 @@ mod tests {
         );
         app.state.workspaces = vec![crate::workspace::Workspace::test_new("manifest-reload")];
         app.state.ensure_test_terminals();
-        let pane_id = app.state.workspaces[0].tabs[0].root_pane;
+        let pane_id = app.state.workspaces[0].tabs[0]
+            .root_pane
+            .expect("test tab has root pane");
         let terminal_id = app.state.workspaces[0].tabs[0].panes[&pane_id]
             .attached_terminal_id
             .clone();
@@ -1474,7 +1530,9 @@ mod tests {
         );
         app.state.workspaces = vec![crate::workspace::Workspace::test_new("manifest-status")];
         app.state.ensure_test_terminals();
-        let pane_id = app.state.workspaces[0].tabs[0].root_pane;
+        let pane_id = app.state.workspaces[0].tabs[0]
+            .root_pane
+            .expect("test tab has root pane");
         let terminal_id = app.state.workspaces[0].tabs[0].panes[&pane_id]
             .attached_terminal_id
             .clone();
@@ -1517,7 +1575,9 @@ mod tests {
         );
         app.state.workspaces = vec![crate::workspace::Workspace::test_new("agent-explain")];
         app.state.ensure_test_terminals();
-        let pane_id = app.state.workspaces[0].tabs[0].root_pane;
+        let pane_id = app.state.workspaces[0].tabs[0]
+            .root_pane
+            .expect("test tab has root pane");
         let terminal_id = app.state.workspaces[0].tabs[0].panes[&pane_id]
             .attached_terminal_id
             .clone();
@@ -1562,7 +1622,9 @@ mod tests {
         );
         app.state.workspaces = vec![crate::workspace::Workspace::test_new("agent-explain-omp")];
         app.state.ensure_test_terminals();
-        let pane_id = app.state.workspaces[0].tabs[0].root_pane;
+        let pane_id = app.state.workspaces[0].tabs[0]
+            .root_pane
+            .expect("test tab has root pane");
         let terminal_id = app.state.workspaces[0].tabs[0].panes[&pane_id]
             .attached_terminal_id
             .clone();
@@ -1604,7 +1666,9 @@ mod tests {
         );
         app.state.workspaces = vec![crate::workspace::Workspace::test_new("process-info")];
         app.state.ensure_test_terminals();
-        let pane_id = app.state.workspaces[0].tabs[0].root_pane;
+        let pane_id = app.state.workspaces[0].tabs[0]
+            .root_pane
+            .expect("test tab has root pane");
         let terminal_id = app.state.workspaces[0].tabs[0].panes[&pane_id]
             .attached_terminal_id
             .clone();
@@ -1675,7 +1739,7 @@ mod tests {
 
         let mut workspace = crate::workspace::Workspace::test_new("stale");
         workspace.custom_name = None;
-        let root = workspace.tabs[0].root_pane;
+        let root = workspace.tabs[0].root_pane.expect("test tab has root pane");
         let terminal_id = workspace.terminal_id(root).cloned().unwrap();
         let temp_root = std::env::temp_dir().join(format!(
             "herdr-toast-context-{}-{}",
@@ -1767,7 +1831,7 @@ mod tests {
 
         let mut workspace = crate::workspace::Workspace::test_new("stale");
         workspace.custom_name = None;
-        let root = workspace.tabs[0].root_pane;
+        let root = workspace.tabs[0].root_pane.expect("test tab has root pane");
         let terminal_id = workspace.terminal_id(root).cloned().unwrap();
         let temp_root = std::env::temp_dir().join(format!(
             "herdr-delayed-toast-context-{}-{}",
@@ -1853,7 +1917,7 @@ mod tests {
     #[test]
     fn overlay_exit_preserves_focus_changed_before_exit() {
         let mut workspace = crate::workspace::Workspace::test_new("overlay");
-        let previous_focus = workspace.tabs[0].root_pane;
+        let previous_focus = workspace.tabs[0].root_pane.expect("test tab has root pane");
         let overlay_pane = workspace.test_split(ratatui::layout::Direction::Horizontal);
         workspace.tabs[0].zoomed = true;
         let new_tab = workspace.test_add_tab(Some("new"));
@@ -1920,7 +1984,7 @@ mod tests {
                 event_hub.clone(),
             );
             let workspace = crate::workspace::Workspace::test_new("idle-agent-exit");
-            let pane_id = workspace.tabs[0].root_pane;
+            let pane_id = workspace.tabs[0].root_pane.expect("test tab has root pane");
             let terminal_id = workspace.terminal_id(pane_id).cloned().unwrap();
             app.state.workspaces = vec![workspace];
             app.state.ensure_test_terminals();
@@ -1964,7 +2028,7 @@ mod tests {
             event_hub.clone(),
         );
         let workspace = crate::workspace::Workspace::test_new("stale-agent-exit");
-        let pane_id = workspace.tabs[0].root_pane;
+        let pane_id = workspace.tabs[0].root_pane.expect("test tab has root pane");
         let terminal_id = workspace.terminal_id(pane_id).cloned().unwrap();
         app.state.workspaces = vec![workspace];
         app.state.ensure_test_terminals();
@@ -2015,7 +2079,7 @@ mod tests {
             event_hub.clone(),
         );
         let mut workspace = crate::workspace::Workspace::test_new("overlay-layout");
-        let previous_focus = workspace.tabs[0].root_pane;
+        let previous_focus = workspace.tabs[0].root_pane.expect("test tab has root pane");
         let overlay_pane = workspace.test_split(ratatui::layout::Direction::Horizontal);
         workspace.tabs[0].layout.focus_pane(previous_focus);
         workspace.tabs[0].zoomed = true;
@@ -2054,7 +2118,7 @@ mod tests {
     #[test]
     fn overlay_exit_preserves_same_tab_focus_changed_before_exit() {
         let mut workspace = crate::workspace::Workspace::test_new("overlay");
-        let previous_focus = workspace.tabs[0].root_pane;
+        let previous_focus = workspace.tabs[0].root_pane.expect("test tab has root pane");
         let overlay_pane = workspace.test_split(ratatui::layout::Direction::Horizontal);
         workspace.tabs[0].layout.focus_pane(previous_focus);
         workspace.tabs[0].zoomed = true;
@@ -2074,7 +2138,7 @@ mod tests {
     #[test]
     fn overlay_exit_restores_previous_focus_when_overlay_still_focused() {
         let mut workspace = crate::workspace::Workspace::test_new("overlay");
-        let previous_focus = workspace.tabs[0].root_pane;
+        let previous_focus = workspace.tabs[0].root_pane.expect("test tab has root pane");
         let overlay_pane = workspace.test_split(ratatui::layout::Direction::Horizontal);
         workspace.tabs[0].zoomed = true;
         let mut app = app_with_overlay(workspace, overlay_pane, previous_focus, false);
@@ -2101,7 +2165,7 @@ mod tests {
             crate::api::EventHub::default(),
         );
         let workspace = crate::workspace::Workspace::test_new("restored");
-        let pane_id = workspace.tabs[0].root_pane;
+        let pane_id = workspace.tabs[0].root_pane.expect("test tab has root pane");
         let terminal_id = workspace.terminal_id(pane_id).cloned().unwrap();
         app.state.workspaces = vec![workspace];
         app.state.ensure_test_terminals();
@@ -2151,7 +2215,7 @@ mod tests {
             crate::api::EventHub::default(),
         );
         let workspace = crate::workspace::Workspace::test_new("powershell");
-        let pane_id = workspace.tabs[0].root_pane;
+        let pane_id = workspace.tabs[0].root_pane.expect("test tab has root pane");
         app.state.workspaces = vec![workspace];
         app.state.ensure_test_terminals();
         app.state.default_shell = "powershell.exe".into();
@@ -2185,7 +2249,7 @@ mod tests {
             crate::api::EventHub::default(),
         );
         let workspace = crate::workspace::Workspace::test_new("powershell");
-        let pane_id = workspace.tabs[0].root_pane;
+        let pane_id = workspace.tabs[0].root_pane.expect("test tab has root pane");
         app.state.workspaces = vec![workspace];
         app.state.ensure_test_terminals();
         app.state.default_shell = "powershell.exe".into();
@@ -2212,7 +2276,7 @@ mod tests {
         let mut workspace = crate::workspace::Workspace::test_new("stale");
         workspace.custom_name = None;
         workspace.identity_cwd = "/__herdr_original__".into();
-        let root = workspace.tabs[0].root_pane;
+        let root = workspace.tabs[0].root_pane.expect("test tab has root pane");
         let terminal_id = workspace.terminal_id(root).cloned().unwrap();
         let workspace_id = workspace.id.clone();
         app.state.workspaces = vec![workspace];

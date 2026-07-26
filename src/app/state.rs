@@ -5,7 +5,7 @@ use ratatui::style::Color;
 use std::hash::{Hash, Hasher};
 
 use crate::detect::AgentState;
-use crate::layout::{PaneId, PaneInfo, SplitBorder};
+use crate::layout::{CollectionId, PaneId, PaneInfo, SplitBorder};
 use crate::selection::Selection;
 
 pub(crate) type InstalledPluginRegistry =
@@ -786,6 +786,7 @@ pub struct ViewState {
     pub mobile_menu_hit_area: Rect,
     pub toast_hit_area: Rect,
     pub pane_infos: Vec<PaneInfo>,
+    pub collection_layouts: Vec<super::collection_view::CollectionLayout>,
     pub split_borders: Vec<SplitBorder>,
 }
 
@@ -806,6 +807,7 @@ pub enum Mode {
     ConfirmRemoveWorktree,
     Resize,
     ConfirmClose,
+    CollectionClose,
     ContextMenu,
     Settings,
     GlobalMenu,
@@ -833,6 +835,7 @@ impl Mode {
                 | Mode::Copy
                 | Mode::Resize
                 | Mode::ConfirmClose
+                | Mode::CollectionClose
                 | Mode::ConfirmRemoveWorktree
                 | Mode::ContextMenu
                 | Mode::GlobalMenu
@@ -1216,6 +1219,12 @@ pub enum ContextMenuKind {
         source_pane_id: Option<PaneId>,
         has_manual_label: bool,
     },
+    CollectionMember {
+        ws_idx: usize,
+        collection_id: CollectionId,
+        pane_id: PaneId,
+        archived: bool,
+    },
 }
 
 /// Right-click context menu state.
@@ -1312,6 +1321,12 @@ impl ContextMenuState {
                 "Zoom",
                 "Close pane",
             ],
+            ContextMenuKind::CollectionMember {
+                archived: false, ..
+            } => &["Maximize", "Archive", "Move out", "Close pane"],
+            ContextMenuKind::CollectionMember { archived: true, .. } => {
+                &["Maximize", "Restore", "Move out", "Close pane"]
+            }
         }
     }
 }
@@ -1412,6 +1427,8 @@ pub struct AppState {
     pub(crate) pane_id_aliases: std::collections::HashMap<u32, PaneId>,
     pub(crate) public_pane_id_aliases: std::collections::HashMap<String, PaneId>,
     pub workspaces: Vec<Workspace>,
+    /// Session-wide delegation provenance, independent of pane placement.
+    pub delegations: crate::delegation::Delegations,
     pub active: Option<usize>,
     pub(crate) previous_pane_focus: Option<PaneFocusTarget>,
     pub selected: usize,
@@ -1460,6 +1477,18 @@ pub struct AppState {
     pub tab_scroll: usize,
     pub tab_scroll_follow_active: bool,
     pub mobile_switcher_scroll: usize,
+    /// Foreground-client presentation state. This is intentionally excluded from persistence.
+    pub(crate) collection_views:
+        std::collections::HashMap<CollectionId, super::collection_view::CollectionViewState>,
+    /// Session-runtime archive timestamps used only for advisory age warnings. Cleanup is explicit.
+    pub(crate) collection_archive_times: std::collections::HashMap<PaneId, std::time::SystemTime>,
+    pub(crate) collection_lifecycle: crate::config::CollectionLifecycleConfig,
+    /// Destructive collection-close prompt for the attached foreground client.
+    pub(crate) pending_collection_close: Option<super::collection_view::PendingCollectionClose>,
+    /// Foreground collection terminal rectangles computed for the runtime geometry arbiter.
+    pub(crate) collection_geometry: super::collection_view::CollectionGeometryProjection,
+    /// Headless mode defers collection PTY resizing to the server geometry arbiter.
+    pub(crate) defer_collection_geometry_claims: bool,
     // View geometry (computed before render, consumed by render + mouse)
     pub view: ViewState,
     pub(crate) drag: Option<DragState>,
@@ -1657,6 +1686,7 @@ impl AppState {
         terminal_runtimes: &crate::terminal::TerminalRuntimeRegistry,
     ) -> bool {
         self.mode == Mode::Terminal
+            && self.focused_collection_terminal_entered()
             && self
                 .active
                 .and_then(|idx| self.focused_runtime_in_workspace(terminal_runtimes, idx))
@@ -1759,7 +1789,18 @@ impl AppState {
         if tab_idx != ws.active_tab_index() {
             return false;
         }
-        ws.active_tab().map(|tab| tab.layout.focused()) == Some(pane_id)
+        let Some(tab) = ws.active_tab() else {
+            return false;
+        };
+        match tab.layout.focused_leaf() {
+            crate::layout::LayoutLeaf::Pane(focused) => focused == pane_id,
+            crate::layout::LayoutLeaf::Collection(collection_id) => {
+                tab.collection(collection_id)
+                    .and_then(|collection| collection.selected())
+                    == Some(pane_id)
+                    && self.focused_collection_terminal_entered()
+            }
+        }
     }
 }
 
@@ -1789,6 +1830,7 @@ impl AppState {
             pane_id_aliases: std::collections::HashMap::new(),
             public_pane_id_aliases: std::collections::HashMap::new(),
             workspaces: Vec::new(),
+            delegations: crate::delegation::Delegations::new(),
             active: None,
             previous_pane_focus: None,
             selected: 0,
@@ -1830,6 +1872,12 @@ impl AppState {
             tab_scroll: 0,
             tab_scroll_follow_active: true,
             mobile_switcher_scroll: 0,
+            collection_views: std::collections::HashMap::new(),
+            collection_archive_times: std::collections::HashMap::new(),
+            collection_lifecycle: crate::config::CollectionLifecycleConfig::default(),
+            pending_collection_close: None,
+            collection_geometry: std::collections::HashMap::new(),
+            defer_collection_geometry_claims: false,
             view: ViewState {
                 layout: ViewLayout::Desktop,
                 sidebar_rect: Rect::default(),
@@ -1844,6 +1892,7 @@ impl AppState {
                 mobile_menu_hit_area: Rect::default(),
                 toast_hit_area: Rect::default(),
                 pane_infos: Vec::new(),
+                collection_layouts: Vec::new(),
                 split_borders: Vec::new(),
             },
             drag: None,
@@ -2256,6 +2305,20 @@ impl AppState {
                 ContextMenuKind::Tab { ws_idx, tab_idx } => {
                     assert_tab_index(ws_idx, tab_idx, "context menu tab")
                 }
+                ContextMenuKind::CollectionMember {
+                    ws_idx,
+                    collection_id,
+                    pane_id,
+                    ..
+                } => {
+                    assert_workspace_index(ws_idx, "collection context menu workspace");
+                    assert!(
+                        self.workspaces[ws_idx].tabs.iter().any(|tab| tab
+                            .collection(collection_id)
+                            .is_some_and(|collection| collection.members().contains(&pane_id))),
+                        "collection context menu must reference a live member"
+                    );
+                }
                 ContextMenuKind::Pane {
                     ws_idx,
                     tab_idx,
@@ -2305,7 +2368,7 @@ mod tests {
     fn agent_terminal_keeps_final_child_cursor_exposed() {
         let mut state = AppState::test_new();
         let ws = crate::workspace::Workspace::test_new("test");
-        let pane_id = ws.tabs[0].root_pane;
+        let pane_id = ws.tabs[0].root_pane.expect("test tab has root pane");
         state.terminals.insert(
             ws.tabs[0].panes[&pane_id].attached_terminal_id.clone(),
             crate::terminal::TerminalState::new(

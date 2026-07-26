@@ -1,4 +1,4 @@
-pub(super) fn tab_attention_priority(state: crate::detect::AgentState, seen: bool) -> u8 {
+pub(crate) fn tab_attention_priority(state: crate::detect::AgentState, seen: bool) -> u8 {
     match (state, seen) {
         (crate::detect::AgentState::Blocked, _) => 4,
         (crate::detect::AgentState::Idle, false) => 3,

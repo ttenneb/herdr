@@ -1400,7 +1400,9 @@ platforms = ["linux", "macos"]
         app.state.ensure_test_terminals();
         app.state.active = Some(0);
         app.state.selected = 0;
-        let root_pane = app.state.workspaces[0].tabs[0].root_pane;
+        let root_pane = app.state.workspaces[0].tabs[0]
+            .root_pane
+            .expect("test tab has root pane");
         let root = unique_temp_path("plugin-popup-ui-busy");
         write_manifest(&root);
         link_manifest(&mut app, &root);
@@ -1462,7 +1464,7 @@ platforms = ["linux", "macos"]
         let mut app = test_app();
         let mut workspace = crate::workspace::Workspace::test_new("plugin-target");
         workspace.custom_name = None;
-        let root_pane = workspace.tabs[0].root_pane;
+        let root_pane = workspace.tabs[0].root_pane.expect("test tab has root pane");
         let root_terminal = workspace.terminal_id(root_pane).cloned().unwrap();
         app.state.workspaces = vec![workspace];
         app.state.ensure_test_terminals();
@@ -1930,7 +1932,9 @@ command = ["sh", "-c", "sleep 1"]
         app.state.active = Some(0);
         app.state.selected = 0;
         app.state.mode = crate::app::Mode::Terminal;
-        let root_pane = app.state.workspaces[0].tabs[0].root_pane;
+        let root_pane = app.state.workspaces[0].tabs[0]
+            .root_pane
+            .expect("test tab has root pane");
         let root_public = app.public_pane_id(0, root_pane).unwrap();
 
         let root = unique_temp_path("plugin-pane-popup");
@@ -2184,7 +2188,7 @@ command = ["sh", "-c", "printf %s ${{HERDR_PANE_ID-unset}} > '{}'; sleep 1"]
         let mut app = test_app();
         app.no_session = false;
         let workspace = crate::workspace::Workspace::test_new("plugin-refresh");
-        let pane_id = workspace.tabs[0].root_pane;
+        let pane_id = workspace.tabs[0].root_pane.expect("test tab has root pane");
         app.state.workspaces = vec![workspace];
         app.state.ensure_test_terminals();
         app.state.active = Some(0);
@@ -2420,7 +2424,7 @@ command = ["sh", "-c", "printf '%s\n%s\n%s' \"$HERDR_PLUGIN_ROOT\" \"$HERDR_PLUG
     async fn current_plugin_context_includes_selected_text_for_focused_pane() {
         let mut app = test_app();
         let workspace = crate::workspace::Workspace::test_new("plugin-selection");
-        let pane_id = workspace.tabs[0].root_pane;
+        let pane_id = workspace.tabs[0].root_pane.expect("test tab has root pane");
         let terminal_id = workspace.terminal_id(pane_id).cloned().unwrap();
         app.state.workspaces = vec![workspace];
         app.state.ensure_test_terminals();
@@ -2583,7 +2587,9 @@ command = ["sh", "-c", "printf '%s' \"$HERDR_PLUGIN_CONTEXT_JSON\" > {}"]
         app.state.ensure_test_terminals();
         app.state.active = Some(0);
         app.state.selected = 0;
-        let active_pane_id = app.state.workspaces[0].tabs[0].root_pane;
+        let active_pane_id = app.state.workspaces[0].tabs[0]
+            .root_pane
+            .expect("test tab has root pane");
         let active_public_pane_id = app.public_pane_id(0, active_pane_id).unwrap();
         let workspace_id = app.public_workspace_id(0);
         let closed_tab_id = format!("{workspace_id}:t99");
@@ -2708,7 +2714,9 @@ command = ["sh", "-c", "printf '%s' \"$HERDR_PLUGIN_CONTEXT_JSON\" > {}"]
         app.state.ensure_test_terminals();
         app.state.active = Some(0);
         app.state.selected = 0;
-        let pane_id = app.state.workspaces[0].tabs[0].root_pane;
+        let pane_id = app.state.workspaces[0].tabs[0]
+            .root_pane
+            .expect("test tab has root pane");
         let root = unique_temp_path("plugin-link-handler");
         write_manifest_content(
             &root,
@@ -2920,7 +2928,9 @@ action = "missing"
             checkout_path: "/repo/herdr-issue".into(),
             is_linked_worktree: true,
         });
-        let pane_id = app.state.workspaces[0].tabs[0].root_pane;
+        let pane_id = app.state.workspaces[0].tabs[0]
+            .root_pane
+            .expect("test tab has root pane");
         let pane_public = app.public_pane_id(0, pane_id).unwrap();
         let tab_public = app.public_tab_id(0, 0).unwrap();
         let workspace_public = app.public_workspace_id(0);
@@ -3195,7 +3205,9 @@ command = ["sh", "-c", "echo ok"]
         app.state.ensure_test_terminals();
         app.state.active = Some(0);
         app.state.selected = 0;
-        let pane_id = app.state.workspaces[0].tabs[0].root_pane;
+        let pane_id = app.state.workspaces[0].tabs[0]
+            .root_pane
+            .expect("test tab has root pane");
         let public_pane_id = app.public_pane_id(0, pane_id).unwrap();
         app.state.plugin_panes.insert(
             pane_id,
@@ -3242,7 +3254,9 @@ command = ["sh", "-c", "echo ok"]
         app.state.ensure_test_terminals();
         app.state.active = Some(0);
         app.state.selected = 0;
-        let pane_id = app.state.workspaces[0].tabs[0].root_pane;
+        let pane_id = app.state.workspaces[0].tabs[0]
+            .root_pane
+            .expect("test tab has root pane");
         app.state.plugin_panes.insert(
             pane_id,
             crate::app::state::PluginPaneRecord {

@@ -491,10 +491,15 @@ fn event_envelope_round_trips() {
                         width: 100,
                         height: 24,
                     },
-                    focused_pane_id: "w_1-1".into(),
+                    focused_pane_id: Some("w_1-1".into()),
+                    focused: LayoutFocusInfo::Pane {
+                        pane_id: "w_1-1".into(),
+                    },
+                    collections: vec![],
                     panes: vec![PaneLayoutPane {
                         pane_id: "w_1-1".into(),
                         focused: true,
+                        placement: PanePlacementInfo::Tiled,
                         rect: PaneLayoutRect {
                             x: 0,
                             y: 0,
@@ -724,6 +729,7 @@ fn worktree_request_and_response_round_trip() {
                 workspace_id: "w_1".into(),
                 tab_id: "w_1:1".into(),
                 focused: true,
+                placement: PanePlacementInfo::Tiled,
                 cwd: Some("/worktrees/herdr/worktree-api".into()),
                 foreground_cwd: None,
                 label: None,
@@ -1017,7 +1023,10 @@ fn layout_export_apply_round_trip() {
                 workspace_id: "w1".into(),
                 tab_id: "w1:1".into(),
                 zoomed: false,
-                focused_pane_id: "w1-1".into(),
+                focused_pane_id: Some("w1-1".into()),
+                focused: LayoutFocusInfo::Pane {
+                    pane_id: "w1-1".into(),
+                },
                 root,
             },
         },
@@ -1033,7 +1042,10 @@ fn layout_export_apply_round_trip() {
                 workspace_id: "w1".into(),
                 tab_id: "w1:1".into(),
                 zoomed: false,
-                focused_pane_id: "w1-1".into(),
+                focused_pane_id: Some("w1-1".into()),
+                focused: LayoutFocusInfo::Pane {
+                    pane_id: "w1-1".into(),
+                },
                 root: LayoutNode::Pane {
                     pane: LayoutPane {
                         pane_id: Some("w1-1".into()),
@@ -1138,6 +1150,7 @@ fn create_response_round_trips_with_root_pane() {
                 workspace_id: "w_1".into(),
                 tab_id: "w_1:2".into(),
                 focused: false,
+                placement: PanePlacementInfo::Tiled,
                 cwd: Some("/tmp/review".into()),
                 foreground_cwd: None,
                 label: None,
@@ -1292,4 +1305,194 @@ fn popup_close_request_round_trips() {
 
     assert_eq!(json["method"], "popup.close");
     assert_eq!(json["params"], serde_json::json!({}));
+}
+
+#[test]
+fn collection_and_delegation_requests_round_trip_exhaustively() {
+    let requests = vec![
+        Method::CollectionList(CollectionListParams {
+            workspace_id: Some("w1".into()),
+            tab_id: None,
+        }),
+        Method::CollectionGet(CollectionTarget {
+            collection_id: "collection_1".into(),
+        }),
+        Method::CollectionCreate(CollectionCreateParams {
+            target_pane_id: "w1:p1".into(),
+            direction: SplitDirection::Right,
+            ratio: Some(0.4),
+            label: Some("helpers".into()),
+            focus: false,
+        }),
+        Method::CollectionAdd(CollectionAddParams {
+            collection_id: "collection_1".into(),
+            pane_id: "w1:p2".into(),
+        }),
+        Method::CollectionMove(CollectionMoveParams {
+            pane_id: "w1:p2".into(),
+            collection_id: "collection_2".into(),
+        }),
+        Method::CollectionPromote(CollectionPromoteParams {
+            pane_id: "w1:p2".into(),
+            target_pane_id: "w1:p1".into(),
+            direction: SplitDirection::Down,
+            ratio: None,
+            focus: true,
+        }),
+        Method::CollectionSelect(CollectionSelectParams {
+            collection_id: "collection_1".into(),
+            pane_id: "w1:p2".into(),
+            focus: false,
+        }),
+        Method::CollectionReorder(CollectionReorderParams {
+            collection_id: "collection_1".into(),
+            pane_id: "w1:p2".into(),
+            index: 0,
+        }),
+        Method::CollectionArchive(CollectionMemberTarget {
+            collection_id: "collection_1".into(),
+            pane_id: "w1:p2".into(),
+        }),
+        Method::CollectionRestore(CollectionMemberTarget {
+            collection_id: "collection_1".into(),
+            pane_id: "w1:p2".into(),
+        }),
+        Method::CollectionCreateMember(CollectionCreateMemberParams {
+            collection_id: "collection_1".into(),
+            cwd: Some("/tmp".into()),
+            env: HashMap::new(),
+            delegation_parent_id: Some("d1".into()),
+            purpose: Some("review".into()),
+        }),
+        Method::CollectionClose(CollectionCloseParams {
+            collection_id: "collection_1".into(),
+            disposition: Some(CollectionCloseDisposition::PromoteMembers),
+            target_pane_id: Some("w1:p1".into()),
+            focus_promoted: false,
+        }),
+        Method::DelegationCreate(DelegationCreateParams {
+            pane_id: Some("w1:p2".into()),
+            parent_id: Some("d1".into()),
+            purpose: Some("review".into()),
+        }),
+        Method::DelegationGet(DelegationTarget {
+            delegation_id: "d2".into(),
+        }),
+        Method::DelegationTree(EmptyParams::default()),
+        Method::DelegationRoot(DelegationTarget {
+            delegation_id: "d2".into(),
+        }),
+        Method::DelegationDescendants(DelegationTarget {
+            delegation_id: "d1".into(),
+        }),
+        Method::DelegationReparent(DelegationReparentParams {
+            delegation_id: "d2".into(),
+            parent_id: None,
+        }),
+        Method::DelegationReorder(DelegationReorderParams {
+            delegation_id: "d2".into(),
+            position: DelegationSiblingPosition::Before {
+                delegation_id: "d3".into(),
+            },
+        }),
+    ];
+    for (index, method) in requests.into_iter().enumerate() {
+        let request = Request {
+            id: format!("nested-{index}"),
+            method,
+        };
+        let json = serde_json::to_value(&request).expect("serialize request");
+        let restored: Request = serde_json::from_value(json).expect("deserialize request");
+        assert_eq!(restored, request);
+    }
+}
+
+#[test]
+fn collection_and_delegation_lifecycle_subscriptions_and_events_round_trip() {
+    let subscriptions = vec![
+        Subscription::CollectionCreated {},
+        Subscription::CollectionMemberAdded {},
+        Subscription::CollectionMemberMoved {},
+        Subscription::CollectionMemberPromoted {},
+        Subscription::CollectionMemberSelected {},
+        Subscription::CollectionMembersReordered {},
+        Subscription::CollectionMemberArchived {},
+        Subscription::CollectionMemberRestored {},
+        Subscription::CollectionClosed {},
+        Subscription::DelegationCreated {},
+        Subscription::DelegationReparented {},
+        Subscription::DelegationReordered {},
+    ];
+    let request = Request {
+        id: "nested-subscriptions".into(),
+        method: Method::EventsSubscribe(EventsSubscribeParams { subscriptions }),
+    };
+    assert_eq!(
+        serde_json::from_value::<Request>(serde_json::to_value(&request).unwrap()).unwrap(),
+        request
+    );
+
+    let collection = CollectionInfo {
+        collection_id: "collection_1".into(),
+        workspace_id: "w1".into(),
+        tab_id: "t1".into(),
+        label: Some("helpers".into()),
+        focused: false,
+        selected_pane_id: None,
+        members: vec![],
+        lifecycle: CollectionLifecycleSummary {
+            active: 0,
+            archived: 0,
+            live: 0,
+            working: 0,
+            blocked: 0,
+            exited: 0,
+        },
+        warnings: vec![],
+    };
+    let delegation = DelegationInfo {
+        delegation_id: "d1".into(),
+        pane_id: None,
+        parent_id: None,
+        purpose: Some("primary".into()),
+        sibling_rank: 0,
+        tombstone: false,
+    };
+    let events = vec![
+        EventEnvelope {
+            event: EventKind::CollectionCreated,
+            data: EventData::CollectionCreated { collection },
+        },
+        EventEnvelope {
+            event: EventKind::CollectionClosed,
+            data: EventData::CollectionClosed {
+                collection_id: "collection_1".into(),
+                workspace_id: "w1".into(),
+                tab_id: "t1".into(),
+            },
+        },
+        EventEnvelope {
+            event: EventKind::DelegationCreated,
+            data: EventData::DelegationCreated {
+                delegation: delegation.clone(),
+            },
+        },
+        EventEnvelope {
+            event: EventKind::DelegationReparented,
+            data: EventData::DelegationReparented {
+                delegation: delegation.clone(),
+                previous_parent_id: Some("d0".into()),
+            },
+        },
+        EventEnvelope {
+            event: EventKind::DelegationReordered,
+            data: EventData::DelegationReordered { delegation },
+        },
+    ];
+    for event in events {
+        assert_eq!(
+            serde_json::from_value::<EventEnvelope>(serde_json::to_value(&event).unwrap()).unwrap(),
+            event
+        );
+    }
 }

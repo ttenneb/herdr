@@ -421,6 +421,28 @@ impl PaneTerminal {
         self.ghostty.render(frame, area, show_cursor);
     }
 
+    #[allow(clippy::too_many_arguments)]
+    pub fn render_clipped(
+        &self,
+        frame: &mut Frame,
+        visible: Rect,
+        logical_rows: u16,
+        logical_cols: u16,
+        source_row: u16,
+        source_col: u16,
+        show_cursor: bool,
+    ) {
+        self.ghostty.render_clipped(
+            frame,
+            visible,
+            logical_rows,
+            logical_cols,
+            source_row,
+            source_col,
+            show_cursor,
+        );
+    }
+
     pub fn collect_dirty_patch(
         &self,
         area_width: u16,
@@ -1805,6 +1827,20 @@ impl GhosttyPaneTerminal {
     }
 
     pub fn render(&self, frame: &mut Frame, area: Rect, show_cursor: bool) {
+        self.render_clipped(frame, area, area.height, area.width, 0, 0, show_cursor);
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn render_clipped(
+        &self,
+        frame: &mut Frame,
+        visible: Rect,
+        logical_rows: u16,
+        logical_cols: u16,
+        source_row: u16,
+        source_col: u16,
+        show_cursor: bool,
+    ) {
         let Ok(mut core) = self.core.lock() else {
             return;
         };
@@ -1845,14 +1881,26 @@ impl GhosttyPaneTerminal {
             };
             let mut grapheme_bytes = Vec::new();
             let mut symbol_scratch = String::new();
+            for _ in 0..source_row {
+                if !rows.next() {
+                    break;
+                }
+            }
+            let render_height = visible.height.min(logical_rows.saturating_sub(source_row));
+            let render_width = visible.width.min(logical_cols.saturating_sub(source_col));
             let mut y = 0u16;
-            while y < area.height && rows.next() {
+            while y < render_height && rows.next() {
                 let mut cells = match rows.populate_cells(&mut row_cells) {
                     Ok(cells) => cells,
                     Err(_) => break,
                 };
+                for _ in 0..source_col {
+                    if !cells.next() {
+                        break;
+                    }
+                }
                 let mut x = 0u16;
-                while x < area.width && cells.next() {
+                while x < render_width && cells.next() {
                     let basic = cells.basic_data().unwrap_or_default();
                     let style = ghostty_cell_style(
                         &cells,
@@ -1876,37 +1924,44 @@ impl GhosttyPaneTerminal {
                             symbol_scratch.as_str()
                         }
                     };
-                    let cell = &mut buf[(area.x + x, area.y + y)];
+                    let cell = &mut buf[(visible.x + x, visible.y + y)];
                     cell.reset();
                     cell.set_symbol(symbol);
                     cell.set_style(style);
                     x += 1;
                 }
-                while x < area.width {
-                    let cell = &mut buf[(area.x + x, area.y + y)];
+                while x < render_width {
+                    let cell = &mut buf[(visible.x + x, visible.y + y)];
                     ghostty_reset_cell(cell, default_fg, default_bg);
                     x += 1;
                 }
                 y += 1;
             }
-            while y < area.height {
-                for x in 0..area.width {
-                    let cell = &mut buf[(area.x + x, area.y + y)];
+            while y < render_height {
+                for x in 0..render_width {
+                    let cell = &mut buf[(visible.x + x, visible.y + y)];
                     ghostty_reset_cell(cell, default_fg, default_bg);
                 }
                 y += 1;
             }
         }
 
-        ghostty_clear_render_dirty(render_state, area.height);
+        ghostty_clear_render_dirty(render_state, logical_rows);
 
         let current_cursor = cursor_state_from_render_state(render_state, decscusr_tracker);
         if show_cursor {
             if let Some(cursor) =
                 effective_cursor_state(&mut core, current_cursor).filter(|cursor| cursor.visible)
             {
-                if cursor.x < area.width && cursor.y < area.height {
-                    frame.set_cursor_position((area.x + cursor.x, area.y + cursor.y));
+                if cursor.x >= source_col
+                    && cursor.x < source_col.saturating_add(visible.width)
+                    && cursor.y >= source_row
+                    && cursor.y < source_row.saturating_add(visible.height)
+                {
+                    frame.set_cursor_position((
+                        visible.x + cursor.x - source_col,
+                        visible.y + cursor.y - source_row,
+                    ));
                 }
             }
         }

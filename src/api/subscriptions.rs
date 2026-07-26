@@ -172,6 +172,51 @@ impl ActiveSubscription {
                 event_kind: crate::api::schema::EventKind::TabMoved,
                 last_sequence: 0,
             })),
+            Subscription::CollectionCreated {} => {
+                event_subscription(crate::api::schema::EventKind::CollectionCreated)
+            }
+            Subscription::CollectionMemberAdded {} => {
+                event_subscription(crate::api::schema::EventKind::CollectionMemberAdded)
+            }
+            Subscription::CollectionMemberMoved {} => {
+                event_subscription(crate::api::schema::EventKind::CollectionMemberMoved)
+            }
+            Subscription::CollectionMemberRemoved {} => {
+                event_subscription(crate::api::schema::EventKind::CollectionMemberRemoved)
+            }
+            Subscription::CollectionMemberPromoted {} => {
+                event_subscription(crate::api::schema::EventKind::CollectionMemberPromoted)
+            }
+            Subscription::CollectionMemberSelected {} => {
+                event_subscription(crate::api::schema::EventKind::CollectionMemberSelected)
+            }
+            Subscription::CollectionMembersReordered {} => {
+                event_subscription(crate::api::schema::EventKind::CollectionMembersReordered)
+            }
+            Subscription::CollectionMemberArchived {} => {
+                event_subscription(crate::api::schema::EventKind::CollectionMemberArchived)
+            }
+            Subscription::CollectionMemberRestored {} => {
+                event_subscription(crate::api::schema::EventKind::CollectionMemberRestored)
+            }
+            Subscription::CollectionClosed {} => {
+                event_subscription(crate::api::schema::EventKind::CollectionClosed)
+            }
+            Subscription::DelegationCreated {} => {
+                event_subscription(crate::api::schema::EventKind::DelegationCreated)
+            }
+            Subscription::DelegationReparented {} => {
+                event_subscription(crate::api::schema::EventKind::DelegationReparented)
+            }
+            Subscription::DelegationReordered {} => {
+                event_subscription(crate::api::schema::EventKind::DelegationReordered)
+            }
+            Subscription::DelegationTombstoned {} => {
+                event_subscription(crate::api::schema::EventKind::DelegationTombstoned)
+            }
+            Subscription::DelegationGarbageCollected {} => {
+                event_subscription(crate::api::schema::EventKind::DelegationGarbageCollected)
+            }
             Subscription::PaneCreated {} => Ok(Self::Event(ActiveEventSubscription {
                 event_kind: crate::api::schema::EventKind::PaneCreated,
                 last_sequence: 0,
@@ -323,6 +368,15 @@ impl ActiveSubscription {
             _ => Ok(self.poll(api_tx, event_hub)),
         }
     }
+}
+
+fn event_subscription(
+    kind: crate::api::schema::EventKind,
+) -> Result<ActiveSubscription, ErrorResponse> {
+    Ok(ActiveSubscription::Event(ActiveEventSubscription {
+        event_kind: kind,
+        last_sequence: 0,
+    }))
 }
 
 impl ActiveEventSubscription {
@@ -654,6 +708,7 @@ mod tests {
             workspace_id: "workspace_1".into(),
             tab_id: "tab_1".into(),
             focused: true,
+            placement: crate::api::schema::PanePlacementInfo::Tiled,
             cwd: None,
             foreground_cwd: None,
             label: None,

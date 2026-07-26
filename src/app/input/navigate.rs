@@ -740,9 +740,18 @@ impl App {
         let Some(ws_idx) = self.state.active else {
             return false;
         };
-        let Some(rt) = self
+        let Some(pane_id) = self
             .state
-            .focused_runtime_in_workspace(&self.terminal_runtimes, ws_idx)
+            .workspaces
+            .get(ws_idx)
+            .and_then(|workspace| workspace.focused_pane_id())
+        else {
+            return false;
+        };
+        self.restore_archived_member_for_input(ws_idx, pane_id);
+        let Some(rt) =
+            self.state
+                .runtime_for_pane_in_workspace(&self.terminal_runtimes, ws_idx, pane_id)
         else {
             return false;
         };
@@ -1879,7 +1888,9 @@ mod tests {
     fn next_agent_starts_at_first_visible_entry_when_focused_agent_is_filtered_out() {
         let mut app = app_with_test_workspaces(&["hidden", "first", "second"]);
         for ws_idx in 0..app.state.workspaces.len() {
-            let pane_id = app.state.workspaces[ws_idx].tabs[0].root_pane;
+            let pane_id = app.state.workspaces[ws_idx].tabs[0]
+                .root_pane
+                .expect("test tab has root pane");
             let terminal_id = app.state.workspaces[ws_idx].tabs[0].panes[&pane_id]
                 .attached_terminal_id
                 .clone();
@@ -1937,7 +1948,9 @@ mod tests {
     #[test]
     fn rename_workspace_prefills_live_terminal_cwd_label() {
         let mut state = state_with_workspaces(&["stale"]);
-        let root = state.workspaces[0].tabs[0].root_pane;
+        let root = state.workspaces[0].tabs[0]
+            .root_pane
+            .expect("test tab has root pane");
         let terminal_id = state.workspaces[0].panes[&root]
             .attached_terminal_id
             .clone();
@@ -2260,7 +2273,9 @@ mod tests {
         state.mode = Mode::Navigate;
         state.keybinds.open_notification_target = crate::config::ActionKeybinds::prefix("g");
         let target_workspace_id = state.workspaces[1].id.clone();
-        let target_pane = state.workspaces[1].tabs[0].root_pane;
+        let target_pane = state.workspaces[1].tabs[0]
+            .root_pane
+            .expect("test tab has root pane");
         state.toast = Some(crate::app::state::ToastNotification {
             kind: crate::app::state::ToastKind::NeedsAttention,
             title: "pi needs attention".into(),
@@ -2324,7 +2339,9 @@ navigate_pane_down = "ctrl+j"
     #[test]
     fn navigate_pane_keys_are_configurable() {
         let mut state = state_with_workspaces(&["test"]);
-        let root = state.workspaces[0].tabs[0].root_pane;
+        let root = state.workspaces[0].tabs[0]
+            .root_pane
+            .expect("test tab has root pane");
         let below = state.workspaces[0].test_split(Direction::Vertical);
         state.workspaces[0].layout.focus_pane(root);
         state.view.pane_infos = state.workspaces[0]
@@ -2354,7 +2371,9 @@ navigate_pane_down = "ctrl+j"
     #[test]
     fn focus_pane_prefix_rhs_does_not_create_navigate_mode_pane_shortcut() {
         let mut state = state_with_workspaces(&["test"]);
-        let root = state.workspaces[0].tabs[0].root_pane;
+        let root = state.workspaces[0].tabs[0]
+            .root_pane
+            .expect("test tab has root pane");
         let below = state.workspaces[0].test_split(Direction::Vertical);
         state.workspaces[0].layout.focus_pane(root);
         state.view.pane_infos = state.workspaces[0]
@@ -2388,7 +2407,9 @@ focus_pane_down = "prefix+f"
     #[test]
     fn customized_navigate_pane_key_disables_matching_prefix_rhs_fallback() {
         let mut state = state_with_workspaces(&["test"]);
-        let root = state.workspaces[0].tabs[0].root_pane;
+        let root = state.workspaces[0].tabs[0]
+            .root_pane
+            .expect("test tab has root pane");
         let below = state.workspaces[0].test_split(Direction::Vertical);
         state.workspaces[0].layout.focus_pane(root);
         state.view.pane_infos = state.workspaces[0]
@@ -2422,7 +2443,9 @@ navigate_pane_down = "ctrl+j"
     #[test]
     fn left_and_right_arrows_remain_permanent_navigate_pane_aliases() {
         let mut state = state_with_workspaces(&["test"]);
-        let root = state.workspaces[0].tabs[0].root_pane;
+        let root = state.workspaces[0].tabs[0]
+            .root_pane
+            .expect("test tab has root pane");
         let right = state.workspaces[0].test_split(Direction::Horizontal);
         state.workspaces[0].layout.focus_pane(right);
         crate::ui::compute_view(&mut state, ratatui::layout::Rect::new(0, 0, 80, 24));
@@ -2811,7 +2834,9 @@ navigate_pane_down = "ctrl+j"
         app.state.active = Some(0);
         app.state.selected = 0;
         app.state.mode = Mode::Terminal;
-        let root = app.state.workspaces[0].tabs[0].root_pane;
+        let root = app.state.workspaces[0].tabs[0]
+            .root_pane
+            .expect("test tab has root pane");
         let right = app.state.workspaces[0].test_split(Direction::Horizontal);
         app.state.workspaces[0].layout.focus_pane(right);
         app.state.view.pane_infos = app.state.workspaces[0]
@@ -3141,7 +3166,7 @@ navigate_pane_down = "ctrl+j"
             app.render_dirty.clone(),
         )
         .expect("workspace should spawn");
-        let root_pane = workspace.tabs[0].root_pane;
+        let root_pane = workspace.tabs[0].root_pane.expect("test tab has root pane");
         app.state.workspaces = vec![workspace];
         app.terminal_runtimes.insert(terminal.id.clone(), runtime);
         app.state.terminals.insert(terminal.id.clone(), terminal);
@@ -3220,7 +3245,7 @@ navigate_pane_down = "ctrl+j"
             crate::api::EventHub::default(),
         );
         let mut workspace = Workspace::test_new("test");
-        let root_pane = workspace.tabs[0].root_pane;
+        let root_pane = workspace.tabs[0].root_pane.expect("test tab has root pane");
         workspace.tabs[0].runtimes.insert(
             root_pane,
             crate::terminal::TerminalRuntime::test_with_scrollback_bytes(
@@ -3289,7 +3314,9 @@ navigate_pane_down = "ctrl+j"
     #[test]
     fn focus_pane_action_keeps_zoomed_when_changing_focus() {
         let mut state = state_with_workspaces(&["test"]);
-        let root = state.workspaces[0].tabs[0].root_pane;
+        let root = state.workspaces[0].tabs[0]
+            .root_pane
+            .expect("test tab has root pane");
         let right = state.workspaces[0].test_split(Direction::Horizontal);
         state.workspaces[0].layout.focus_pane(root);
         state.workspaces[0].zoomed = true;

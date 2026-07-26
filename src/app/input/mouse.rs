@@ -54,6 +54,8 @@ pub(super) enum MouseAction {
     },
     RenameModal(ModalAction),
     ConfirmCloseAccept,
+    CollectionClosePromote,
+    CollectionCloseCascade,
     ContextMenu {
         menu: ContextMenuState,
         idx: usize,
@@ -72,7 +74,7 @@ impl AppState {
         terminal_runtimes: &TerminalRuntimeRegistry,
         mouse: MouseEvent,
     ) {
-        if self.mode != Mode::Terminal {
+        if self.mode != Mode::Terminal || !self.focused_collection_terminal_entered() {
             return;
         }
         let Some(info) = self.pane_at(mouse.column, mouse.row).cloned() else {
@@ -222,6 +224,31 @@ impl AppState {
                 self.selection = None;
                 self.selection_autoscroll = None;
                 self.workspace_press = None;
+
+                if self.mode == Mode::CollectionClose {
+                    let popup = crate::ui::collection_close_popup_rect(self.view.terminal_area)?;
+                    let inner = Rect::new(
+                        popup.x + 1,
+                        popup.y + 1,
+                        popup.width.saturating_sub(2),
+                        popup.height.saturating_sub(2),
+                    );
+                    let (promote, cascade, cancel) =
+                        crate::ui::collection_close_button_rects(inner);
+                    if crate::app::collection_view::contains(promote, mouse.column, mouse.row) {
+                        return Some(MouseAction::CollectionClosePromote);
+                    }
+                    if crate::app::collection_view::contains(cascade, mouse.column, mouse.row) {
+                        return Some(MouseAction::CollectionCloseCascade);
+                    }
+                    if crate::app::collection_view::contains(cancel, mouse.column, mouse.row)
+                        || !crate::app::collection_view::contains(popup, mouse.column, mouse.row)
+                    {
+                        self.pending_collection_close = None;
+                        self.mode = Mode::Terminal;
+                    }
+                    return None;
+                }
 
                 if self.mode == Mode::ConfirmClose {
                     let popup = self.confirm_close_rect();
@@ -1871,7 +1898,7 @@ mod tests {
     async fn terminal_wheel_uses_configured_mouse_scroll_lines() {
         let mut app = app_for_mouse_test();
         let mut ws = Workspace::test_new("test");
-        let pane_id = ws.tabs[0].root_pane;
+        let pane_id = ws.tabs[0].root_pane.expect("test tab has root pane");
         let pane_infos = ws.tabs[0].layout.panes(Rect::new(26, 2, 80, 18));
         let info = pane_infos[0].clone();
         ws.tabs[0].runtimes.insert(
@@ -1909,7 +1936,7 @@ mod tests {
     async fn mouse_dispatcher_forwards_horizontal_wheel_to_mouse_reporting_pane() {
         let mut app = app_for_mouse_test();
         let mut ws = Workspace::test_new("test");
-        let pane_id = ws.tabs[0].root_pane;
+        let pane_id = ws.tabs[0].root_pane.expect("test tab has root pane");
         let pane_infos = ws.tabs[0].layout.panes(Rect::new(26, 2, 80, 18));
         let info = pane_infos[0].clone();
         let (runtime, mut input_rx) =
@@ -1969,7 +1996,7 @@ mod tests {
     async fn horizontal_wheel_stays_inert_for_non_mouse_reporting_pane() {
         let mut app = app_for_mouse_test();
         let mut ws = Workspace::test_new("test");
-        let pane_id = ws.tabs[0].root_pane;
+        let pane_id = ws.tabs[0].root_pane.expect("test tab has root pane");
         let pane_infos = ws.tabs[0].layout.panes(Rect::new(26, 2, 80, 18));
         let info = pane_infos[0].clone();
         let (runtime, mut input_rx) =
@@ -2006,7 +2033,7 @@ mod tests {
     async fn configured_right_click_passthrough_forwards_full_gesture_to_pane() {
         let mut app = app_for_mouse_test();
         let mut ws = Workspace::test_new("test");
-        let pane_id = ws.tabs[0].root_pane;
+        let pane_id = ws.tabs[0].root_pane.expect("test tab has root pane");
         let pane_infos = ws.tabs[0].layout.panes(Rect::new(26, 2, 80, 18));
         let info = pane_infos[0].clone();
         let (runtime, mut input_rx) =
@@ -2063,7 +2090,7 @@ mod tests {
     async fn captured_left_press_focuses_target_before_forwarding() {
         let mut app = app_for_mouse_test();
         let mut ws = Workspace::test_new("test");
-        let source = ws.tabs[0].root_pane;
+        let source = ws.tabs[0].root_pane.expect("test tab has root pane");
         let target = ws.test_split(Direction::Horizontal);
         ws.tabs[0].layout.focus_pane(source);
         app.state.workspaces = vec![ws];
@@ -2102,7 +2129,7 @@ mod tests {
     async fn pane_mouse_only_forwards_moved_events_for_any_motion_apps() {
         let mut app = app_for_mouse_test();
         let mut ws = Workspace::test_new("test");
-        let pane_id = ws.tabs[0].root_pane;
+        let pane_id = ws.tabs[0].root_pane.expect("test tab has root pane");
         let pane_infos = ws.tabs[0].layout.panes(Rect::new(26, 2, 80, 18));
         let info = pane_infos[0].clone();
         let (runtime, mut input_rx) =
@@ -2141,7 +2168,7 @@ mod tests {
     async fn pane_mouse_motion_uses_computed_inner_rect_offsets() {
         let mut app = app_for_mouse_test();
         let mut ws = Workspace::test_new("test");
-        let pane_id = ws.tabs[0].root_pane;
+        let pane_id = ws.tabs[0].root_pane.expect("test tab has root pane");
         let (runtime, mut input_rx) =
             crate::terminal::TerminalRuntime::test_with_channel_and_scrollback_bytes(
                 80,
@@ -2181,7 +2208,7 @@ mod tests {
     async fn mouse_dispatcher_downgrades_sgr_pixel_motion_to_cell_coordinates() {
         let mut app = app_for_mouse_test();
         let mut ws = Workspace::test_new("test");
-        let pane_id = ws.tabs[0].root_pane;
+        let pane_id = ws.tabs[0].root_pane.expect("test tab has root pane");
         let (runtime, mut input_rx) =
             crate::terminal::TerminalRuntime::test_with_channel_and_scrollback_bytes(
                 80,
@@ -2218,7 +2245,7 @@ mod tests {
     async fn mouse_dispatcher_does_not_forward_motion_behind_herdr_modes() {
         let mut app = app_for_mouse_test();
         let mut ws = Workspace::test_new("test");
-        let pane_id = ws.tabs[0].root_pane;
+        let pane_id = ws.tabs[0].root_pane.expect("test tab has root pane");
         let (runtime, mut input_rx) =
             crate::terminal::TerminalRuntime::test_with_channel_and_scrollback_bytes(
                 80,
@@ -2249,7 +2276,7 @@ mod tests {
     async fn unset_right_click_passthrough_keeps_modified_right_click_as_herdr_menu() {
         let mut app = app_for_mouse_test();
         let mut ws = Workspace::test_new("test");
-        let pane_id = ws.tabs[0].root_pane;
+        let pane_id = ws.tabs[0].root_pane.expect("test tab has root pane");
         let pane_infos = ws.tabs[0].layout.panes(Rect::new(26, 2, 80, 18));
         let info = pane_infos[0].clone();
         let (runtime, mut input_rx) =
@@ -2288,7 +2315,7 @@ mod tests {
     async fn pane_right_click_keeps_focus_and_swap_menu_swaps_with_focused_pane() {
         let mut app = app_for_mouse_test();
         let mut ws = Workspace::test_new("test");
-        let source = ws.tabs[0].root_pane;
+        let source = ws.tabs[0].root_pane.expect("test tab has root pane");
         let target = ws.test_split(Direction::Horizontal);
         ws.tabs[0].layout.focus_pane(source);
         app.state.workspaces = vec![ws];
@@ -2372,7 +2399,7 @@ mod tests {
     async fn normal_right_click_keeps_focus_and_exposes_swap_for_reporting_pane() {
         let mut app = app_for_mouse_test();
         let mut ws = Workspace::test_new("test");
-        let source = ws.tabs[0].root_pane;
+        let source = ws.tabs[0].root_pane.expect("test tab has root pane");
         let target = ws.test_split(Direction::Horizontal);
         ws.tabs[0].layout.focus_pane(source);
         app.state.workspaces = vec![ws];
@@ -2418,7 +2445,7 @@ mod tests {
     async fn right_click_passthrough_requires_exact_modifier_match() {
         let mut app = app_for_mouse_test();
         let mut ws = Workspace::test_new("test");
-        let pane_id = ws.tabs[0].root_pane;
+        let pane_id = ws.tabs[0].root_pane.expect("test tab has root pane");
         let pane_infos = ws.tabs[0].layout.panes(Rect::new(26, 2, 80, 18));
         let info = pane_infos[0].clone();
         let (runtime, mut input_rx) =
@@ -2456,7 +2483,7 @@ mod tests {
     async fn right_click_passthrough_does_not_forward_pane_frame_clicks() {
         let mut app = app_for_mouse_test();
         let mut ws = Workspace::test_new("test");
-        let pane_id = ws.tabs[0].root_pane;
+        let pane_id = ws.tabs[0].root_pane.expect("test tab has root pane");
         let other_pane = ws.test_split(Direction::Vertical);
         app.state.workspaces = vec![ws];
         app.state.active = Some(0);
@@ -2558,7 +2585,9 @@ mod tests {
         let mut app = app_for_mouse_test();
         let active = Workspace::test_new("active");
         let mut background = Workspace::test_new("background");
-        let first_pane = background.tabs[0].root_pane;
+        let first_pane = background.tabs[0]
+            .root_pane
+            .expect("test tab has root pane");
         let target_pane = background.test_split(Direction::Horizontal);
         background.tabs[0].layout.focus_pane(first_pane);
 
@@ -2609,7 +2638,11 @@ mod tests {
         assert_eq!(app.state.active, Some(0));
         assert_eq!(
             app.state.workspaces[0].focused_pane_id(),
-            Some(app.state.workspaces[0].tabs[0].root_pane)
+            Some(
+                app.state.workspaces[0].tabs[0]
+                    .root_pane
+                    .expect("test tab has root pane")
+            )
         );
     }
 
@@ -2618,7 +2651,9 @@ mod tests {
         let mut app = app_for_mouse_test();
         let active = Workspace::test_new("active");
         let background = Workspace::test_new("background");
-        let target_pane = background.tabs[0].root_pane;
+        let target_pane = background.tabs[0]
+            .root_pane
+            .expect("test tab has root pane");
         let workspace_id = background.id.clone();
 
         app.state.workspaces = vec![active, background];
@@ -2917,7 +2952,9 @@ mod tests {
         app.state.terminals.insert(terminal.id.clone(), terminal);
         app.state.active = Some(0);
         app.state.selected = 0;
-        let pane_id = app.state.workspaces[0].tabs[0].root_pane;
+        let pane_id = app.state.workspaces[0].tabs[0]
+            .root_pane
+            .expect("test tab has root pane");
         let runtime_count = app.terminal_runtimes.len();
         app.state.context_menu = Some(ContextMenuState {
             kind: ContextMenuKind::Pane {
@@ -3189,7 +3226,7 @@ mod tests {
     async fn dragging_vertical_pane_split_still_resizes_when_pane_mouse_reporting_is_enabled() {
         let mut app = app_for_mouse_test();
         let mut ws = Workspace::test_new("test");
-        let first_pane = ws.tabs[0].root_pane;
+        let first_pane = ws.tabs[0].root_pane.expect("test tab has root pane");
         let second_pane = ws.test_split(Direction::Vertical);
 
         app.state.workspaces = vec![ws];
@@ -3258,7 +3295,7 @@ mod tests {
     async fn dragging_horizontal_pane_split_still_resizes_when_pane_mouse_reporting_is_enabled() {
         let mut app = app_for_mouse_test();
         let mut ws = Workspace::test_new("test");
-        let first_pane = ws.tabs[0].root_pane;
+        let first_pane = ws.tabs[0].root_pane.expect("test tab has root pane");
         let second_pane = ws.test_split(Direction::Horizontal);
 
         app.state.workspaces = vec![ws];
@@ -3445,7 +3482,7 @@ mod tests {
     fn clicking_pane_context_menu_close_leaves_context_menu_mode() {
         let mut app = app_for_mouse_test();
         let mut ws = Workspace::test_new("one");
-        let first_pane = ws.tabs[0].root_pane;
+        let first_pane = ws.tabs[0].root_pane.expect("test tab has root pane");
         let second_pane = ws.test_split(Direction::Horizontal);
         ws.tabs[0].layout.focus_pane(second_pane);
         app.state.workspaces = vec![ws];
@@ -3497,7 +3534,7 @@ mod tests {
     fn clicking_pane_context_menu_close_last_parent_group_pane_keeps_confirmation_mode() {
         let mut app = app_for_mouse_test();
         let mut parent = Workspace::test_new("main");
-        let pane_id = parent.tabs[0].root_pane;
+        let pane_id = parent.tabs[0].root_pane.expect("test tab has root pane");
         mark_worktree_space_member(&mut parent, 0, "repo-key");
         let mut child = Workspace::test_new("issue");
         mark_worktree_space_member(&mut child, 1, "repo-key");

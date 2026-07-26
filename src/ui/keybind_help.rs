@@ -159,6 +159,21 @@ pub(super) fn keybind_help_groups(app: &AppState) -> Vec<HelpGroup> {
     ];
     groups.push(("panes", panes));
 
+    groups.push((
+        "terminal collections",
+        vec![
+            help_entry("↑ / ↓ / j / k", "select member in list mode"),
+            help_entry("space", "expand or collapse preview"),
+            help_entry("enter", "enter selected terminal"),
+            help_entry("esc / prefix", "return to collection list"),
+            help_entry("z", "maximize or restore member"),
+            help_entry("+ / -", "resize selected preview"),
+            help_entry("ctrl+↑ / ctrl+↓", "reorder member"),
+            help_entry("a / o / x", "archive / move out / close member"),
+            help_entry("shift+x", "close collection"),
+        ],
+    ));
+
     if !kb.custom_commands.is_empty() {
         groups.push((
             "custom",

@@ -1014,7 +1014,7 @@ mod tests {
     ) -> (App, crate::layout::PaneId) {
         let mut app = app_for_mouse_test();
         let mut ws = Workspace::test_new("test");
-        let pane_id = ws.tabs[0].root_pane;
+        let pane_id = ws.tabs[0].root_pane.expect("test tab has root pane");
         let pane_infos = ws.tabs[0].layout.panes(Rect::new(0, 0, 20, 5));
         let info = pane_infos[0].clone();
         ws.tabs[0].runtimes.insert(
@@ -1052,7 +1052,7 @@ mod tests {
     ) -> (App, crate::layout::PaneId, crate::layout::PaneId) {
         let mut app = app_for_mouse_test();
         let mut ws = Workspace::test_new("test");
-        let first_pane = ws.tabs[0].root_pane;
+        let first_pane = ws.tabs[0].root_pane.expect("test tab has root pane");
         let second_pane = ws.test_split(ratatui::layout::Direction::Horizontal);
         let pane_infos = ws.tabs[0].layout.panes(Rect::new(0, 0, 40, 5));
         let first_info = pane_infos
@@ -1304,7 +1304,9 @@ mod tests {
     async fn copy_mode_clears_when_source_tab_closes_after_focus_away() {
         let (mut app, first_pane, _) = app_with_split_copy_screen(b"alpha\nbeta\n");
         let survivor_tab = app.state.workspaces[0].test_add_tab(Some("survivor"));
-        let survivor_pane = app.state.workspaces[0].tabs[survivor_tab].root_pane;
+        let survivor_pane = app.state.workspaces[0].tabs[survivor_tab]
+            .root_pane
+            .expect("test tab has root pane");
         let survivor_terminal = app.state.workspaces[0].tabs[survivor_tab].panes[&survivor_pane]
             .attached_terminal_id
             .clone();

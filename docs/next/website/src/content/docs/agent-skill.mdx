@@ -20,6 +20,9 @@ With the skill installed, an agent can:
 - read pane output and recent logs
 - wait for servers, tests, or another agent to finish
 - start helper agents in sibling panes
+- organize helper PTYs in one collection without stealing focus
+- record delegation parentage and purpose independently of placement
+- preserve human attention and choose explicit archive or close outcomes
 
 The skill is not a separate app or service. It is a markdown instruction file for agents.
 
@@ -58,7 +61,9 @@ This prevents an agent outside Herdr from trying to control a session it does no
 
 ## Agent-facing reference
 
-The full command guide lives in the skill file itself. It covers pane IDs, `pane split`, `pane run`, `pane read`, `pane wait-output`, `agent wait`, workspace and tab commands, and coordination recipes.
+The command guide lives in the skill file itself. It covers pane IDs, `pane split`, `pane run`, `pane read`, `pane wait-output`, `agent wait`, workspace and tab commands, and coordination recipes.
+
+For collections, also follow [Grouped agent orchestration](/docs/agent-automation/#grouped-agent-orchestration): reuse a helper collection, create provenance explicitly, preserve focus, do not treat `done`/`idle` as proof of success, archive only after handling results, and promote rather than cascade-close when terminals should survive. The installed binary is authoritative for exact `collection` and `delegation` syntax.
 
 Read the source file here:
 

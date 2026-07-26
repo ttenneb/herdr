@@ -250,7 +250,7 @@ async fn retained_update_falls_back_for_mixed_app_geometry() {
 fn stream_set_has_graphics_only_render_impact() {
     let mut server = test_headless_server();
     let workspace = crate::workspace::Workspace::test_new("graphics");
-    let pane_id = workspace.tabs[0].root_pane;
+    let pane_id = workspace.tabs[0].root_pane.expect("test tab has root pane");
     let public_pane_id = format!("{}:p1", workspace.id);
     server.app.state.workspaces = vec![workspace];
     server.app.state.active = Some(0);
@@ -333,7 +333,7 @@ fn stream_set_has_graphics_only_render_impact() {
 fn rejected_or_stale_requests_do_not_schedule_rendering() {
     let mut server = test_headless_server();
     let workspace = crate::workspace::Workspace::test_new("graphics");
-    let pane_id = workspace.tabs[0].root_pane;
+    let pane_id = workspace.tabs[0].root_pane.expect("test tab has root pane");
     let public_pane_id = format!("{}:p1", workspace.id);
     server.app.state.workspaces = vec![workspace];
     server.app.state.active = Some(0);

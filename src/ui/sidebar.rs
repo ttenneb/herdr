@@ -24,6 +24,12 @@ pub(crate) struct AgentPanelEntry {
     pub ws_idx: usize,
     pub tab_idx: usize,
     pub pane_id: crate::layout::PaneId,
+    /// Delegation-tree presentation metadata. Roots are emphasized; ordinary descendants are
+    /// collapsed unless selected or urgent, while their attention rolls up to the root.
+    pub depth: usize,
+    pub is_delegation_root: bool,
+    pub external_parent: bool,
+    pub hidden_descendants: usize,
     pub primary_label: String,
     pub primary_tab_label: Option<String>,
     pub pane_label: Option<String>,
@@ -130,7 +136,7 @@ fn agent_panel_entries_with_runtimes(
 ) -> Vec<AgentPanelEntry> {
     let mut entries = collect_agent_panel_entries_with_runtimes(app, terminal_runtimes);
     crate::app::agent_view::apply_agent_view(app, &mut entries);
-    entries
+    hierarchical_agent_projection(app, entries)
 }
 
 fn collect_agent_panel_entries_with_runtimes(
@@ -164,6 +170,10 @@ fn collect_agent_panel_entries_with_runtimes(
                         ws_idx,
                         tab_idx: detail.tab_idx,
                         pane_id: detail.pane_id,
+                        depth: 0,
+                        is_delegation_root: false,
+                        external_parent: false,
+                        hidden_descendants: 0,
                         primary_label: workspace_label.clone(),
                         primary_tab_label: show_tab.then_some(detail.tab_label),
                         pane_label: detail.pane_label,
@@ -181,6 +191,114 @@ fn collect_agent_panel_entries_with_runtimes(
                 })
         })
         .collect()
+}
+
+fn hierarchical_agent_projection(
+    app: &AppState,
+    entries: Vec<AgentPanelEntry>,
+) -> Vec<AgentPanelEntry> {
+    use std::collections::{HashMap, HashSet};
+
+    let source_order: HashMap<_, _> = entries
+        .iter()
+        .enumerate()
+        .map(|(index, entry)| (entry.pane_id, index))
+        .collect();
+    let mut by_pane: HashMap<_, _> = entries
+        .into_iter()
+        .map(|entry| (entry.pane_id, entry))
+        .collect();
+    let included: HashSet<_> = by_pane
+        .keys()
+        .filter_map(|pane| {
+            app.delegations
+                .delegation_for_pane(*pane)
+                .map(|record| record.id)
+        })
+        .collect();
+    let projection = app.delegations.preorder_projection(&included);
+    let mut output: Vec<AgentPanelEntry> = Vec::with_capacity(by_pane.len());
+    let mut roots: HashMap<_, usize> = HashMap::new();
+
+    for projected in projection {
+        let Some(record) = app.delegations.get(projected.id) else {
+            continue;
+        };
+        let Some(pane_id) = record.pane_id else {
+            continue;
+        };
+        let Some(mut entry) = by_pane.remove(&pane_id) else {
+            continue;
+        };
+        entry.depth = projected.depth;
+        entry.is_delegation_root = projected.depth == 0;
+        entry.external_parent = projected.external_parent_id.is_some();
+        if projected.depth == 0 {
+            roots.insert(projected.id, output.len());
+            output.push(entry);
+            continue;
+        }
+
+        let root_id = app.delegations.root(projected.id).unwrap_or(projected.id);
+        let root_index = roots.get(&root_id).copied().or_else(|| {
+            // A filtered/external parent makes this branch a local display root.
+            output
+                .iter()
+                .rposition(|candidate| candidate.is_delegation_root)
+        });
+        if let Some(root_index) = root_index {
+            let priority = crate::app::api_helpers::tab_attention_priority(entry.state, entry.seen);
+            let root_priority = crate::app::api_helpers::tab_attention_priority(
+                output[root_index].state,
+                output[root_index].seen,
+            );
+            if priority > root_priority {
+                output[root_index].state = entry.state;
+                output[root_index].seen = entry.seen;
+            }
+            output[root_index].hidden_descendants =
+                output[root_index].hidden_descendants.saturating_add(1);
+        }
+
+        let selected = app
+            .workspaces
+            .get(entry.ws_idx)
+            .and_then(|ws| ws.tabs.get(entry.tab_idx))
+            .is_some_and(|tab| match tab.pane_placement(entry.pane_id) {
+                Some(crate::layout::PanePlacement::Collection(id)) => {
+                    tab.collection(id)
+                        .and_then(|collection| collection.selected())
+                        == Some(entry.pane_id)
+                }
+                Some(crate::layout::PanePlacement::Tiled) => {
+                    tab.layout.focused_leaf() == crate::layout::LayoutLeaf::Pane(entry.pane_id)
+                }
+                None => false,
+            });
+        let urgent =
+            entry.state == AgentState::Blocked || (entry.state == AgentState::Idle && !entry.seen);
+        if selected || urgent {
+            if let Some(root_index) = root_index {
+                output[root_index].hidden_descendants =
+                    output[root_index].hidden_descendants.saturating_sub(1);
+            }
+            output.push(entry);
+        }
+    }
+
+    // Agents without delegation metadata remain ordinary session roots in stable source order.
+    let mut ungrouped: Vec<_> = by_pane.into_values().collect();
+    ungrouped.sort_by_key(|entry| {
+        source_order
+            .get(&entry.pane_id)
+            .copied()
+            .unwrap_or(usize::MAX)
+    });
+    output.extend(ungrouped.into_iter().map(|mut entry| {
+        entry.is_delegation_root = true;
+        entry
+    }));
+    output
 }
 
 pub(super) fn agent_panel_status_key(state: AgentState, seen: bool) -> &'static str {
@@ -1384,10 +1502,10 @@ fn render_agent_detail(
         } else {
             Style::default()
         };
-        let name_style = if is_active {
+        let name_style = if is_active || detail.is_delegation_root {
             Style::default().fg(p.text).add_modifier(Modifier::BOLD)
         } else {
-            Style::default().fg(p.subtext0).add_modifier(Modifier::BOLD)
+            Style::default().fg(p.subtext0)
         };
         let status_style = if is_active {
             Style::default().fg(label_color)
@@ -1398,7 +1516,20 @@ fn render_agent_detail(
         let state_icon = agent_icon(detail.state, detail.seen, app.spinner_tick, p);
 
         for (row_index, resolved) in rows.iter().take(height as usize).enumerate() {
-            let mut spans = vec![Span::raw(if row_index == 0 { " " } else { "   " })];
+            let prefix = if row_index == 0 {
+                let indent = "  ".repeat(detail.depth.min(6));
+                let provenance = if detail.external_parent { "↰ " } else { "" };
+                let collapsed = if detail.is_delegation_root && detail.hidden_descendants > 0 {
+                    "▸ "
+                } else {
+                    ""
+                };
+                format!(" {indent}{provenance}{collapsed}")
+            } else {
+                format!("   {}", "  ".repeat(detail.depth.min(6)))
+            };
+            let prefix_width = display_width_u16(&prefix);
+            let mut spans = vec![Span::raw(prefix)];
             spans.extend(resolved_token_spans(
                 resolved,
                 state_icon,
@@ -1407,9 +1538,14 @@ fn render_agent_detail(
                 agent_style,
                 agent_style,
                 p,
-                body.width
-                    .saturating_sub(if row_index == 0 { 1 } else { 3 }) as usize,
+                body.width.saturating_sub(prefix_width) as usize,
             ));
+            if row_index == 0 && detail.hidden_descendants > 0 {
+                spans.push(Span::styled(
+                    format!("  +{}", detail.hidden_descendants),
+                    Style::default().fg(p.overlay0).add_modifier(Modifier::DIM),
+                ));
+            }
             frame.render_widget(
                 Paragraph::new(Line::from(spans)).style(row_style),
                 Rect::new(body.x, row_y + row_index as u16, body.width, 1),
@@ -1501,7 +1637,7 @@ mod tests {
     fn default_agent_rows_remove_redundant_state_text() {
         let mut app = crate::app::state::AppState::test_new();
         let workspace = Workspace::test_new("one");
-        let pane_id = workspace.tabs[0].root_pane;
+        let pane_id = workspace.tabs[0].root_pane.expect("test tab has root pane");
         app.workspaces = vec![workspace];
         app.ensure_test_terminals();
         app.active = Some(0);
@@ -1555,7 +1691,7 @@ rows = [[{ token = "workspace", bold = false }, { token = "agent", dim = false }
         let mut app = crate::app::state::AppState::test_new();
         app.sidebar_agents = config.ui.sidebar.agents;
         let workspace = Workspace::test_new("one");
-        let pane_id = workspace.tabs[0].root_pane;
+        let pane_id = workspace.tabs[0].root_pane.expect("test tab has root pane");
         app.workspaces = vec![workspace];
         app.ensure_test_terminals();
         app.active = Some(0);
@@ -1698,7 +1834,7 @@ rows = [[{ token = "git_status", fg = "#123456" }]]
         app.workspaces = vec![Workspace::test_new("one"), Workspace::test_new("two")];
         app.ensure_test_terminals();
         for (workspace, agent) in app.workspaces.iter().zip([Agent::Pi, Agent::Claude]) {
-            let pane_id = workspace.tabs[0].root_pane;
+            let pane_id = workspace.tabs[0].root_pane.expect("test tab has root pane");
             let terminal_id = workspace.tabs[0].panes[&pane_id]
                 .attached_terminal_id
                 .clone();
@@ -1727,7 +1863,9 @@ rows = [[{ token = "git_status", fg = "#123456" }]]
         let mut app = crate::app::state::AppState::test_new();
         let mut workspace = Workspace::test_new("very-long-workspace-name");
         let tab_idx = workspace.test_add_tab(Some("logs"));
-        let pane_id = workspace.tabs[tab_idx].root_pane;
+        let pane_id = workspace.tabs[tab_idx]
+            .root_pane
+            .expect("test tab has root pane");
         app.workspaces = vec![workspace];
         app.ensure_test_terminals();
         let terminal_id = app.workspaces[0].tabs[tab_idx].panes[&pane_id]
@@ -1753,7 +1891,7 @@ rows = [[{ token = "git_status", fg = "#123456" }]]
     fn stripped_terminal_title_renders_with_unicode_width_truncation() {
         let mut app = crate::app::state::AppState::test_new();
         let workspace = Workspace::test_new("one");
-        let pane_id = workspace.tabs[0].root_pane;
+        let pane_id = workspace.tabs[0].root_pane.expect("test tab has root pane");
         app.workspaces = vec![workspace];
         app.ensure_test_terminals();
         let terminal_id = app.workspaces[0].tabs[0].panes[&pane_id]
@@ -1807,13 +1945,15 @@ rows = [[{ token = "git_status", fg = "#123456" }]]
         ];
         app.ensure_test_terminals();
         for workspace in &app.workspaces {
-            let pane_id = workspace.tabs[0].root_pane;
+            let pane_id = workspace.tabs[0].root_pane.expect("test tab has root pane");
             let terminal_id = workspace.tabs[0].panes[&pane_id]
                 .attached_terminal_id
                 .clone();
             app.terminals.get_mut(&terminal_id).unwrap().detected_agent = Some(Agent::Pi);
         }
-        let first_pane = app.workspaces[0].tabs[0].root_pane;
+        let first_pane = app.workspaces[0].tabs[0]
+            .root_pane
+            .expect("test tab has root pane");
         let first_terminal = app.workspaces[0].tabs[0].panes[&first_pane]
             .attached_terminal_id
             .clone();
@@ -1863,7 +2003,7 @@ rows = [[{ token = "git_status", fg = "#123456" }]]
     fn oversized_agent_override_is_clipped_to_the_panel_body() {
         let mut app = crate::app::state::AppState::test_new();
         let workspace = Workspace::test_new("one");
-        let pane_id = workspace.tabs[0].root_pane;
+        let pane_id = workspace.tabs[0].root_pane.expect("test tab has root pane");
         app.workspaces = vec![workspace];
         app.ensure_test_terminals();
         let terminal_id = app.workspaces[0].tabs[0].panes[&pane_id]
@@ -1931,7 +2071,9 @@ rows = [[{ token = "git_status", fg = "#123456" }]]
             (2, 0, Agent::Codex),
             (2, 1, Agent::Pi),
         ] {
-            let pane_id = app.workspaces[ws_idx].tabs[tab_idx].root_pane;
+            let pane_id = app.workspaces[ws_idx].tabs[tab_idx]
+                .root_pane
+                .expect("test tab has root pane");
             let terminal_id = app.workspaces[ws_idx].tabs[tab_idx].panes[&pane_id]
                 .attached_terminal_id
                 .clone();
@@ -1975,7 +2117,9 @@ rows = [[{ token = "git_status", fg = "#123456" }]]
         app.agent_panel_sort = crate::app::state::AgentPanelSort::Priority;
 
         let set_state = |app: &mut crate::app::state::AppState, ws_idx: usize, state| {
-            let pane = app.workspaces[ws_idx].tabs[0].root_pane;
+            let pane = app.workspaces[ws_idx].tabs[0]
+                .root_pane
+                .expect("test tab has root pane");
             let terminal_id = app.workspaces[ws_idx].tabs[0].panes[&pane]
                 .attached_terminal_id
                 .clone();
@@ -1988,7 +2132,9 @@ rows = [[{ token = "git_status", fg = "#123456" }]]
         set_state(&mut app, 2, AgentState::Working);
         set_state(&mut app, 3, AgentState::Blocked);
 
-        let done_pane = app.workspaces[1].tabs[0].root_pane;
+        let done_pane = app.workspaces[1].tabs[0]
+            .root_pane
+            .expect("test tab has root pane");
         app.workspaces[1].tabs[0]
             .panes
             .get_mut(&done_pane)
@@ -2004,13 +2150,58 @@ rows = [[{ token = "git_status", fg = "#123456" }]]
     }
 
     #[test]
+    fn delegation_projection_collapses_quiet_descendants_and_rolls_up_urgent_state() {
+        let mut app = crate::app::state::AppState::test_new();
+        let mut workspace = Workspace::test_new("tree");
+        let root = workspace.tabs[0].root_pane.expect("root pane");
+        let quiet = workspace.test_split(ratatui::layout::Direction::Horizontal);
+        let urgent = workspace.test_split(ratatui::layout::Direction::Horizontal);
+        app.workspaces = vec![workspace];
+        app.ensure_test_terminals();
+        app.active = Some(0);
+        for (pane, state) in [
+            (root, AgentState::Working),
+            (quiet, AgentState::Working),
+            (urgent, AgentState::Blocked),
+        ] {
+            let terminal_id = app.workspaces[0].tabs[0].panes[&pane]
+                .attached_terminal_id
+                .clone();
+            let terminal = app.terminals.get_mut(&terminal_id).expect("terminal");
+            terminal.detected_agent = Some(Agent::Claude);
+            terminal.state = state;
+        }
+        let root_delegation = app
+            .delegations
+            .create(Some(root), None, Some("primary".into()))
+            .expect("root delegation");
+        app.delegations
+            .create(Some(quiet), Some(root_delegation), Some("quiet".into()))
+            .expect("quiet delegation");
+        app.delegations
+            .create(Some(urgent), Some(root_delegation), Some("urgent".into()))
+            .expect("urgent delegation");
+
+        let entries = agent_panel_entries(&app);
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].pane_id, root);
+        assert!(entries[0].is_delegation_root);
+        assert_eq!(entries[0].hidden_descendants, 1);
+        assert_eq!(entries[0].state, AgentState::Blocked);
+        assert_eq!(entries[1].pane_id, urgent);
+        assert_eq!(entries[1].depth, 1);
+    }
+
+    #[test]
     fn collapsed_sidebar_numbers_grouped_agents_by_list_position() {
         let mut app = crate::app::state::AppState::test_new();
         app.workspaces = vec![Workspace::test_new("one"), Workspace::test_new("two")];
         app.ensure_test_terminals();
 
         for ws_idx in 0..app.workspaces.len() {
-            let pane = app.workspaces[ws_idx].tabs[0].root_pane;
+            let pane = app.workspaces[ws_idx].tabs[0]
+                .root_pane
+                .expect("test tab has root pane");
             let terminal_id = app.workspaces[ws_idx].tabs[0].panes[&pane]
                 .attached_terminal_id
                 .clone();
@@ -2040,7 +2231,9 @@ rows = [[{ token = "git_status", fg = "#123456" }]]
         app.ensure_test_terminals();
 
         for ws_idx in 0..app.workspaces.len() {
-            let pane = app.workspaces[ws_idx].tabs[0].root_pane;
+            let pane = app.workspaces[ws_idx].tabs[0]
+                .root_pane
+                .expect("test tab has root pane");
             let terminal_id = app.workspaces[ws_idx].tabs[0].panes[&pane]
                 .attached_terminal_id
                 .clone();
@@ -2066,9 +2259,9 @@ rows = [[{ token = "git_status", fg = "#123456" }]]
     #[test]
     fn collapsed_sidebar_numbers_priority_agents_by_list_position() {
         let first = Workspace::test_new("one");
-        let first_pane = first.tabs[0].root_pane;
+        let first_pane = first.tabs[0].root_pane.expect("test tab has root pane");
         let mut second = Workspace::test_new("two");
-        let second_pane = second.tabs[0].root_pane;
+        let second_pane = second.tabs[0].root_pane.expect("test tab has root pane");
         let urgent_pane = second.test_split(ratatui::layout::Direction::Horizontal);
 
         let mut app = crate::app::state::AppState::test_new();
@@ -2132,7 +2325,7 @@ rows = [[{ token = "git_status", fg = "#123456" }]]
         let mut workspace = Workspace::test_new("stale-name");
         workspace.custom_name = None;
         workspace.identity_cwd = stale_cwd.clone();
-        let pane = workspace.tabs[0].root_pane;
+        let pane = workspace.tabs[0].root_pane.expect("test tab has root pane");
 
         app.workspaces = vec![workspace];
         app.ensure_test_terminals();
@@ -2183,7 +2376,7 @@ rows = [[{ token = "git_status", fg = "#123456" }]]
     fn all_workspaces_agent_panel_entries_prefer_agent_names_for_agent_identity() {
         let mut app = crate::app::state::AppState::test_new();
         let workspace = Workspace::test_new("bridge");
-        let first_pane = workspace.tabs[0].root_pane;
+        let first_pane = workspace.tabs[0].root_pane.expect("test tab has root pane");
 
         app.workspaces = vec![workspace];
         app.ensure_test_terminals();
