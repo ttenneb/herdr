@@ -441,7 +441,7 @@ impl App {
         Ok((current.clone(), action.clone()))
     }
 
-    fn start_queued_context_menu_plugin_providers(&mut self) {
+    pub(crate) fn start_queued_context_menu_plugin_providers(&mut self) {
         loop {
             if self.state.plugin_action_choices_requests_in_flight.len()
                 >= runtime::MAX_PLUGIN_ACTION_CHOICES_PROVIDERS_IN_FLIGHT
@@ -513,30 +513,13 @@ impl App {
             .cloned()
             .collect::<Vec<_>>();
         for request_id in &request_ids {
-            if let Some(cancellation) = self.plugin_choice_provider_cancellations.remove(request_id)
-            {
-                cancellation
-                    .signal
-                    .store(true, std::sync::atomic::Ordering::Release);
-                if let Some(log) = self
-                    .state
-                    .plugin_command_logs
-                    .iter_mut()
-                    .find(|log| log.log_id == cancellation.log_id)
-                {
-                    log.finished_unix_ms = Some(runtime::current_unix_ms());
-                    log.error = Some("choices provider cancelled".to_string());
-                    log.status = crate::api::schema::PluginCommandStatus::Failed;
-                }
+            if let Some(cancellation) = self.plugin_choice_provider_cancellations.get(request_id) {
+                cancellation.cancel();
             }
-            self.state
-                .plugin_action_choices_requests_in_flight
-                .remove(request_id);
         }
-        self.state.plugin_action_choices_providers_in_flight = self
-            .state
-            .plugin_action_choices_providers_in_flight
-            .saturating_sub(request_ids.len());
+        // Keep cancelled providers admitted until their completion events confirm
+        // process cleanup. Releasing these slots while workers are still exiting
+        // would let rapidly reopened menus exceed the global process limit.
     }
 
     pub(crate) fn cancel_open_context_menu_plugin_generation(&mut self) {

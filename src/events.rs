@@ -164,7 +164,11 @@ pub enum AppEvent {
         stdout: String,
         stderr: String,
         result: Result<crate::api::schema::PluginActionChoices, String>,
+        /// The provider result is complete, but its process is still being reaped.
+        cleanup_pending: bool,
     },
+    /// Deferred process cleanup for a choices provider finished.
+    PluginActionChoicesCleanupFinished { request_id: String },
     /// Background `git worktree add` completed.
     WorktreeAddFinished(Box<WorktreeAddResult>),
     /// Background `git worktree remove` completed.

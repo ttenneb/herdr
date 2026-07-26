@@ -1266,7 +1266,7 @@ fn install_preview_lines(
             let contexts = choice_provider_contexts(&action.contexts);
             let platforms = choice_provider_platforms(&action.platforms, &plugin.platforms);
             lines.push(format!(
-                "    choices provider for action {} (runs automatically when matching context menus open; contexts: {contexts}; platforms: {platforms}): {}",
+                "    choices provider for action {} (runs automatically when eligible matching context menus open, up to 8 providers per menu; contexts: {contexts}; platforms: {platforms}): {}",
                 action.id,
                 command.join(" ")
             ));
@@ -1827,8 +1827,8 @@ mod tests {
         assert_eq!(
             provider_lines,
             [
-                "    choices provider for action inherited (runs automatically when matching context menus open; contexts: workspace, pane; platforms: linux, macos): list-inherited",
-                "    choices provider for action override (runs automatically when matching context menus open; contexts: tab; platforms: windows): list-override",
+                "    choices provider for action inherited (runs automatically when eligible matching context menus open, up to 8 providers per menu; contexts: workspace, pane; platforms: linux, macos): list-inherited",
+                "    choices provider for action override (runs automatically when eligible matching context menus open, up to 8 providers per menu; contexts: tab; platforms: windows): list-override",
             ]
         );
     }
@@ -1850,7 +1850,7 @@ mod tests {
 
         let lines = install_preview_lines(&plugin, &source, None);
 
-        assert!(lines.iter().any(|line| line == "    choices provider for action all-platforms (runs automatically when matching context menus open; contexts: pane; platforms: linux, macos, windows): list-all"));
+        assert!(lines.iter().any(|line| line == "    choices provider for action all-platforms (runs automatically when eligible matching context menus open, up to 8 providers per menu; contexts: pane; platforms: linux, macos, windows): list-all"));
     }
 
     #[test]

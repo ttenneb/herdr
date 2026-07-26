@@ -96,9 +96,33 @@ impl PaneClickState {
     }
 }
 
+#[derive(Clone)]
 pub(crate) struct PluginChoiceProviderCancellation {
     pub(crate) signal: Arc<AtomicBool>,
-    pub(crate) log_id: String,
+    spawn_gate: Arc<std::sync::Mutex<()>>,
+}
+
+impl PluginChoiceProviderCancellation {
+    pub(crate) fn new() -> Self {
+        Self {
+            signal: Arc::new(AtomicBool::new(false)),
+            spawn_gate: Arc::new(std::sync::Mutex::new(())),
+        }
+    }
+
+    pub(crate) fn cancel(&self) {
+        let _gate = self
+            .spawn_gate
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        self.signal.store(true, Ordering::Release);
+    }
+
+    pub(crate) fn lock_spawn(&self) -> std::sync::MutexGuard<'_, ()> {
+        self.spawn_gate
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
 }
 
 pub struct App {

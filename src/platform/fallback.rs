@@ -9,9 +9,12 @@ pub fn raise_server_nofile_limit() {}
 pub(crate) struct ProcessIsolation;
 
 pub(crate) fn spawn_isolated_process_platform(
-    command: &mut Command,
+    _command: &mut Command,
 ) -> std::io::Result<(Child, ProcessIsolation)> {
-    command.spawn().map(|child| (child, ProcessIsolation))
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "isolated plugin choice providers are unsupported on this platform",
+    ))
 }
 
 pub(crate) fn terminate_isolated_process_platform(

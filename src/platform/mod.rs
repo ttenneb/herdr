@@ -56,6 +56,7 @@ impl IsolatedChild {
         let (mut child, mut isolation) = spawn_isolated_process_platform(command)?;
         if let Err(error) = configure_isolated_output_platform(&child) {
             let _ = terminate_isolated_process_platform(&mut child, &mut isolation);
+            let _ = child.wait();
             return Err(error);
         }
         Ok(Self { child, isolation })
@@ -83,6 +84,14 @@ impl IsolatedChild {
 
     pub(crate) fn terminate_tree(&mut self) -> std::io::Result<()> {
         terminate_isolated_process_platform(&mut self.child, &mut self.isolation)
+    }
+
+    /// Finish teardown after the bounded provider-result path has completed.
+    /// Callers run this on their existing worker thread and retain admission
+    /// capacity until it returns.
+    pub(crate) fn reap(mut self) {
+        let _ = self.terminate_tree();
+        let _ = self.child.wait();
     }
 }
 

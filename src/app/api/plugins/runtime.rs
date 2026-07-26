@@ -295,33 +295,42 @@ impl App {
         self.state
             .plugin_action_choices_requests_in_flight
             .insert(request_id.clone());
-        let cancellation = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-        self.plugin_choice_provider_cancellations.insert(
-            request_id.clone(),
-            crate::app::PluginChoiceProviderCancellation {
-                signal: cancellation.clone(),
-                log_id: log_id.clone(),
-            },
-        );
+        let cancellation = crate::app::PluginChoiceProviderCancellation::new();
+        self.plugin_choice_provider_cancellations
+            .insert(request_id.clone(), cancellation.clone());
 
         let event_tx = self.event_tx.clone();
         std::thread::spawn(move || {
             let mut command = crate::plugin_command::command_for_argv(&program, &args);
             configure_plugin_command(&mut command, &plugin_root, &env);
             command.stdin(Stdio::null());
-            let completion = run_choices_provider(command, &cancellation);
+            let ChoicesProviderCompletion {
+                exit_code,
+                stdout,
+                stderr,
+                result,
+                deferred_reap,
+            } = run_choices_provider(command, &cancellation);
+            let cleanup_pending = deferred_reap.is_some();
             let event = crate::events::AppEvent::PluginActionChoicesFinished {
-                request_id,
+                request_id: request_id.clone(),
                 plugin_id,
                 action_id,
                 log_id,
                 finished_unix_ms: current_unix_ms(),
-                exit_code: completion.exit_code,
-                stdout: completion.stdout,
-                stderr: completion.stderr,
-                result: completion.result,
+                exit_code,
+                stdout,
+                stderr,
+                result,
+                cleanup_pending,
             };
             let _ = event_tx.blocking_send(event);
+            if let Some(child) = deferred_reap {
+                child.reap();
+                let _ = event_tx.blocking_send(
+                    crate::events::AppEvent::PluginActionChoicesCleanupFinished { request_id },
+                );
+            }
         });
 
         Ok(log)
@@ -503,12 +512,27 @@ struct ChoicesProviderCompletion {
     stdout: String,
     stderr: String,
     result: Result<crate::api::schema::PluginActionChoices, String>,
+    deferred_reap: Option<crate::platform::IsolatedChild>,
 }
 
 fn run_choices_provider(
     mut command: Command,
-    cancellation: &std::sync::atomic::AtomicBool,
+    cancellation: &crate::app::PluginChoiceProviderCancellation,
 ) -> ChoicesProviderCompletion {
+    let spawn_gate = cancellation.lock_spawn();
+    if cancellation
+        .signal
+        .load(std::sync::atomic::Ordering::Acquire)
+    {
+        drop(spawn_gate);
+        return ChoicesProviderCompletion {
+            exit_code: None,
+            stdout: String::new(),
+            stderr: String::new(),
+            result: Err("choices provider cancelled".to_string()),
+            deferred_reap: None,
+        };
+    }
     let mut child = match crate::platform::IsolatedChild::spawn(&mut command) {
         Ok(child) => child,
         Err(err) => {
@@ -517,9 +541,11 @@ fn run_choices_provider(
                 stdout: String::new(),
                 stderr: String::new(),
                 result: Err(format!("failed to spawn choices provider: {err}")),
+                deferred_reap: None,
             };
         }
     };
+    drop(spawn_gate);
     let mut stdout = BoundedOutput::default();
     let mut stderr = BoundedOutput::default();
     let mut buffer = [0_u8; 8192];
@@ -536,14 +562,21 @@ fn run_choices_provider(
                 break (Some(status), None);
             }
             Ok(None)
-                if !cancellation.load(std::sync::atomic::Ordering::Acquire)
+                if !cancellation
+                    .signal
+                    .load(std::sync::atomic::Ordering::Acquire)
                     && Instant::now() < deadline =>
             {
                 std::thread::sleep(Duration::from_millis(10));
             }
-            Ok(None) if cancellation.load(std::sync::atomic::Ordering::Acquire) => {
+            Ok(None)
+                if cancellation
+                    .signal
+                    .load(std::sync::atomic::Ordering::Acquire) =>
+            {
                 let termination_error = child.terminate_tree().err();
-                let status = child.wait().ok();
+                let status = reap_terminated_provider(&mut child);
+                drain_provider_output_available(&mut child, &mut stdout, &mut stderr, &mut buffer);
                 let message = termination_error.map_or_else(
                     || "choices provider cancelled".to_string(),
                     |err| format!("choices provider cancellation failed: {err}"),
@@ -597,6 +630,7 @@ fn run_choices_provider(
         stdout: stdout_log,
         stderr: stderr_log,
         result,
+        deferred_reap: status.is_none().then_some(child),
     }
 }
 

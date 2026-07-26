@@ -66,6 +66,11 @@ const FOREGROUND_PROCESS_SNAPSHOT_CACHE_TTL: Duration = Duration::from_millis(25
 
 pub(crate) struct ProcessIsolation(Option<HANDLE>);
 
+// SAFETY: ProcessIsolation exclusively owns the job handle. Windows kernel
+// handles may be used and closed from any thread, and the wrapper has no
+// thread-affine state.
+unsafe impl Send for ProcessIsolation {}
+
 impl Drop for ProcessIsolation {
     fn drop(&mut self) {
         if let Some(job) = self.0.take() {

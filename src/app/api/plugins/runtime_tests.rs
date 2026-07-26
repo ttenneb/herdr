@@ -63,7 +63,69 @@ fn shell(script: &str) -> ChoicesProviderCompletion {
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    run_choices_provider(command, &std::sync::atomic::AtomicBool::new(false))
+    run_choices_provider(
+        command,
+        &crate::app::PluginChoiceProviderCancellation::new(),
+    )
+}
+
+struct ProcessGuard(u32);
+
+impl ProcessGuard {
+    fn from_pid_file(path: &std::path::Path) -> Self {
+        let deadline = Instant::now() + Duration::from_secs(1);
+        loop {
+            if let Ok(pid) = std::fs::read_to_string(path) {
+                return Self(pid.trim().parse().unwrap());
+            }
+            assert!(
+                Instant::now() < deadline,
+                "descendant pid file was not written"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    fn assert_gone(&self) {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while process_exists(self.0) && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(
+            !process_exists(self.0),
+            "descendant {} survived cleanup",
+            self.0
+        );
+    }
+}
+
+impl Drop for ProcessGuard {
+    fn drop(&mut self) {
+        unsafe {
+            libc::kill(self.0 as i32, libc::SIGKILL);
+        }
+    }
+}
+
+fn process_exists(pid: u32) -> bool {
+    let result = unsafe { libc::kill(pid as i32, 0) };
+    result == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+}
+
+fn handle_provider_events_until_idle(app: &mut App) {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while app.state.plugin_action_choices_providers_in_flight > 0 {
+        match app.event_rx.try_recv() {
+            Ok(event) => app.handle_internal_event(event),
+            Err(tokio::sync::mpsc::error::TryRecvError::Empty) => {
+                assert!(Instant::now() < deadline, "provider cleanup did not finish");
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
+                panic!("provider event channel disconnected")
+            }
+        }
+    }
 }
 
 #[test]
@@ -99,26 +161,43 @@ fn provider_success_malformed_nonzero_and_spawn_failure() {
 
     let mut missing = Command::new("/definitely/missing/herdr-provider");
     missing.stdout(Stdio::piped()).stderr(Stdio::piped());
-    assert!(
-        run_choices_provider(missing, &std::sync::atomic::AtomicBool::new(false))
-            .result
-            .unwrap_err()
-            .contains("failed to spawn")
-    );
+    assert!(run_choices_provider(
+        missing,
+        &crate::app::PluginChoiceProviderCancellation::new(),
+    )
+    .result
+    .unwrap_err()
+    .contains("failed to spawn"));
 }
 
 #[test]
 fn provider_timeout_terminates_process_group() {
+    let root = root("choices-timeout-tree");
+    let pid_file = root.join("descendant.pid");
     let started = Instant::now();
-    let result = shell("sleep 30 & wait").result.unwrap_err();
+    let result = shell(&format!(
+        "sleep 30 & echo $! > {}; wait",
+        pid_file.display()
+    ))
+    .result
+    .unwrap_err();
+    let descendant = ProcessGuard::from_pid_file(&pid_file);
     assert!(started.elapsed() < Duration::from_secs(5));
     assert!(result.contains("timed out after 2 seconds"));
+    descendant.assert_gone();
+    std::fs::remove_dir_all(root).ok();
 }
 
 #[test]
 fn provider_completion_kills_descendant_that_retains_output_pipes() {
+    let root = root("choices-completion-tree");
+    let pid_file = root.join("descendant.pid");
     let started = Instant::now();
-    let completion = shell(r#"sleep 30 & printf '%s' '{"version":1,"choices":[]}'"#);
+    let completion = shell(&format!(
+        r#"sleep 30 & echo $! > {}; printf '%s' '{{"version":1,"choices":[]}}'"#,
+        pid_file.display()
+    ));
+    let descendant = ProcessGuard::from_pid_file(&pid_file);
 
     assert!(
         started.elapsed() < Duration::from_secs(3),
@@ -126,13 +205,21 @@ fn provider_completion_kills_descendant_that_retains_output_pipes() {
     );
     assert_eq!(completion.exit_code, Some(0));
     assert!(completion.result.is_ok(), "{:?}", completion.result);
+    descendant.assert_gone();
+    std::fs::remove_dir_all(root).ok();
 }
 
 #[cfg(target_os = "linux")]
 #[test]
 fn provider_completion_does_not_wait_for_escaped_descendant_pipes() {
+    let root = root("choices-escaped-completion");
+    let pid_file = root.join("descendant.pid");
     let started = Instant::now();
-    let completion = shell(r#"setsid sh -c 'sleep 5' & printf '%s' '{"version":1,"choices":[]}'"#);
+    let completion = shell(&format!(
+        r#"setsid sh -c 'echo $$ > {}; sleep 30' & printf '%s' '{{"version":1,"choices":[]}}'"#,
+        pid_file.display()
+    ));
+    let _descendant = ProcessGuard::from_pid_file(&pid_file);
 
     assert!(
         started.elapsed() < Duration::from_secs(3),
@@ -140,21 +227,29 @@ fn provider_completion_does_not_wait_for_escaped_descendant_pipes() {
     );
     assert_eq!(completion.exit_code, Some(0));
     assert!(completion.result.is_ok(), "{:?}", completion.result);
+    std::fs::remove_dir_all(root).ok();
 }
 
 #[cfg(target_os = "linux")]
 #[test]
 fn provider_timeout_does_not_wait_for_escaped_descendant_pipes() {
+    let root = root("choices-escaped-timeout");
+    let pid_file = root.join("descendant.pid");
     let started = Instant::now();
-    let result = shell(r#"setsid sh -c 'sleep 5' & wait"#)
-        .result
-        .unwrap_err();
+    let result = shell(&format!(
+        r#"setsid sh -c 'echo $$ > {}; sleep 30' & wait"#,
+        pid_file.display()
+    ))
+    .result
+    .unwrap_err();
+    let _descendant = ProcessGuard::from_pid_file(&pid_file);
 
     assert!(
         started.elapsed() < Duration::from_secs(4),
         "provider timeout waited for an escaped descendant pipe"
     );
     assert!(result.contains("timed out after 2 seconds"));
+    std::fs::remove_dir_all(root).ok();
 }
 
 #[test]
@@ -223,6 +318,7 @@ fn provider_is_async_correlated_and_accounted() {
 #[test]
 fn escaped_descendant_pipes_do_not_hold_provider_capacity() {
     let root = root("choices-escaped-capacity");
+    let pid_file = root.join("descendant.pid");
     let plugin = plugin(&root);
     let mut app = test_app();
     let started = Instant::now();
@@ -233,13 +329,17 @@ fn escaped_descendant_pipes_do_not_hold_provider_capacity() {
         vec![
             "sh".into(),
             "-c".into(),
-            r#"setsid sh -c 'sleep 5' & printf '{"version":1,"choices":[]}'"#.into(),
+            format!(
+                r#"setsid sh -c 'echo $$ > {}; sleep 30' & printf '{{"version":1,"choices":[]}}'"#,
+                pid_file.display()
+            ),
         ],
         &context(),
     )
     .unwrap();
 
     let event = app.event_rx.blocking_recv().unwrap();
+    let _descendant = ProcessGuard::from_pid_file(&pid_file);
     assert!(
         started.elapsed() < Duration::from_secs(3),
         "escaped output pipes held provider capacity"
@@ -312,6 +412,7 @@ fn provider_completion_accounting_survives_log_eviction_and_duplicates() {
             version: 1,
             choices: vec![],
         }),
+        cleanup_pending: false,
     });
     assert_eq!(app.state.plugin_action_choices_providers_in_flight, 0);
     assert!(app
@@ -361,7 +462,7 @@ fn provider_admission_is_dedicated_and_bounded_to_four() {
 }
 
 #[test]
-fn dismiss_and_reopen_releases_full_provider_capacity_immediately() {
+fn dismiss_and_reopen_releases_capacity_only_after_cancelled_workers_finish() {
     use crate::app::state::{
         ContextMenuKind, ContextMenuPluginState, ContextMenuState, ContextMenuTarget, Mode,
     };
@@ -393,17 +494,48 @@ fn dismiss_and_reopen_releases_full_provider_capacity_immediately() {
 
     app.handle_context_menu_key_via_api(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
 
+    assert_eq!(
+        app.state.plugin_action_choices_providers_in_flight,
+        MAX_PLUGIN_ACTION_CHOICES_PROVIDERS_IN_FLIGHT
+    );
+    assert_eq!(
+        app.state.plugin_action_choices_requests_in_flight.len(),
+        MAX_PLUGIN_ACTION_CHOICES_PROVIDERS_IN_FLIGHT
+    );
+    assert_eq!(
+        app.plugin_choice_provider_cancellations.len(),
+        MAX_PLUGIN_ACTION_CHOICES_PROVIDERS_IN_FLIGHT
+    );
+    let rejected_while_cancelling = app.start_plugin_action_choices_provider(
+        "context-menu-12-too-early".into(),
+        &plugin,
+        "choose".into(),
+        vec!["sh".into(), "-c".into(), "exit 0".into()],
+        &context(),
+    );
+    assert!(matches!(
+        rejected_while_cancelling,
+        Err(("plugin_action_choices_provider_limit_reached", _))
+    ));
+    handle_provider_events_until_idle(&mut app);
     assert_eq!(app.state.plugin_action_choices_providers_in_flight, 0);
     assert!(app
         .state
         .plugin_action_choices_requests_in_flight
         .is_empty());
     assert!(app.plugin_choice_provider_cancellations.is_empty());
-    assert!(app.state.plugin_command_logs.iter().all(|log| {
-        log.status == PluginCommandStatus::Failed
-            && log.error.as_deref() == Some("choices provider cancelled")
-            && log.finished_unix_ms.is_some()
-    }));
+    assert_eq!(
+        app.state
+            .plugin_command_logs
+            .iter()
+            .filter(|log| {
+                log.status == PluginCommandStatus::Failed
+                    && log.error.as_deref() == Some("choices provider cancelled")
+                    && log.finished_unix_ms.is_some()
+            })
+            .count(),
+        MAX_PLUGIN_ACTION_CHOICES_PROVIDERS_IN_FLIGHT
+    );
     for index in 0..MAX_PLUGIN_ACTION_CHOICES_PROVIDERS_IN_FLIGHT {
         app.start_plugin_action_choices_provider(
             format!("context-menu-12-{index}"),
@@ -419,7 +551,90 @@ fn dismiss_and_reopen_releases_full_provider_capacity_immediately() {
         MAX_PLUGIN_ACTION_CHOICES_PROVIDERS_IN_FLIGHT
     );
     app.cancel_context_menu_plugin_generation(12);
+    assert_eq!(
+        app.state.plugin_action_choices_providers_in_flight,
+        MAX_PLUGIN_ACTION_CHOICES_PROVIDERS_IN_FLIGHT
+    );
+    handle_provider_events_until_idle(&mut app);
     assert_eq!(app.state.plugin_action_choices_providers_in_flight, 0);
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[test]
+fn deferred_reaping_retains_admission_until_cleanup_event() {
+    let mut app = test_app();
+    app.state.plugin_action_choices_providers_in_flight = 1;
+    app.state
+        .plugin_action_choices_requests_in_flight
+        .insert("deferred-request".into());
+    app.plugin_choice_provider_cancellations.insert(
+        "deferred-request".into(),
+        crate::app::PluginChoiceProviderCancellation::new(),
+    );
+    app.push_plugin_command_log(PluginCommandLogInfo {
+        log_id: "plugin-log-1".into(),
+        plugin_id: "example.choices-runtime".into(),
+        action_id: Some("choose".into()),
+        event: None,
+        command: vec!["provider".into()],
+        status: PluginCommandStatus::Running,
+        started_unix_ms: 0,
+        finished_unix_ms: None,
+        exit_code: None,
+        stdout: None,
+        stderr: None,
+        error: None,
+    });
+
+    app.handle_internal_event(crate::events::AppEvent::PluginActionChoicesFinished {
+        request_id: "deferred-request".into(),
+        plugin_id: "example.choices-runtime".into(),
+        action_id: "choose".into(),
+        log_id: "plugin-log-1".into(),
+        finished_unix_ms: current_unix_ms(),
+        exit_code: None,
+        stdout: String::new(),
+        stderr: String::new(),
+        result: Err("cleanup deferred".into()),
+        cleanup_pending: true,
+    });
+    assert_eq!(app.state.plugin_action_choices_providers_in_flight, 1);
+    assert!(app
+        .state
+        .plugin_action_choices_requests_in_flight
+        .contains("deferred-request"));
+
+    app.handle_internal_event(
+        crate::events::AppEvent::PluginActionChoicesCleanupFinished {
+            request_id: "deferred-request".into(),
+        },
+    );
+    assert_eq!(app.state.plugin_action_choices_providers_in_flight, 0);
+    assert!(app
+        .state
+        .plugin_action_choices_requests_in_flight
+        .is_empty());
+}
+
+#[test]
+fn provider_cancelled_before_worker_start_never_executes_command() {
+    let root = root("choices-pre-spawn-cancel");
+    let marker = root.join("executed");
+    let mut command = crate::plugin_command::command_for_argv(
+        "sh",
+        &["-c".into(), format!("touch {}", marker.display())],
+    );
+    command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let cancellation = crate::app::PluginChoiceProviderCancellation::new();
+    cancellation.cancel();
+
+    let completion = run_choices_provider(command, &cancellation);
+
+    assert_eq!(completion.result.unwrap_err(), "choices provider cancelled");
+    assert!(!marker.exists());
     std::fs::remove_dir_all(root).ok();
 }
 
