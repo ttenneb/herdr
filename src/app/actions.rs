@@ -251,6 +251,7 @@ pub struct PaneStateUpdate {
     pub agent_release_status: Option<crate::api::schema::AgentStatus>,
 }
 
+#[derive(Default)]
 pub(crate) struct PaneDestructionSummary {
     pub tombstoned_delegations: Vec<(crate::delegation::DelegationId, PaneId)>,
     pub garbage_collected_delegations: Vec<crate::delegation::DelegationId>,
@@ -1658,9 +1659,9 @@ impl AppState {
         }
     }
 
-    pub fn close_selected_workspace(&mut self) {
+    pub fn close_selected_workspace(&mut self) -> PaneDestructionSummary {
         if self.workspaces.is_empty() {
-            return;
+            return PaneDestructionSummary::default();
         }
         self.selection = None;
         self.selection_autoscroll = None;
@@ -1693,7 +1694,7 @@ impl AppState {
                 crate::logging::workspace_closed(&workspace_id);
             }
         }
-        self.finalize_pane_destruction(pane_ids);
+        let destruction = self.finalize_pane_destruction(pane_ids);
         for idx in close_indices.iter().rev() {
             self.workspaces.remove(*idx);
         }
@@ -1716,6 +1717,7 @@ impl AppState {
             self.tab_scroll_follow_active = true;
             self.refresh_tab_bar_view();
         }
+        destruction
     }
 
     pub(crate) fn refresh_tab_bar_view(&mut self) {

@@ -145,7 +145,7 @@ impl App {
             return encode_error(id, "collection_add_failed", "pane is not tiled");
         }
         let response = self.handle_pane_move(
-            format!("{id}:move"),
+            id.clone(),
             PaneMoveParams {
                 pane_id: params.pane_id,
                 destination: PaneMoveDestination::Collection {
@@ -154,8 +154,19 @@ impl App {
                 focus: false,
             },
         );
-        if serde_json::from_str::<crate::api::schema::SuccessResponse>(&response).is_err() {
-            return response;
+        match serde_json::from_str::<crate::api::schema::SuccessResponse>(&response) {
+            Ok(crate::api::schema::SuccessResponse {
+                result: ResponseResult::PaneMove { move_result },
+                ..
+            }) if move_result.changed => {}
+            Ok(_) => {
+                return encode_error(
+                    id,
+                    "collection_add_unchanged",
+                    "pane placement was unchanged",
+                )
+            }
+            Err(_) => return response,
         }
         self.handle_collection_get(
             id,
@@ -191,7 +202,7 @@ impl App {
             );
         };
         let response = self.handle_pane_move(
-            format!("{id}:move"),
+            id.clone(),
             PaneMoveParams {
                 pane_id: params.pane_id,
                 destination: PaneMoveDestination::Collection {
@@ -200,8 +211,19 @@ impl App {
                 focus: false,
             },
         );
-        if serde_json::from_str::<crate::api::schema::SuccessResponse>(&response).is_err() {
-            return response;
+        match serde_json::from_str::<crate::api::schema::SuccessResponse>(&response) {
+            Ok(crate::api::schema::SuccessResponse {
+                result: ResponseResult::PaneMove { move_result },
+                ..
+            }) if move_result.changed => {}
+            Ok(_) => {
+                return encode_error(
+                    id,
+                    "collection_move_unchanged",
+                    "pane placement was unchanged",
+                )
+            }
+            Err(_) => return response,
         }
         self.handle_collection_get(
             id,
@@ -437,6 +459,34 @@ impl App {
             .iter()
             .filter_map(|pane_id| self.state.workspaces[ws_idx].terminal_id(*pane_id).cloned())
             .collect();
+        let closes_workspace = self.state.workspaces[ws_idx].tabs.len() == 1
+            && self.state.workspaces[ws_idx].tabs[tab_idx]
+                .layout
+                .leaf_count()
+                == 1;
+        let requests_cascade = members.is_empty()
+            || params.disposition == Some(CollectionCloseDisposition::CascadeClose);
+        if closes_workspace && requests_cascade {
+            if self.state.confirm_close
+                && self
+                    .state
+                    .workspace_close_would_close_worktree_group(ws_idx)
+            {
+                return encode_error(
+                    id,
+                    "confirmation_required",
+                    "closing this collection would close a worktree group",
+                );
+            }
+            // A final collection is workspace closure regardless of whether it has members. Keep
+            // all group, collection, pane, runtime, delegation, and event cleanup centralized.
+            return self.handle_workspace_close(
+                id,
+                crate::api::schema::WorkspaceTarget {
+                    workspace_id: closed_workspace_id,
+                },
+            );
+        }
         if members.is_empty() {
             if self.state.workspaces[ws_idx].tabs[tab_idx]
                 .layout
@@ -510,22 +560,9 @@ impl App {
                             "collection contains an unaddressable pane",
                         );
                     };
-                    let closes_workspace = self.state.workspaces[ws_idx].tabs.len() == 1
-                        && self.state.workspaces[ws_idx].tabs[tab_idx]
-                            .layout
-                            .leaf_count()
-                            == 1;
-                    if closes_workspace && self.state.confirm_implicit_worktree_group_close(ws_idx)
-                    {
-                        return encode_error(
-                            id,
-                            "confirmation_required",
-                            "closing this collection would close a worktree group",
-                        );
-                    }
                     let workspace_id = self.public_workspace_id(ws_idx);
                     let tab_id = self.public_tab_id(ws_idx, tab_idx).unwrap_or_default();
-                    let workspace_snapshot = closes_workspace.then(|| self.workspace_info(ws_idx));
+                    let workspace_snapshot = None;
                     let outcome = match self.state.workspaces[ws_idx]
                         .cascade_close_collection(collection_id)
                     {
@@ -1228,6 +1265,32 @@ mod tests {
         assert_eq!(app.event_hub.current_sequence(), events_before);
     }
 
+    #[test]
+    fn collection_move_reports_unchanged_with_original_request_id() {
+        let (mut app, root, second, _) = app_with_panes();
+        let collection_id = create_collection(&mut app, root);
+        let pane_id = app.public_pane_id(0, second).expect("public pane");
+        let added = request(
+            &mut app,
+            Method::CollectionAdd(CollectionAddParams {
+                collection_id: collection_id.clone(),
+                pane_id: pane_id.clone(),
+            }),
+        );
+        assert!(added.get("error").is_none(), "{added}");
+        app.state.workspaces[0].tabs[0].zoomed = true;
+
+        let response = request(
+            &mut app,
+            Method::CollectionMove(CollectionMoveParams {
+                pane_id,
+                collection_id,
+            }),
+        );
+        assert_eq!(response["id"], "test");
+        assert_eq!(response["error"]["code"], "collection_move_unchanged");
+    }
+
     #[tokio::test]
     async fn collection_api_covers_membership_selection_order_archive_promotion_and_close() {
         let (mut app, root, second, third) = app_with_panes();
@@ -1689,6 +1752,41 @@ mod tests {
             }),
         );
         let source_collection = create_collection(&mut app, root);
+        let source_layout_before = app.state.workspaces[1].tabs[0].layout.leaves();
+        let source_focus_before = app.state.workspaces[1].tabs[0].layout.focused_leaf();
+        let public_number_before = app.state.workspaces[1].public_pane_number(second);
+        let archive_time_before = app.state.collection_archive_times.get(&second).copied();
+        crate::workspace::fail_next_collection_mutation_for_test();
+        let failed_back = request(
+            &mut app,
+            Method::CollectionMove(CollectionMoveParams {
+                pane_id: source_public.clone(),
+                collection_id: source_collection.clone(),
+            }),
+        );
+        assert_eq!(failed_back["id"], "test");
+        assert_eq!(failed_back["error"]["code"], "pane_move_failed");
+        assert_eq!(
+            app.state.workspaces[1].tabs[0].layout.leaves(),
+            source_layout_before
+        );
+        assert_eq!(
+            app.state.workspaces[1].tabs[0].layout.focused_leaf(),
+            source_focus_before
+        );
+        assert_eq!(
+            app.state.workspaces[1].public_pane_number(second),
+            public_number_before
+        );
+        assert_eq!(
+            app.state.collection_archive_times.get(&second).copied(),
+            archive_time_before
+        );
+        assert!(app.state.workspaces[1].tabs[0]
+            .collection(parse_collection_id(&target_collection).expect("target collection"))
+            .expect("source collection retained")
+            .is_archived(second));
+
         let moved_back = request(
             &mut app,
             Method::CollectionMove(CollectionMoveParams {
@@ -1707,6 +1805,147 @@ mod tests {
         assert_eq!(
             app.state.workspaces[0].terminal_id(second),
             Some(&terminal_id)
+        );
+    }
+
+    #[test]
+    fn empty_final_collection_uses_group_workspace_close_path() {
+        let (_tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = App::new(
+            &Config::default(),
+            true,
+            None,
+            rx,
+            crate::api::EventHub::default(),
+        );
+        let workspace = Workspace::test_new("root");
+        let root = workspace.tabs[0].root_pane.expect("root");
+        app.state.workspaces = vec![workspace];
+        app.state.ensure_test_terminals();
+        let collection_id = create_collection(&mut app, root);
+        let root_id = app.public_pane_id(0, root).expect("public root");
+        let added = request(
+            &mut app,
+            Method::CollectionAdd(CollectionAddParams {
+                collection_id: collection_id.clone(),
+                pane_id: root_id,
+            }),
+        );
+        assert!(added.get("error").is_none(), "{added}");
+        let collection = parse_collection_id(&collection_id).expect("collection id");
+        assert!(app.state.workspaces[0].tabs[0]
+            .layout
+            .remove_collection_member(collection, root));
+        app.state.workspaces[0].tabs[0].panes.remove(&root);
+        app.state.workspaces[0].tabs[0].root_pane = None;
+        assert_eq!(app.state.workspaces[0].tabs[0].layout.leaf_count(), 1);
+
+        let membership = |linked| crate::workspace::WorktreeSpaceMembership {
+            key: "repo-key".into(),
+            label: "repo".into(),
+            repo_root: "/repo".into(),
+            checkout_path: if linked {
+                "/repo-linked".into()
+            } else {
+                "/repo".into()
+            },
+            is_linked_worktree: linked,
+        };
+        app.state.workspaces[0].worktree_space = Some(membership(false));
+        let mut linked = Workspace::test_new("linked");
+        linked.worktree_space = Some(membership(true));
+        app.state.workspaces.push(linked);
+        app.state.ensure_test_terminals();
+        app.state.confirm_close = false;
+        let sequence = app.event_hub.current_sequence();
+
+        let closed = request(
+            &mut app,
+            Method::CollectionClose(CollectionCloseParams {
+                collection_id,
+                disposition: None,
+                target_pane_id: None,
+                focus_promoted: false,
+            }),
+        );
+
+        assert_eq!(closed["result"]["type"], "ok");
+        assert!(app.state.workspaces.is_empty());
+        let events = app.event_hub.events_after(sequence);
+        assert_eq!(
+            events
+                .iter()
+                .filter(|(_, event)| event.event == EventKind::WorkspaceClosed)
+                .count(),
+            2
+        );
+        assert!(events
+            .iter()
+            .any(|(_, event)| event.event == EventKind::CollectionClosed));
+    }
+
+    #[test]
+    fn final_collection_close_uses_group_workspace_close_and_emits_all_events() {
+        let (mut app, root, second, third) = app_with_panes();
+        let collection_id = create_collection(&mut app, root);
+        for pane in [root, second, third] {
+            let pane_id = app.public_pane_id(0, pane).expect("public pane");
+            let added = request(
+                &mut app,
+                Method::CollectionAdd(CollectionAddParams {
+                    collection_id: collection_id.clone(),
+                    pane_id,
+                }),
+            );
+            assert!(added.get("error").is_none(), "{added}");
+        }
+        app.state.workspaces.push(Workspace::test_new("linked"));
+        let membership = |linked| crate::workspace::WorktreeSpaceMembership {
+            key: "repo-key".into(),
+            label: "repo".into(),
+            repo_root: "/repo".into(),
+            checkout_path: if linked {
+                "/repo-linked".into()
+            } else {
+                "/repo".into()
+            },
+            is_linked_worktree: linked,
+        };
+        app.state.workspaces[0].worktree_space = Some(membership(false));
+        app.state.workspaces[1].worktree_space = Some(membership(true));
+        app.state.ensure_test_terminals();
+        app.state.confirm_close = false;
+        let sequence = app.event_hub.current_sequence();
+
+        let closed = request(
+            &mut app,
+            Method::CollectionClose(CollectionCloseParams {
+                collection_id,
+                disposition: Some(CollectionCloseDisposition::CascadeClose),
+                target_pane_id: None,
+                focus_promoted: false,
+            }),
+        );
+
+        assert_eq!(closed["result"]["type"], "ok");
+        assert!(app.state.workspaces.is_empty());
+        let events = app.event_hub.events_after(sequence);
+        assert_eq!(
+            events
+                .iter()
+                .filter(|(_, event)| event.event == EventKind::WorkspaceClosed)
+                .count(),
+            2
+        );
+        assert!(events
+            .iter()
+            .any(|(_, event)| event.event == EventKind::CollectionClosed));
+        assert_eq!(
+            events
+                .iter()
+                .filter(|(_, event)| event.event == EventKind::PaneClosed)
+                .count(),
+            4
         );
     }
 

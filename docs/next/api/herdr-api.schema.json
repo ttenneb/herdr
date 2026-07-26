@@ -1,7 +1,7 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "protocol": 18,
-  "schema_version": 1,
+  "schema_version": 2,
   "schemas": {
     "error_response": {
       "$defs": {
@@ -1282,7 +1282,10 @@
               "type": "string"
             },
             "placement": {
-              "$ref": "#/schemas/event/$defs/PanePlacementInfo"
+              "$ref": "#/schemas/event/$defs/PanePlacementInfo",
+              "default": {
+                "type": "tiled"
+              }
             },
             "revision": {
               "format": "uint64",
@@ -1349,7 +1352,6 @@
             "workspace_id",
             "tab_id",
             "focused",
-            "placement",
             "agent_status",
             "revision"
           ],
@@ -1364,7 +1366,10 @@
               "type": "string"
             },
             "placement": {
-              "$ref": "#/schemas/event/$defs/PanePlacementInfo"
+              "$ref": "#/schemas/event/$defs/PanePlacementInfo",
+              "default": {
+                "type": "tiled"
+              }
             },
             "rect": {
               "$ref": "#/schemas/event/$defs/PaneLayoutRect"
@@ -1373,7 +1378,6 @@
           "required": [
             "pane_id",
             "focused",
-            "placement",
             "rect"
           ],
           "type": "object"
@@ -1425,7 +1429,11 @@
               "type": "array"
             },
             "focused": {
-              "$ref": "#/schemas/event/$defs/LayoutFocusInfo"
+              "$ref": "#/schemas/event/$defs/LayoutFocusInfo",
+              "default": {
+                "pane_id": "",
+                "type": "pane"
+              }
             },
             "focused_pane_id": {
               "type": [
@@ -1460,9 +1468,7 @@
             "tab_id",
             "zoomed",
             "area",
-            "focused",
             "panes",
-            "collections",
             "splits"
           ],
           "type": "object"
@@ -8997,7 +9003,11 @@
         "LayoutDescription": {
           "properties": {
             "focused": {
-              "$ref": "#/schemas/success_response/$defs/LayoutFocusInfo"
+              "$ref": "#/schemas/success_response/$defs/LayoutFocusInfo",
+              "default": {
+                "pane_id": "",
+                "type": "pane"
+              }
             },
             "focused_pane_id": {
               "type": [
@@ -9022,7 +9032,6 @@
             "workspace_id",
             "tab_id",
             "zoomed",
-            "focused",
             "root"
           ],
           "type": "object"
@@ -9290,7 +9299,10 @@
               "type": "string"
             },
             "placement": {
-              "$ref": "#/schemas/success_response/$defs/PanePlacementInfo"
+              "$ref": "#/schemas/success_response/$defs/PanePlacementInfo",
+              "default": {
+                "type": "tiled"
+              }
             },
             "revision": {
               "format": "uint64",
@@ -9357,7 +9369,6 @@
             "workspace_id",
             "tab_id",
             "focused",
-            "placement",
             "agent_status",
             "revision"
           ],
@@ -9372,7 +9383,10 @@
               "type": "string"
             },
             "placement": {
-              "$ref": "#/schemas/success_response/$defs/PanePlacementInfo"
+              "$ref": "#/schemas/success_response/$defs/PanePlacementInfo",
+              "default": {
+                "type": "tiled"
+              }
             },
             "rect": {
               "$ref": "#/schemas/success_response/$defs/PaneLayoutRect"
@@ -9381,7 +9395,6 @@
           "required": [
             "pane_id",
             "focused",
-            "placement",
             "rect"
           ],
           "type": "object"
@@ -9433,7 +9446,11 @@
               "type": "array"
             },
             "focused": {
-              "$ref": "#/schemas/success_response/$defs/LayoutFocusInfo"
+              "$ref": "#/schemas/success_response/$defs/LayoutFocusInfo",
+              "default": {
+                "pane_id": "",
+                "type": "pane"
+              }
             },
             "focused_pane_id": {
               "type": [
@@ -9468,9 +9485,7 @@
             "tab_id",
             "zoomed",
             "area",
-            "focused",
             "panes",
-            "collections",
             "splits"
           ],
           "type": "object"

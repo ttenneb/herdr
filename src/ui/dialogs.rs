@@ -50,7 +50,7 @@ pub(crate) fn collection_close_button_rects(inner: Rect) -> (Rect, Rect, Rect) {
 }
 
 pub(super) fn render_collection_close_overlay(app: &AppState, frame: &mut Frame, area: Rect) {
-    let Some(pending) = app.pending_collection_close else {
+    let Some(pending) = app.pending_collection_close.as_ref() else {
         return;
     };
     super::dim_background(frame, area);
@@ -909,7 +909,12 @@ mod tests {
     fn collection_close_dialog_shows_disposition_counts_and_state_warning() {
         let mut app = AppState::test_new();
         app.pending_collection_close = Some(crate::app::collection_view::PendingCollectionClose {
+            workspace_id: "w1".into(),
+            tab_id: "w1:t1".into(),
             collection_id: crate::layout::CollectionId::from_raw(1).expect("valid collection id"),
+            member_ids: Vec::new(),
+            collection_revision: 0,
+            group_close: None,
             cleanup_archive: false,
             active: 3,
             archived: 2,

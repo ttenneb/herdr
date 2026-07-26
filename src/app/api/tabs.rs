@@ -297,6 +297,15 @@ impl App {
                 },
             });
         }
+        for (_, pane_id) in &public_panes {
+            self.emit_event(EventEnvelope {
+                event: EventKind::PaneClosed,
+                data: EventData::PaneClosed {
+                    pane_id: pane_id.clone(),
+                    workspace_id: workspace_id.clone(),
+                },
+            });
+        }
         self.emit_pane_destruction_events(destruction, &public_panes);
         self.emit_event(EventEnvelope {
             event: EventKind::TabClosed,
@@ -393,6 +402,77 @@ mod tests {
                     && tabs[2].tab_id == moved_id
             )
         }));
+    }
+
+    #[test]
+    fn tab_close_emits_every_pane_and_child_lifecycle_before_tab_closed() {
+        let event_hub = crate::api::EventHub::default();
+        let (_api_tx, api_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = App::new(&Config::default(), true, None, api_rx, event_hub.clone());
+        let mut workspace = Workspace::test_new("tab-close-events");
+        let tiled = workspace.tabs[0].root_pane.expect("root pane");
+        let collected = workspace.test_split(ratatui::layout::Direction::Horizontal);
+        let collection = workspace
+            .create_collection_near(
+                0,
+                crate::layout::LayoutLeaf::Pane(tiled),
+                ratatui::layout::Direction::Vertical,
+                0.5,
+                None,
+            )
+            .expect("collection");
+        workspace
+            .collect_pane(collected, collection)
+            .expect("collect pane");
+        workspace.test_add_tab(Some("keep"));
+        app.state.workspaces = vec![workspace];
+        app.state.ensure_test_terminals();
+        app.state
+            .delegations
+            .create(Some(collected), None, Some("child".into()))
+            .expect("delegation");
+        let tab_id = app.public_tab_id(0, 0).expect("tab id");
+        let expected_panes = [tiled, collected]
+            .into_iter()
+            .map(|pane| app.public_pane_id(0, pane).expect("pane id"))
+            .collect::<std::collections::HashSet<_>>();
+
+        let response = app.handle_tab_close("close".into(), TabTarget { tab_id });
+
+        let _: SuccessResponse = serde_json::from_str(&response).expect("success");
+        let events = event_hub.events_after(0);
+        let tab_closed = events
+            .iter()
+            .position(|(_, event)| event.event == EventKind::TabClosed)
+            .expect("tab.closed");
+        let closed_panes = events
+            .iter()
+            .enumerate()
+            .filter_map(|(position, (_, event))| match &event.data {
+                EventData::PaneClosed { pane_id, .. } => Some((position, pane_id.clone())),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            closed_panes
+                .iter()
+                .map(|(_, pane)| pane.clone())
+                .collect::<std::collections::HashSet<_>>(),
+            expected_panes
+        );
+        assert!(closed_panes
+            .iter()
+            .all(|(position, _)| *position < tab_closed));
+        for kind in [
+            EventKind::CollectionMemberRemoved,
+            EventKind::CollectionClosed,
+            EventKind::DelegationTombstoned,
+            EventKind::DelegationGarbageCollected,
+        ] {
+            assert!(events[..tab_closed]
+                .iter()
+                .any(|(_, event)| event.event == kind));
+        }
     }
 
     #[test]

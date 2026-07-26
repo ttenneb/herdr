@@ -91,9 +91,10 @@ pub enum CollectionCloseDisposition {
     PromoteMembers,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema, Default)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum PanePlacementInfo {
+    #[default]
     Tiled,
     Collection {
         collection_id: String,

@@ -1113,6 +1113,9 @@ impl App {
     }
 
     pub(super) fn confirm_close_accept_via_api(&mut self) {
+        if self.confirm_pending_collection_group_close() {
+            return;
+        }
         let ws_idx = self.state.selected;
         if ws_idx < self.state.workspaces.len() {
             self.close_workspace_idx_via_api(ws_idx);
@@ -1163,7 +1166,10 @@ impl App {
             Some(ModalAction::Confirm) => {
                 self.confirm_close_accept_via_api();
             }
-            Some(ModalAction::Cancel) => confirm_close_cancel(&mut self.state),
+            Some(ModalAction::Cancel) if !self.cancel_pending_collection_group_close() => {
+                confirm_close_cancel(&mut self.state);
+            }
+            Some(ModalAction::Cancel) => {}
             _ => {}
         }
     }

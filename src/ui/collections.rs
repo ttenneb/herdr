@@ -475,7 +475,10 @@ pub(crate) fn render_collections(
                 rect,
             );
         }
-        if layout.content_height > layout.viewport_height && layout.inner_rect.height > 0 {
+        if layout.content_height > layout.viewport_height
+            && layout.inner_rect.width > 0
+            && layout.inner_rect.height > 0
+        {
             let track = layout.inner_rect.height as usize;
             let thumb_height = ((layout.viewport_height * track) / layout.content_height)
                 .max(1)
@@ -758,6 +761,37 @@ mod tests {
             .collect::<String>();
         assert!(rendered.contains("Helpers"));
         assert!(rendered.contains("Active · empty"));
+    }
+
+    #[test]
+    fn zero_width_collection_interior_does_not_draw_scrollbar_over_border() {
+        let mut ws = Workspace::test_new("tiny-collection");
+        let root = ws.tabs[0].root_pane.expect("root");
+        let child = ws.test_split(Direction::Horizontal);
+        let id = ws
+            .create_collection_near(0, LayoutLeaf::Pane(root), Direction::Vertical, 0.5, None)
+            .expect("collection");
+        ws.collect_pane(child, id).expect("collect");
+        let mut app = AppState::test_new();
+        app.workspaces = vec![ws];
+        app.active = Some(0);
+        let area = Rect::new(0, 0, 2, 4);
+        let layouts = compute_collection_layouts(
+            &mut app,
+            &TerminalRuntimeRegistry::new(),
+            area,
+            false,
+            Default::default(),
+        );
+        assert_eq!(layouts[0].inner_rect.width, 0);
+        assert!(layouts[0].content_height > layouts[0].viewport_height);
+        let mut terminal = Terminal::new(TestBackend::new(2, 4)).expect("terminal");
+        terminal
+            .draw(|frame| {
+                render_collections(&app, &TerminalRuntimeRegistry::new(), &layouts, frame)
+            })
+            .expect("render");
+        assert_ne!(terminal.backend().buffer()[(0, 1)].symbol(), "█");
     }
 
     #[test]

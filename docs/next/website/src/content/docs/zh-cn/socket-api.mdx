@@ -100,6 +100,8 @@ herdr pane read w1:p2 --source recent --lines 50
 | Worktree | `worktree.list`、`worktree.create`、`worktree.open`、`worktree.remove` |
 | 标签页 | `tab.create`、`tab.list`、`tab.get`、`tab.focus`、`tab.rename`、`tab.move`、`tab.close` |
 | 窗格 | `pane.split`、`pane.swap`、`pane.move`、`pane.zoom`、`pane.layout`、`pane.process_info`、`pane.neighbor`、`pane.edges`、`pane.focus_direction`、`pane.resize`、`pane.list`、`pane.current`、`pane.get`、`pane.rename`、`pane.send_text`、`pane.send_keys`、`pane.send_input`、`pane.read`、`pane.graphics.info`、`pane.graphics.set`、`pane.graphics.clear`、`pane.graphics.stream`、`pane.report_agent`、`pane.report_agent_session`、`pane.report_metadata`、`pane.clear_agent_authority`、`pane.release_agent`、`pane.close`、`pane.wait_for_output` |
+| 集合 | `collection.list`、`collection.get`、`collection.create`、`collection.add`、`collection.move`、`collection.promote`、`collection.select`、`collection.reorder`、`collection.archive`、`collection.restore`、`collection.member_create`、`collection.close` |
+| 委派 | `delegation.create`、`delegation.get`、`delegation.tree`、`delegation.root`、`delegation.descendants`、`delegation.reparent`、`delegation.reorder` |
 | 弹窗 | `popup.close` |
 | 布局 | `layout.export`、`layout.apply`、`layout.set_split_ratio` |
 | 智能体 | `agent.list`、`agent.get`、`agent.read`、`agent.explain`、`agent.send_keys`、`agent.prompt`、`agent.wait`、`agent.rename`、`agent.focus`、`agent.start` |
@@ -613,6 +615,25 @@ workspace 的 get/list 响应会公开生成的 `tokens` 映射,空间侧边栏�
 
 钩子可能乱序发送更新时,使用 `seq`。对同一 `source`,序号小于等于最后接受序号的上报会被 API 接受,但被窗格状态忽略。每个窗格或工作区在其生命周期内最多接受来自 32 个不同来源的带序号令牌上报;清除或过期不会释放这些来源名额。
 
+## 集合与委派
+
+窗格集合使用 `collection.list`、`collection.get`、`collection.create`、
+`collection.add`、`collection.move`、`collection.promote`、`collection.select`、
+`collection.reorder`、`collection.archive`、`collection.restore`、
+`collection.member_create` 和 `collection.close`。关闭非空集合时必须提供
+`disposition: "cascade_close"` 或 `"promote_members"`;若操作会关闭工作树组,可能返回
+`confirmation_required`。集合响应包含稳定 ID、有序成员、归档/选择状态、生命周期计数和提示。
+
+委派元数据独立于布局。使用 `delegation.create`、`delegation.get`、
+`delegation.tree`、`delegation.root`、`delegation.descendants`、
+`delegation.reparent` 和 `delegation.reorder` 管理父子关系、用途、派生根和同级顺序。
+形成循环的重新挂接会被原子拒绝。
+
+`PaneInfo.placement` 与每个 `PaneLayoutPane.placement` 为 `tiled`,或带有
+`collection_id`、`member_index`、`archived`、`selected` 的 `collection`。
+`PaneLayoutSnapshot.collections` 描述集合叶节点;`focused` 是窗格或集合的类型化焦点。
+为支持空集合,`focused_pane_id` 是可选字段。可移植布局根节点同样可以包含集合叶节点。
+
 ## 事件订阅
 
 需要长期数据流时订阅事件:
@@ -635,6 +656,8 @@ workspace 的 get/list 响应会公开生成的 `tokens` 映射,空间侧边栏�
 标签页事件订阅包括 `tab.created`、`tab.closed`、`tab.focused`、`tab.renamed` 和 `tab.moved`。`tab.moved` 包含被移动的 `tab_id`、`workspace_id`、请求的 `insert_index` 和该工作区更新后的有序 `tabs` 列表。
 窗格事件订阅包括 `pane.created`、`pane.updated`、`pane.closed`、`pane.focused`、`pane.moved`、`pane.exited`、`pane.agent_detected`、`pane.output_matched`、`pane.agent_status_changed` 和 `pane.scroll_changed`。终端标题变化可能发出 `pane.updated`,但如果原始标题只有旋转指示符发生变化且 `terminal_title_stripped` 不变,则不会发出。`pane.scroll_changed` 只针对一个 `pane_id`,每当 Herdr 观察到滚动快照变化时,都会发出 `pane_id`、`workspace_id` 和当前 `scroll` 指标。
 布局事件订阅包括 `layout.updated`。该事件携带一个标签页更新后的 `PaneLayoutSnapshot`。使用 `session.snapshot` 引导的客户端应替换具有相同 `workspace_id` 和 `tab_id` 的缓存布局。
+
+集合事件包括 `collection.created`、`collection.member_added`、`collection.member_moved`、`collection.member_removed`、`collection.member_promoted`、`collection.member_selected`、`collection.members_reordered`、`collection.member_archived`、`collection.member_restored` 和 `collection.closed`。委派事件包括 `delegation.created`、`delegation.reparented`、`delegation.reordered`、`delegation.tombstoned` 和 `delegation.garbage_collected`。可用时变更事件携带变更后的记录;删除/关闭事件携带用于清除缓存的稳定 ID。
 
 Worktree 事件订阅包括 `worktree.created`、`worktree.opened` 和 `worktree.removed`。Worktree 事件描述 Git 检出的生命周期。`worktree.created` 包含打开的 `workspace` 和创建的 `worktree`。`worktree.opened` 包含目标 `workspace`、打开的 `worktree` 和 `already_open`。`worktree.removed` 包含 `workspace_id`、被移除的 `worktree` 和 `forced`。
 

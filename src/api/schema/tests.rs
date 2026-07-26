@@ -33,7 +33,7 @@ fn protocol_schema_document() -> serde_json::Value {
     serde_json::json!({
         "$schema": "https://json-schema.org/draft/2020-12/schema",
         "title": "Herdr API",
-        "schema_version": 1,
+        "schema_version": 2,
         "protocol": crate::protocol::PROTOCOL_VERSION,
         "schemas": {
             "request": protocol_schema_entry::<Request>("request"),
@@ -43,6 +43,28 @@ fn protocol_schema_document() -> serde_json::Value {
             "subscription_event": protocol_schema_entry::<SubscriptionEventEnvelope>("subscription_event"),
         },
     })
+}
+
+#[test]
+fn legacy_pane_layout_response_deserializes_without_collection_fields() {
+    let legacy = serde_json::json!({
+        "workspace_id": "w1",
+        "tab_id": "w1:t1",
+        "zoomed": false,
+        "area": {"x": 0, "y": 0, "width": 80, "height": 24},
+        "focused_pane_id": "w1:p1",
+        "panes": [],
+        "splits": []
+    });
+    let layout: PaneLayoutSnapshot = serde_json::from_value(legacy).expect("legacy layout");
+    assert!(layout.collections.is_empty());
+    assert!(matches!(layout.focused, LayoutFocusInfo::Pane { .. }));
+}
+
+#[test]
+fn collection_schema_uses_bumped_compatibility_versions() {
+    assert_eq!(protocol_schema_document()["schema_version"], 2);
+    assert_eq!(crate::protocol::PROTOCOL_VERSION, 18);
 }
 
 #[test]

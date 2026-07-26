@@ -127,6 +127,8 @@ pub struct PaneCollection {
     members: Vec<PaneId>,
     archived: HashSet<PaneId>,
     selected: Option<PaneId>,
+    /// Monotonic membership/archive revision used to bind destructive confirmations.
+    revision: u64,
 }
 
 impl PaneCollection {
@@ -137,6 +139,7 @@ impl PaneCollection {
             members: Vec::new(),
             archived: HashSet::new(),
             selected: None,
+            revision: 0,
         }
     }
 
@@ -150,6 +153,10 @@ impl PaneCollection {
 
     pub fn is_archived(&self, pane_id: PaneId) -> bool {
         self.archived.contains(&pane_id)
+    }
+
+    pub(crate) fn revision(&self) -> u64 {
+        self.revision
     }
 
     pub fn active_members(&self) -> impl Iterator<Item = PaneId> + '_ {
@@ -187,6 +194,7 @@ impl PaneCollection {
             members,
             archived,
             selected,
+            revision: 0,
         })
     }
 }
@@ -489,6 +497,7 @@ impl TileLayout {
         };
         collection.members.push(pane);
         collection.selected.get_or_insert(pane);
+        collection.revision = collection.revision.saturating_add(1);
         self.refresh_legacy_root();
         true
     }
@@ -509,6 +518,7 @@ impl TileLayout {
                 .or_else(|| index.checked_sub(1).and_then(|i| collection.members.get(i)))
                 .copied();
         }
+        collection.revision = collection.revision.saturating_add(1);
         self.refresh_legacy_root();
         true
     }
@@ -545,6 +555,7 @@ impl TileLayout {
         }
         let pane = collection.members.remove(current);
         collection.members.insert(index, pane);
+        collection.revision = collection.revision.saturating_add(1);
         self.refresh_legacy_root();
         true
     }
@@ -561,10 +572,13 @@ impl TileLayout {
         if !collection.members.contains(&pane) {
             return false;
         }
-        if archived {
-            collection.archived.insert(pane);
+        let changed = if archived {
+            collection.archived.insert(pane)
         } else {
-            collection.archived.remove(&pane);
+            collection.archived.remove(&pane)
+        };
+        if changed {
+            collection.revision = collection.revision.saturating_add(1);
         }
         true
     }

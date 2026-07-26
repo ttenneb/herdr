@@ -17,6 +17,7 @@ struct ForegroundClaim {
     geometry: TerminalGeometry,
     accepted: Option<TerminalGeometry>,
     changed_at: Instant,
+    dragging: bool,
 }
 
 /// Server-owned arbitration for foreground full-app collection geometry.
@@ -43,7 +44,14 @@ impl GeometryClaims {
         });
         for (terminal_id, geometry) in desired {
             match self.claims.get_mut(terminal_id) {
-                Some(claim) if claim.client_id == client_id && claim.geometry == *geometry => {}
+                Some(claim) if claim.client_id == client_id && claim.geometry == *geometry => {
+                    // Releasing a drag must commit its final geometry even when the final render
+                    // reports the same rectangle as the last dragging render.
+                    if claim.dragging && !dragging {
+                        claim.changed_at = now - DRAG_DEBOUNCE;
+                    }
+                    claim.dragging = dragging;
+                }
                 Some(claim) => {
                     self.next_revision = self.next_revision.saturating_add(1);
                     *claim = ForegroundClaim {
@@ -52,6 +60,7 @@ impl GeometryClaims {
                         geometry: *geometry,
                         accepted: claim.accepted,
                         changed_at: if dragging { now } else { now - DRAG_DEBOUNCE },
+                        dragging,
                     };
                 }
                 None => {
@@ -64,6 +73,7 @@ impl GeometryClaims {
                             geometry: *geometry,
                             accepted: None,
                             changed_at: if dragging { now } else { now - DRAG_DEBOUNCE },
+                            dragging,
                         },
                     );
                 }
@@ -154,6 +164,26 @@ mod tests {
         assert!(claims
             .ready(&Default::default(), now + DRAG_DEBOUNCE)
             .is_empty());
+    }
+
+    #[test]
+    fn ending_drag_accepts_final_unchanged_geometry_immediately() {
+        let now = Instant::now();
+        let id = terminal(3);
+        let final_geometry = geometry(12, 60);
+        let mut claims = GeometryClaims::default();
+        claims.submit_foreground(4, &HashMap::from([(id.clone(), final_geometry)]), true, now);
+        assert!(claims.ready(&Default::default(), now).is_empty());
+        claims.submit_foreground(
+            4,
+            &HashMap::from([(id, final_geometry)]),
+            false,
+            now + Duration::from_millis(10),
+        );
+        assert_eq!(
+            claims.ready(&Default::default(), now + Duration::from_millis(10))[0].1,
+            final_geometry
+        );
     }
 
     #[test]

@@ -562,7 +562,7 @@ impl App {
 
         let source_public_id = match params.source_pane_id {
             Some(raw) => self
-                .parse_pane_id(&raw)
+                .parse_pane_id(raw.as_str())
                 .and_then(|(idx, pane_id)| {
                     self.state
                         .workspaces
@@ -577,7 +577,7 @@ impl App {
         };
         let target_public_id = match params.target_pane_id {
             Some(raw) => self
-                .parse_pane_id(&raw)
+                .parse_pane_id(raw.as_str())
                 .and_then(|(idx, pane_id)| {
                     self.state
                         .workspaces
@@ -806,7 +806,7 @@ impl App {
                 }
                 let target_pane_id = match target_pane_id {
                     Some(raw) => {
-                        let Some((pane_ws_idx, pane_id)) = self.parse_pane_id(&raw) else {
+                        let Some((pane_ws_idx, pane_id)) = self.parse_pane_id(raw.as_str()) else {
                             return encode_error(
                                 id,
                                 "target_pane_not_found",
@@ -865,6 +865,12 @@ impl App {
             }
         };
 
+        // Consume all known fallible collection-layout validation before detaching the source.
+        // The remaining transfer operations were prevalidated above and are infallible commits.
+        if crate::workspace::take_collection_mutation_failure_for_test() {
+            return encode_error(id, "pane_move_failed", "pane move validation failed");
+        }
+
         let previous_focus = self.state.current_pane_focus_target();
         let taken = match self
             .state
@@ -877,6 +883,7 @@ impl App {
         };
         let source_removed_tab_id = taken.removed_tab_idx.map(|_| previous_tab_id.clone());
         let source_workspace_empty = taken.workspace_empty;
+        let source_recovery = taken.recovery;
         let moved = taken.moved;
         let cross_workspace = match &resolved {
             ResolvedPaneMoveDestination::Collection {
@@ -890,42 +897,13 @@ impl App {
             }
             ResolvedPaneMoveDestination::NewWorkspace { .. } => true,
         };
-        if cross_workspace {
-            if let Some(ws) = self.state.workspaces.get_mut(source_ws_idx) {
-                ws.unregister_moved_pane(source_pane_id);
-            }
-            self.state
-                .public_pane_id_aliases
-                .insert(previous_pane_id.clone(), source_pane_id);
-        }
-
+        // Keep an emptied source workspace in place until the destination commit succeeds. This
+        // makes every failure restorable from the exact detached tab snapshot without rebuilding
+        // workspace identity, numbering, focus, collection placement, or archive metadata.
         let mut closed_workspace_id = None;
-        if source_workspace_empty && cross_workspace {
-            self.state.workspaces.remove(source_ws_idx);
-            closed_workspace_id = Some(previous_workspace_id.clone());
-            if self.state.workspaces.is_empty() {
-                self.state.active = None;
-                self.state.selected = 0;
-            } else {
-                if let Some(active) = self.state.active {
-                    if active == source_ws_idx {
-                        self.state.active =
-                            Some(source_ws_idx.min(self.state.workspaces.len() - 1));
-                    } else if active > source_ws_idx {
-                        self.state.active = Some(active - 1);
-                    }
-                }
-                if self.state.selected == source_ws_idx {
-                    self.state.selected = source_ws_idx.min(self.state.workspaces.len() - 1);
-                } else if self.state.selected > source_ws_idx {
-                    self.state.selected -= 1;
-                }
-            }
-        }
-
         let mut created_workspace = false;
         let mut created_tab = false;
-        let (target_ws_idx, target_tab_idx, moved_pane_id) = match resolved {
+        let (mut target_ws_idx, target_tab_idx, moved_pane_id) = match resolved {
             ResolvedPaneMoveDestination::Collection {
                 collection_id,
                 cross_workspace: _,
@@ -933,7 +911,7 @@ impl App {
                 let Some((target_ws_idx, target_tab_idx, target_collection_id)) =
                     self.resolve_collection(&collection_id)
                 else {
-                    self.recover_failed_pane_move(recovery_context, moved);
+                    self.recover_failed_pane_move(recovery_context, source_recovery, moved);
                     return encode_error(id, "pane_move_failed", "target collection disappeared");
                 };
                 let previous_target_focus = self.state.workspaces[target_ws_idx].tabs
@@ -945,7 +923,7 @@ impl App {
                 {
                     Ok(pane_id) => pane_id,
                     Err((_error, moved)) => {
-                        self.recover_failed_pane_move(recovery_context, moved);
+                        self.recover_failed_pane_move(recovery_context, source_recovery, moved);
                         return encode_error(
                             id,
                             "pane_move_failed",
@@ -968,7 +946,7 @@ impl App {
                 cross_workspace: _,
             } => {
                 let Some((target_ws_idx, target_tab_idx)) = self.parse_tab_id(&tab_id) else {
-                    self.recover_failed_pane_move(recovery_context, moved);
+                    self.recover_failed_pane_move(recovery_context, source_recovery, moved);
                     return encode_error(id, "pane_move_failed", "target tab disappeared");
                 };
                 let previous_target_focus = self.state.workspaces[target_ws_idx].tabs
@@ -986,7 +964,7 @@ impl App {
                     ) {
                     Ok(pane_id) => pane_id,
                     Err(moved) => {
-                        self.recover_failed_pane_move(recovery_context, moved);
+                        self.recover_failed_pane_move(recovery_context, source_recovery, moved);
                         return encode_error(
                             id,
                             "pane_move_failed",
@@ -1006,7 +984,7 @@ impl App {
                 label,
             } => {
                 let Some(target_ws_idx) = self.parse_workspace_id(&workspace_id) else {
-                    self.recover_failed_pane_move(recovery_context, moved);
+                    self.recover_failed_pane_move(recovery_context, source_recovery, moved);
                     return encode_error(id, "pane_move_failed", "target workspace disappeared");
                 };
                 let moved_pane_id = moved.pane_id;
@@ -1045,6 +1023,40 @@ impl App {
                 (target_ws_idx, 0, moved_pane_id)
             }
         };
+
+        if cross_workspace {
+            if let Some(workspace) = self.state.workspaces.get_mut(source_ws_idx) {
+                workspace.unregister_moved_pane(source_pane_id);
+            }
+            self.state
+                .public_pane_id_aliases
+                .insert(previous_pane_id.clone(), source_pane_id);
+        }
+        if source_workspace_empty && cross_workspace {
+            self.state.workspaces.remove(source_ws_idx);
+            closed_workspace_id = Some(previous_workspace_id.clone());
+            if source_ws_idx < target_ws_idx {
+                target_ws_idx -= 1;
+            }
+            if self.state.workspaces.is_empty() {
+                self.state.active = None;
+                self.state.selected = 0;
+            } else {
+                if let Some(active) = self.state.active {
+                    if active == source_ws_idx {
+                        self.state.active =
+                            Some(source_ws_idx.min(self.state.workspaces.len() - 1));
+                    } else if active > source_ws_idx {
+                        self.state.active = Some(active - 1);
+                    }
+                }
+                if self.state.selected == source_ws_idx {
+                    self.state.selected = source_ws_idx.min(self.state.workspaces.len() - 1);
+                } else if self.state.selected > source_ws_idx {
+                    self.state.selected -= 1;
+                }
+            }
+        }
 
         if focus || self.state.active.is_none() {
             self.state
@@ -1204,16 +1216,11 @@ impl App {
     fn recover_failed_pane_move(
         &mut self,
         context: PaneMoveRecoveryContext,
+        recovery: crate::workspace::PaneMoveSourceRecovery,
         moved: crate::workspace::MovedPane,
     ) {
         if let Some(ws_idx) = self.parse_workspace_id(&context.previous_workspace_id) {
-            self.state.workspaces[ws_idx].create_tab_from_existing_pane(
-                moved,
-                context.previous_tab_label,
-                self.event_tx.clone(),
-                self.render_notify.clone(),
-                self.render_dirty.clone(),
-            );
+            self.state.workspaces[ws_idx].restore_failed_pane_move(recovery, moved);
         } else {
             let mut workspace = crate::workspace::Workspace::from_existing_pane(
                 context.previous_workspace_label,
@@ -1696,14 +1703,17 @@ impl App {
         };
         let workspace_id = self.public_workspace_id(ws_idx);
         let layout_update_target = self.layout_update_target_after_pane_removal(ws_idx, pane_id);
-        if self.state.close_pane_would_close_workspace(ws_idx, pane_id)
-            && self.state.confirm_implicit_worktree_group_close(ws_idx)
-        {
+        let closes_workspace = self.state.close_pane_would_close_workspace(ws_idx, pane_id);
+        if closes_workspace && self.state.confirm_implicit_worktree_group_close(ws_idx) {
             return Err(encode_error(
                 id,
                 "confirmation_required",
                 "closing this pane would close a worktree group",
             ));
+        }
+        if closes_workspace {
+            self.close_workspace_group_with_lifecycle(ws_idx);
+            return Ok(());
         }
         let workspace_snapshot = self.workspace_info(ws_idx);
         let source_collection_id = self.state.workspaces[ws_idx]
@@ -2470,6 +2480,109 @@ mod tests {
         assert_eq!(success.id, "req");
         assert_eq!(app.state.request_remove_linked_worktree, None);
         assert!(app.state.workspaces.is_empty());
+    }
+
+    #[test]
+    fn final_pane_close_emits_complete_worktree_group_lifecycle_in_order() {
+        let event_hub = crate::api::EventHub::default();
+        let (_api_tx, api_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = App::new(&Config::default(), true, None, api_rx, event_hub.clone());
+        let mut root_workspace = Workspace::test_new("root");
+        let root_pane = root_workspace.tabs[0].root_pane.expect("root pane");
+        let mut peer_workspace = Workspace::test_new("peer");
+        let peer_tiled = peer_workspace.tabs[0].root_pane.expect("peer root");
+        let peer_collected = peer_workspace.test_split(ratatui::layout::Direction::Horizontal);
+        let collection = peer_workspace
+            .create_collection_near(
+                0,
+                crate::layout::LayoutLeaf::Pane(peer_tiled),
+                ratatui::layout::Direction::Vertical,
+                0.5,
+                None,
+            )
+            .expect("collection");
+        peer_workspace
+            .collect_pane(peer_collected, collection)
+            .expect("collect peer pane");
+        peer_workspace.test_add_tab(Some("peer second tab"));
+        let peer_second_tab = peer_workspace.tabs[1].root_pane.expect("second tab pane");
+        let membership = |linked| crate::workspace::WorktreeSpaceMembership {
+            key: "repo-key".into(),
+            label: "repo".into(),
+            repo_root: "/repo".into(),
+            checkout_path: if linked {
+                "/repo-peer".into()
+            } else {
+                "/repo".into()
+            },
+            is_linked_worktree: linked,
+        };
+        root_workspace.worktree_space = Some(membership(false));
+        peer_workspace.worktree_space = Some(membership(true));
+        app.state.workspaces = vec![root_workspace, peer_workspace];
+        app.state.active = Some(0);
+        app.state.selected = 0;
+        app.state.confirm_close = false;
+        app.state.ensure_test_terminals();
+        let pane_ids = [root_pane, peer_tiled, peer_collected, peer_second_tab];
+        for pane_id in pane_ids {
+            app.state
+                .delegations
+                .create(Some(pane_id), None, Some("lifecycle".into()))
+                .expect("delegation");
+        }
+        let expected_public_panes = pane_ids
+            .into_iter()
+            .enumerate()
+            .map(|(position, pane)| {
+                app.public_pane_id(usize::from(position != 0), pane)
+                    .expect("public pane")
+            })
+            .collect::<std::collections::HashSet<_>>();
+        let target = app.public_pane_id(0, root_pane).expect("target pane");
+
+        let response = app.handle_pane_close("close".into(), PaneTarget { pane_id: target });
+
+        let _: SuccessResponse = serde_json::from_str(&response).expect("success");
+        assert!(app.state.workspaces.is_empty());
+        let events = event_hub.events_after(0);
+        let positions = |kind| {
+            events
+                .iter()
+                .enumerate()
+                .filter_map(|(position, (_, event))| (event.event == kind).then_some(position))
+                .collect::<Vec<_>>()
+        };
+        let pane_positions = positions(EventKind::PaneClosed);
+        let tombstone_positions = positions(EventKind::DelegationTombstoned);
+        let tab_positions = positions(EventKind::TabClosed);
+        let workspace_positions = positions(EventKind::WorkspaceClosed);
+        assert_eq!(pane_positions.len(), 4);
+        assert_eq!(tombstone_positions.len(), 4);
+        assert_eq!(positions(EventKind::DelegationGarbageCollected).len(), 4);
+        assert_eq!(tab_positions.len(), 3);
+        assert_eq!(workspace_positions.len(), 2);
+        assert_eq!(positions(EventKind::CollectionMemberRemoved).len(), 1);
+        assert_eq!(positions(EventKind::CollectionClosed).len(), 1);
+        assert!(pane_positions
+            .iter()
+            .all(|position| *position < tab_positions[0]));
+        assert!(tombstone_positions
+            .iter()
+            .all(|position| *position < tab_positions[0]));
+        assert!(tab_positions
+            .iter()
+            .all(|position| *position < workspace_positions[0]));
+        assert_eq!(
+            events
+                .iter()
+                .filter_map(|(_, event)| match &event.data {
+                    EventData::PaneClosed { pane_id, .. } => Some(pane_id.clone()),
+                    _ => None,
+                })
+                .collect::<std::collections::HashSet<_>>(),
+            expected_public_panes
+        );
     }
 
     #[test]
@@ -3436,7 +3549,7 @@ mod tests {
         app.state.active = None;
         app.state.selected = 0;
 
-        app.recover_failed_pane_move(context, taken.moved);
+        app.recover_failed_pane_move(context, taken.recovery, taken.moved);
 
         assert_eq!(app.state.workspaces.len(), 1);
         assert_eq!(app.state.workspaces[0].id, previous_workspace_id);

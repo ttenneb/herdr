@@ -143,24 +143,31 @@ impl App {
         let Some(ws_idx) = self.state.active else {
             return;
         };
-        let Some(collection) = self.state.workspaces[ws_idx]
-            .active_tab()
+        let tab_idx = self.state.workspaces[ws_idx].active_tab;
+        self.open_collection_close_dialog_at(ws_idx, tab_idx, collection_id, cleanup_archive);
+    }
+
+    fn open_collection_close_dialog_at(
+        &mut self,
+        ws_idx: usize,
+        tab_idx: usize,
+        collection_id: CollectionId,
+        cleanup_archive: bool,
+    ) {
+        let workspace_id = self.public_workspace_id(ws_idx);
+        let Some(tab_id) = self.public_tab_id(ws_idx, tab_idx) else {
+            return;
+        };
+        let Some(collection) = self
+            .state
+            .workspaces
+            .get(ws_idx)
+            .and_then(|workspace| workspace.tabs.get(tab_idx))
             .and_then(|tab| tab.collection(collection_id))
         else {
             return;
         };
-        if collection.members().is_empty() {
-            let _ = self.dispatch_runtime_mutation(
-                "tui.collection.close_empty",
-                Method::CollectionClose(CollectionCloseParams {
-                    collection_id: format!("collection_{}", collection_id.raw()),
-                    disposition: None,
-                    target_pane_id: None,
-                    focus_promoted: false,
-                }),
-            );
-            return;
-        }
+        let collection_is_empty = collection.members().is_empty();
         let active = collection.active_members().count();
         let archived = collection.archived_members().count();
         if cleanup_archive && archived == 0 {
@@ -176,7 +183,8 @@ impl App {
         let mut blocked = 0;
         for pane_id in &counted_members {
             let Some(pane) = self.state.workspaces[ws_idx]
-                .active_tab()
+                .tabs
+                .get(tab_idx)
                 .and_then(|tab| tab.panes.get(pane_id))
             else {
                 continue;
@@ -195,7 +203,12 @@ impl App {
         }
         self.state.pending_collection_close =
             Some(crate::app::collection_view::PendingCollectionClose {
+                workspace_id,
+                tab_id,
                 collection_id,
+                member_ids: counted_members.clone(),
+                collection_revision: collection.revision(),
+                group_close: None,
                 cleanup_archive,
                 active,
                 archived,
@@ -205,12 +218,206 @@ impl App {
                 blocked,
             });
         self.state.mode = Mode::CollectionClose;
+        if collection_is_empty {
+            let final_collection = self.state.workspaces[ws_idx].tabs.len() == 1
+                && self.state.workspaces[ws_idx]
+                    .tabs
+                    .get(tab_idx)
+                    .is_some_and(|tab| tab.layout.leaf_count() == 1);
+            if final_collection
+                && self.state.confirm_close
+                && self.begin_pending_collection_group_close(ws_idx)
+            {
+                return;
+            }
+            let _ = self.dispatch_runtime_mutation(
+                "tui.collection.close_empty",
+                Method::CollectionClose(CollectionCloseParams {
+                    collection_id: format!("collection_{}", collection_id.raw()),
+                    disposition: None,
+                    target_pane_id: None,
+                    focus_promoted: false,
+                }),
+            );
+            self.state.pending_collection_close = None;
+            self.state.collection_views.remove(&collection_id);
+            self.state.mode = if self.state.active.is_some() {
+                Mode::Terminal
+            } else {
+                Mode::Navigate
+            };
+        }
+    }
+
+    fn begin_pending_collection_group_close(&mut self, ws_idx: usize) -> bool {
+        let Some(space) = self.state.workspaces.get(ws_idx).and_then(|workspace| {
+            workspace
+                .worktree_space()
+                .filter(|space| !space.is_linked_worktree)
+        }) else {
+            return false;
+        };
+        let worktree_key = space.key.clone();
+        let workspace_member_ids = self
+            .state
+            .workspaces
+            .iter()
+            .enumerate()
+            .filter(|(_, workspace)| {
+                workspace
+                    .worktree_space()
+                    .is_some_and(|member| member.key == worktree_key)
+            })
+            .map(|(idx, _)| self.public_workspace_id(idx))
+            .collect::<Vec<_>>();
+        if workspace_member_ids.len() < 2 {
+            return false;
+        }
+        let workspace_id = self.public_workspace_id(ws_idx);
+        let Some(pending) = self.state.pending_collection_close.as_mut() else {
+            return false;
+        };
+        pending.group_close = Some(crate::app::collection_view::PendingCollectionGroupClose {
+            workspace_id,
+            worktree_key,
+            workspace_member_ids,
+        });
+        self.state.selected = ws_idx;
+        self.state.mode = Mode::ConfirmClose;
+        true
+    }
+
+    fn pending_collection_origin_index(
+        &self,
+        pending: &crate::app::collection_view::PendingCollectionClose,
+    ) -> Option<(usize, usize)> {
+        let ws_idx = self.parse_workspace_id(&pending.workspace_id)?;
+        let (tab_ws_idx, tab_idx) = self.parse_tab_id(&pending.tab_id)?;
+        (ws_idx == tab_ws_idx).then_some((ws_idx, tab_idx))
+    }
+
+    fn pending_collection_matches(
+        &self,
+        pending: &crate::app::collection_view::PendingCollectionClose,
+    ) -> Option<(usize, usize)> {
+        let (ws_idx, tab_idx) = self.pending_collection_origin_index(pending)?;
+        let collection = self
+            .state
+            .workspaces
+            .get(ws_idx)?
+            .tabs
+            .get(tab_idx)?
+            .collection(pending.collection_id)?;
+        let members = if pending.cleanup_archive {
+            collection.archived_members().collect::<Vec<_>>()
+        } else {
+            collection.members().to_vec()
+        };
+        (collection.revision() == pending.collection_revision && members == pending.member_ids)
+            .then_some((ws_idx, tab_idx))
+    }
+
+    fn reopen_pending_collection_close(
+        &mut self,
+        pending: &crate::app::collection_view::PendingCollectionClose,
+    ) {
+        self.state.mode = if self.state.active.is_some() {
+            Mode::Terminal
+        } else {
+            Mode::Navigate
+        };
+        let Some((ws_idx, tab_idx)) = self.pending_collection_origin_index(pending) else {
+            return;
+        };
+        self.open_collection_close_dialog_at(
+            ws_idx,
+            tab_idx,
+            pending.collection_id,
+            pending.cleanup_archive,
+        );
+    }
+
+    pub(super) fn confirm_pending_collection_group_close(&mut self) -> bool {
+        let Some(pending) = self.state.pending_collection_close.take() else {
+            return false;
+        };
+        let Some(group) = pending.group_close.as_ref() else {
+            self.state.pending_collection_close = Some(pending);
+            return false;
+        };
+        let target = self.pending_collection_matches(&pending);
+        let group_matches = target.is_some_and(|(ws_idx, tab_idx)| {
+            self.state.workspaces[ws_idx].tabs.len() == 1
+                && self.state.workspaces[ws_idx].tabs[tab_idx]
+                    .layout
+                    .leaf_count()
+                    == 1
+                && group.workspace_id == pending.workspace_id
+                && self.state.workspaces[ws_idx]
+                    .worktree_space()
+                    .is_some_and(|space| {
+                        !space.is_linked_worktree && space.key == group.worktree_key
+                    })
+                && self
+                    .state
+                    .workspaces
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, workspace)| {
+                        workspace
+                            .worktree_space()
+                            .is_some_and(|member| member.key == group.worktree_key)
+                    })
+                    .map(|(idx, _)| self.public_workspace_id(idx))
+                    .eq(group.workspace_member_ids.iter().cloned())
+        });
+        if group_matches {
+            let _ = self.dispatch_runtime_mutation(
+                "tui.collection.close_group",
+                Method::WorkspaceClose(crate::api::schema::WorkspaceTarget {
+                    workspace_id: group.workspace_id.clone(),
+                }),
+            );
+            self.state.collection_views.remove(&pending.collection_id);
+            self.state.mode = if self.state.active.is_some() {
+                Mode::Terminal
+            } else {
+                Mode::Navigate
+            };
+        } else {
+            self.state.mode = if self.state.active.is_some() {
+                Mode::Terminal
+            } else {
+                Mode::Navigate
+            };
+            self.reopen_pending_collection_close(&pending);
+        }
+        true
+    }
+
+    pub(super) fn cancel_pending_collection_group_close(&mut self) -> bool {
+        if self
+            .state
+            .pending_collection_close
+            .as_ref()
+            .is_none_or(|pending| pending.group_close.is_none())
+        {
+            return false;
+        }
+        self.state.pending_collection_close = None;
+        self.state.mode = if self.state.active.is_some() {
+            Mode::Terminal
+        } else {
+            Mode::Navigate
+        };
+        true
     }
 
     pub(crate) fn handle_collection_close_key(&mut self, key: crossterm::event::KeyEvent) {
         let cleanup_archive = self
             .state
             .pending_collection_close
+            .as_ref()
             .is_some_and(|pending| pending.cleanup_archive);
         let disposition = match key.code {
             KeyCode::Char('c') | KeyCode::Char('C') | KeyCode::Enter if cleanup_archive => {
@@ -233,23 +440,31 @@ impl App {
             self.state.mode = Mode::Terminal;
             return;
         };
+        let Some((ws_idx, tab_idx)) = self.pending_collection_matches(&pending) else {
+            self.reopen_pending_collection_close(&pending);
+            return;
+        };
+        if !pending.cleanup_archive
+            && disposition == Some(CollectionCloseDisposition::CascadeClose)
+            && self.state.workspaces[ws_idx].tabs.len() == 1
+            && self.state.workspaces[ws_idx].tabs[tab_idx]
+                .layout
+                .leaf_count()
+                == 1
+        {
+            self.state.pending_collection_close = Some(pending.clone());
+            if self.begin_pending_collection_group_close(ws_idx) {
+                return;
+            }
+            self.state.pending_collection_close = None;
+        }
         if pending.cleanup_archive {
-            let archived_members = self
-                .state
-                .active
-                .and_then(|ws_idx| self.state.workspaces.get(ws_idx))
-                .and_then(|ws| ws.active_tab())
-                .and_then(|tab| tab.collection(pending.collection_id))
-                .map(|collection| collection.archived_members().collect::<Vec<_>>())
-                .unwrap_or_default();
-            for pane_id in archived_members {
-                if let Some(ws_idx) = self.state.active {
-                    if let Some(public) = self.public_pane_id(ws_idx, pane_id) {
-                        let _ = self.dispatch_runtime_mutation(
-                            "tui.collection.archive_cleanup",
-                            Method::PaneClose(crate::api::schema::PaneTarget { pane_id: public }),
-                        );
-                    }
+            for pane_id in pending.member_ids.iter().copied() {
+                if let Some(public) = self.public_pane_id(ws_idx, pane_id) {
+                    let _ = self.dispatch_runtime_mutation(
+                        "tui.collection.archive_cleanup",
+                        Method::PaneClose(crate::api::schema::PaneTarget { pane_id: public }),
+                    );
                 }
             }
         } else {
@@ -802,6 +1017,53 @@ impl App {
 #[cfg(test)]
 mod tests {
     use crate::{app::AppState, layout::LayoutLeaf, workspace::Workspace};
+
+    fn group_membership(
+        linked: bool,
+        checkout_path: &str,
+    ) -> crate::workspace::WorktreeSpaceMembership {
+        crate::workspace::WorktreeSpaceMembership {
+            key: "repo-key".into(),
+            label: "repo".into(),
+            repo_root: "/repo".into(),
+            checkout_path: checkout_path.into(),
+            is_linked_worktree: linked,
+        }
+    }
+
+    fn grouped_final_collection_app() -> (
+        crate::app::App,
+        crate::layout::CollectionId,
+        crate::layout::PaneId,
+    ) {
+        let mut app = super::super::app_for_mouse_test();
+        let mut root_workspace = Workspace::test_new("root");
+        let root = root_workspace.tabs[0].root_pane.expect("root pane");
+        let child = root_workspace.test_split(ratatui::layout::Direction::Horizontal);
+        let collection = root_workspace
+            .create_collection_near(
+                0,
+                LayoutLeaf::Pane(root),
+                ratatui::layout::Direction::Vertical,
+                0.5,
+                None,
+            )
+            .expect("collection");
+        root_workspace
+            .collect_pane(root, collection)
+            .expect("collect root");
+        root_workspace
+            .collect_pane(child, collection)
+            .expect("collect child");
+        root_workspace.worktree_space = Some(group_membership(false, "/repo"));
+        let mut linked = Workspace::test_new("linked");
+        linked.worktree_space = Some(group_membership(true, "/repo-linked"));
+        app.state.workspaces = vec![root_workspace, linked];
+        app.state.active = Some(0);
+        app.state.selected = 0;
+        app.state.confirm_close = true;
+        (app, collection, child)
+    }
     #[test]
     fn archive_cleanup_confirmation_summarizes_only_archived_members() {
         let mut app = super::super::app_for_mouse_test();
@@ -849,6 +1111,120 @@ mod tests {
                 .len(),
             2
         );
+    }
+
+    #[test]
+    fn destructive_confirmation_reprompts_when_archive_revision_changes() {
+        let mut app = super::super::app_for_mouse_test();
+        let mut ws = Workspace::test_new("stale-close");
+        let root = ws.tabs[0].root_pane.expect("root");
+        let child = ws.test_split(ratatui::layout::Direction::Horizontal);
+        let collection = ws
+            .create_collection_near(
+                0,
+                LayoutLeaf::Pane(root),
+                ratatui::layout::Direction::Vertical,
+                0.5,
+                None,
+            )
+            .expect("collection");
+        ws.collect_pane(child, collection).expect("collect");
+        ws.tabs[0]
+            .layout
+            .focus_leaf(LayoutLeaf::Collection(collection));
+        app.state.workspaces = vec![ws];
+        app.state.active = Some(0);
+        app.open_collection_close_dialog(collection, false);
+        let original_revision = app
+            .state
+            .pending_collection_close
+            .as_ref()
+            .expect("prompt")
+            .collection_revision;
+        app.state.workspaces[0]
+            .set_collection_member_archived(child, collection, true)
+            .expect("archive mutation");
+
+        app.handle_collection_close_key(crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::Char('c'),
+            crossterm::event::KeyModifiers::empty(),
+        ));
+
+        let replacement = app
+            .state
+            .pending_collection_close
+            .as_ref()
+            .expect("replacement prompt");
+        assert!(replacement.collection_revision > original_revision);
+        assert_eq!(app.state.mode, crate::app::Mode::CollectionClose);
+        assert_eq!(app.state.workspaces[0].tabs[0].pane_count(), 2);
+    }
+
+    #[test]
+    fn first_stage_confirmation_uses_origin_after_shared_navigation_changes() {
+        let (mut app, collection, _) = grouped_final_collection_app();
+        app.open_collection_close_dialog(collection, false);
+        let origin_workspace_id = app
+            .state
+            .pending_collection_close
+            .as_ref()
+            .expect("prompt")
+            .workspace_id
+            .clone();
+
+        app.state.active = Some(1);
+        app.state.workspaces[1].active_tab = 0;
+        app.handle_collection_close_key(crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::Char('p'),
+            crossterm::event::KeyModifiers::empty(),
+        ));
+
+        let origin_idx = app
+            .parse_workspace_id(&origin_workspace_id)
+            .expect("origin remains");
+        assert!(app.state.workspaces[origin_idx].tabs[0]
+            .collection(collection)
+            .is_none());
+        assert_eq!(app.state.active, Some(1));
+        assert!(app.state.pending_collection_close.is_none());
+    }
+
+    #[test]
+    fn second_stage_group_close_revalidates_collection_revision_before_dispatch() {
+        let (mut app, collection, child) = grouped_final_collection_app();
+        app.open_collection_close_dialog(collection, false);
+        app.handle_collection_close_key(crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::Char('c'),
+            crossterm::event::KeyModifiers::empty(),
+        ));
+        assert_eq!(app.state.mode, crate::app::Mode::ConfirmClose);
+
+        app.state.workspaces[0]
+            .set_collection_member_archived(child, collection, true)
+            .expect("mutate between prompts");
+        assert!(app.confirm_pending_collection_group_close());
+
+        assert_eq!(app.state.workspaces.len(), 2);
+        assert_eq!(app.state.mode, crate::app::Mode::CollectionClose);
+        assert!(app.state.pending_collection_close.is_some());
+    }
+
+    #[test]
+    fn second_stage_group_close_revalidates_exact_group_membership_before_dispatch() {
+        let (mut app, collection, _) = grouped_final_collection_app();
+        app.open_collection_close_dialog(collection, false);
+        app.handle_collection_close_key(crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::Char('c'),
+            crossterm::event::KeyModifiers::empty(),
+        ));
+        let mut added = Workspace::test_new("added");
+        added.worktree_space = Some(group_membership(true, "/repo-added"));
+        app.state.workspaces.push(added);
+
+        assert!(app.confirm_pending_collection_group_close());
+
+        assert_eq!(app.state.workspaces.len(), 3);
+        assert_eq!(app.state.mode, crate::app::Mode::CollectionClose);
     }
 
     #[test]

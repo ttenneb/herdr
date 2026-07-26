@@ -8,9 +8,9 @@ use ratatui::layout::Direction;
 use tokio::sync::{mpsc, Notify};
 
 use crate::events::AppEvent;
-use crate::layout::{CollectionId, LayoutLeaf, PaneId};
 #[cfg(test)]
-use crate::layout::{PanePlacement, TileLayout};
+use crate::layout::PanePlacement;
+use crate::layout::{CollectionId, LayoutLeaf, PaneId, TileLayout};
 use crate::pane::{PaneLaunchEnv, PaneState};
 use crate::terminal::{TerminalId, TerminalRuntime, TerminalRuntimeRegistry, TerminalState};
 
@@ -23,7 +23,10 @@ use self::git::git_ahead_behind;
 use self::git::git_status_cache_key_for_space;
 #[cfg(test)]
 pub(crate) use self::tab::fail_next_collection_mutation_for_test;
-pub(crate) use self::{git::git_status_snapshot_for_cwd_with_demand, tab::MovedPane};
+pub(crate) use self::{
+    git::git_status_snapshot_for_cwd_with_demand,
+    tab::{take_collection_mutation_failure_for_test, MovedPane},
+};
 pub use self::{
     git::{
         derive_label_from_cwd, fallback_label_from_cwd, git_branch, git_space_metadata,
@@ -1017,6 +1020,10 @@ impl Workspace {
 
     pub(crate) fn take_pane_for_move(&mut self, pane_id: PaneId) -> Option<TakenPane> {
         let tab_idx = self.find_tab_index_for_pane(pane_id)?;
+        let previous_active_tab = self.active_tab;
+        let source_layout = self.tabs[tab_idx].layout.clone();
+        let source_root_pane = self.tabs[tab_idx].root_pane;
+        let source_zoomed = self.tabs[tab_idx].zoomed;
         let pane_count = self.tabs[tab_idx].pane_count();
         if pane_count <= 1 && self.tabs[tab_idx].layout.is_single_pane_leaf() {
             let mut tab = self.tabs.remove(tab_idx);
@@ -1024,6 +1031,14 @@ impl Workspace {
             self.adjust_active_tab_after_removal(tab_idx);
             return Some(TakenPane {
                 moved,
+                recovery: PaneMoveSourceRecovery {
+                    tab_idx,
+                    previous_active_tab,
+                    source_layout,
+                    source_root_pane,
+                    source_zoomed,
+                    removed_tab: Some(tab),
+                },
                 removed_tab_idx: Some(tab_idx),
                 workspace_empty: self.tabs.is_empty(),
             });
@@ -1032,9 +1047,40 @@ impl Workspace {
         let moved = self.tabs[tab_idx].take_pane_for_move(pane_id)?;
         Some(TakenPane {
             moved,
+            recovery: PaneMoveSourceRecovery {
+                tab_idx,
+                previous_active_tab,
+                source_layout,
+                source_root_pane,
+                source_zoomed,
+                removed_tab: None,
+            },
             removed_tab_idx: None,
             workspace_empty: false,
         })
+    }
+
+    pub(crate) fn restore_failed_pane_move(
+        &mut self,
+        mut recovery: PaneMoveSourceRecovery,
+        moved: MovedPane,
+    ) {
+        let pane_id = moved.pane_id;
+        if let Some(mut tab) = recovery.removed_tab.take() {
+            tab.layout = recovery.source_layout;
+            tab.root_pane = recovery.source_root_pane;
+            tab.zoomed = recovery.source_zoomed;
+            tab.panes.insert(pane_id, moved.pane_state);
+            self.tabs.insert(recovery.tab_idx.min(self.tabs.len()), tab);
+        } else if let Some(tab) = self.tabs.get_mut(recovery.tab_idx) {
+            tab.layout = recovery.source_layout;
+            tab.root_pane = recovery.source_root_pane;
+            tab.zoomed = recovery.source_zoomed;
+            tab.panes.insert(pane_id, moved.pane_state);
+        }
+        self.active_tab = recovery
+            .previous_active_tab
+            .min(self.tabs.len().saturating_sub(1));
     }
 
     pub fn create_collection_near(
@@ -1658,8 +1704,18 @@ pub(crate) struct CollectionCloseOutcome {
     pub workspace_empty: bool,
 }
 
+pub(crate) struct PaneMoveSourceRecovery {
+    tab_idx: usize,
+    previous_active_tab: usize,
+    source_layout: TileLayout,
+    source_root_pane: Option<PaneId>,
+    source_zoomed: bool,
+    removed_tab: Option<Tab>,
+}
+
 pub(crate) struct TakenPane {
     pub moved: MovedPane,
+    pub recovery: PaneMoveSourceRecovery,
     pub removed_tab_idx: Option<usize>,
     pub workspace_empty: bool,
 }

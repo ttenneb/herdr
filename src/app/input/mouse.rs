@@ -18,8 +18,8 @@ use crate::{
 use super::WheelRouting;
 use super::{
     modal::{
-        apply_global_menu_action, confirm_close_cancel, global_menu_actions, leave_modal,
-        modal_action_from_buttons, open_global_menu, open_new_tab_dialog, ModalAction,
+        apply_global_menu_action, global_menu_actions, leave_modal, modal_action_from_buttons,
+        open_global_menu, open_new_tab_dialog, ModalAction,
     },
     settings::SettingsAction,
     ScrollbarClickTarget, TAB_DRAG_THRESHOLD, WORKSPACE_DRAG_THRESHOLD,
@@ -54,6 +54,7 @@ pub(super) enum MouseAction {
     },
     RenameModal(ModalAction),
     ConfirmCloseAccept,
+    ConfirmCloseCancel,
     CollectionClosePromote,
     CollectionCloseCascade,
     ContextMenu {
@@ -270,7 +271,9 @@ impl AppState {
                         Some(ModalAction::Confirm) => {
                             return Some(MouseAction::ConfirmCloseAccept);
                         }
-                        Some(ModalAction::Cancel) | None => confirm_close_cancel(self),
+                        Some(ModalAction::Cancel) | None => {
+                            return Some(MouseAction::ConfirmCloseCancel);
+                        }
                         _ => {}
                     }
                     return None;

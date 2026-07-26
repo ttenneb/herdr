@@ -152,6 +152,7 @@ pub struct LayoutDescription {
     pub zoomed: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub focused_pane_id: Option<String>,
+    #[serde(default = "default_layout_focus")]
     pub focused: LayoutFocusInfo,
     pub root: LayoutNode,
 }
@@ -404,6 +405,7 @@ pub struct PaneInfo {
     pub workspace_id: String,
     pub tab_id: String,
     pub focused: bool,
+    #[serde(default)]
     pub placement: PanePlacementInfo,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cwd: Option<String>,
@@ -551,8 +553,10 @@ pub struct PaneLayoutSnapshot {
     pub area: PaneLayoutRect,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub focused_pane_id: Option<String>,
+    #[serde(default = "default_layout_focus")]
     pub focused: LayoutFocusInfo,
     pub panes: Vec<PaneLayoutPane>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub collections: Vec<CollectionInfo>,
     pub splits: Vec<PaneLayoutSplit>,
 }
@@ -570,6 +574,12 @@ pub enum LayoutFocusInfo {
     },
 }
 
+fn default_layout_focus() -> LayoutFocusInfo {
+    LayoutFocusInfo::Pane {
+        pane_id: String::new(),
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct PaneLayoutRect {
     pub x: u16,
@@ -582,6 +592,7 @@ pub struct PaneLayoutRect {
 pub struct PaneLayoutPane {
     pub pane_id: String,
     pub focused: bool,
+    #[serde(default)]
     pub placement: PanePlacementInfo,
     pub rect: PaneLayoutRect,
 }
