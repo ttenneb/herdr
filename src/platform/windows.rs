@@ -22,8 +22,9 @@ use windows_sys::{
             Diagnostics::{
                 Debug::ReadProcessMemory,
                 ToolHelp::{
-                    CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W,
-                    TH32CS_SNAPPROCESS,
+                    CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, Thread32First,
+                    Thread32Next, PROCESSENTRY32W, TH32CS_SNAPPROCESS, TH32CS_SNAPTHREAD,
+                    THREADENTRY32,
                 },
             },
             JobObjects::{
@@ -33,10 +34,12 @@ use windows_sys::{
             },
             Memory::{GlobalAlloc, GlobalLock, GlobalUnlock, GMEM_MOVEABLE},
             Ole::CF_UNICODETEXT,
+            Pipes::PeekNamedPipe,
             Threading::{
-                GetCurrentProcess, GetExitCodeProcess, OpenProcess, TerminateProcess,
-                CREATE_NO_WINDOW, DETACHED_PROCESS, PROCESS_BASIC_INFORMATION,
-                PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_TERMINATE, PROCESS_VM_READ,
+                GetCurrentProcess, GetExitCodeProcess, OpenProcess, OpenThread, ResumeThread,
+                TerminateProcess, CREATE_NO_WINDOW, CREATE_SUSPENDED, DETACHED_PROCESS,
+                PROCESS_BASIC_INFORMATION, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_TERMINATE,
+                PROCESS_VM_READ, THREAD_SUSPEND_RESUME,
             },
         },
         UI::{
@@ -56,7 +59,7 @@ use windows_sys::{
     },
 };
 
-use super::{ClipboardImage, ForegroundJob, Signal};
+use super::{AvailableOutput, ClipboardImage, ForegroundJob, Signal};
 
 const STILL_ACTIVE: u32 = 259;
 const FOREGROUND_PROCESS_SNAPSHOT_CACHE_TTL: Duration = Duration::from_millis(250);
@@ -74,34 +77,80 @@ impl Drop for ProcessIsolation {
 pub(crate) fn spawn_isolated_process_platform(
     command: &mut Command,
 ) -> std::io::Result<(Child, ProcessIsolation)> {
-    use std::os::windows::io::AsRawHandle;
+    use std::os::windows::{io::AsRawHandle, process::CommandExt};
 
-    let child = command.spawn()?;
+    // std::process::Command cannot supply PROC_THREAD_ATTRIBUTE_JOB_LIST. Start
+    // suspended instead, assign the only thread's process to the job, and resume
+    // it only after assignment succeeds. This preserves Command's quoting,
+    // environment, and stdio behavior while closing the pre-assignment race.
     let job = unsafe { CreateJobObjectW(null_mut(), std::ptr::null()) };
     if job.is_null() {
-        return Ok((child, ProcessIsolation(None)));
+        return Err(std::io::Error::last_os_error());
     }
-
+    let isolation = ProcessIsolation(Some(job));
     let mut limits = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
     limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
-    let configured = unsafe {
+    if unsafe {
         SetInformationJobObject(
             job,
             JobObjectExtendedLimitInformation,
             (&limits as *const JOBOBJECT_EXTENDED_LIMIT_INFORMATION).cast(),
             size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
-        ) != 0
-    };
-    let assigned = configured
-        && unsafe { AssignProcessToJobObject(job, child.as_raw_handle() as HANDLE) != 0 };
-    if assigned {
-        Ok((child, ProcessIsolation(Some(job))))
-    } else {
-        unsafe { CloseHandle(job) };
-        // Assignment can fail when the host itself is in a restrictive job.
-        // Keep the child and use the descendant-snapshot fallback at timeout.
-        Ok((child, ProcessIsolation(None)))
+        )
+    } == 0
+    {
+        return Err(std::io::Error::last_os_error());
     }
+
+    command.creation_flags(CREATE_NO_WINDOW | CREATE_SUSPENDED);
+    let mut child = command.spawn()?;
+    if unsafe { AssignProcessToJobObject(job, child.as_raw_handle() as HANDLE) } == 0 {
+        let error = std::io::Error::last_os_error();
+        let _ = child.kill();
+        return Err(error);
+    }
+
+    let thread = match suspended_process_thread(child.id()) {
+        Ok(thread) => thread,
+        Err(error) => {
+            let _ = unsafe { TerminateJobObject(job, 1) };
+            return Err(error);
+        }
+    };
+    let resumed = unsafe { ResumeThread(thread) };
+    unsafe { CloseHandle(thread) };
+    if resumed == u32::MAX {
+        let error = std::io::Error::last_os_error();
+        let _ = unsafe { TerminateJobObject(job, 1) };
+        return Err(error);
+    }
+
+    Ok((child, isolation))
+}
+
+fn suspended_process_thread(pid: u32) -> std::io::Result<HANDLE> {
+    let snapshot = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0) };
+    if snapshot == INVALID_HANDLE_VALUE {
+        return Err(std::io::Error::last_os_error());
+    }
+    let mut entry = THREADENTRY32 {
+        dwSize: size_of::<THREADENTRY32>() as u32,
+        ..THREADENTRY32::default()
+    };
+    let mut has_entry = unsafe { Thread32First(snapshot, &mut entry) } != 0;
+    let mut thread = None;
+    while has_entry {
+        if entry.th32OwnerProcessID == pid {
+            let handle = unsafe { OpenThread(THREAD_SUSPEND_RESUME, 0, entry.th32ThreadID) };
+            if !handle.is_null() {
+                thread = Some(handle);
+                break;
+            }
+        }
+        has_entry = unsafe { Thread32Next(snapshot, &mut entry) } != 0;
+    }
+    unsafe { CloseHandle(snapshot) };
+    thread.ok_or_else(std::io::Error::last_os_error)
 }
 
 pub(crate) fn terminate_isolated_process_platform(
@@ -134,6 +183,61 @@ pub(crate) fn terminate_isolated_process_platform(
         },
     };
     root_result.and_then(|()| descendant_error.map_or(Ok(()), Err))
+}
+
+pub(crate) fn configure_isolated_output_platform(_child: &Child) -> std::io::Result<()> {
+    Ok(())
+}
+
+pub(crate) fn read_child_stdout_available_platform(
+    child: &mut Child,
+    buffer: &mut [u8],
+) -> std::io::Result<AvailableOutput> {
+    read_available_pipe(child.stdout.as_mut(), buffer)
+}
+
+pub(crate) fn read_child_stderr_available_platform(
+    child: &mut Child,
+    buffer: &mut [u8],
+) -> std::io::Result<AvailableOutput> {
+    read_available_pipe(child.stderr.as_mut(), buffer)
+}
+
+fn read_available_pipe(
+    reader: Option<&mut (impl std::io::Read + std::os::windows::io::AsRawHandle)>,
+    buffer: &mut [u8],
+) -> std::io::Result<AvailableOutput> {
+    let Some(reader) = reader else {
+        return Ok(AvailableOutput::Closed);
+    };
+    let mut available = 0;
+    if unsafe {
+        PeekNamedPipe(
+            reader.as_raw_handle() as HANDLE,
+            null_mut(),
+            0,
+            null_mut(),
+            &mut available,
+            null_mut(),
+        )
+    } == 0
+    {
+        let error = std::io::Error::last_os_error();
+        return match error.raw_os_error() {
+            Some(109 | 232) => Ok(AvailableOutput::Closed),
+            _ => Err(error),
+        };
+    }
+    if available == 0 {
+        return Ok(AvailableOutput::Open);
+    }
+    let read_len = buffer.len().min(available as usize);
+    match reader.read(&mut buffer[..read_len]) {
+        Ok(0) => Ok(AvailableOutput::Closed),
+        Ok(read) => Ok(AvailableOutput::Bytes(read)),
+        Err(error) if error.kind() == std::io::ErrorKind::Interrupted => Ok(AvailableOutput::Open),
+        Err(error) => Err(error),
+    }
 }
 
 fn terminate_process(pid: u32) -> std::io::Result<()> {
@@ -1208,6 +1312,31 @@ mod tests {
     use windows_sys::Win32::System::Console::{
         AllocConsole, FreeConsole, GetConsoleProcessList, GetConsoleWindow,
     };
+
+    #[test]
+    fn isolated_process_is_assigned_to_job_before_spawn_returns() {
+        use std::os::windows::io::AsRawHandle;
+        use windows_sys::{Win32::Foundation::HANDLE, Win32::System::JobObjects::IsProcessInJob};
+
+        let mut command = Command::new("cmd.exe");
+        command
+            .args(["/d", "/c", "ping -n 30 127.0.0.1 >nul"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let (mut child, mut isolation) =
+            super::spawn_isolated_process_platform(&mut command).expect("spawn isolated process");
+        let job = isolation.0.expect("isolated process must have a job");
+        let mut assigned = 0;
+        assert_ne!(
+            unsafe { IsProcessInJob(child.as_raw_handle() as HANDLE, job, &mut assigned,) },
+            0,
+            "query job assignment"
+        );
+        assert_ne!(assigned, 0, "child must be assigned before provider runs");
+        super::terminate_isolated_process_platform(&mut child, &mut isolation)
+            .expect("terminate isolated process");
+    }
 
     #[test]
     fn cmd_agent_command_encodes_edge_arguments_without_cmd_expansion() {

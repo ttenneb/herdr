@@ -87,6 +87,16 @@ fn provider_success_malformed_nonzero_and_spawn_failure() {
         .stderr
         .contains("truncated plugin output after 16384 bytes"));
 
+    let oversized_stdout = shell("head -c 70000 /dev/zero");
+    assert!(oversized_stdout
+        .result
+        .unwrap_err()
+        .contains("choices output exceeds 64 KiB"));
+    assert!(oversized_stdout.stdout.len() < 66 * 1024);
+    assert!(oversized_stdout
+        .stdout
+        .contains("truncated plugin output after 65536 bytes"));
+
     let mut missing = Command::new("/definitely/missing/herdr-provider");
     missing.stdout(Stdio::piped()).stderr(Stdio::piped());
     assert!(run_choices_provider(missing)
@@ -114,6 +124,35 @@ fn provider_completion_kills_descendant_that_retains_output_pipes() {
     );
     assert_eq!(completion.exit_code, Some(0));
     assert!(completion.result.is_ok(), "{:?}", completion.result);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn provider_completion_does_not_wait_for_escaped_descendant_pipes() {
+    let started = Instant::now();
+    let completion = shell(r#"setsid sh -c 'sleep 5' & printf '%s' '{"version":1,"choices":[]}'"#);
+
+    assert!(
+        started.elapsed() < Duration::from_secs(3),
+        "provider completion waited for an escaped descendant pipe"
+    );
+    assert_eq!(completion.exit_code, Some(0));
+    assert!(completion.result.is_ok(), "{:?}", completion.result);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn provider_timeout_does_not_wait_for_escaped_descendant_pipes() {
+    let started = Instant::now();
+    let result = shell(r#"setsid sh -c 'sleep 5' & wait"#)
+        .result
+        .unwrap_err();
+
+    assert!(
+        started.elapsed() < Duration::from_secs(4),
+        "provider timeout waited for an escaped descendant pipe"
+    );
+    assert!(result.contains("timed out after 2 seconds"));
 }
 
 #[test]
@@ -175,6 +214,40 @@ fn provider_is_async_correlated_and_accounted() {
         app.state.plugin_command_logs[0].status,
         PluginCommandStatus::Succeeded
     );
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn escaped_descendant_pipes_do_not_hold_provider_capacity() {
+    let root = root("choices-escaped-capacity");
+    let plugin = plugin(&root);
+    let mut app = test_app();
+    let started = Instant::now();
+    app.start_plugin_action_choices_provider(
+        "escaped-request".into(),
+        &plugin,
+        "choose".into(),
+        vec![
+            "sh".into(),
+            "-c".into(),
+            r#"setsid sh -c 'sleep 5' & printf '{"version":1,"choices":[]}'"#.into(),
+        ],
+        &context(),
+    )
+    .unwrap();
+
+    let event = app.event_rx.blocking_recv().unwrap();
+    assert!(
+        started.elapsed() < Duration::from_secs(3),
+        "escaped output pipes held provider capacity"
+    );
+    app.handle_internal_event(event);
+    assert_eq!(app.state.plugin_action_choices_providers_in_flight, 0);
+    assert!(app
+        .state
+        .plugin_action_choices_requests_in_flight
+        .is_empty());
     std::fs::remove_dir_all(root).ok();
 }
 

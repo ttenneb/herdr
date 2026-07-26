@@ -53,29 +53,44 @@ pub(crate) struct IsolatedChild {
 
 impl IsolatedChild {
     pub(crate) fn spawn(command: &mut std::process::Command) -> std::io::Result<Self> {
-        let (child, isolation) = spawn_isolated_process_platform(command)?;
+        let (mut child, mut isolation) = spawn_isolated_process_platform(command)?;
+        if let Err(error) = configure_isolated_output_platform(&child) {
+            let _ = terminate_isolated_process_platform(&mut child, &mut isolation);
+            return Err(error);
+        }
         Ok(Self { child, isolation })
     }
 
-    pub(crate) fn stdout(&mut self) -> Option<std::process::ChildStdout> {
-        self.child.stdout.take()
+    /// Read bytes currently available on stdout without waiting for a writer.
+    pub(crate) fn read_stdout_available(
+        &mut self,
+        buffer: &mut [u8],
+    ) -> std::io::Result<AvailableOutput> {
+        read_child_stdout_available_platform(&mut self.child, buffer)
     }
 
-    pub(crate) fn stderr(&mut self) -> Option<std::process::ChildStderr> {
-        self.child.stderr.take()
+    /// Read bytes currently available on stderr without waiting for a writer.
+    pub(crate) fn read_stderr_available(
+        &mut self,
+        buffer: &mut [u8],
+    ) -> std::io::Result<AvailableOutput> {
+        read_child_stderr_available_platform(&mut self.child, buffer)
     }
 
     pub(crate) fn try_wait(&mut self) -> std::io::Result<Option<std::process::ExitStatus>> {
         self.child.try_wait()
     }
 
-    pub(crate) fn wait(&mut self) -> std::io::Result<std::process::ExitStatus> {
-        self.child.wait()
-    }
-
     pub(crate) fn terminate_tree(&mut self) -> std::io::Result<()> {
         terminate_isolated_process_platform(&mut self.child, &mut self.isolation)
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AvailableOutput {
+    Bytes(usize),
+    Open,
+    Closed,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

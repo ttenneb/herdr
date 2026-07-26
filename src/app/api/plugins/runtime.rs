@@ -509,22 +509,19 @@ fn run_choices_provider(mut command: Command) -> ChoicesProviderCompletion {
             };
         }
     };
-    let stdout_reader = child.stdout().map(|stdout| {
-        std::thread::spawn(move || read_bounded_output(stdout, PLUGIN_COMMAND_OUTPUT_MAX_BYTES))
-    });
-    let stderr_reader = child.stderr().map(|stderr| {
-        std::thread::spawn(move || read_bounded_output(stderr, PLUGIN_CHOICES_STDERR_MAX_BYTES))
-    });
-
+    let mut stdout = BoundedOutput::default();
+    let mut stderr = BoundedOutput::default();
+    let mut buffer = [0_u8; 8192];
     let deadline = Instant::now() + PLUGIN_CHOICES_TIMEOUT;
     let (status, execution_error) = loop {
+        drain_provider_output_once(&mut child, &mut stdout, &mut stderr, &mut buffer);
         match child.try_wait() {
             Ok(Some(status)) => {
-                // The root can exit while descendants retain its output pipes.
-                // Preserve the observed root status, but tear down the isolated
-                // tree before joining readers so inherited descriptors cannot
-                // keep completion blocked indefinitely.
+                // Descendants can retain or deliberately escape with inherited
+                // pipes. Terminate the isolated tree, then drain only bytes that
+                // are already available; pipe EOF is never a completion gate.
                 let _ = child.terminate_tree();
+                drain_provider_output_available(&mut child, &mut stdout, &mut stderr, &mut buffer);
                 break (Some(status), None);
             }
             Ok(None) if Instant::now() < deadline => {
@@ -532,7 +529,8 @@ fn run_choices_provider(mut command: Command) -> ChoicesProviderCompletion {
             }
             Ok(None) => {
                 let termination_error = child.terminate_tree().err();
-                let status = child.wait().ok();
+                let status = reap_terminated_provider(&mut child);
+                drain_provider_output_available(&mut child, &mut stdout, &mut stderr, &mut buffer);
                 let message = termination_error.map_or_else(
                     || "choices provider timed out after 2 seconds".to_string(),
                     |err| format!(
@@ -543,7 +541,7 @@ fn run_choices_provider(mut command: Command) -> ChoicesProviderCompletion {
             }
             Err(err) => {
                 let _ = child.terminate_tree();
-                let _ = child.wait();
+                drain_provider_output_available(&mut child, &mut stdout, &mut stderr, &mut buffer);
                 break (
                     None,
                     Some(format!("failed waiting for choices provider: {err}")),
@@ -552,12 +550,6 @@ fn run_choices_provider(mut command: Command) -> ChoicesProviderCompletion {
         }
     };
 
-    let stdout = stdout_reader
-        .and_then(|reader| reader.join().ok())
-        .unwrap_or_default();
-    let stderr = stderr_reader
-        .and_then(|reader| reader.join().ok())
-        .unwrap_or_default();
     let stdout_log = stdout.log_string(PLUGIN_COMMAND_OUTPUT_MAX_BYTES);
     let stderr_log = stderr.log_string(PLUGIN_CHOICES_STDERR_MAX_BYTES);
     let exit_code = status.as_ref().and_then(std::process::ExitStatus::code);
@@ -592,6 +584,13 @@ struct BoundedOutput {
 }
 
 impl BoundedOutput {
+    fn append(&mut self, bytes: &[u8], cap: usize) {
+        let remaining = cap.saturating_sub(self.bytes.len());
+        self.bytes
+            .extend_from_slice(&bytes[..bytes.len().min(remaining)]);
+        self.truncated |= bytes.len() > remaining;
+    }
+
     fn log_string(&self, cap: usize) -> String {
         let mut output = String::from_utf8_lossy(&self.bytes).into_owned();
         if self.truncated {
@@ -603,27 +602,52 @@ impl BoundedOutput {
     }
 }
 
-fn read_bounded_output(mut reader: impl Read, cap: usize) -> BoundedOutput {
-    let mut output = BoundedOutput {
-        bytes: Vec::with_capacity(cap.min(8192)),
-        truncated: false,
-    };
-    let mut buffer = [0_u8; 8192];
-    loop {
-        match reader.read(&mut buffer) {
-            Ok(0) => break,
-            Ok(read) => {
-                let remaining = cap.saturating_sub(output.bytes.len());
-                output
-                    .bytes
-                    .extend_from_slice(&buffer[..read.min(remaining)]);
-                output.truncated |= read > remaining;
-            }
-            Err(err) if err.kind() == std::io::ErrorKind::Interrupted => continue,
-            Err(_) => break,
+fn drain_provider_output_once(
+    child: &mut crate::platform::IsolatedChild,
+    stdout: &mut BoundedOutput,
+    stderr: &mut BoundedOutput,
+    buffer: &mut [u8],
+) -> bool {
+    let mut read_bytes = false;
+    if let Ok(crate::platform::AvailableOutput::Bytes(read)) = child.read_stdout_available(buffer) {
+        stdout.append(&buffer[..read], PLUGIN_COMMAND_OUTPUT_MAX_BYTES);
+        read_bytes = true;
+    }
+    if let Ok(crate::platform::AvailableOutput::Bytes(read)) = child.read_stderr_available(buffer) {
+        stderr.append(&buffer[..read], PLUGIN_CHOICES_STDERR_MAX_BYTES);
+        read_bytes = true;
+    }
+    read_bytes
+}
+
+fn drain_provider_output_available(
+    child: &mut crate::platform::IsolatedChild,
+    stdout: &mut BoundedOutput,
+    stderr: &mut BoundedOutput,
+    buffer: &mut [u8],
+) {
+    // More than enough to drain both bounded outputs, but finite even if an
+    // escaped descendant continuously writes to an inherited pipe.
+    for _ in 0..32 {
+        if !drain_provider_output_once(child, stdout, stderr, buffer) {
+            break;
         }
     }
-    output
+}
+
+fn reap_terminated_provider(
+    child: &mut crate::platform::IsolatedChild,
+) -> Option<std::process::ExitStatus> {
+    let deadline = Instant::now() + Duration::from_millis(100);
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => return Some(status),
+            Ok(None) if Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            Ok(None) | Err(_) => return None,
+        }
+    }
 }
 
 fn current_unix_ms() -> u64 {
