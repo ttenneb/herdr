@@ -1437,6 +1437,73 @@ impl AppState {
         true
     }
 
+    pub fn move_workspace_block(
+        &mut self,
+        workspace_ids: &[String],
+        before_workspace_id: Option<&str>,
+    ) -> bool {
+        let moved_ids = workspace_ids
+            .iter()
+            .map(String::as_str)
+            .collect::<std::collections::HashSet<_>>();
+        if moved_ids.is_empty()
+            || moved_ids.len() != workspace_ids.len()
+            || !workspace_ids
+                .iter()
+                .all(|id| self.workspaces.iter().any(|workspace| workspace.id == *id))
+            || before_workspace_id.is_some_and(|id| {
+                moved_ids.contains(id)
+                    || !self.workspaces.iter().any(|workspace| workspace.id == id)
+            })
+        {
+            return false;
+        }
+
+        let mut desired_ids = self
+            .workspaces
+            .iter()
+            .filter(|workspace| !moved_ids.contains(workspace.id.as_str()))
+            .map(|workspace| workspace.id.clone())
+            .collect::<Vec<_>>();
+        let insert_idx = before_workspace_id
+            .and_then(|id| desired_ids.iter().position(|candidate| candidate == id))
+            .unwrap_or(desired_ids.len());
+        desired_ids.splice(insert_idx..insert_idx, workspace_ids.iter().cloned());
+        if self
+            .workspaces
+            .iter()
+            .map(|workspace| workspace.id.as_str())
+            .eq(desired_ids.iter().map(String::as_str))
+        {
+            return false;
+        }
+
+        let active_id = self.active.map(|idx| self.workspaces[idx].id.clone());
+        let selected_id = self
+            .workspaces
+            .get(self.selected)
+            .map(|workspace| workspace.id.clone());
+        let desired_positions = desired_ids
+            .iter()
+            .enumerate()
+            .map(|(index, id)| (id.clone(), index))
+            .collect::<std::collections::HashMap<_, _>>();
+
+        self.mark_session_dirty();
+        self.workspaces.sort_by_key(|workspace| {
+            desired_positions
+                .get(&workspace.id)
+                .copied()
+                .unwrap_or(usize::MAX)
+        });
+        self.active = active_id.and_then(|id| self.workspaces.iter().position(|ws| ws.id == id));
+        self.selected = selected_id
+            .and_then(|id| self.workspaces.iter().position(|ws| ws.id == id))
+            .unwrap_or(0);
+        self.ensure_workspace_visible(self.selected);
+        true
+    }
+
     pub fn scroll_tabs_left(&mut self) {
         self.tab_scroll_follow_active = false;
         self.tab_scroll = self.tab_scroll.saturating_sub(1);
@@ -1694,6 +1761,10 @@ impl AppState {
                 crate::logging::workspace_closed(&workspace_id);
             }
         }
+        let active_workspace_id = self
+            .active
+            .and_then(|idx| self.workspaces.get(idx))
+            .map(|ws| ws.id.clone());
         let destruction = self.finalize_pane_destruction(pane_ids);
         for idx in close_indices.iter().rev() {
             self.workspaces.remove(*idx);
@@ -1706,6 +1777,12 @@ impl AppState {
             self.tab_scroll = 0;
             self.tab_scroll_follow_active = true;
         } else {
+            // Keep focus on the previously focused workspace
+            if let Some(id) = active_workspace_id {
+                if let Some(idx) = self.workspaces.iter().position(|ws| ws.id == id) {
+                    self.selected = idx;
+                }
+            }
             if self.selected >= self.workspaces.len() {
                 self.selected = self.workspaces.len() - 1;
             }
@@ -3331,6 +3408,11 @@ impl AppState {
         self.mark_session_dirty();
 
         if should_close_workspace {
+            let active_workspace_id = self
+                .active
+                .and_then(|idx| self.workspaces.get(idx))
+                .map(|ws| ws.id.clone());
+            let selected_workspace_id = self.workspaces.get(self.selected).map(|ws| ws.id.clone());
             self.workspaces.remove(ws_idx);
             self.remove_unattached_terminal_ids(workspace_terminal_ids);
             if self.workspaces.is_empty() {
@@ -3340,14 +3422,29 @@ impl AppState {
                     self.mode = Mode::Navigate;
                 }
             } else {
+                // Keep focus on the previously focused workspace
+                if let Some(id) = active_workspace_id {
+                    if let Some(idx) = self.workspaces.iter().position(|ws| ws.id == id) {
+                        self.active = Some(idx);
+                    }
+                }
                 if let Some(active) = self.active {
                     if active >= self.workspaces.len() {
                         self.active = Some(self.workspaces.len() - 1);
                     }
                 }
+                if let Some(id) = selected_workspace_id {
+                    if let Some(idx) = self.workspaces.iter().position(|ws| ws.id == id) {
+                        self.selected = idx;
+                    }
+                }
                 if self.selected >= self.workspaces.len() {
                     self.selected = self.workspaces.len() - 1;
                 }
+                self.workspace_scroll = self
+                    .workspace_scroll
+                    .min(self.workspaces.len().saturating_sub(1));
+                self.ensure_workspace_visible(self.selected);
             }
         } else {
             self.remove_unattached_terminal_ids(pane_terminal_id);
@@ -4558,6 +4655,59 @@ mod tests {
     }
 
     #[test]
+    fn move_workspace_block_collects_non_contiguous_members() {
+        let mut state =
+            app_with_workspaces(&["child-one", "normal", "parent", "child-two", "tail"]);
+        let parent_id = state.workspaces[2].id.clone();
+        let child_one_id = state.workspaces[0].id.clone();
+        let child_two_id = state.workspaces[3].id.clone();
+        let tail_id = state.workspaces[4].id.clone();
+        state.active = Some(0);
+        state.selected = 4;
+
+        assert!(state.move_workspace_block(
+            &[parent_id, child_one_id.clone(), child_two_id],
+            Some(&tail_id),
+        ));
+
+        let names = state
+            .workspaces
+            .iter()
+            .map(|workspace| workspace.display_name())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            names,
+            ["normal", "parent", "child-one", "child-two", "tail"]
+        );
+        assert_eq!(state.workspaces[state.active.unwrap()].id, child_one_id);
+        assert_eq!(state.workspaces[state.selected].id, tail_id);
+    }
+
+    #[test]
+    fn move_workspace_block_rejects_invalid_and_noop_orders() {
+        let mut state = app_with_workspaces(&["a", "b", "c"]);
+        let ids = state
+            .workspaces
+            .iter()
+            .map(|workspace| workspace.id.clone())
+            .collect::<Vec<_>>();
+
+        assert!(!state.move_workspace_block(&[], None));
+        assert!(!state.move_workspace_block(&[ids[0].clone(), ids[0].clone()], None));
+        assert!(!state.move_workspace_block(&["missing".into()], None));
+        assert!(!state.move_workspace_block(&[ids[0].clone()], Some(&ids[0])));
+        assert!(!state.move_workspace_block(&[ids[0].clone()], Some(&ids[1])));
+        assert_eq!(
+            state
+                .workspaces
+                .iter()
+                .map(|workspace| workspace.display_name())
+                .collect::<Vec<_>>(),
+            ["a", "b", "c"]
+        );
+    }
+
+    #[test]
     fn close_workspace_adjusts_indices() {
         let mut state = app_with_workspaces(&["a", "b", "c"]);
         state.selected = 1;
@@ -4621,6 +4771,50 @@ mod tests {
         assert_eq!(state.workspaces.len(), 1);
         assert_eq!(state.selected, 0);
         assert_eq!(state.active, Some(0));
+    }
+
+    #[test]
+    fn close_non_focused_workspace_keeps_focus() {
+        let mut state = app_with_workspaces(&["a", "b", "c"]);
+        state.selected = 1;
+        state.active = Some(0);
+
+        state.close_selected_workspace();
+
+        assert_eq!(state.workspaces.len(), 2);
+        assert_eq!(state.workspaces[0].display_name(), "a");
+        assert_eq!(state.workspaces[1].display_name(), "c");
+        assert_eq!(state.selected, 0);
+        assert_eq!(state.active, Some(0));
+        state.assert_invariants_for_test();
+    }
+
+    #[test]
+    fn pane_died_self_closing_earlier_workspace_keeps_focus() {
+        let names = (0..20).map(|i| format!("ws{i:02}")).collect::<Vec<_>>();
+        let name_refs = names.iter().map(String::as_str).collect::<Vec<_>>();
+        let mut state = app_with_workspaces(&name_refs);
+        state.selected = 1;
+        state.active = Some(1);
+        // Constrain the sidebar viewport so the focused workspace starts
+        // off-screen: 20 workspaces cannot all fit in 12 rows, so index 1 is
+        // hidden at maximum scroll regardless of individual card height.
+        state.view.sidebar_rect = ratatui::layout::Rect::new(0, 0, 30, 12);
+        state.workspace_scroll =
+            crate::ui::normalized_workspace_scroll(&state, state.view.sidebar_rect, usize::MAX / 2);
+        let cards = crate::ui::compute_workspace_card_areas(&state, state.view.sidebar_rect);
+        assert!(cards.iter().all(|card| card.ws_idx != 1));
+
+        let pane_id = *state.workspaces[0].panes.keys().next().unwrap();
+        state.handle_pane_died(pane_id);
+
+        assert_eq!(state.workspaces.len(), 19);
+        assert_eq!(state.workspaces[0].display_name(), "ws01");
+        assert_eq!(state.selected, 0);
+        assert_eq!(state.active, Some(0));
+        let cards = crate::ui::compute_workspace_card_areas(&state, state.view.sidebar_rect);
+        assert!(cards.iter().any(|card| card.ws_idx == 0));
+        state.assert_invariants_for_test();
     }
 
     #[test]

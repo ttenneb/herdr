@@ -819,6 +819,10 @@ pub enum Mode {
 }
 
 impl Mode {
+    pub(crate) fn mouse_motion_changes_view(self) -> bool {
+        matches!(self, Self::GlobalMenu | Self::ContextMenu | Self::Navigator)
+    }
+
     /// Whether keys in this mode are commands/navigation (an ASCII input source is wanted) rather
     /// than free text. This is an explicit **allowlist** of the prefix command/navigation realm:
     /// any mode NOT listed defaults to leaving the user's IME alone (the safe default), so adding a
@@ -1143,10 +1147,16 @@ pub struct SettingsState {
     pub original_theme: Option<String>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum WorkspaceDropTarget {
+    Before(usize),
+    End,
+}
+
 pub(crate) enum DragTarget {
     WorkspaceReorder {
         source_ws_idx: usize,
-        insert_idx: Option<usize>,
+        drop_target: Option<WorkspaceDropTarget>,
     },
     TabReorder {
         ws_idx: usize,
@@ -2483,16 +2493,11 @@ impl AppState {
             match &drag.target {
                 DragTarget::WorkspaceReorder {
                     source_ws_idx,
-                    insert_idx,
+                    drop_target,
                 } => {
                     assert_workspace_index(*source_ws_idx, "workspace drag source");
-                    if let Some(insert_idx) = insert_idx {
-                        assert!(
-                            *insert_idx <= self.workspaces.len(),
-                            "workspace drag insert index {} out of bounds for {} workspaces",
-                            insert_idx,
-                            self.workspaces.len()
-                        );
+                    if let Some(WorkspaceDropTarget::Before(ws_idx)) = drop_target {
+                        assert_workspace_index(*ws_idx, "workspace drag target");
                     }
                 }
                 DragTarget::TabReorder {

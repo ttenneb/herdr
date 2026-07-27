@@ -1070,6 +1070,9 @@ impl App {
             Method::WorkspaceMove(params) => {
                 return self.handle_workspace_move(request.id, params);
             }
+            Method::WorkspaceMoveBlock(params) => {
+                return self.handle_workspace_move_block(request.id, params);
+            }
             Method::WorkspaceReportMetadata(params) => {
                 return self.handle_workspace_report_metadata(request.id, params);
             }

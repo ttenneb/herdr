@@ -259,6 +259,17 @@ fn terminate_process(pid: u32) -> std::io::Result<()> {
     }
 }
 
+pub(crate) fn encode_windows_conpty_shift_enter(key: crate::input::TerminalKey) -> Option<Vec<u8>> {
+    use crossterm::event::{KeyCode, KeyEventKind, KeyModifiers};
+
+    if key.code != KeyCode::Enter || key.modifiers != KeyModifiers::SHIFT {
+        return None;
+    }
+
+    let key_down = !matches!(key.kind, KeyEventKind::Release);
+    Some(format!("\x1b[13;28;13;{};16;1_", u8::from(key_down)).into_bytes())
+}
+
 #[derive(Debug)]
 struct CachedProcessSnapshot {
     built_at: Instant,

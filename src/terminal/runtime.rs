@@ -433,6 +433,15 @@ impl TerminalRuntime {
         self.0.try_send_bytes(bytes)
     }
 
+    pub fn try_send_prompt_transaction(
+        &self,
+        text: Bytes,
+        enter: Bytes,
+        delay: std::time::Duration,
+    ) -> Result<(), crate::pane::PromptTransactionAdmissionError> {
+        self.0.try_send_prompt_transaction(text, enter, delay)
+    }
+
     pub async fn send_paste(&self, text: String) -> Result<(), mpsc::error::SendError<Bytes>> {
         self.0.send_paste(text).await
     }

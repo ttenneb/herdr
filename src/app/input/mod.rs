@@ -427,6 +427,9 @@ impl App {
                         source_ws_idx,
                         insert_idx,
                     } => self.move_workspace_via_api(source_ws_idx, insert_idx),
+                    MouseAction::MoveWorkspaceBlock { params } => {
+                        self.move_workspace_block_via_api(params)
+                    }
                     MouseAction::MoveTab {
                         ws_idx,
                         source_tab_idx,
@@ -562,7 +565,9 @@ impl App {
         let Some(bytes) = bytes else {
             return;
         };
-        rt.scroll_reset();
+        if !matches!(mouse.kind, MouseEventKind::Moved) {
+            rt.scroll_reset();
+        }
         if let Err(err) = rt.try_send_bytes(Bytes::from(bytes)) {
             warn!(err = %err, kind = ?mouse.kind, "failed to forward popup mouse event");
         }

@@ -1,3 +1,5 @@
+use std::time::Duration;
+
 use bytes::Bytes;
 
 use crate::api::schema::{
@@ -7,6 +9,8 @@ use crate::api::schema::{
 use crate::app::App;
 
 use super::responses::{encode_error, encode_error_body, encode_success};
+
+const AGENT_PROMPT_SUBMIT_DELAY: Duration = Duration::from_millis(300);
 
 impl App {
     pub(super) fn handle_agent_list(&mut self, id: String) -> String {
@@ -94,19 +98,30 @@ impl App {
                 ),
             );
         }
-        let bytes = crate::app::api_helpers::encode_api_submission(runtime, &params.text);
-        let restore = self.begin_archived_member_input(resolved.ws_idx, resolved.pane_id);
+        let (text, enter) =
+            crate::app::api_helpers::encode_api_submission_parts(runtime, &params.text);
         let result = self
             .lookup_runtime_sender(resolved.ws_idx, resolved.pane_id)
             .expect("runtime was just verified")
-            .try_send_bytes(Bytes::from(bytes));
+            .try_send_prompt_transaction(
+                Bytes::from(text),
+                Bytes::from(enter),
+                AGENT_PROMPT_SUBMIT_DELAY,
+            );
         if let Err(err) = result {
-            if let Some(restore) = restore {
-                self.rollback_archived_member_input(restore);
-            }
-            return encode_error(id, "agent_prompt_failed", err.to_string());
+            let code = match err {
+                crate::pane::PromptTransactionAdmissionError::Full => "agent_prompt_queue_full",
+                crate::pane::PromptTransactionAdmissionError::PayloadTooLarge => {
+                    "agent_prompt_payload_too_large"
+                }
+                crate::pane::PromptTransactionAdmissionError::InputFull
+                | crate::pane::PromptTransactionAdmissionError::Closed => "agent_prompt_failed",
+            };
+            return encode_error(id, code, err.to_string());
         }
-        if let Some(restore) = restore {
+        // A response means this runtime admitted the complete transaction. Only then
+        // may prompt input restore an archived collection member.
+        if let Some(restore) = self.begin_archived_member_input(resolved.ws_idx, resolved.pane_id) {
             self.commit_archived_member_input(restore);
         }
         let Some(agent) = self.agent_info(resolved.ws_idx, resolved.pane_id) else {
@@ -369,10 +384,16 @@ mod tests {
         let events_before = app.event_hub.current_sequence();
 
         let (runtime, _rx) =
-            crate::terminal::TerminalRuntime::test_with_channel_capacity(80, 24, 1);
-        runtime
-            .try_send_bytes(Bytes::from_static(b"occupied"))
-            .expect("fill runtime input queue");
+            crate::terminal::TerminalRuntime::test_with_channel_capacity(80, 24, 16);
+        for _ in 0..8 {
+            runtime
+                .try_send_prompt_transaction(
+                    Bytes::from_static(b"occupied"),
+                    Bytes::from_static(b"\r"),
+                    Duration::from_secs(1),
+                )
+                .expect("fill the runtime-owned prompt transaction queue");
+        }
         app.state.insert_test_runtime(pane_id, runtime);
         let failed = app.handle_agent_prompt(
             "failed".into(),
@@ -382,7 +403,8 @@ mod tests {
                 wait: None,
             },
         );
-        assert!(serde_json::from_str::<crate::api::schema::ErrorResponse>(&failed).is_ok());
+        let failed: crate::api::schema::ErrorResponse = serde_json::from_str(&failed).unwrap();
+        assert_eq!(failed.error.code, "agent_prompt_queue_full");
         assert!(app.state.workspaces[0].tabs[0]
             .collection(collection)
             .expect("collection")
@@ -437,7 +459,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn agent_prompt_accepts_pane_ids_and_working_agents_atomically() {
+    async fn agent_prompt_sends_text_then_delays_enter() {
         let mut app = app_with_agent();
         let pane_id = app.state.workspaces[0].tabs[0]
             .root_pane
@@ -456,6 +478,7 @@ mod tests {
         app.state.insert_test_runtime(pane_id, runtime);
 
         let public_pane_id = app.public_pane_id(0, pane_id).unwrap();
+        let bracketed_started = std::time::Instant::now();
         let response = app.handle_agent_prompt(
             "req".into(),
             AgentPromptParams {
@@ -471,14 +494,23 @@ mod tests {
         assert_eq!(agent.name.as_deref(), Some("reviewer"));
         assert_eq!(
             rx.try_recv().unwrap(),
-            Bytes::from_static(b"\x1b[200~A != B\x1b[201~\r")
+            Bytes::from_static(b"\x1b[200~A != B\x1b[201~")
         );
         assert!(rx.try_recv().is_err());
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(1), rx.recv())
+                .await
+                .unwrap()
+                .unwrap(),
+            Bytes::from_static(b"\r")
+        );
+        assert!(bracketed_started.elapsed() >= AGENT_PROMPT_SUBMIT_DELAY);
 
         app.lookup_runtime_sender(0, pane_id)
             .unwrap()
             .test_process_pty_bytes(b"\x1b[?2004l");
-        let unbracketed = app.handle_agent_prompt(
+        let raw_started = std::time::Instant::now();
+        let raw_response = app.handle_agent_prompt(
             "req-raw".into(),
             AgentPromptParams {
                 target: "reviewer".into(),
@@ -486,13 +518,21 @@ mod tests {
                 wait: None,
             },
         );
-        let unbracketed: SuccessResponse = serde_json::from_str(&unbracketed).unwrap();
+        let raw_response: SuccessResponse = serde_json::from_str(&raw_response).unwrap();
         assert!(matches!(
-            unbracketed.result,
+            raw_response.result,
             ResponseResult::AgentPrompted { .. }
         ));
-        assert_eq!(rx.try_recv().unwrap(), Bytes::from_static(b"A != B\r"));
+        assert_eq!(rx.try_recv().unwrap(), Bytes::from_static(b"A != B"));
         assert!(rx.try_recv().is_err());
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(1), rx.recv())
+                .await
+                .unwrap()
+                .unwrap(),
+            Bytes::from_static(b"\r")
+        );
+        assert!(raw_started.elapsed() >= AGENT_PROMPT_SUBMIT_DELAY);
 
         let rejected = app.handle_agent_prompt(
             "req-label".into(),
@@ -505,6 +545,91 @@ mod tests {
         let error: crate::api::schema::ErrorResponse = serde_json::from_str(&rejected).unwrap();
         assert_eq!(error.error.code, "agent_not_found");
         assert!(rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn concurrent_agent_prompts_keep_each_text_and_delayed_enter_together() {
+        let mut app = app_with_agent();
+        let pane_id = app.state.workspaces[0].tabs[0]
+            .root_pane
+            .expect("root pane");
+        let terminal_id = app.state.workspaces[0]
+            .terminal_id(pane_id)
+            .unwrap()
+            .clone();
+        let terminal = app.state.terminals.get_mut(&terminal_id).unwrap();
+        terminal.set_agent_name("reviewer".into());
+        terminal.set_detected_state(Some(Agent::Pi), AgentState::Idle);
+        let (runtime, mut rx) =
+            crate::terminal::TerminalRuntime::test_with_channel_capacity(80, 24, 4);
+        app.state.insert_test_runtime(pane_id, runtime);
+        let target = app.public_pane_id(0, pane_id).unwrap();
+
+        for (id, text) in [("one", "first"), ("two", "second")] {
+            let response = app.handle_agent_prompt(
+                id.into(),
+                AgentPromptParams {
+                    target: target.clone(),
+                    text: text.into(),
+                    wait: None,
+                },
+            );
+            assert!(serde_json::from_str::<SuccessResponse>(&response).is_ok());
+        }
+
+        assert_eq!(rx.recv().await.unwrap(), Bytes::from_static(b"first"));
+        assert_eq!(rx.recv().await.unwrap(), Bytes::from_static(b"\r"));
+        assert_eq!(rx.recv().await.unwrap(), Bytes::from_static(b"second"));
+        assert_eq!(rx.recv().await.unwrap(), Bytes::from_static(b"\r"));
+    }
+
+    #[tokio::test]
+    async fn prompt_close_or_runtime_replacement_cancels_delayed_enter() {
+        let mut app = app_with_agent();
+        let pane_id = app.state.workspaces[0].tabs[0]
+            .root_pane
+            .expect("root pane");
+        let terminal_id = app.state.workspaces[0]
+            .terminal_id(pane_id)
+            .unwrap()
+            .clone();
+        let terminal = app.state.terminals.get_mut(&terminal_id).unwrap();
+        terminal.set_agent_name("reviewer".into());
+        terminal.set_detected_state(Some(Agent::Pi), AgentState::Idle);
+        let (runtime, mut old_rx) =
+            crate::terminal::TerminalRuntime::test_with_channel_capacity(80, 24, 2);
+        app.state.insert_test_runtime(pane_id, runtime);
+        let target = app.public_pane_id(0, pane_id).unwrap();
+        let response = app.handle_agent_prompt(
+            "close".into(),
+            AgentPromptParams {
+                target,
+                text: "first".into(),
+                wait: None,
+            },
+        );
+        assert!(serde_json::from_str::<SuccessResponse>(&response).is_ok());
+        assert_eq!(old_rx.recv().await.unwrap(), Bytes::from_static(b"first"));
+
+        // Replacing the runtime drops the old identity and cancels its queue.
+        let (replacement, mut replacement_rx) =
+            crate::terminal::TerminalRuntime::test_with_channel_capacity(80, 24, 2);
+        app.state.workspaces[0].insert_test_runtime(pane_id, replacement);
+        assert_ne!(
+            tokio::time::timeout(
+                AGENT_PROMPT_SUBMIT_DELAY + Duration::from_millis(100),
+                old_rx.recv()
+            )
+            .await
+            .ok()
+            .flatten(),
+            Some(Bytes::from_static(b"\r")),
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), replacement_rx.recv())
+                .await
+                .is_err()
+        );
     }
 
     #[tokio::test]

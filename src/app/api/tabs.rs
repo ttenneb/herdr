@@ -230,6 +230,10 @@ impl App {
             return tab_not_found(id, &target.tab_id);
         };
         let workspace_id = self.public_workspace_id(ws_idx);
+        let Some(ws) = self.state.workspaces.get(ws_idx) else {
+            return tab_not_found(id, &target.tab_id);
+        };
+        let closes_workspace = ws.tabs.len() <= 1;
         let terminal_ids = self.state.terminal_ids_for_tab(ws_idx, tab_idx);
         let pane_ids = self
             .state
@@ -255,16 +259,24 @@ impl App {
                     .map(|collection| (collection_id, collection.members().to_vec()))
             })
             .collect::<Vec<_>>();
+
+        if closes_workspace {
+            if self.state.confirm_implicit_worktree_group_close(ws_idx) {
+                return encode_error(
+                    id,
+                    "confirmation_required",
+                    "closing this tab would close a worktree group",
+                );
+            }
+            // The parent may own linked worktree workspaces.  Use the canonical
+            // group close path so every member emits the complete lifecycle.
+            self.close_workspace_group_with_lifecycle(ws_idx);
+            return encode_success(id, ResponseResult::Ok {});
+        }
+
         let Some(ws) = self.state.workspaces.get_mut(ws_idx) else {
             return tab_not_found(id, &target.tab_id);
         };
-        if ws.tabs.len() <= 1 {
-            return encode_error(
-                id,
-                "tab_close_failed",
-                "cannot close the last tab in a workspace",
-            );
-        }
         if !ws.close_tab(tab_idx) {
             return encode_error(
                 id,
@@ -352,6 +364,129 @@ mod tests {
         config::{Config, ShellModeConfig},
         workspace::Workspace,
     };
+
+    #[test]
+    fn api_tab_close_last_tab_closes_workspace_after_pane_lifecycle_events() {
+        let event_hub = crate::api::EventHub::default();
+        let (_api_tx, api_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = App::new(&Config::default(), true, None, api_rx, event_hub.clone());
+        app.state.workspaces = vec![Workspace::test_new("tabs")];
+        app.state.active = Some(0);
+        app.state.selected = 0;
+        let tab_id = app.public_tab_id(0, 0).expect("tab id");
+        let workspace_id = app.public_workspace_id(0);
+        let pane_id = app.public_pane_id(
+            0,
+            app.state.workspaces[0].tabs[0]
+                .root_pane
+                .expect("test tab has root pane"),
+        );
+
+        let response = app.handle_tab_close(
+            "req".into(),
+            TabTarget {
+                tab_id: tab_id.clone(),
+            },
+        );
+
+        let success: SuccessResponse = serde_json::from_str(&response).expect("success");
+        assert_eq!(success.result, ResponseResult::Ok {});
+        assert!(app.state.workspaces.is_empty());
+        assert!(app.state.active.is_none());
+        let events = event_hub.events_after(0);
+        assert!(events.iter().any(|(_, event)| {
+            matches!(
+                &event.data,
+                EventData::PaneClosed { pane_id: closed_pane_id, .. }
+                    if Some(closed_pane_id) == pane_id.as_ref()
+            )
+        }));
+        assert!(matches!(
+            &events[events.len() - 2].1.data,
+            EventData::TabClosed {
+                tab_id: closed_tab_id,
+                workspace_id: closed_workspace_id,
+            } if closed_tab_id == &tab_id && closed_workspace_id == &workspace_id
+        ));
+        assert!(matches!(
+            &events[events.len() - 1].1.data,
+            EventData::WorkspaceClosed {
+                workspace_id: closed_workspace_id,
+                workspace: Some(workspace),
+            } if closed_workspace_id == &workspace_id
+                && workspace.workspace_id == workspace_id
+        ));
+    }
+
+    #[test]
+    fn closing_parent_last_tab_uses_group_lifecycle_for_linked_worktree() {
+        let event_hub = crate::api::EventHub::default();
+        let (_api_tx, api_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = App::new(&Config::default(), true, None, api_rx, event_hub.clone());
+        let mut parent = Workspace::test_new("parent");
+        let pane = parent.tabs[0].root_pane.expect("root pane");
+        parent.worktree_space = Some(crate::workspace::WorktreeSpaceMembership {
+            key: "repo".into(),
+            label: "repo".into(),
+            repo_root: "/repo".into(),
+            checkout_path: "/repo".into(),
+            is_linked_worktree: false,
+        });
+        let mut linked = Workspace::test_new("linked");
+        linked.worktree_space = Some(crate::workspace::WorktreeSpaceMembership {
+            key: "repo".into(),
+            label: "repo".into(),
+            repo_root: "/repo".into(),
+            checkout_path: "/repo/linked".into(),
+            is_linked_worktree: true,
+        });
+        app.state.workspaces = vec![parent, linked];
+        app.state.active = Some(0);
+        app.state.selected = 0;
+        app.state.ensure_test_terminals();
+        app.state
+            .delegations
+            .create(Some(pane), None, Some("child".into()))
+            .unwrap();
+        let tab_id = app.public_tab_id(0, 0).unwrap();
+        // Confirmation remains the API default; this test exercises the accepted close.
+        app.state.confirm_close = false;
+        let parent_id = app.public_workspace_id(0);
+        let linked_id = app.public_workspace_id(1);
+
+        let response = app.handle_tab_close("close".into(), TabTarget { tab_id });
+        assert!(serde_json::from_str::<SuccessResponse>(&response).is_ok());
+        assert!(app.state.workspaces.is_empty());
+        let events = event_hub.events_after(0);
+        for kind in [
+            EventKind::PaneClosed,
+            EventKind::DelegationTombstoned,
+            EventKind::DelegationGarbageCollected,
+            EventKind::TabClosed,
+            EventKind::WorkspaceClosed,
+        ] {
+            assert!(
+                events.iter().any(|(_, event)| event.event == kind),
+                "missing {kind:?}"
+            );
+        }
+        let closed_workspaces = events
+            .iter()
+            .filter_map(|(_, event)| match &event.data {
+                EventData::WorkspaceClosed { workspace_id, .. } => Some(workspace_id),
+                _ => None,
+            })
+            .collect::<std::collections::HashSet<_>>();
+        assert!(closed_workspaces.contains(&parent_id));
+        assert!(closed_workspaces.contains(&linked_id));
+        let first_workspace = events
+            .iter()
+            .position(|(_, event)| event.event == EventKind::WorkspaceClosed)
+            .unwrap();
+        assert!(events[..first_workspace]
+            .iter()
+            .any(|(_, event)| event.event == EventKind::TabClosed));
+    }
 
     #[test]
     fn api_tab_move_reorders_tabs_in_target_workspace() {
