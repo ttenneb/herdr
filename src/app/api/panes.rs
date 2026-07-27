@@ -1748,7 +1748,7 @@ impl App {
             self.emit_event(EventEnvelope {
                 event: EventKind::PaneClosed,
                 data: EventData::PaneClosed {
-                    pane_id: public_pane_id,
+                    pane_id: public_pane_id.clone(),
                     workspace_id: workspace_id.clone(),
                 },
             });
@@ -1766,7 +1766,7 @@ impl App {
             self.emit_event(EventEnvelope {
                 event: EventKind::PaneClosed,
                 data: EventData::PaneClosed {
-                    pane_id: public_pane_id,
+                    pane_id: public_pane_id.clone(),
                     workspace_id,
                 },
             });
@@ -1775,7 +1775,7 @@ impl App {
             }
         }
 
-        self.emit_pane_destruction_events(destruction, &[(pane_id, target.pane_id.clone())]);
+        self.emit_pane_destruction_events(destruction, &[(pane_id, public_pane_id)]);
 
         Ok(())
     }
@@ -2537,6 +2537,49 @@ mod tests {
             .expect("layout update");
         assert!(layout.panes.is_empty());
         assert_eq!(layout.collections.len(), 2);
+    }
+
+    #[test]
+    fn delegated_pane_close_uses_canonical_id_after_alias_resolution() {
+        let event_hub = crate::api::EventHub::default();
+        let (_api_tx, api_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = App::new(&Config::default(), true, None, api_rx, event_hub.clone());
+        let mut workspace = Workspace::test_new("destination");
+        let pane = workspace.tabs[0].root_pane.expect("root pane");
+        workspace.test_split(ratatui::layout::Direction::Horizontal);
+        app.state.workspaces = vec![workspace];
+        app.state.ensure_test_terminals();
+        app.state
+            .delegations
+            .create(Some(pane), None, Some("delegated".into()))
+            .expect("delegation");
+        let canonical = app.public_pane_id(0, pane).expect("canonical pane id");
+        let stale_alias = "old-workspace:p9".to_string();
+        app.state
+            .public_pane_id_aliases
+            .insert(stale_alias.clone(), pane);
+        let sequence = event_hub.current_sequence();
+
+        let response = app.handle_pane_close(
+            "close".into(),
+            PaneTarget {
+                pane_id: stale_alias.clone(),
+            },
+        );
+
+        let _: SuccessResponse = serde_json::from_str(&response).expect("success");
+        let events = event_hub.events_after(sequence);
+        let closed_id = events.iter().find_map(|(_, event)| match &event.data {
+            EventData::PaneClosed { pane_id, .. } => Some(pane_id),
+            _ => None,
+        });
+        let tombstoned_id = events.iter().find_map(|(_, event)| match &event.data {
+            EventData::DelegationTombstoned { pane_id, .. } => Some(pane_id),
+            _ => None,
+        });
+        assert_eq!(closed_id, Some(&canonical));
+        assert_eq!(tombstoned_id, Some(&canonical));
+        assert_ne!(tombstoned_id, Some(&stale_alias));
     }
 
     #[test]
