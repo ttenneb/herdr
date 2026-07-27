@@ -977,8 +977,10 @@ pub struct PaneRuntime {
     preserve_processes_on_drop: bool,
     // Task handles for deterministic shutdown
     detect_handle: Option<tokio::task::AbortHandle>,
+    prompt_queue: Arc<PromptTransactionQueue>,
 }
 
+#[derive(Clone)]
 enum PaneRuntimeIo {
     Actor(PtyIoActorHandle),
     #[cfg(test)]
@@ -1109,6 +1111,290 @@ impl PaneRuntimeIo {
     }
 }
 
+/// Each terminal admits at most eight prompt transactions (including the active
+/// transaction) and 64 KiB of their text+Enter payloads. This is deliberately
+/// small: prompts are interactive control input, not a bulk transport.
+const MAX_PROMPT_TRANSACTIONS: usize = 8;
+const MAX_PROMPT_TRANSACTION_BYTES: usize = 64 * 1024;
+
+/// The caller can distinguish a full runtime-owned prompt queue from a PTY input
+/// failure and decide whether retrying after drain is appropriate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PromptTransactionAdmissionError {
+    Full,
+    PayloadTooLarge,
+    InputFull,
+    Closed,
+}
+
+impl std::fmt::Display for PromptTransactionAdmissionError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Full => "agent prompt transaction queue is full",
+            Self::PayloadTooLarge => "agent prompt transaction exceeds the runtime byte limit",
+            Self::InputFull => "terminal input queue is full",
+            Self::Closed => "terminal runtime is closed",
+        })
+    }
+}
+
+impl std::error::Error for PromptTransactionAdmissionError {}
+
+/// Serializes API prompt text and its delayed Enter against one terminal identity.
+/// Queued transactions never migrate to a replacement runtime; shutdown and handoff
+/// cancel the queue before its delayed Enter can be written.
+struct PromptTransactionQueue {
+    // This is captured when the runtime is created and never replaced. A prompt
+    // transaction therefore cannot write to a runtime imported after handoff.
+    io: PaneRuntimeIo,
+    state: std::sync::Mutex<PromptTransactionState>,
+    cancelled: AtomicBool,
+    cancel_notify: Notify,
+    #[cfg(test)]
+    enter_admission_started: Notify,
+    #[cfg(test)]
+    workers: std::sync::atomic::AtomicUsize,
+    #[cfg(test)]
+    worker_exited: Notify,
+}
+
+struct PromptTransaction {
+    text: Bytes,
+    enter: Bytes,
+    delay: std::time::Duration,
+    bytes: usize,
+}
+
+#[derive(Default)]
+struct PromptTransactionState {
+    active: bool,
+    active_bytes: usize,
+    pending_bytes: usize,
+    pending: std::collections::VecDeque<PromptTransaction>,
+}
+
+impl PromptTransactionQueue {
+    fn new(io: PaneRuntimeIo) -> Arc<Self> {
+        Arc::new(Self {
+            io,
+            state: std::sync::Mutex::new(PromptTransactionState::default()),
+            cancelled: AtomicBool::new(false),
+            cancel_notify: Notify::new(),
+            #[cfg(test)]
+            enter_admission_started: Notify::new(),
+            #[cfg(test)]
+            workers: std::sync::atomic::AtomicUsize::new(0),
+            #[cfg(test)]
+            worker_exited: Notify::new(),
+        })
+    }
+
+    fn submit(
+        self: &Arc<Self>,
+        text: Bytes,
+        enter: Bytes,
+        delay: std::time::Duration,
+    ) -> Result<(), PromptTransactionAdmissionError> {
+        let transaction = PromptTransaction {
+            bytes: text.len().saturating_add(enter.len()),
+            text,
+            enter,
+            delay,
+        };
+        if transaction.bytes > MAX_PROMPT_TRANSACTION_BYTES {
+            return Err(PromptTransactionAdmissionError::PayloadTooLarge);
+        }
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if self.cancelled.load(Ordering::Acquire) {
+            return Err(PromptTransactionAdmissionError::Closed);
+        }
+        // Count the active transaction as well as queued transactions. Holding this
+        // lock through first-text admission makes the check and reservation atomic.
+        if state
+            .pending
+            .len()
+            .saturating_add(usize::from(state.active))
+            >= MAX_PROMPT_TRANSACTIONS
+        {
+            return Err(PromptTransactionAdmissionError::Full);
+        }
+        if state
+            .active_bytes
+            .saturating_add(state.pending_bytes)
+            .saturating_add(transaction.bytes)
+            > MAX_PROMPT_TRANSACTION_BYTES
+        {
+            return Err(PromptTransactionAdmissionError::Full);
+        }
+        if state.active {
+            state.pending_bytes = state.pending_bytes.saturating_add(transaction.bytes);
+            state.pending.push_back(transaction);
+            return Ok(());
+        }
+        // The first text write is deliberately synchronous so callers can roll back
+        // archived-member restoration when no input was accepted.
+        if let Err(err) = self.io.try_send_bytes(transaction.text.clone()) {
+            return Err(match err {
+                mpsc::error::TrySendError::Full(_) => PromptTransactionAdmissionError::InputFull,
+                mpsc::error::TrySendError::Closed(_) => PromptTransactionAdmissionError::Closed,
+            });
+        }
+        state.active = true;
+        state.active_bytes = transaction.bytes;
+        let PromptTransaction { enter, delay, .. } = transaction;
+        drop(state);
+        self.spawn_worker(enter, delay);
+        Ok(())
+    }
+
+    fn spawn_worker(self: &Arc<Self>, enter: Bytes, delay: std::time::Duration) {
+        let queue = Arc::clone(self);
+        #[cfg(test)]
+        queue.workers.fetch_add(1, Ordering::Release);
+        tokio::spawn(async move {
+            #[cfg(test)]
+            let _worker = PromptTransactionWorker(&queue);
+            let mut enter = enter;
+            let mut delay = delay;
+            loop {
+                // Cancellation must also interrupt the delay so a dropped runtime
+                // never retains a sleeping prompt worker.
+                if queue.wait_for_delay_or_cancellation(delay).await {
+                    return;
+                }
+                #[cfg(test)]
+                queue.enter_admission_started.notify_one();
+                // Do not leave an Enter send future alive after cancellation. Tokio
+                // mpsc cancellation drops an unadmitted message, so cancellation
+                // while backpressured cannot leak it once capacity is released.
+                if queue.send_enter_or_cancelled(enter).await.is_err() {
+                    queue.cancel();
+                    return;
+                }
+                let next = {
+                    let mut state = queue
+                        .state
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    state.active = false;
+                    state.active_bytes = 0;
+                    if queue.cancelled.load(Ordering::Acquire) {
+                        None
+                    } else if let Some(transaction) = state.pending.pop_front() {
+                        state.pending_bytes = state.pending_bytes.saturating_sub(transaction.bytes);
+                        // Do not let a failed text write skip ahead to a later prompt.
+                        if queue.io.try_send_bytes(transaction.text.clone()).is_ok() {
+                            state.active = true;
+                            state.active_bytes = transaction.bytes;
+                            Some((transaction.enter, transaction.delay))
+                        } else {
+                            state.pending.clear();
+                            state.pending_bytes = 0;
+                            None
+                        }
+                    } else {
+                        None
+                    }
+                };
+                let Some((next_enter, next_delay)) = next else {
+                    return;
+                };
+                enter = next_enter;
+                delay = next_delay;
+            }
+        });
+    }
+
+    async fn wait_for_delay_or_cancellation(&self, delay: std::time::Duration) -> bool {
+        tokio::select! {
+            biased;
+            _ = self.cancelled() => true,
+            _ = tokio::time::sleep(delay) => self.cancelled.load(Ordering::Acquire),
+        }
+    }
+
+    async fn send_enter_or_cancelled(&self, enter: Bytes) -> Result<(), ()> {
+        tokio::select! {
+            biased;
+            _ = self.cancelled() => Err(()),
+            result = self.io.send_bytes(enter) => {
+                if result.is_ok() && !self.cancelled.load(Ordering::Acquire) {
+                    Ok(())
+                } else {
+                    Err(())
+                }
+            }
+        }
+    }
+
+    // A single worker owns this queue. `notify_one` retains a permit if it
+    // fires just before this future is polled, avoiding a lost cancellation.
+    async fn cancelled(&self) {
+        if self.cancelled.load(Ordering::Acquire) {
+            return;
+        }
+        let notified = self.cancel_notify.notified();
+        tokio::pin!(notified);
+        if self.cancelled.load(Ordering::Acquire) {
+            return;
+        }
+        notified.await;
+    }
+
+    fn cancel(&self) {
+        if !self.cancelled.swap(true, Ordering::AcqRel) {
+            self.cancel_notify.notify_one();
+        }
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        state.pending.clear();
+        state.pending_bytes = 0;
+        state.active = false;
+        state.active_bytes = 0;
+    }
+
+    #[cfg(test)]
+    async fn wait_for_enter_admission(&self) {
+        if self.cancelled.load(Ordering::Acquire) {
+            return;
+        }
+        let notified = self.enter_admission_started.notified();
+        tokio::pin!(notified);
+        if self.cancelled.load(Ordering::Acquire) {
+            return;
+        }
+        notified.await;
+    }
+
+    #[cfg(test)]
+    async fn wait_for_worker_exit(&self) {
+        while self.workers.load(Ordering::Acquire) != 0 {
+            let notified = self.worker_exited.notified();
+            tokio::pin!(notified);
+            if self.workers.load(Ordering::Acquire) == 0 {
+                return;
+            }
+            notified.await;
+        }
+    }
+}
+
+#[cfg(test)]
+struct PromptTransactionWorker<'a>(&'a PromptTransactionQueue);
+
+#[cfg(test)]
+impl Drop for PromptTransactionWorker<'_> {
+    fn drop(&mut self) {
+        self.0.workers.fetch_sub(1, Ordering::AcqRel);
+        self.0.worker_exited.notify_one();
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WheelRouting {
     HostScroll,
@@ -1123,6 +1409,7 @@ impl Drop for PaneRuntime {
         if let Some(handle) = &self.detect_handle {
             handle.abort();
         }
+        self.prompt_queue.cancel();
         self.io.shutdown();
         if !self.preserve_processes_on_drop {
             shutdown_pane_processes(
@@ -1472,6 +1759,7 @@ fn publish_reported_cwd(
 
 impl PaneRuntime {
     pub fn shutdown(mut self) {
+        self.prompt_queue.cancel();
         if let Some(handle) = self.detect_handle.take() {
             handle.abort();
         }
@@ -1491,6 +1779,8 @@ impl PaneRuntime {
 
     #[cfg(unix)]
     pub fn preserve_for_handoff(mut self) {
+        // Prompt transactions are process-local and must not outlive this runtime.
+        self.prompt_queue.cancel();
         if let Err(err) = self.io.release_after_commit() {
             warn!(
                 pane = self.pane_id.raw(),
@@ -1852,7 +2142,8 @@ impl PaneRuntime {
         Ok(Self {
             pane_id,
             terminal,
-            io,
+            io: io.clone(),
+            prompt_queue: PromptTransactionQueue::new(io),
             current_size: Cell::new((rows, cols, cell_width_px, cell_height_px)),
             child_pid,
             reported_cwd,
@@ -2366,7 +2657,8 @@ impl PaneRuntime {
         Ok(Self {
             pane_id,
             terminal,
-            io,
+            io: io.clone(),
+            prompt_queue: PromptTransactionQueue::new(io),
             current_size: Cell::new((rows, cols, 0, 0)),
             child_pid,
             reported_cwd,
@@ -2650,6 +2942,15 @@ impl PaneRuntime {
         self.io.try_send_bytes(bytes)
     }
 
+    pub fn try_send_prompt_transaction(
+        &self,
+        text: Bytes,
+        enter: Bytes,
+        delay: std::time::Duration,
+    ) -> Result<(), PromptTransactionAdmissionError> {
+        self.prompt_queue.submit(text, enter, delay)
+    }
+
     pub async fn send_paste(&self, text: String) -> Result<(), mpsc::error::SendError<Bytes>> {
         self.send_bytes(self.paste_payload(text)).await
     }
@@ -2866,9 +3167,13 @@ impl PaneRuntime {
                     GhosttyPaneTerminal::new(terminal, tx.clone()).unwrap(),
                 )),
                 io: PaneRuntimeIo::TestChannel {
+                    sender: tx.clone(),
+                    resize_tx: resize_tx.clone(),
+                },
+                prompt_queue: PromptTransactionQueue::new(PaneRuntimeIo::TestChannel {
                     sender: tx,
                     resize_tx,
-                },
+                }),
                 current_size: Cell::new((rows, cols, 0, 0)),
                 child_pid: Arc::new(AtomicU32::new(0)),
                 reported_cwd: Arc::new(Mutex::new(None)),
@@ -3351,6 +3656,150 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn prompt_transactions_are_bounded_and_admit_again_after_drain() {
+        let (runtime, mut rx) = PaneRuntime::test_with_channel_capacity(80, 24, 32);
+        for index in 0..MAX_PROMPT_TRANSACTIONS {
+            runtime
+                .try_send_prompt_transaction(
+                    Bytes::from(format!("prompt-{index}")),
+                    Bytes::from_static(b"\r"),
+                    std::time::Duration::from_millis(1),
+                )
+                .expect("transaction within limit is admitted");
+        }
+        assert_eq!(
+            runtime.try_send_prompt_transaction(
+                Bytes::from_static(b"over-limit"),
+                Bytes::from_static(b"\r"),
+                std::time::Duration::from_millis(1),
+            ),
+            Err(PromptTransactionAdmissionError::Full),
+            "the active transaction counts toward the per-terminal limit"
+        );
+
+        for index in 0..MAX_PROMPT_TRANSACTIONS {
+            assert_eq!(
+                tokio::time::timeout(std::time::Duration::from_secs(1), rx.recv())
+                    .await
+                    .expect("transaction should drain"),
+                Some(Bytes::from(format!("prompt-{index}")))
+            );
+            assert_eq!(
+                tokio::time::timeout(std::time::Duration::from_secs(1), rx.recv())
+                    .await
+                    .expect("delayed Enter should drain"),
+                Some(Bytes::from_static(b"\r"))
+            );
+        }
+        tokio::task::yield_now().await;
+        runtime
+            .try_send_prompt_transaction(
+                Bytes::from_static(b"recovered"),
+                Bytes::from_static(b"\r"),
+                std::time::Duration::from_millis(1),
+            )
+            .expect("draining releases prompt admission capacity");
+        assert_eq!(rx.recv().await, Some(Bytes::from_static(b"recovered")));
+        assert_eq!(rx.recv().await, Some(Bytes::from_static(b"\r")));
+    }
+
+    #[tokio::test]
+    async fn prompt_transaction_shutdown_cancels_backpressured_enter_without_a_task_leak() {
+        let (runtime, mut rx) = PaneRuntime::test_with_channel_capacity(80, 24, 1);
+        let queue = Arc::clone(&runtime.prompt_queue);
+        runtime
+            .try_send_prompt_transaction(
+                Bytes::from_static(b"shutdown-text"),
+                Bytes::from_static(b"\r"),
+                std::time::Duration::ZERO,
+            )
+            .expect("text occupies the only input queue slot");
+        queue.wait_for_enter_admission().await;
+
+        runtime.shutdown();
+        queue.wait_for_worker_exit().await;
+
+        assert_eq!(rx.recv().await, Some(Bytes::from_static(b"shutdown-text")));
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(20), rx.recv())
+                .await
+                .is_err(),
+            "freeing capacity after cancellation must not admit the delayed Enter"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn prompt_transaction_handoff_cancels_backpressured_enter_before_replacement() {
+        let (runtime, mut old_rx) = PaneRuntime::test_with_channel_capacity(80, 24, 1);
+        let queue = Arc::clone(&runtime.prompt_queue);
+        runtime
+            .try_send_prompt_transaction(
+                Bytes::from_static(b"handoff-text"),
+                Bytes::from_static(b"\r"),
+                std::time::Duration::ZERO,
+            )
+            .expect("text occupies the only input queue slot");
+        queue.wait_for_enter_admission().await;
+
+        runtime.preserve_for_handoff();
+        queue.wait_for_worker_exit().await;
+        assert_eq!(
+            old_rx.recv().await,
+            Some(Bytes::from_static(b"handoff-text"))
+        );
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(20), old_rx.recv())
+                .await
+                .is_err(),
+            "handoff must discard an Enter that was waiting for capacity"
+        );
+
+        let (replacement, mut replacement_rx) = PaneRuntime::test_with_channel_capacity(80, 24, 1);
+        replacement
+            .try_send_prompt_transaction(
+                Bytes::from_static(b"replacement-text"),
+                Bytes::from_static(b"\r"),
+                std::time::Duration::ZERO,
+            )
+            .expect("replacement accepts its own transaction");
+        assert_eq!(
+            replacement_rx.recv().await,
+            Some(Bytes::from_static(b"replacement-text"))
+        );
+        assert_eq!(replacement_rx.recv().await, Some(Bytes::from_static(b"\r")));
+    }
+
+    #[tokio::test]
+    async fn prompt_transaction_payloads_are_byte_bounded() {
+        let (runtime, _rx) = PaneRuntime::test_with_channel_capacity(80, 24, 2);
+        assert_eq!(
+            runtime.try_send_prompt_transaction(
+                Bytes::from(vec![b'x'; MAX_PROMPT_TRANSACTION_BYTES]),
+                Bytes::from_static(b"\r"),
+                std::time::Duration::from_secs(1),
+            ),
+            Err(PromptTransactionAdmissionError::PayloadTooLarge)
+        );
+        runtime
+            .try_send_prompt_transaction(
+                Bytes::from(vec![b'x'; MAX_PROMPT_TRANSACTION_BYTES / 2 - 1]),
+                Bytes::from_static(b"\r"),
+                std::time::Duration::from_secs(1),
+            )
+            .expect("first half-limit transaction is admitted");
+        assert_eq!(
+            runtime.try_send_prompt_transaction(
+                Bytes::from(vec![b'x'; MAX_PROMPT_TRANSACTION_BYTES / 2]),
+                Bytes::from_static(b"\r"),
+                std::time::Duration::from_secs(1),
+            ),
+            Err(PromptTransactionAdmissionError::Full),
+            "active and queued payloads share the runtime byte cap"
+        );
+    }
+
+    #[tokio::test]
     async fn focus_events_are_forwarded_when_enabled() {
         let (tx, mut rx) = mpsc::channel(4);
         let (resize_tx, _resize_rx) = watch::channel((80, 24, 0, 0));
@@ -3364,9 +3813,13 @@ mod tests {
                 GhosttyPaneTerminal::new(terminal, tx.clone()).unwrap(),
             )),
             io: PaneRuntimeIo::TestChannel {
+                sender: tx.clone(),
+                resize_tx: resize_tx.clone(),
+            },
+            prompt_queue: PromptTransactionQueue::new(PaneRuntimeIo::TestChannel {
                 sender: tx,
                 resize_tx,
-            },
+            }),
             current_size: Cell::new((80, 24, 0, 0)),
             child_pid: Arc::new(AtomicU32::new(0)),
             reported_cwd: Arc::new(Mutex::new(None)),
@@ -3395,9 +3848,13 @@ mod tests {
                 GhosttyPaneTerminal::new(terminal, tx.clone()).unwrap(),
             )),
             io: PaneRuntimeIo::TestChannel {
+                sender: tx.clone(),
+                resize_tx: resize_tx.clone(),
+            },
+            prompt_queue: PromptTransactionQueue::new(PaneRuntimeIo::TestChannel {
                 sender: tx,
                 resize_tx,
-            },
+            }),
             current_size: Cell::new((80, 24, 0, 0)),
             child_pid: Arc::new(AtomicU32::new(0)),
             reported_cwd: Arc::new(Mutex::new(None)),
