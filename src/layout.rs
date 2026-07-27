@@ -60,13 +60,12 @@ impl CollectionId {
         self.0
     }
 
+    /// Reconstruct an ID from persisted state while reserving it from allocation.
     pub fn from_raw(id: u64) -> Result<Self, CollectionIdError> {
-        if id == 0 || id == u64::MAX {
-            return Err(CollectionIdError::Invalid);
-        }
-        let next = id.checked_add(1).ok_or(CollectionIdError::Invalid)?;
+        let id = Self::parse_raw(id)?;
+        let next = id.0.checked_add(1).ok_or(CollectionIdError::Invalid)?;
         let mut current = NEXT_COLLECTION_ID.load(std::sync::atomic::Ordering::Relaxed);
-        while current <= id {
+        while current <= id.0 {
             match NEXT_COLLECTION_ID.compare_exchange_weak(
                 current,
                 next,
@@ -77,7 +76,23 @@ impl CollectionId {
                 Err(observed) => current = observed,
             }
         }
-        Ok(Self(id))
+        Ok(id)
+    }
+
+    /// Parse an untrusted public ID without changing allocator state.
+    pub fn parse(raw: &str) -> Result<Self, CollectionIdError> {
+        let id = raw
+            .strip_prefix(Self::SERIALIZED_PREFIX)
+            .ok_or(CollectionIdError::Invalid)?
+            .parse::<u64>()
+            .map_err(|_| CollectionIdError::Invalid)?;
+        Self::parse_raw(id)
+    }
+
+    fn parse_raw(id: u64) -> Result<Self, CollectionIdError> {
+        (id > 0 && id < u64::MAX)
+            .then_some(Self(id))
+            .ok_or(CollectionIdError::Invalid)
     }
 }
 
@@ -96,12 +111,9 @@ impl<'de> serde::Deserialize<'de> for CollectionId {
         D: serde::Deserializer<'de>,
     {
         let value = <String as serde::Deserialize>::deserialize(deserializer)?;
-        let raw = value
-            .strip_prefix(Self::SERIALIZED_PREFIX)
-            .ok_or_else(|| serde::de::Error::custom("invalid collection id prefix"))?
-            .parse::<u64>()
-            .map_err(serde::de::Error::custom)?;
-        Self::from_raw(raw).map_err(|_| serde::de::Error::custom("invalid collection id"))
+        let id =
+            Self::parse(&value).map_err(|_| serde::de::Error::custom("invalid collection id"))?;
+        Self::from_raw(id.raw()).map_err(|_| serde::de::Error::custom("invalid collection id"))
     }
 }
 
@@ -580,6 +592,25 @@ impl TileLayout {
         if changed {
             collection.revision = collection.revision.saturating_add(1);
         }
+        true
+    }
+
+    /// Undo a just-started archived-member restore without advancing the destructive
+    /// confirmation revision. This is deliberately narrower than a general revision setter.
+    pub(crate) fn rollback_member_restore(
+        &mut self,
+        id: CollectionId,
+        pane: PaneId,
+        original_revision: u64,
+    ) -> bool {
+        let Some(collection) = self.collections.get_mut(&id) else {
+            return false;
+        };
+        if !collection.members.contains(&pane) || collection.archived.contains(&pane) {
+            return false;
+        }
+        collection.archived.insert(pane);
+        collection.revision = original_revision;
         true
     }
 
@@ -1383,6 +1414,17 @@ mod tests {
         let allocated = CollectionId::alloc().expect("collection id available");
         assert_ne!(restored, allocated);
         assert!(allocated.raw() > restored.raw());
+    }
+
+    #[test]
+    fn untrusted_collection_id_parsing_does_not_reserve_allocator_space() {
+        let before = CollectionId::alloc().expect("collection ID available");
+        let parsed = CollectionId::parse("collection_18446744073709551614")
+            .expect("near-max public ID parses");
+        let after = CollectionId::alloc().expect("untrusted lookup must not exhaust allocation");
+
+        assert!(parsed.raw() > after.raw());
+        assert_eq!(after.raw(), before.raw() + 1);
     }
 
     #[test]

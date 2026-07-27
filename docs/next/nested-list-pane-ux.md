@@ -405,6 +405,14 @@ Expansion, preview sizing, scroll position, and local maximize are client-local 
 
 The API and event model uses neutral runtime terminology such as collection and member rather than UI-specific names such as card, sidebar, or widget.
 
+## Future runtime work
+
+- **Delegation bootstrap:** `session.snapshot` currently omits delegation state. Clients must use
+  `delegation.tree` as a workaround, but event history retains only 512 events, so it cannot
+  provide a cursor-bounded atomic bootstrap. Add delegation state to snapshots together with a
+  cursor-bounded atomic delegation bootstrap protocol in a future feature; do not treat the
+  current workaround as lossless synchronization.
+
 ## Open implementation questions
 
 The product semantics and core runtime boundaries are settled. Detailed implementation design still needs to determine:

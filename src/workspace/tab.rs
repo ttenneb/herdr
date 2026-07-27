@@ -546,6 +546,21 @@ impl Tab {
         Ok(())
     }
 
+    pub(crate) fn rollback_collection_member_restore(
+        &mut self,
+        collection_id: CollectionId,
+        pane_id: PaneId,
+        original_revision: u64,
+    ) -> Result<(), CollectionMutationError> {
+        if !self
+            .layout
+            .rollback_member_restore(collection_id, pane_id, original_revision)
+        {
+            return Err(CollectionMutationError::PaneNotMember);
+        }
+        Ok(())
+    }
+
     pub fn is_auto_named(&self) -> bool {
         self.custom_name.is_none()
     }

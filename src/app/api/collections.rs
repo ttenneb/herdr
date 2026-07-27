@@ -12,6 +12,15 @@ use crate::layout::{CollectionId, LayoutLeaf, PanePlacement};
 
 use super::responses::{encode_error, encode_success};
 
+#[derive(Clone, Copy)]
+pub(crate) struct ArchivedMemberInputRestore {
+    ws_idx: usize,
+    tab_idx: usize,
+    collection_id: CollectionId,
+    pane_id: crate::layout::PaneId,
+    original_revision: u64,
+}
+
 impl App {
     pub(super) fn handle_collection_list(
         &self,
@@ -1194,47 +1203,74 @@ impl App {
         }
     }
 
+    /// Begin restoring an archived member for input. The caller must commit after the first
+    /// successful enqueue or roll back when no input was accepted.
+    pub(crate) fn begin_archived_member_input(
+        &mut self,
+        ws_idx: usize,
+        pane_id: crate::layout::PaneId,
+    ) -> Option<ArchivedMemberInputRestore> {
+        let tab_idx = self
+            .state
+            .workspaces
+            .get(ws_idx)?
+            .find_tab_index_for_pane(pane_id)?;
+        let PanePlacement::Collection(collection_id) =
+            self.state.workspaces[ws_idx].tabs[tab_idx].pane_placement(pane_id)?
+        else {
+            return None;
+        };
+        let collection = self.state.workspaces[ws_idx].tabs[tab_idx].collection(collection_id)?;
+        let (archived, original_revision) =
+            (collection.is_archived(pane_id), collection.revision());
+        (archived
+            && self.state.workspaces[ws_idx]
+                .set_collection_member_archived(pane_id, collection_id, false)
+                .is_ok())
+        .then_some(ArchivedMemberInputRestore {
+            ws_idx,
+            tab_idx,
+            collection_id,
+            pane_id,
+            original_revision,
+        })
+    }
+
+    pub(crate) fn commit_archived_member_input(&mut self, restore: ArchivedMemberInputRestore) {
+        self.state.collection_archive_times.remove(&restore.pane_id);
+        self.state.mark_session_dirty();
+        self.schedule_session_save();
+        if let (Some(collection), Some(public_pane_id)) = (
+            self.collection_info(restore.ws_idx, restore.tab_idx, restore.collection_id),
+            self.public_pane_id(restore.ws_idx, restore.pane_id),
+        ) {
+            self.emit_collection_event(
+                EventKind::CollectionMemberRestored,
+                EventData::CollectionMemberRestored {
+                    collection,
+                    pane_id: public_pane_id,
+                },
+            );
+        }
+    }
+
+    pub(crate) fn rollback_archived_member_input(&mut self, restore: ArchivedMemberInputRestore) {
+        let _ = self.state.workspaces[restore.ws_idx].rollback_collection_member_restore(
+            restore.tab_idx,
+            restore.pane_id,
+            restore.collection_id,
+            restore.original_revision,
+        );
+    }
+
+    // TUI input is already accepted before this helper is called, so it commits immediately.
     pub(crate) fn restore_archived_member_for_input(
         &mut self,
         ws_idx: usize,
         pane_id: crate::layout::PaneId,
     ) {
-        let Some(tab_idx) = self
-            .state
-            .workspaces
-            .get(ws_idx)
-            .and_then(|ws| ws.find_tab_index_for_pane(pane_id))
-        else {
-            return;
-        };
-        let Some(PanePlacement::Collection(collection_id)) =
-            self.state.workspaces[ws_idx].tabs[tab_idx].pane_placement(pane_id)
-        else {
-            return;
-        };
-        let archived = self.state.workspaces[ws_idx].tabs[tab_idx]
-            .collection(collection_id)
-            .is_some_and(|collection| collection.is_archived(pane_id));
-        if archived
-            && self.state.workspaces[ws_idx]
-                .set_collection_member_archived(pane_id, collection_id, false)
-                .is_ok()
-        {
-            self.state.collection_archive_times.remove(&pane_id);
-            self.state.mark_session_dirty();
-            self.schedule_session_save();
-            if let (Some(collection), Some(public_pane_id)) = (
-                self.collection_info(ws_idx, tab_idx, collection_id),
-                self.public_pane_id(ws_idx, pane_id),
-            ) {
-                self.emit_collection_event(
-                    EventKind::CollectionMemberRestored,
-                    EventData::CollectionMemberRestored {
-                        collection,
-                        pane_id: public_pane_id,
-                    },
-                );
-            }
+        if let Some(restore) = self.begin_archived_member_input(ws_idx, pane_id) {
+            self.commit_archived_member_input(restore);
         }
     }
 
@@ -1265,7 +1301,7 @@ pub(super) fn collection_id_string(id: CollectionId) -> String {
         .unwrap_or_else(|| format!("collection_{}", id.raw()))
 }
 fn parse_collection_id(raw: &str) -> Option<CollectionId> {
-    serde_json::from_value(serde_json::Value::String(raw.to_string())).ok()
+    CollectionId::parse(raw).ok()
 }
 fn split_direction(direction: crate::api::schema::SplitDirection) -> ratatui::layout::Direction {
     match direction {
@@ -1788,6 +1824,240 @@ mod tests {
                 .pane_id,
             api.public_pane_id(0, second).expect("public pane")
         );
+    }
+
+    #[test]
+    fn unknown_near_max_collection_requests_do_not_reserve_ids() {
+        let (mut app, _root, member, _) = app_with_panes();
+        let member_public = app.public_pane_id(0, member).expect("public pane");
+        let before = CollectionId::alloc().expect("collection ID available");
+        let unknown = "collection_18446744073709551614".to_string();
+
+        assert!(app.resolve_collection(&unknown).is_none());
+        let response = app.handle_collection_archive(
+            "unknown".into(),
+            CollectionMemberTarget {
+                collection_id: unknown,
+                pane_id: member_public,
+            },
+            true,
+        );
+        assert!(serde_json::from_str::<crate::api::schema::ErrorResponse>(&response).is_ok());
+        let after = CollectionId::alloc().expect("unknown mutation must not exhaust allocation");
+        assert_eq!(after.raw(), before.raw() + 1);
+    }
+
+    #[tokio::test]
+    async fn archived_input_restores_only_after_an_enqueue_is_accepted() {
+        let (mut app, root, member, _) = app_with_panes();
+        let collection_id = create_collection(&mut app, root);
+        let member_public = app.public_pane_id(0, member).expect("public pane");
+        request(
+            &mut app,
+            Method::CollectionAdd(CollectionAddParams {
+                collection_id: collection_id.clone(),
+                pane_id: member_public.clone(),
+            }),
+        );
+        request(
+            &mut app,
+            Method::CollectionArchive(CollectionMemberTarget {
+                collection_id: collection_id.clone(),
+                pane_id: member_public.clone(),
+            }),
+        );
+        let archived_at = app.state.collection_archive_times[&member];
+        let collection = parse_collection_id(&collection_id).expect("collection ID");
+        let archive_revision = app.state.workspaces[0].tabs[0]
+            .collection(collection)
+            .expect("collection")
+            .revision();
+
+        let events_before = app.event_hub.current_sequence();
+        let missing = app.handle_pane_send_text(
+            "missing".into(),
+            crate::api::schema::PaneSendTextParams {
+                pane_id: member_public.clone(),
+                text: "resume".into(),
+            },
+        );
+        assert!(serde_json::from_str::<crate::api::schema::ErrorResponse>(&missing).is_ok());
+        assert!(app.state.workspaces[0].tabs[0]
+            .collection(collection)
+            .expect("collection")
+            .is_archived(member));
+        assert_eq!(app.state.collection_archive_times[&member], archived_at);
+        assert_eq!(app.event_hub.current_sequence(), events_before);
+
+        let (runtime, _rx) =
+            crate::terminal::TerminalRuntime::test_with_channel_capacity(80, 24, 1);
+        runtime
+            .try_send_bytes(bytes::Bytes::from_static(b"occupied"))
+            .expect("fill runtime input queue");
+        app.state.insert_test_runtime(member, runtime);
+        let failed = app.handle_pane_send_text(
+            "failed".into(),
+            crate::api::schema::PaneSendTextParams {
+                pane_id: member_public.clone(),
+                text: "resume".into(),
+            },
+        );
+        assert!(serde_json::from_str::<crate::api::schema::ErrorResponse>(&failed).is_ok());
+        assert!(app.state.workspaces[0].tabs[0]
+            .collection(collection)
+            .expect("collection")
+            .is_archived(member));
+        assert_eq!(app.state.collection_archive_times[&member], archived_at);
+        assert_eq!(
+            app.state.workspaces[0].tabs[0]
+                .collection(collection)
+                .expect("collection")
+                .revision(),
+            archive_revision
+        );
+        assert_eq!(app.event_hub.current_sequence(), events_before);
+
+        let invalid_input = app.handle_pane_send_input(
+            "invalid-input".into(),
+            crate::api::schema::PaneSendInputParams {
+                pane_id: member_public.clone(),
+                text: "resume".into(),
+                keys: vec!["not-a-key".into()],
+            },
+        );
+        assert!(serde_json::from_str::<crate::api::schema::ErrorResponse>(&invalid_input).is_ok());
+        let invalid_keys = app.handle_pane_send_keys(
+            "invalid-keys".into(),
+            crate::api::schema::PaneSendKeysParams {
+                pane_id: member_public.clone(),
+                keys: vec!["not-a-key".into()],
+            },
+        );
+        assert!(serde_json::from_str::<crate::api::schema::ErrorResponse>(&invalid_keys).is_ok());
+        assert!(app.state.workspaces[0].tabs[0]
+            .collection(collection)
+            .expect("collection")
+            .is_archived(member));
+        assert_eq!(app.state.collection_archive_times[&member], archived_at);
+        assert_eq!(app.event_hub.current_sequence(), events_before);
+
+        let (runtime, mut empty_rx) =
+            crate::terminal::TerminalRuntime::test_with_channel_capacity(80, 24, 2);
+        app.state.insert_test_runtime(member, runtime);
+        for (id, response) in [
+            (
+                "empty-text",
+                app.handle_pane_send_text(
+                    "empty-text".into(),
+                    crate::api::schema::PaneSendTextParams {
+                        pane_id: member_public.clone(),
+                        text: String::new(),
+                    },
+                ),
+            ),
+            (
+                "empty-input",
+                app.handle_pane_send_input(
+                    "empty-input".into(),
+                    crate::api::schema::PaneSendInputParams {
+                        pane_id: member_public.clone(),
+                        text: String::new(),
+                        keys: Vec::new(),
+                    },
+                ),
+            ),
+            (
+                "empty-keys",
+                app.handle_pane_send_keys(
+                    "empty-keys".into(),
+                    crate::api::schema::PaneSendKeysParams {
+                        pane_id: member_public.clone(),
+                        keys: Vec::new(),
+                    },
+                ),
+            ),
+        ] {
+            assert!(
+                serde_json::from_str::<crate::api::schema::SuccessResponse>(&response).is_ok(),
+                "{id} retains its successful response"
+            );
+            assert!(app.state.workspaces[0].tabs[0]
+                .collection(collection)
+                .expect("collection")
+                .is_archived(member));
+            assert_eq!(app.state.collection_archive_times[&member], archived_at);
+            assert_eq!(app.event_hub.current_sequence(), events_before);
+        }
+        assert_eq!(
+            empty_rx.try_recv().expect("empty text enqueued"),
+            bytes::Bytes::new()
+        );
+        assert_eq!(
+            empty_rx.try_recv().expect("empty input enqueued"),
+            bytes::Bytes::new()
+        );
+        assert!(empty_rx.try_recv().is_err());
+
+        let (runtime, mut rx) =
+            crate::terminal::TerminalRuntime::test_with_channel_capacity(80, 24, 2);
+        app.state.insert_test_runtime(member, runtime);
+        let sent = app.handle_pane_send_text(
+            "sent".into(),
+            crate::api::schema::PaneSendTextParams {
+                pane_id: member_public,
+                text: "resume".into(),
+            },
+        );
+        assert!(serde_json::from_str::<crate::api::schema::SuccessResponse>(&sent).is_ok());
+        assert_eq!(
+            rx.try_recv().expect("input accepted"),
+            bytes::Bytes::from_static(b"resume")
+        );
+        assert!(!app.state.workspaces[0].tabs[0]
+            .collection(collection)
+            .expect("collection")
+            .is_archived(member));
+        assert!(!app.state.collection_archive_times.contains_key(&member));
+        assert_eq!(app.event_hub.current_sequence(), events_before + 1);
+        assert!(matches!(
+            app.event_hub.events_after(events_before).as_slice(),
+            [(
+                _,
+                EventEnvelope {
+                    event: EventKind::CollectionMemberRestored,
+                    ..
+                }
+            )]
+        ));
+
+        app.state.workspaces[0]
+            .set_collection_member_archived(member, collection, true)
+            .expect("archive member for partial delivery");
+        app.state
+            .collection_archive_times
+            .insert(member, std::time::SystemTime::now());
+        let events_before_partial = app.event_hub.current_sequence();
+        let (runtime, mut partial_rx) =
+            crate::terminal::TerminalRuntime::test_with_channel_capacity(80, 24, 1);
+        app.state.insert_test_runtime(member, runtime);
+        let partial = app.handle_pane_send_keys(
+            "partial".into(),
+            crate::api::schema::PaneSendKeysParams {
+                pane_id: app.public_pane_id(0, member).expect("public pane"),
+                keys: vec!["enter".into(), "up".into()],
+            },
+        );
+        assert!(serde_json::from_str::<crate::api::schema::ErrorResponse>(&partial).is_ok());
+        assert_eq!(
+            partial_rx.try_recv().expect("first key accepted"),
+            bytes::Bytes::from_static(b"\r")
+        );
+        assert!(!app.state.workspaces[0].tabs[0]
+            .collection(collection)
+            .expect("collection")
+            .is_archived(member));
+        assert!(!app.state.collection_archive_times.contains_key(&member));
+        assert_eq!(app.event_hub.current_sequence(), events_before_partial + 1);
     }
 
     #[tokio::test]

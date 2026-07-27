@@ -49,9 +49,10 @@ impl<'de> Deserialize<'de> for DelegationId {
     where
         D: Deserializer<'de>,
     {
-        String::deserialize(deserializer)?
-            .parse()
-            .map_err(D::Error::custom)
+        let id = String::deserialize(deserializer)?
+            .parse::<DelegationId>()
+            .map_err(D::Error::custom)?;
+        Self::from_raw(id.raw()).map_err(D::Error::custom)
     }
 }
 
@@ -70,7 +71,7 @@ impl FromStr for DelegationId {
             .ok_or(ParseDelegationIdError)?
             .parse::<u64>()
             .map_err(|_| ParseDelegationIdError)?;
-        Self::from_raw(raw)
+        (raw > 0).then_some(Self(raw)).ok_or(ParseDelegationIdError)
     }
 }
 
@@ -880,6 +881,18 @@ mod tests {
         assert!(DelegationId::from_raw(0).is_err());
         assert!("d0".parse::<DelegationId>().is_err());
         assert!(serde_json::from_str::<DelegationId>("0").is_err());
+    }
+
+    #[test]
+    fn untrusted_delegation_id_parsing_does_not_reserve_allocator_space() {
+        let before = DelegationId::alloc().expect("delegation ID available");
+        let parsed = "d18446744073709551615"
+            .parse::<DelegationId>()
+            .expect("near-max public ID parses");
+        let after = DelegationId::alloc().expect("untrusted lookup must not exhaust allocation");
+
+        assert!(parsed.raw() > after.raw());
+        assert_eq!(after.raw(), before.raw() + 1);
     }
 
     #[test]

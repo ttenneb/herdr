@@ -1419,6 +1419,22 @@ impl Workspace {
         self.tabs[tab_idx].set_collection_member_archived(collection_id, pane_id, archived)
     }
 
+    /// Undo a just-started archived-member restore in its original tab without changing its
+    /// destructive-confirmation revision.
+    pub(crate) fn rollback_collection_member_restore(
+        &mut self,
+        tab_idx: usize,
+        pane_id: PaneId,
+        collection_id: CollectionId,
+        original_revision: u64,
+    ) -> Result<(), CollectionMutationError> {
+        let tab = self
+            .tabs
+            .get_mut(tab_idx)
+            .ok_or(CollectionMutationError::PaneNotFound)?;
+        tab.rollback_collection_member_restore(collection_id, pane_id, original_revision)
+    }
+
     pub(crate) fn insert_moved_pane_into_collection(
         &mut self,
         tab_idx: usize,

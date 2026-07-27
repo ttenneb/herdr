@@ -1648,12 +1648,25 @@ impl App {
         let Some((ws_idx, pane_id)) = self.parse_pane_id(&params.pane_id) else {
             return pane_not_found(id, &params.pane_id);
         };
-        self.restore_archived_member_for_input(ws_idx, pane_id);
-        let Some(runtime) = self.lookup_runtime_sender(ws_idx, pane_id) else {
+        if self.lookup_runtime_sender(ws_idx, pane_id).is_none() {
             return pane_not_found(id, &params.pane_id);
-        };
-        if let Err(err) = runtime.try_send_bytes(Bytes::from(params.text)) {
+        }
+        let bytes = Bytes::from(params.text);
+        let restore = (!bytes.is_empty())
+            .then(|| self.begin_archived_member_input(ws_idx, pane_id))
+            .flatten();
+        let result = self
+            .lookup_runtime_sender(ws_idx, pane_id)
+            .expect("runtime was just verified")
+            .try_send_bytes(bytes);
+        if let Err(err) = result {
+            if let Some(restore) = restore {
+                self.rollback_archived_member_input(restore);
+            }
             return encode_error(id, "pane_send_failed", err.to_string());
+        }
+        if let Some(restore) = restore {
+            self.commit_archived_member_input(restore);
         }
 
         encode_success(id, ResponseResult::Ok {})
@@ -1667,7 +1680,6 @@ impl App {
         let Some((ws_idx, pane_id)) = self.parse_pane_id(&params.pane_id) else {
             return pane_not_found(id, &params.pane_id);
         };
-        self.restore_archived_member_for_input(ws_idx, pane_id);
         let Some(runtime) = self.lookup_runtime_sender(ws_idx, pane_id) else {
             return pane_not_found(id, &params.pane_id);
         };
@@ -1679,8 +1691,21 @@ impl App {
             Ok(bytes) => bytes,
             Err(key) => return encode_error(id, "invalid_key", format!("unsupported key {key}")),
         };
-        if let Err(err) = runtime.try_send_bytes(Bytes::from(bytes)) {
+        let restore = (!bytes.is_empty())
+            .then(|| self.begin_archived_member_input(ws_idx, pane_id))
+            .flatten();
+        let result = self
+            .lookup_runtime_sender(ws_idx, pane_id)
+            .expect("runtime was just verified")
+            .try_send_bytes(Bytes::from(bytes));
+        if let Err(err) = result {
+            if let Some(restore) = restore {
+                self.rollback_archived_member_input(restore);
+            }
             return encode_error(id, "pane_send_failed", err.to_string());
+        }
+        if let Some(restore) = restore {
+            self.commit_archived_member_input(restore);
         }
 
         encode_success(id, ResponseResult::Ok {})
@@ -1815,7 +1840,6 @@ impl App {
         let Some((ws_idx, pane_id)) = self.parse_pane_id(&params.pane_id) else {
             return pane_not_found(id, &params.pane_id);
         };
-        self.restore_archived_member_for_input(ws_idx, pane_id);
         let Some(runtime) = self.lookup_runtime_sender(ws_idx, pane_id) else {
             return pane_not_found(id, &params.pane_id);
         };
@@ -1823,10 +1847,31 @@ impl App {
             Ok(encoded_keys) => encoded_keys,
             Err(key) => return encode_error(id, "invalid_key", format!("unsupported key {key}")),
         };
+        let mut restore = None;
+        let mut accepted = false;
         for bytes in encoded_keys {
-            if let Err(err) = runtime.try_send_bytes(Bytes::from(bytes)) {
+            if !bytes.is_empty() && restore.is_none() {
+                restore = self.begin_archived_member_input(ws_idx, pane_id);
+            }
+            let nonempty = !bytes.is_empty();
+            let result = self
+                .lookup_runtime_sender(ws_idx, pane_id)
+                .expect("runtime was just verified")
+                .try_send_bytes(Bytes::from(bytes));
+            if let Err(err) = result {
+                if let Some(restore) = restore {
+                    if accepted {
+                        self.commit_archived_member_input(restore);
+                    } else {
+                        self.rollback_archived_member_input(restore);
+                    }
+                }
                 return encode_error(id, "pane_send_failed", err.to_string());
             }
+            accepted |= nonempty;
+        }
+        if let Some(restore) = restore {
+            self.commit_archived_member_input(restore);
         }
 
         encode_success(id, ResponseResult::Ok {})

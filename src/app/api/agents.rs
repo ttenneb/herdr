@@ -81,7 +81,6 @@ impl App {
         if terminal.managed_agent_launch_pending() {
             return agent_not_ready(id, &params.target);
         }
-        self.restore_archived_member_for_input(resolved.ws_idx, resolved.pane_id);
         let Some(runtime) = self.lookup_runtime_sender(resolved.ws_idx, resolved.pane_id) else {
             return agent_not_found(id, &params.target);
         };
@@ -96,8 +95,19 @@ impl App {
             );
         }
         let bytes = crate::app::api_helpers::encode_api_submission(runtime, &params.text);
-        if let Err(err) = runtime.try_send_bytes(Bytes::from(bytes)) {
+        let restore = self.begin_archived_member_input(resolved.ws_idx, resolved.pane_id);
+        let result = self
+            .lookup_runtime_sender(resolved.ws_idx, resolved.pane_id)
+            .expect("runtime was just verified")
+            .try_send_bytes(Bytes::from(bytes));
+        if let Err(err) = result {
+            if let Some(restore) = restore {
+                self.rollback_archived_member_input(restore);
+            }
             return encode_error(id, "agent_prompt_failed", err.to_string());
+        }
+        if let Some(restore) = restore {
+            self.commit_archived_member_input(restore);
         }
         let Some(agent) = self.agent_info(resolved.ws_idx, resolved.pane_id) else {
             return agent_not_found(id, &params.target);
@@ -242,7 +252,6 @@ impl App {
         else {
             return agent_not_ready(id, &params.target);
         };
-        self.restore_archived_member_for_input(resolved.ws_idx, resolved.pane_id);
         let Some(runtime) = self.lookup_runtime_sender(resolved.ws_idx, resolved.pane_id) else {
             return agent_not_found(id, &params.target);
         };
@@ -256,8 +265,21 @@ impl App {
             }
         };
         let bytes: Vec<u8> = encoded.into_iter().flatten().collect();
-        if let Err(err) = runtime.try_send_bytes(Bytes::from(bytes)) {
+        let restore = (!bytes.is_empty())
+            .then(|| self.begin_archived_member_input(resolved.ws_idx, resolved.pane_id))
+            .flatten();
+        let result = self
+            .lookup_runtime_sender(resolved.ws_idx, resolved.pane_id)
+            .expect("runtime was just verified")
+            .try_send_bytes(Bytes::from(bytes));
+        if let Err(err) = result {
+            if let Some(restore) = restore {
+                self.rollback_archived_member_input(restore);
+            }
             return encode_error(id, "agent_send_keys_failed", err.to_string());
+        }
+        if let Some(restore) = restore {
+            self.commit_archived_member_input(restore);
         }
 
         encode_success(id, ResponseResult::Ok {})
@@ -309,6 +331,112 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn agent_input_restores_archived_members_only_after_delivery() {
+        let mut app = app_with_agent();
+        let pane_id = app.state.workspaces[0].tabs[0]
+            .root_pane
+            .expect("root pane");
+        let collection = app.state.workspaces[0]
+            .create_collection_near(
+                0,
+                crate::layout::LayoutLeaf::Pane(pane_id),
+                ratatui::layout::Direction::Horizontal,
+                0.5,
+                None,
+            )
+            .expect("create collection");
+        app.state.workspaces[0]
+            .collect_pane(pane_id, collection)
+            .expect("collect pane");
+        app.state.workspaces[0]
+            .set_collection_member_archived(pane_id, collection, true)
+            .expect("archive member");
+        let archive_revision = app.state.workspaces[0].tabs[0]
+            .collection(collection)
+            .expect("collection")
+            .revision();
+        let archived_at = std::time::SystemTime::now();
+        app.state
+            .collection_archive_times
+            .insert(pane_id, archived_at);
+        let terminal_id = app.state.workspaces[0].tabs[0].panes[&pane_id]
+            .attached_terminal_id
+            .clone();
+        let terminal = app.state.terminals.get_mut(&terminal_id).expect("terminal");
+        terminal.set_agent_name("reviewer".into());
+        terminal.set_detected_state(Some(Agent::Pi), AgentState::Idle);
+        let public_pane_id = app.public_pane_id(0, pane_id).expect("public pane");
+        let events_before = app.event_hub.current_sequence();
+
+        let (runtime, _rx) =
+            crate::terminal::TerminalRuntime::test_with_channel_capacity(80, 24, 1);
+        runtime
+            .try_send_bytes(Bytes::from_static(b"occupied"))
+            .expect("fill runtime input queue");
+        app.state.insert_test_runtime(pane_id, runtime);
+        let failed = app.handle_agent_prompt(
+            "failed".into(),
+            AgentPromptParams {
+                target: public_pane_id.clone(),
+                text: "resume".into(),
+                wait: None,
+            },
+        );
+        assert!(serde_json::from_str::<crate::api::schema::ErrorResponse>(&failed).is_ok());
+        assert!(app.state.workspaces[0].tabs[0]
+            .collection(collection)
+            .expect("collection")
+            .is_archived(pane_id));
+        assert_eq!(app.state.collection_archive_times[&pane_id], archived_at);
+        assert_eq!(
+            app.state.workspaces[0].tabs[0]
+                .collection(collection)
+                .expect("collection")
+                .revision(),
+            archive_revision
+        );
+        assert_eq!(app.event_hub.current_sequence(), events_before);
+
+        let (runtime, mut rx) =
+            crate::terminal::TerminalRuntime::test_with_channel_capacity(80, 24, 2);
+        app.state.insert_test_runtime(pane_id, runtime);
+        let empty = app.handle_agent_send_keys(
+            "empty".into(),
+            AgentSendKeysParams {
+                target: public_pane_id.clone(),
+                keys: Vec::new(),
+            },
+        );
+        assert!(serde_json::from_str::<SuccessResponse>(&empty).is_ok());
+        assert_eq!(rx.try_recv().expect("empty input accepted"), Bytes::new());
+        assert!(app.state.workspaces[0].tabs[0]
+            .collection(collection)
+            .expect("collection")
+            .is_archived(pane_id));
+        assert_eq!(app.state.collection_archive_times[&pane_id], archived_at);
+        assert_eq!(app.event_hub.current_sequence(), events_before);
+
+        let sent = app.handle_agent_send_keys(
+            "sent".into(),
+            AgentSendKeysParams {
+                target: public_pane_id,
+                keys: vec!["enter".into()],
+            },
+        );
+        assert!(serde_json::from_str::<SuccessResponse>(&sent).is_ok());
+        assert_eq!(
+            rx.try_recv().expect("input accepted"),
+            Bytes::from_static(b"\r")
+        );
+        assert!(!app.state.workspaces[0].tabs[0]
+            .collection(collection)
+            .expect("collection")
+            .is_archived(pane_id));
+        assert!(!app.state.collection_archive_times.contains_key(&pane_id));
+        assert_eq!(app.event_hub.current_sequence(), events_before + 1);
+    }
+
+    #[tokio::test]
     async fn agent_prompt_accepts_pane_ids_and_working_agents_atomically() {
         let mut app = app_with_agent();
         let pane_id = app.state.workspaces[0].tabs[0]
@@ -350,7 +478,7 @@ mod tests {
         app.lookup_runtime_sender(0, pane_id)
             .unwrap()
             .test_process_pty_bytes(b"\x1b[?2004l");
-        let raw = app.handle_agent_prompt(
+        let unbracketed = app.handle_agent_prompt(
             "req-raw".into(),
             AgentPromptParams {
                 target: "reviewer".into(),
@@ -358,8 +486,11 @@ mod tests {
                 wait: None,
             },
         );
-        let raw: SuccessResponse = serde_json::from_str(&raw).unwrap();
-        assert!(matches!(raw.result, ResponseResult::AgentPrompted { .. }));
+        let unbracketed: SuccessResponse = serde_json::from_str(&unbracketed).unwrap();
+        assert!(matches!(
+            unbracketed.result,
+            ResponseResult::AgentPrompted { .. }
+        ));
         assert_eq!(rx.try_recv().unwrap(), Bytes::from_static(b"A != B\r"));
         assert!(rx.try_recv().is_err());
 
