@@ -72,6 +72,9 @@ impl App {
         }
 
         if key.code == KeyCode::Esc {
+            // Prefix then Escape leaves an explicitly entered collection terminal without
+            // stealing bare Escape from shells, editors, pagers, or terminal applications.
+            self.exit_focused_collection_terminal();
             leave_command_mode(&mut self.state);
             return;
         }

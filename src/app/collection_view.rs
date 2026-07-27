@@ -73,6 +73,8 @@ pub(crate) struct CollectionViewState {
     pub(crate) maximized: Option<PaneId>,
     pub(crate) resize_drag: Option<(PaneId, u16, u16)>,
     pub(crate) row_drag: Option<(PaneId, u16)>,
+    /// Child terminal scrollbar thumb currently being dragged.
+    pub(crate) child_scrollbar_drag: Option<(PaneId, u16)>,
 }
 impl CollectionViewState {
     pub(crate) fn preview_height(&self, pane_id: PaneId) -> u16 {
@@ -88,6 +90,13 @@ impl CollectionViewState {
             height.clamp(MIN_PREVIEW_HEIGHT, MAX_PREVIEW_HEIGHT),
         );
     }
+    pub(crate) fn terminal_entered(&self, pane_id: Option<PaneId>) -> bool {
+        pane_id.is_some_and(|pane| {
+            self.mode == CollectionInteractionMode::Terminal
+                && self.entered == Some(pane)
+                && (self.expanded.contains(&pane) || self.maximized == Some(pane))
+        })
+    }
     pub(crate) fn retain_members(&mut self, members: &[PaneId]) {
         let members: HashSet<_> = members.iter().copied().collect();
         self.expanded.retain(|pane| members.contains(pane));
@@ -100,6 +109,12 @@ impl CollectionViewState {
         if self.entered.is_some_and(|pane| !members.contains(&pane)) {
             self.entered = None;
             self.mode = CollectionInteractionMode::List;
+        }
+        if self
+            .child_scrollbar_drag
+            .is_some_and(|(pane, _)| !members.contains(&pane))
+        {
+            self.child_scrollbar_drag = None;
         }
     }
 }
@@ -114,6 +129,7 @@ pub(crate) enum CollectionHitKind {
     Row,
     Disclosure,
     Preview,
+    PreviewScrollbar,
     ResizeHandle,
     Chrome,
 }
@@ -137,6 +153,8 @@ pub(crate) struct CollectionRowView {
     pub(crate) row_rect: Rect,
     /// Visible, clipped render/hit rectangle.
     pub(crate) preview_rect: Option<Rect>,
+    /// Visible portion of the child's independently reserved scrollbar gutter.
+    pub(crate) preview_scrollbar_rect: Option<Rect>,
     /// Full logical PTY preview dimensions, independent of viewport clipping.
     pub(crate) preview_size: Option<(u16, u16)>,
     /// First logical terminal row shown in `preview_rect`.
@@ -155,7 +173,11 @@ pub(crate) struct CollectionLayout {
     pub(crate) content_height: usize,
     pub(crate) viewport_height: usize,
     pub(crate) scroll: usize,
+    /// Dedicated collection scrollbar gutter, separate from row and child terminal content.
+    pub(crate) scrollbar_rect: Option<Rect>,
     pub(crate) maximized: Option<PaneId>,
+    pub(crate) maximized_preview_rect: Option<Rect>,
+    pub(crate) maximized_scrollbar_rect: Option<Rect>,
 }
 impl CollectionLayout {
     pub(crate) fn hit_at(&self, x: u16, y: u16) -> Option<CollectionHitRegion> {
@@ -222,9 +244,9 @@ impl AppState {
             .and_then(|ws| ws.active_tab())
             .and_then(|tab| tab.collection(id))
             .and_then(|collection| collection.selected());
-        self.collection_views.get(&id).is_some_and(|view| {
-            view.mode == CollectionInteractionMode::Terminal && view.entered == selected
-        })
+        self.collection_views
+            .get(&id)
+            .is_some_and(|view| view.terminal_entered(selected))
     }
 }
 

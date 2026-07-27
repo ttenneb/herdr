@@ -1,7 +1,7 @@
 use crossterm::event::{
     KeyCode, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
 };
-use ratatui::widgets::Borders;
+use ratatui::{layout::Rect, widgets::Borders};
 
 use crate::{
     api::schema::{
@@ -41,9 +41,22 @@ impl App {
         self.state
             .collection_views
             .get(&collection_id)
-            .is_some_and(|view| {
-                view.mode == CollectionInteractionMode::Terminal && view.entered == selected
-            })
+            .is_some_and(|view| view.terminal_entered(selected))
+    }
+
+    pub(crate) fn exit_focused_collection_terminal(&mut self) -> bool {
+        let Some((_, collection_id, selected)) = self.focused_collection() else {
+            return false;
+        };
+        let Some(view) = self.state.collection_views.get_mut(&collection_id) else {
+            return false;
+        };
+        if !view.terminal_entered(selected) {
+            return false;
+        }
+        view.mode = CollectionInteractionMode::List;
+        view.entered = None;
+        true
     }
 
     pub(crate) fn handle_collection_key(&mut self, key: TerminalKey) -> bool {
@@ -58,17 +71,11 @@ impl App {
             .state
             .collection_views
             .get(&collection_id)
-            .is_some_and(|view| {
-                view.mode == CollectionInteractionMode::Terminal && view.entered == selected
-            });
+            .is_some_and(|view| view.terminal_entered(selected));
         if entered {
-            if self.state.is_prefix_key(key) {
-                if let Some(view) = self.state.collection_views.get_mut(&collection_id) {
-                    view.mode = CollectionInteractionMode::List;
-                    view.entered = None;
-                }
-                return true;
-            }
+            // Entered terminals retain ordinary terminal input, including bare Escape. The
+            // configured Herdr prefix enters command mode; prefix then Escape returns to the
+            // collection list, while prefix then prefix keeps literal-prefix passthrough.
             return false;
         }
 
@@ -661,7 +668,12 @@ impl App {
             .collection_views
             .entry(collection_id)
             .or_default();
-        if !view.expanded.remove(&pane) {
+        if view.expanded.remove(&pane) {
+            if view.entered == Some(pane) {
+                view.mode = CollectionInteractionMode::List;
+                view.entered = None;
+            }
+        } else {
             view.expanded.insert(pane);
         }
     }
@@ -762,6 +774,126 @@ impl App {
         self.state.collection_views.remove(&collection_id);
     }
 
+    fn collection_child_preview_info(
+        &self,
+        collection_id: CollectionId,
+        pane_id: PaneId,
+    ) -> Option<(Rect, u16, u16)> {
+        let layout = self
+            .state
+            .view
+            .collection_layouts
+            .iter()
+            .find(|layout| layout.id == collection_id)?;
+        if layout.maximized == Some(pane_id) {
+            let rect = layout.maximized_preview_rect.unwrap_or(layout.inner_rect);
+            return Some((rect, 0, rect.height));
+        }
+        let row = layout.rows.iter().find(|row| row.pane_id == pane_id)?;
+        Some((
+            row.preview_rect?,
+            row.preview_row_offset,
+            row.preview_size?.0,
+        ))
+    }
+
+    fn scroll_collection_child_wheel(
+        &mut self,
+        ws_idx: usize,
+        collection_id: CollectionId,
+        pane_id: PaneId,
+        mouse: MouseEvent,
+        allow_terminal_routing: bool,
+    ) {
+        self.restore_archived_member_for_input(ws_idx, pane_id);
+        let Some((rect, row_offset, _)) =
+            self.collection_child_preview_info(collection_id, pane_id)
+        else {
+            return;
+        };
+        let logical_mouse = MouseEvent {
+            column: mouse.column.clamp(rect.x, rect.right().saturating_sub(1)),
+            row: mouse.row.saturating_add(row_offset),
+            ..mouse
+        };
+        let info = PaneInfo {
+            id: pane_id,
+            rect,
+            inner_rect: rect,
+            scrollbar_rect: None,
+            borders: Borders::NONE,
+            is_focused: true,
+        };
+        if allow_terminal_routing
+            && self
+                .state
+                .forward_pane_wheel(&self.terminal_runtimes, &info, logical_mouse)
+        {
+            return;
+        }
+        if let Some(runtime) =
+            self.state
+                .runtime_for_pane_in_workspace(&self.terminal_runtimes, ws_idx, pane_id)
+        {
+            match mouse.kind {
+                MouseEventKind::ScrollUp => runtime.scroll_up(self.state.mouse_scroll_lines),
+                MouseEventKind::ScrollDown => runtime.scroll_down(self.state.mouse_scroll_lines),
+                _ => {}
+            }
+        }
+    }
+
+    fn set_collection_child_scrollbar_from_row(
+        &self,
+        ws_idx: usize,
+        collection_id: CollectionId,
+        pane_id: PaneId,
+        screen_row: u16,
+        grab_row_offset: Option<u16>,
+    ) -> Option<u16> {
+        let (_, clipped_row_offset, logical_rows) =
+            self.collection_child_preview_info(collection_id, pane_id)?;
+        let layout = self
+            .state
+            .view
+            .collection_layouts
+            .iter()
+            .find(|layout| layout.id == collection_id)?;
+        let visible_track = if layout.maximized == Some(pane_id) {
+            layout.maximized_scrollbar_rect?
+        } else {
+            layout
+                .rows
+                .iter()
+                .find(|row| row.pane_id == pane_id)?
+                .preview_scrollbar_rect?
+        };
+        let runtime =
+            self.state
+                .runtime_for_pane_in_workspace(&self.terminal_runtimes, ws_idx, pane_id)?;
+        let metrics = runtime.scroll_metrics()?;
+        let logical_track = Rect::new(0, 0, 1, logical_rows);
+        let logical_row = clipped_row_offset.saturating_add(
+            screen_row
+                .clamp(visible_track.y, visible_track.bottom().saturating_sub(1))
+                .saturating_sub(visible_track.y),
+        );
+        if grab_row_offset.is_none() {
+            if let Some(grab) =
+                crate::ui::scrollbar_thumb_grab_offset(metrics, logical_track, logical_row)
+            {
+                return Some(grab);
+            }
+        }
+        let offset = if let Some(grab) = grab_row_offset {
+            crate::ui::scrollbar_offset_from_drag_row(metrics, logical_track, logical_row, grab)
+        } else {
+            crate::ui::scrollbar_offset_from_row(metrics, logical_track, logical_row)
+        };
+        runtime.set_scroll_offset_from_bottom(offset);
+        None
+    }
+
     pub(crate) fn handle_collection_mouse(&mut self, mouse: MouseEvent) -> bool {
         let hit = self
             .state
@@ -769,6 +901,34 @@ impl App {
             .collection_layouts
             .iter()
             .find_map(|layout| layout.hit_at(mouse.column, mouse.row));
+        if let Some((collection_id, pane, grab_row_offset)) =
+            self.state.collection_views.iter().find_map(|(id, view)| {
+                view.child_scrollbar_drag
+                    .map(|(pane, grab)| (*id, pane, grab))
+            })
+        {
+            match mouse.kind {
+                MouseEventKind::Drag(MouseButton::Left) => {
+                    if let Some(ws_idx) = self.state.active {
+                        let _ = self.set_collection_child_scrollbar_from_row(
+                            ws_idx,
+                            collection_id,
+                            pane,
+                            mouse.row,
+                            Some(grab_row_offset),
+                        );
+                    }
+                    return true;
+                }
+                MouseEventKind::Up(MouseButton::Left) => {
+                    if let Some(view) = self.state.collection_views.get_mut(&collection_id) {
+                        view.child_scrollbar_drag = None;
+                    }
+                    return true;
+                }
+                _ => {}
+            }
+        }
         if let Some((collection_id, pane, start_row, start_height)) =
             self.state.collection_views.iter().find_map(|(id, view)| {
                 view.resize_drag
@@ -833,7 +993,8 @@ impl App {
         };
         match mouse.kind {
             MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => {
-                if hit.kind == CollectionHitKind::Preview
+                let child_scrollbar = hit.kind == CollectionHitKind::PreviewScrollbar;
+                let entered_preview = hit.kind == CollectionHitKind::Preview
                     && self
                         .state
                         .collection_views
@@ -841,22 +1002,18 @@ impl App {
                         .is_some_and(|v| {
                             v.mode == CollectionInteractionMode::Terminal
                                 && v.entered == hit.pane_id
-                        })
-                {
+                        });
+                if child_scrollbar || entered_preview {
                     if let Some(pane) = hit.pane_id {
-                        self.restore_archived_member_for_input(ws_idx, pane);
-                        let info = PaneInfo {
-                            id: pane,
-                            rect: hit.rect,
-                            inner_rect: hit.rect,
-                            scrollbar_rect: None,
-                            borders: Borders::NONE,
-                            is_focused: true,
-                        };
-                        self.state.forward_pane_wheel(
-                            &self.terminal_runtimes,
-                            &info,
-                            terminal_mouse,
+                        // A scrollbar gutter is host UI, so wheel input there must always move
+                        // host scrollback even when the child requested mouse or alternate-scroll
+                        // reporting. Only entered terminal content forwards those routing modes.
+                        self.scroll_collection_child_wheel(
+                            ws_idx,
+                            hit.collection_id,
+                            pane,
+                            mouse,
+                            entered_preview,
                         );
                     }
                 } else {
@@ -882,6 +1039,24 @@ impl App {
                         true,
                     );
                     match hit.kind {
+                        CollectionHitKind::PreviewScrollbar => {
+                            self.restore_archived_member_for_input(ws_idx, pane);
+                            let grab = self.set_collection_child_scrollbar_from_row(
+                                ws_idx,
+                                hit.collection_id,
+                                pane,
+                                mouse.row,
+                                None,
+                            );
+                            if let Some(grab_row_offset) = grab {
+                                let view = self
+                                    .state
+                                    .collection_views
+                                    .entry(hit.collection_id)
+                                    .or_default();
+                                view.child_scrollbar_drag = Some((pane, grab_row_offset));
+                            }
+                        }
                         CollectionHitKind::Disclosure => {
                             self.toggle_selected_expanded(hit.collection_id)
                         }
@@ -1016,7 +1191,287 @@ impl App {
 
 #[cfg(test)]
 mod tests {
-    use crate::{app::AppState, layout::LayoutLeaf, workspace::Workspace};
+    use crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+    use ratatui::layout::Rect;
+    use tokio::sync::mpsc;
+
+    use crate::{
+        app::AppState, layout::LayoutLeaf, terminal::TerminalRuntimeRegistry, workspace::Workspace,
+    };
+
+    fn collection_scroll_app(
+        terminal_mode: &[u8],
+        extra_members: usize,
+    ) -> (
+        crate::app::App,
+        crate::layout::CollectionId,
+        crate::layout::PaneId,
+        mpsc::Receiver<bytes::Bytes>,
+    ) {
+        let mut app = super::super::app_for_mouse_test();
+        let mut ws = Workspace::test_new("collection-scroll");
+        let root = ws.tabs[0].root_pane.expect("root");
+        let child = ws.test_split(ratatui::layout::Direction::Horizontal);
+        let collection = ws
+            .create_collection_near(
+                0,
+                LayoutLeaf::Pane(root),
+                ratatui::layout::Direction::Horizontal,
+                0.5,
+                None,
+            )
+            .expect("collection");
+        ws.collect_pane(child, collection).expect("collect child");
+        for _ in 0..extra_members {
+            let pane = ws.test_split(ratatui::layout::Direction::Horizontal);
+            ws.collect_pane(pane, collection).expect("collect extra");
+        }
+        ws.tabs[0]
+            .layout
+            .focus_leaf(LayoutLeaf::Collection(collection));
+        let history = (0..60).map(|n| format!("line {n}\r\n")).collect::<String>();
+        let (runtime, rx) =
+            crate::terminal::TerminalRuntime::test_with_channel_and_scrollback_bytes(
+                40,
+                8,
+                64 * 1024,
+                history.as_bytes(),
+                8,
+            );
+        runtime.test_process_pty_bytes(terminal_mode);
+        ws.tabs[0].runtimes.insert(child, runtime);
+        app.state.workspaces = vec![ws];
+        app.state.active = Some(0);
+        app.state
+            .enter_collection_terminal_from_foreground(0, collection, child);
+        let surface = crate::ui::compute_tab_surface(
+            &mut app.state,
+            &TerminalRuntimeRegistry::new(),
+            Rect::new(0, 0, 80, 20),
+            false,
+            Default::default(),
+        );
+        app.state.view.collection_layouts = surface.collection_layouts;
+        (app, collection, child, rx)
+    }
+
+    fn mouse(kind: MouseEventKind, column: u16, row: u16) -> MouseEvent {
+        MouseEvent {
+            kind,
+            column,
+            row,
+            modifiers: KeyModifiers::NONE,
+        }
+    }
+
+    #[tokio::test]
+    async fn entered_preview_host_wheel_scrolls_child_and_non_entered_preview_scrolls_collection() {
+        let (mut app, collection, child, _rx) = collection_scroll_app(b"", 12);
+        let row = app.state.view.collection_layouts[0]
+            .rows
+            .iter()
+            .find(|row| row.pane_id == child)
+            .expect("child row");
+        let preview = row.preview_rect.expect("preview");
+        let child_scrollbar = row.preview_scrollbar_rect.expect("child scrollbar");
+        let collection_row = row.row_rect;
+        let before = app.state.workspaces[0].tabs[0].runtimes[&child]
+            .scroll_metrics()
+            .expect("metrics")
+            .offset_from_bottom;
+        app.handle_collection_mouse(mouse(MouseEventKind::ScrollUp, preview.x, preview.y));
+        let after = app.state.workspaces[0].tabs[0].runtimes[&child]
+            .scroll_metrics()
+            .expect("metrics")
+            .offset_from_bottom;
+        assert!(
+            after > before,
+            "HostScroll must fall back to child scrollback"
+        );
+        assert_eq!(app.state.collection_views[&collection].scroll, 0);
+
+        app.state
+            .collection_views
+            .get_mut(&collection)
+            .expect("view")
+            .mode = crate::app::collection_view::CollectionInteractionMode::List;
+        app.handle_collection_mouse(mouse(MouseEventKind::ScrollDown, preview.x, preview.y));
+        assert!(app.state.collection_views[&collection].scroll > 0);
+        assert_eq!(
+            app.state.workspaces[0].tabs[0].runtimes[&child]
+                .scroll_metrics()
+                .expect("metrics")
+                .offset_from_bottom,
+            after
+        );
+
+        let collection_after_preview = app.state.collection_views[&collection].scroll;
+        app.handle_collection_mouse(mouse(
+            MouseEventKind::ScrollDown,
+            child_scrollbar.x,
+            child_scrollbar.y,
+        ));
+        assert!(
+            app.state.workspaces[0].tabs[0].runtimes[&child]
+                .scroll_metrics()
+                .expect("metrics")
+                .offset_from_bottom
+                < after
+        );
+        assert_eq!(
+            app.state.collection_views[&collection].scroll,
+            collection_after_preview
+        );
+
+        app.handle_collection_mouse(mouse(
+            MouseEventKind::ScrollDown,
+            collection_row.x,
+            collection_row.y,
+        ));
+        assert!(app.state.collection_views[&collection].scroll > collection_after_preview);
+    }
+
+    #[tokio::test]
+    async fn entered_preview_mouse_report_and_alternate_scroll_are_forwarded() {
+        for (mode, host_scrollback_available) in [
+            (b"\x1b[?1000h".as_slice(), true),
+            (b"\x1b[?1049h\x1b[?1007h".as_slice(), false),
+        ] {
+            // Build the layout while host scrollback is visible so the host scrollbar has a hit
+            // region, then let the child request terminal wheel routing. The existing host gutter
+            // remains host-owned until the next render, just like an ordinary pane.
+            let (mut app, _collection, child, mut rx) = collection_scroll_app(b"", 0);
+            let row = &app.state.view.collection_layouts[0].rows[0];
+            let preview = row.preview_rect.expect("preview");
+            let scrollbar = row.preview_scrollbar_rect.expect("child scrollbar");
+            app.state.workspaces[0].tabs[0].runtimes[&child].test_process_pty_bytes(mode);
+            app.handle_collection_mouse(mouse(MouseEventKind::ScrollUp, preview.x, preview.y));
+            assert!(
+                rx.try_recv().is_ok(),
+                "routing mode {mode:?} must reach PTY"
+            );
+            assert_eq!(
+                app.state.workspaces[0].tabs[0].runtimes[&child]
+                    .scroll_metrics()
+                    .expect("metrics")
+                    .offset_from_bottom,
+                0
+            );
+
+            app.handle_collection_mouse(mouse(MouseEventKind::ScrollUp, scrollbar.x, scrollbar.y));
+            assert!(
+                rx.try_recv().is_err(),
+                "scrollbar wheel must not reach PTY in routing mode {mode:?}"
+            );
+            let offset = app.state.workspaces[0].tabs[0].runtimes[&child]
+                .scroll_metrics()
+                .expect("metrics")
+                .offset_from_bottom;
+            if host_scrollback_available {
+                assert!(
+                    offset > 0,
+                    "scrollbar wheel must move available host scrollback in routing mode {mode:?}"
+                );
+            } else {
+                assert_eq!(
+                    offset, 0,
+                    "alternate-screen scrollbar input must remain host-owned without reaching PTY"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn child_scrollbar_click_and_drag_never_move_collection_scroll() {
+        let (mut app, collection, child, _rx) = collection_scroll_app(b"", 12);
+        app.state
+            .collection_views
+            .get_mut(&collection)
+            .expect("view")
+            .scroll = 4;
+        let surface = crate::ui::compute_tab_surface(
+            &mut app.state,
+            &TerminalRuntimeRegistry::new(),
+            Rect::new(0, 0, 80, 20),
+            false,
+            Default::default(),
+        );
+        app.state.view.collection_layouts = surface.collection_layouts;
+        let row = app.state.view.collection_layouts[0]
+            .rows
+            .iter()
+            .find(|row| row.pane_id == child)
+            .expect("child row");
+        let track = row.preview_scrollbar_rect.expect("child scrollbar");
+        let metrics = app.state.workspaces[0].tabs[0].runtimes[&child]
+            .scroll_metrics()
+            .expect("metrics");
+        let logical_rows = row.preview_size.expect("logical preview").0;
+        let preview_row_offset = row.preview_row_offset;
+        assert!(preview_row_offset > 0, "preview must be clipped at the top");
+        let thumb =
+            crate::ui::scrollbar_thumb(metrics, Rect::new(0, 0, 1, logical_rows)).expect("thumb");
+        let thumb_screen_row = track
+            .y
+            .saturating_add(thumb.top.saturating_sub(row.preview_row_offset));
+        let collection_scroll = app.state.collection_views[&collection].scroll;
+
+        app.handle_collection_mouse(mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            track.x,
+            track.y,
+        ));
+        assert!(
+            app.state.workspaces[0].tabs[0].runtimes[&child]
+                .scroll_metrics()
+                .expect("metrics")
+                .offset_from_bottom
+                > 0,
+            "track click must scroll only the child"
+        );
+        assert_eq!(
+            app.state.collection_views[&collection].scroll,
+            collection_scroll
+        );
+        app.state.workspaces[0].tabs[0].runtimes[&child].set_scroll_offset_from_bottom(0);
+
+        app.handle_collection_mouse(mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            track.x,
+            thumb_screen_row,
+        ));
+        assert!(
+            app.state.collection_views[&collection]
+                .child_scrollbar_drag
+                .is_some(),
+            "track={track:?} logical_rows={logical_rows} row_offset={} thumb={thumb:?} click={thumb_screen_row}",
+            preview_row_offset
+        );
+        app.handle_collection_mouse(mouse(
+            MouseEventKind::Drag(MouseButton::Left),
+            track.x,
+            track.y,
+        ));
+        app.handle_collection_mouse(mouse(
+            MouseEventKind::Up(MouseButton::Left),
+            track.x,
+            track.y,
+        ));
+        assert!(
+            app.state.workspaces[0].tabs[0].runtimes[&child]
+                .scroll_metrics()
+                .expect("metrics")
+                .offset_from_bottom
+                > 0
+        );
+        assert_eq!(
+            app.state.collection_views[&collection].scroll,
+            collection_scroll
+        );
+        assert!(app.state.collection_views[&collection]
+            .child_scrollbar_drag
+            .is_none());
+    }
 
     fn group_membership(
         linked: bool,
@@ -1228,7 +1683,7 @@ mod tests {
     }
 
     #[test]
-    fn entered_collection_routes_bare_escape_to_pty_and_prefix_exits() {
+    fn entered_collection_routes_bare_escape_and_prefix_escape_exits() {
         let mut app = super::super::app_for_mouse_test();
         let mut ws = Workspace::test_new("escape");
         let root = ws.tabs[0].root_pane.expect("root");
@@ -1262,8 +1717,77 @@ mod tests {
             crossterm::event::KeyCode::Char('b'),
             crossterm::event::KeyModifiers::CONTROL,
         );
-        assert!(app.handle_collection_key(prefix));
+        assert!(!app.handle_collection_key(prefix));
+        assert!(
+            app.state.focused_collection_terminal_entered(),
+            "the prefix alone must not leave terminal mode"
+        );
+        app.state.mode = crate::app::Mode::Prefix;
+        app.handle_prefix_key(escape);
         assert!(!app.state.focused_collection_terminal_entered());
+        assert_eq!(app.state.mode, crate::app::Mode::Terminal);
+
+        assert!(
+            !app.state
+                .enter_collection_terminal_from_foreground(0, collection, child),
+            "pane was already acknowledged"
+        );
+        app.toggle_selected_expanded(collection);
+        assert!(
+            !app.state.focused_collection_terminal_entered(),
+            "a collapsed child cannot retain terminal input"
+        );
+        let next = crate::input::TerminalKey::new(
+            crossterm::event::KeyCode::Char('j'),
+            crossterm::event::KeyModifiers::empty(),
+        );
+        assert!(
+            app.handle_collection_key(next),
+            "list navigation must be consumed instead of reaching a collapsed PTY"
+        );
+    }
+
+    #[test]
+    fn headless_list_navigation_is_consumed_before_child_pty_forwarding() {
+        let mut app = super::super::app_for_mouse_test();
+        let mut ws = Workspace::test_new("headless-list");
+        let root = ws.tabs[0].root_pane.expect("root");
+        let first = ws.test_split(ratatui::layout::Direction::Horizontal);
+        let second = ws.test_split(ratatui::layout::Direction::Horizontal);
+        let collection = ws
+            .create_collection_near(
+                0,
+                LayoutLeaf::Pane(root),
+                ratatui::layout::Direction::Vertical,
+                0.5,
+                None,
+            )
+            .expect("collection");
+        ws.collect_pane(first, collection).expect("collect first");
+        ws.collect_pane(second, collection).expect("collect second");
+        ws.select_collection_member(first, collection)
+            .expect("select first");
+        ws.tabs[0]
+            .layout
+            .focus_leaf(LayoutLeaf::Collection(collection));
+        app.state.workspaces = vec![ws];
+        app.state.active = Some(0);
+
+        let next = crate::input::TerminalKey::new(
+            crossterm::event::KeyCode::Char('j'),
+            crossterm::event::KeyModifiers::empty(),
+        );
+        assert!(app.handle_terminal_key_headless(next).is_none());
+        assert_eq!(
+            app.state.workspaces[0].tabs[0]
+                .collection(collection)
+                .and_then(|collection| collection.selected()),
+            Some(second)
+        );
+        assert!(
+            !app.state.focused_collection_terminal_entered(),
+            "headless list navigation must not enter a child PTY"
+        );
     }
 
     #[test]

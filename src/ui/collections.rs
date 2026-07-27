@@ -8,11 +8,16 @@ use ratatui::{
     Frame,
 };
 
+use super::scrollbar::{
+    render_scrollbar, render_scrollbar_clipped, reserve_terminal_scrollbar_gutter,
+    should_show_scrollbar,
+};
+
 use crate::{
     app::{
         collection_view::{
-            CollectionHitKind, CollectionHitRegion, CollectionInteractionMode, CollectionLayout,
-            CollectionRowView, CollectionSection,
+            CollectionHitKind, CollectionHitRegion, CollectionLayout, CollectionRowView,
+            CollectionSection,
         },
         AppState,
     },
@@ -116,27 +121,45 @@ pub(crate) fn compute_collection_layouts(
         } else {
             continue;
         };
-        let inner = Rect::new(
+        let collection_viewport = Rect::new(
             rect.x.saturating_add(1),
             rect.y.saturating_add(1),
             rect.width.saturating_sub(2),
             rect.height.saturating_sub(2),
         );
+        // Collection scrolling owns an outer stable gutter. Child previews reserve a
+        // second, independent gutter inside this content rectangle.
+        let (inner, collection_gutter) = reserve_terminal_scrollbar_gutter(collection_viewport);
         let members = collection.members().to_vec();
         let view = app.collection_views.entry(collection.id).or_default();
         view.retain_members(&members);
         let view = view.clone();
         let maximized = view.maximized.filter(|pane| members.contains(pane));
         if let Some(pane_id) = maximized {
-            let hits = vec![CollectionHitRegion {
+            let (preview_rect, gutter) = reserve_terminal_scrollbar_gutter(rect);
+            let runtime = app.runtime_for_pane_in_workspace(terminal_runtimes, ws_idx, pane_id);
+            let scrollbar_rect = runtime
+                .and_then(|rt| rt.scroll_metrics())
+                .filter(|metrics| should_show_scrollbar(*metrics))
+                .and(gutter);
+            let mut hits = vec![CollectionHitRegion {
                 collection_id: collection.id,
                 pane_id: Some(pane_id),
                 kind: CollectionHitKind::Preview,
-                rect,
+                rect: preview_rect,
                 terminal_row_offset: 0,
             }];
-            if resize_panes && rect.width > 0 && rect.height > 0 {
-                desired_geometry.push((pane_id, rect));
+            if let Some(scrollbar_rect) = scrollbar_rect {
+                hits.push(CollectionHitRegion {
+                    collection_id: collection.id,
+                    pane_id: Some(pane_id),
+                    kind: CollectionHitKind::PreviewScrollbar,
+                    rect: scrollbar_rect,
+                    terminal_row_offset: 0,
+                });
+            }
+            if resize_panes && preview_rect.width > 0 && preview_rect.height > 0 {
+                desired_geometry.push((pane_id, preview_rect));
             }
             layouts.push(CollectionLayout {
                 id: collection.id,
@@ -146,10 +169,13 @@ pub(crate) fn compute_collection_layouts(
                 archive_header: None,
                 rows: Vec::new(),
                 hits,
-                content_height: inner.height as usize,
-                viewport_height: inner.height as usize,
+                content_height: rect.height as usize,
+                viewport_height: rect.height as usize,
                 scroll: 0,
+                scrollbar_rect: None,
                 maximized,
+                maximized_preview_rect: Some(preview_rect),
+                maximized_scrollbar_rect: scrollbar_rect,
             });
             continue;
         }
@@ -198,6 +224,15 @@ pub(crate) fn compute_collection_layouts(
             rect: inner,
             terminal_row_offset: 0,
         }];
+        if let Some(gutter) = collection_gutter {
+            hits.push(CollectionHitRegion {
+                collection_id: collection.id,
+                pane_id: None,
+                kind: CollectionHitKind::Chrome,
+                rect: gutter,
+                terminal_row_offset: 0,
+            });
+        }
 
         let mut append_rows =
             |section: CollectionSection, entries: &[(PaneId, usize, bool)], y: &mut usize| {
@@ -219,14 +254,32 @@ pub(crate) fn compute_collection_layouts(
                         Rect::default()
                     };
                     let mut preview_rect = None;
+                    let mut preview_scrollbar_rect = None;
                     let mut preview_row_offset = 0;
                     let mut resize_rect = None;
+                    let mut preview_cols = inner.width;
                     if expanded.contains(&pane_id) {
-                        if let Some((rect, offset)) =
+                        if let Some((slot, offset)) =
                             clipped_block_rect(inner, *y, heights[&pane_id], scroll)
                         {
-                            preview_rect = Some(rect);
+                            let (content, gutter) = reserve_terminal_scrollbar_gutter(slot);
+                            preview_rect = Some(content);
                             preview_row_offset = offset;
+                            preview_cols = content.width;
+                            preview_scrollbar_rect = app
+                                .runtime_for_pane_in_workspace(terminal_runtimes, ws_idx, pane_id)
+                                .and_then(|rt| rt.scroll_metrics())
+                                .filter(|metrics| should_show_scrollbar(*metrics))
+                                .and(gutter);
+                        } else {
+                            preview_cols = reserve_terminal_scrollbar_gutter(Rect::new(
+                                0,
+                                0,
+                                inner.width,
+                                heights[&pane_id],
+                            ))
+                            .0
+                            .width;
                         }
                         *y += heights[&pane_id] as usize;
                         resize_rect = clipped_line_rect(inner, *y, scroll);
@@ -257,6 +310,15 @@ pub(crate) fn compute_collection_layouts(
                             terminal_row_offset: preview_row_offset,
                         });
                     }
+                    if let Some(rect) = preview_scrollbar_rect {
+                        hits.push(CollectionHitRegion {
+                            collection_id: collection.id,
+                            pane_id: Some(pane_id),
+                            kind: CollectionHitKind::PreviewScrollbar,
+                            rect,
+                            terminal_row_offset: preview_row_offset,
+                        });
+                    }
                     if let Some(rect) = resize_rect {
                         hits.push(CollectionHitRegion {
                             collection_id: collection.id,
@@ -274,9 +336,10 @@ pub(crate) fn compute_collection_layouts(
                         virtual_y,
                         row_rect,
                         preview_rect,
+                        preview_scrollbar_rect,
                         preview_size: expanded
                             .contains(&pane_id)
-                            .then_some((heights[&pane_id], inner.width)),
+                            .then_some((heights[&pane_id], preview_cols)),
                         preview_row_offset,
                         resize_rect,
                     });
@@ -313,7 +376,12 @@ pub(crate) fn compute_collection_layouts(
             content_height,
             viewport_height,
             scroll,
+            scrollbar_rect: (content_height > viewport_height)
+                .then_some(collection_gutter)
+                .flatten(),
             maximized: None,
+            maximized_preview_rect: None,
+            maximized_scrollbar_rect: None,
         });
     }
     for (pane_id, rect) in desired_geometry {
@@ -392,11 +460,24 @@ pub(crate) fn render_collections(
         }
         if let Some(pane_id) = layout.maximized {
             if let Some(runtime) = app.runtime_for_pane_in_workspace(runtimes, ws_idx, pane_id) {
+                let preview_rect = layout.maximized_preview_rect.unwrap_or(layout.inner_rect);
                 runtime.render(
                     frame,
-                    layout.inner_rect,
+                    preview_rect,
                     focused && collection_terminal_entered(app, layout.id),
                 );
+                if let (Some(track), Some(metrics)) =
+                    (layout.maximized_scrollbar_rect, runtime.scroll_metrics())
+                {
+                    render_scrollbar(
+                        frame,
+                        metrics,
+                        track,
+                        app.palette.overlay0,
+                        app.palette.overlay1,
+                        "▐",
+                    );
+                }
             }
             continue;
         }
@@ -475,33 +556,27 @@ pub(crate) fn render_collections(
                 rect,
             );
         }
-        if layout.content_height > layout.viewport_height
-            && layout.inner_rect.width > 0
-            && layout.inner_rect.height > 0
-        {
-            let track = layout.inner_rect.height as usize;
-            let thumb_height = ((layout.viewport_height * track) / layout.content_height)
-                .max(1)
-                .min(track);
-            let travel = track.saturating_sub(thumb_height);
-            let max_scroll = layout.content_height.saturating_sub(layout.viewport_height);
-            let thumb_top = (layout.scroll * travel)
-                .checked_div(max_scroll)
-                .unwrap_or_default();
-            let x = layout.inner_rect.right().saturating_sub(1);
-            let top = layout.inner_rect.y.saturating_add(thumb_top as u16);
-            for y in top..top.saturating_add(thumb_height as u16) {
-                frame.buffer_mut()[(x, y)]
-                    .set_symbol("█")
-                    .set_style(Style::default().fg(app.palette.overlay1));
-            }
+        if let Some(track) = layout.scrollbar_rect {
+            let max_offset = layout.content_height.saturating_sub(layout.viewport_height);
+            render_scrollbar(
+                frame,
+                crate::pane::ScrollMetrics {
+                    offset_from_bottom: max_offset.saturating_sub(layout.scroll),
+                    max_offset_from_bottom: max_offset,
+                    viewport_rows: layout.viewport_height,
+                },
+                track,
+                app.palette.surface_dim,
+                app.palette.overlay1,
+                "█",
+            );
         }
         for row in &layout.rows {
             if row.row_rect.width == 0 {
                 continue;
             }
             let selected = collection.and_then(|c| c.selected()) == Some(row.pane_id);
-            let (state, seen, identity, title) = tab
+            let (state, seen, label) = tab
                 .panes
                 .get(&row.pane_id)
                 .and_then(|pane| {
@@ -525,19 +600,18 @@ pub(crate) fn render_collections(
                                         .and_then(|argv| argv.first().cloned())
                                 })
                                 .unwrap_or_else(|| format!("pane {}", row.pane_id.raw()));
-                            let title = terminal.terminal_title_stripped().or_else(|| {
-                                app.delegations
-                                    .delegation_for_pane(row.pane_id)
-                                    .and_then(|d| d.purpose.clone())
-                            });
-                            (terminal.state, pane.seen, identity, title)
+                            let label = app
+                                .delegations
+                                .delegation_for_pane(row.pane_id)
+                                .and_then(|delegation| delegation.purpose.clone())
+                                .unwrap_or(identity);
+                            (terminal.state, pane.seen, label)
                         })
                 })
                 .unwrap_or((
                     crate::detect::AgentState::Unknown,
                     true,
                     format!("pane {}", row.pane_id.raw()),
-                    None,
                 ));
             let (dot, dot_style) = super::status::state_dot(state, seen, &app.palette);
             let disclosure = if app
@@ -545,15 +619,15 @@ pub(crate) fn render_collections(
                 .get(&layout.id)
                 .is_some_and(|v| v.expanded.contains(&row.pane_id))
             {
-                "▾"
+                "⌄"
             } else {
-                "▸"
+                "›"
             };
             let indent = "  ".repeat(row.depth);
             let external = if row.external_parent { "↰ " } else { "" };
-            let mut spans = vec![
+            let spans = vec![
                 Span::styled(
-                    if selected { "› " } else { "  " },
+                    if selected { "▸ " } else { "  " },
                     if selected {
                         Style::default()
                             .fg(app.palette.accent)
@@ -568,16 +642,10 @@ pub(crate) fn render_collections(
                 Span::styled(dot, dot_style),
                 Span::raw(" "),
                 Span::styled(
-                    format!("{external}{identity}"),
+                    format!("{external}{label}"),
                     Style::default().fg(app.palette.text),
                 ),
             ];
-            if let Some(title) = title {
-                spans.push(Span::styled(
-                    format!("  {title}"),
-                    Style::default().fg(app.palette.subtext0),
-                ));
-            }
             let style = if selected {
                 Style::default().bg(app.palette.surface0)
             } else if row.section == CollectionSection::Archived {
@@ -601,6 +669,29 @@ pub(crate) fn render_collections(
                         0,
                         focused && selected && collection_terminal_entered(app, layout.id),
                     );
+                    if let (Some(track), Some(metrics)) =
+                        (row.preview_scrollbar_rect, runtime.scroll_metrics())
+                    {
+                        let child_focused = focused && selected;
+                        render_scrollbar_clipped(
+                            frame,
+                            metrics,
+                            track,
+                            logical_rows,
+                            row.preview_row_offset,
+                            if child_focused {
+                                app.palette.overlay0
+                            } else {
+                                app.palette.surface_dim
+                            },
+                            if child_focused {
+                                app.palette.overlay1
+                            } else {
+                                app.palette.overlay0
+                            },
+                            if child_focused { "▐" } else { "▕" },
+                        );
+                    }
                 }
             }
             if let Some(rect) = row.resize_rect {
@@ -621,9 +712,9 @@ pub(crate) fn collection_terminal_entered(app: &AppState, id: CollectionId) -> b
         .and_then(|ws| ws.active_tab())
         .and_then(|tab| tab.collection(id))
         .and_then(|collection| collection.selected());
-    app.collection_views.get(&id).is_some_and(|view| {
-        view.mode == CollectionInteractionMode::Terminal && view.entered == selected
-    })
+    app.collection_views
+        .get(&id)
+        .is_some_and(|view| view.terminal_entered(selected))
 }
 
 pub(crate) fn collection_preview_region(
@@ -632,12 +723,8 @@ pub(crate) fn collection_preview_region(
 ) -> Option<(Rect, u16, u16, u16)> {
     for layout in layouts {
         if layout.maximized == Some(pane_id) {
-            return Some((
-                layout.inner_rect,
-                0,
-                layout.inner_rect.height,
-                layout.inner_rect.width,
-            ));
+            let rect = layout.maximized_preview_rect.unwrap_or(layout.inner_rect);
+            return Some((rect, 0, rect.height, rect.width));
         }
         if let Some(row) = layout.rows.iter().find(|row| row.pane_id == pane_id) {
             if let (Some(rect), Some((rows, cols))) = (row.preview_rect, row.preview_size) {
@@ -652,7 +739,12 @@ pub(crate) fn collection_preview_infos(
     layouts: &[CollectionLayout],
 ) -> impl Iterator<Item = (PaneId, Rect)> + '_ {
     layouts.iter().flat_map(|layout| {
-        let maximized = layout.maximized.map(|pane| (pane, layout.inner_rect));
+        let maximized = layout.maximized.map(|pane| {
+            (
+                pane,
+                layout.maximized_preview_rect.unwrap_or(layout.inner_rect),
+            )
+        });
         maximized.into_iter().chain(
             layout
                 .rows
@@ -861,7 +953,127 @@ mod tests {
         );
         assert_eq!(
             app.collection_geometry[&terminal_id].cols,
-            layouts[0].rect.width
+            layouts[0]
+                .maximized_preview_rect
+                .expect("maximized content")
+                .width
+        );
+    }
+
+    #[tokio::test]
+    async fn expanded_child_and_collection_scrollbars_use_independent_gutters() {
+        let mut ws = Workspace::test_new("collection-gutters");
+        let root = ws.tabs[0].root_pane.expect("root");
+        let child = ws.test_split(Direction::Horizontal);
+        let id = ws
+            .create_collection_near(0, LayoutLeaf::Pane(root), Direction::Vertical, 0.5, None)
+            .expect("collection");
+        ws.collect_pane(child, id).expect("collect");
+        for _ in 0..10 {
+            let pane = ws.test_split(Direction::Horizontal);
+            ws.collect_pane(pane, id).expect("collect extra");
+        }
+        let history = (0..40).map(|n| format!("line {n}\r\n")).collect::<String>();
+        ws.tabs[0].runtimes.insert(
+            child,
+            crate::terminal::TerminalRuntime::test_with_scrollback_bytes(
+                40,
+                8,
+                16 * 1024,
+                history.as_bytes(),
+            ),
+        );
+        let mut app = AppState::test_new();
+        app.workspaces = vec![ws];
+        app.active = Some(0);
+        app.collection_views
+            .entry(id)
+            .or_default()
+            .expanded
+            .insert(child);
+
+        let layouts = compute_collection_layouts(
+            &mut app,
+            &TerminalRuntimeRegistry::new(),
+            Rect::new(0, 0, 80, 14),
+            false,
+            Default::default(),
+        );
+        let layout = &layouts[0];
+        let row = layout
+            .rows
+            .iter()
+            .find(|row| row.pane_id == child)
+            .expect("child row");
+        let collection_track = layout.scrollbar_rect.expect("collection scrollbar");
+        let child_track = row
+            .preview_scrollbar_rect
+            .expect("child terminal scrollbar");
+        let preview = row.preview_rect.expect("child content");
+        assert_eq!(collection_track.x, child_track.x + 1);
+        assert_eq!(preview.right(), child_track.x);
+        assert_eq!(row.preview_size.expect("logical preview").1, preview.width);
+
+        let mut terminal = Terminal::new(TestBackend::new(80, 14)).expect("terminal");
+        terminal
+            .draw(|frame| {
+                render_collections(&app, &TerminalRuntimeRegistry::new(), &layouts, frame)
+            })
+            .expect("render");
+        assert_ne!(
+            terminal.backend().buffer()[(child_track.x, child_track.y)].symbol(),
+            terminal.backend().buffer()[(preview.right().saturating_sub(1), child_track.y)]
+                .symbol()
+        );
+    }
+
+    #[tokio::test]
+    async fn clipped_child_keeps_logical_geometry_and_scrollbar_coordinates() {
+        let mut ws = Workspace::test_new("clipped-child-scrollbar");
+        let root = ws.tabs[0].root_pane.expect("root");
+        let child = ws.test_split(Direction::Horizontal);
+        let terminal_id = ws.terminal_id(child).expect("terminal").clone();
+        let id = ws
+            .create_collection_near(0, LayoutLeaf::Pane(root), Direction::Vertical, 0.5, None)
+            .expect("collection");
+        ws.collect_pane(child, id).expect("collect");
+        let history = (0..40).map(|n| format!("line {n}\r\n")).collect::<String>();
+        ws.tabs[0].runtimes.insert(
+            child,
+            crate::terminal::TerminalRuntime::test_with_scrollback_bytes(
+                40,
+                8,
+                16 * 1024,
+                history.as_bytes(),
+            ),
+        );
+        let mut app = AppState::test_new();
+        app.workspaces = vec![ws];
+        app.active = Some(0);
+        app.defer_collection_geometry_claims = true;
+        let view = app.collection_views.entry(id).or_default();
+        view.expanded.insert(child);
+        view.scroll = 4;
+
+        let layouts = compute_collection_layouts(
+            &mut app,
+            &TerminalRuntimeRegistry::new(),
+            Rect::new(0, 0, 50, 9),
+            true,
+            Default::default(),
+        );
+        let row = &layouts[0].rows[0];
+        assert!(row.preview_row_offset > 0);
+        assert_eq!(
+            row.preview_scrollbar_rect
+                .expect("visible child scrollbar")
+                .height,
+            row.preview_rect.expect("visible content").height
+        );
+        assert_eq!(app.collection_geometry[&terminal_id].rows, 8);
+        assert_eq!(
+            app.collection_geometry[&terminal_id].cols,
+            row.preview_size.expect("logical preview").1
         );
     }
 

@@ -6,7 +6,9 @@ use ratatui::{
     Frame,
 };
 
-use super::scrollbar::{render_pane_scrollbar, should_show_scrollbar};
+use super::scrollbar::{
+    render_pane_scrollbar, reserve_terminal_scrollbar_gutter, should_show_scrollbar,
+};
 #[cfg(test)]
 use super::text::display_width;
 use super::text::truncate_end;
@@ -32,16 +34,7 @@ fn pane_border_title(label: &str, pane_width: u16, _focused: bool) -> Option<Str
 }
 
 fn stable_terminal_inner_rect(pane_inner: Rect) -> Rect {
-    if pane_inner.width <= 4 {
-        return pane_inner;
-    }
-
-    Rect::new(
-        pane_inner.x,
-        pane_inner.y,
-        pane_inner.width.saturating_sub(1),
-        pane_inner.height,
-    )
+    reserve_terminal_scrollbar_gutter(pane_inner).0
 }
 
 pub(crate) fn pane_inner_rect(area: Rect, borders: Borders) -> Rect {
@@ -144,20 +137,11 @@ fn runtime_for_tab_pane<'a>(
 }
 
 fn stable_scrollbar_gutter(rt: &TerminalRuntime, pane_inner: Rect) -> (Rect, Option<Rect>) {
-    let inner_rect = stable_terminal_inner_rect(pane_inner);
-    if inner_rect == pane_inner {
-        return (inner_rect, None);
-    }
-    let gutter = Rect::new(
-        pane_inner.x + pane_inner.width.saturating_sub(1),
-        pane_inner.y,
-        1,
-        pane_inner.height,
-    );
+    let (inner_rect, gutter) = reserve_terminal_scrollbar_gutter(pane_inner);
     let scrollbar_rect = rt
         .scroll_metrics()
         .filter(|metrics| should_show_scrollbar(*metrics))
-        .map(|_| gutter);
+        .and(gutter);
 
     (inner_rect, scrollbar_rect)
 }

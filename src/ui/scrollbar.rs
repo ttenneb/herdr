@@ -11,6 +11,23 @@ pub(crate) fn pane_scrollbar_rect(info: &PaneInfo) -> Option<Rect> {
     info.scrollbar_rect
 }
 
+/// Reserve the same stable right-side gutter used by ordinary terminal panes.
+/// The gutter does not appear or disappear as scrollback changes, so PTY width is stable.
+pub(crate) fn reserve_terminal_scrollbar_gutter(area: Rect) -> (Rect, Option<Rect>) {
+    if area.width <= 4 {
+        return (area, None);
+    }
+    (
+        Rect::new(area.x, area.y, area.width.saturating_sub(1), area.height),
+        Some(Rect::new(
+            area.right().saturating_sub(1),
+            area.y,
+            1,
+            area.height,
+        )),
+    )
+}
+
 pub(crate) fn release_notes_scrollbar_rect(
     body: Rect,
     metrics: crate::pane::ScrollMetrics,
@@ -75,7 +92,7 @@ pub(crate) fn scrollbar_thumb_grab_offset(
     row: u16,
 ) -> Option<u16> {
     let thumb = scrollbar_thumb(metrics, track)?;
-    (row >= thumb.top && row < thumb.top + thumb.len).then_some(row - thumb.top)
+    (row >= thumb.top && row < thumb.top + thumb.len).then(|| row - thumb.top)
 }
 
 fn scrollbar_offset_from_thumb_top(
@@ -130,6 +147,37 @@ pub(crate) fn scrollbar_offset_from_drag_row(
     let row_offset = clamped_row.saturating_sub(track.y) as usize;
     let desired_top = row_offset.saturating_sub(grab_row_offset as usize);
     scrollbar_offset_from_thumb_top(metrics, track, desired_top)
+}
+
+pub(super) fn render_scrollbar_clipped(
+    frame: &mut Frame,
+    metrics: crate::pane::ScrollMetrics,
+    visible_track: Rect,
+    logical_height: u16,
+    logical_row_offset: u16,
+    track_color: Color,
+    thumb_color: Color,
+    thumb_symbol: &str,
+) {
+    let Some(thumb) = scrollbar_thumb(metrics, Rect::new(0, 0, 1, logical_height)) else {
+        return;
+    };
+    let visible_end = logical_row_offset.saturating_add(visible_track.height);
+    let thumb_end = thumb.top.saturating_add(thumb.len);
+    let buf = frame.buffer_mut();
+    for logical_y in logical_row_offset..visible_end {
+        let screen_y = visible_track
+            .y
+            .saturating_add(logical_y.saturating_sub(logical_row_offset));
+        let cell = &mut buf[(visible_track.x, screen_y)];
+        if logical_y >= thumb.top && logical_y < thumb_end {
+            cell.set_symbol(thumb_symbol);
+            cell.set_style(Style::default().fg(thumb_color));
+        } else {
+            cell.set_symbol("▕");
+            cell.set_style(Style::default().fg(track_color));
+        }
+    }
 }
 
 pub(super) fn render_scrollbar(

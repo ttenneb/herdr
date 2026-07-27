@@ -49,6 +49,8 @@ pub(crate) use self::release_notes::{
     RELEASE_NOTES_MODAL_SIZE,
 };
 use self::release_notes::{render_product_announcement_overlay, render_release_notes_overlay};
+#[cfg(test)]
+pub(crate) use self::scrollbar::scrollbar_thumb;
 pub(crate) use self::scrollbar::{
     pane_scrollbar_rect, release_notes_scrollbar_rect, scrollbar_offset_from_drag_row,
     scrollbar_offset_from_row, scrollbar_thumb_grab_offset, should_show_scrollbar,

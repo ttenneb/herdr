@@ -53,6 +53,13 @@ impl App {
             }
         }
 
+        // Headless clients must use the same collection list/terminal-mode router as the
+        // monolithic TUI. Otherwise ordinary list keys bypass collection state and leak into the
+        // selected child PTY even while every preview is collapsed.
+        if self.handle_collection_key(key) {
+            return None;
+        }
+
         let input = self.prepare_terminal_key_forward(source_id, key)?;
         let sent = self
             .lookup_runtime_sender(input.ws_idx, input.pane_id)

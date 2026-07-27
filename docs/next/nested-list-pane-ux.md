@@ -241,7 +241,7 @@ List mode controls the group rather than sending input to a child terminal. It s
 
 ### Terminal mode
 
-Terminal mode sends input directly to the selected child PTY. A clear Herdr escape or prefix action returns to list mode without terminating or interrupting the child.
+Terminal mode sends input directly to the selected child PTY. The configured Herdr prefix followed by Esc returns to list mode without terminating or interrupting the child. Bare Esc remains child input, and prefix followed by prefix retains literal-prefix passthrough.
 
 Exact bindings should follow Herdr's existing prefix, navigate, resize, copy, and zoom interaction language rather than introducing an unrelated keymap.
 
