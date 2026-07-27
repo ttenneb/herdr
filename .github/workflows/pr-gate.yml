@@ -15,7 +15,7 @@ jobs:
       - name: Check pull request intake policy
         uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9
         with:
-          github-token: ${{ secrets.KANGAL_GITHUB_TOKEN }}
+          github-token: ${{ secrets.KANGAL_GITHUB_TOKEN || github.token }}
           script: |
             const CANONICAL_REPOSITORY = 'ogulcancelik/herdr';
             const KANGAL_USER_ID = 285672167;
@@ -36,7 +36,7 @@ jobs:
             const repositoryName = context.payload.repository.full_name.toLowerCase();
 
             if (repositoryName !== CANONICAL_REPOSITORY) {
-              core.setFailed(`PR Gate only runs for ${CANONICAL_REPOSITORY}`);
+              core.info(`Skipping canonical PR Gate policy on fork ${repositoryName}`);
               return;
             }
 
