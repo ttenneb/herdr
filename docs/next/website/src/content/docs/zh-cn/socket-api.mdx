@@ -166,7 +166,7 @@ CLI 的 `herdr api snapshot` 会把当前 `session.snapshot` 响应输出为 JSO
 
 `pane.process_info` 返回窗格的 shell pid、可用时的前台进程组 id,以及平台暴露时带有 pid、名称、argv/cmdline 和 cwd 的前台进程。
 
-`layout.export` 返回可移植的标签页布局树。省略 `tab_id` 和 `pane_id` 导出活动标签页,传 `tab_id` 导出该标签页,或传 `pane_id` 导出包含该窗格的标签页。
+`layout.export` 返回可移植的标签页布局树。省略 `tab_id` 和 `pane_id` 导出活动标签页,传 `tab_id` 导出该标签页,或传 `pane_id` 导出包含该窗格的标签页。包含任何集合叶节点的标签页会以 `layout_contains_collections` 被拒绝。导出前必须移除或关闭每个集合叶节点。对于有成员的集合,可以先将成员提升或移动为普通平铺窗格;空集合叶节点无法通过提升成员解决,仍须移除或关闭。会话快照和实时移交仍会保留集合。
 
 ```json
 {"id":"req_export","method":"layout.export","params":{"tab_id":"w1:t1"}}
@@ -622,7 +622,7 @@ workspace 的 get/list 响应会公开生成的 `tokens` 映射,空间侧边栏�
 `collection.reorder`、`collection.archive`、`collection.restore`、
 `collection.member_create` 和 `collection.close`。关闭非空集合时必须提供
 `disposition: "cascade_close"` 或 `"promote_members"`;若操作会关闭工作树组,可能返回
-`confirmation_required`。集合响应包含稳定 ID、有序成员、归档/选择状态、生命周期计数和提示。
+`confirmation_required`。集合响应包含稳定 ID、有序成员、归档/选择状态、生命周期计数和提示。对于已委派成员,`collection.reorder.index` 是移动子树根节点所请求的最终规范显示索引。该索引在移除待移动子树后解释,且目标必须是同一委派父项、同一活动/归档分区中的同级子树边界;如需更改父项,请使用 `delegation.reparent`。未委派成员仍直接重排成员向量。
 
 委派元数据独立于布局。使用 `delegation.create`、`delegation.get`、
 `delegation.tree`、`delegation.root`、`delegation.descendants`、
@@ -632,7 +632,7 @@ workspace 的 get/list 响应会公开生成的 `tokens` 映射,空间侧边栏�
 `PaneInfo.placement` 与每个 `PaneLayoutPane.placement` 为 `tiled`,或带有
 `collection_id`、`member_index`、`archived`、`selected` 的 `collection`。
 `PaneLayoutSnapshot.collections` 描述集合叶节点;`focused` 是窗格或集合的类型化焦点。
-为支持空集合,`focused_pane_id` 是可选字段。可移植布局根节点同样可以包含集合叶节点。
+为支持空集合,`focused_pane_id` 是可选字段。可移植布局根节点不支持集合叶节点。`layout.export` 会拒绝空集合和非空集合,而不会静默丢失集合结构或成员。导出前必须移除或关闭所有集合叶节点;有成员的集合可以先提升或移动成员,而空叶节点仍须移除或关闭。快照和会话持久化仍支持集合。
 
 ## 事件订阅
 

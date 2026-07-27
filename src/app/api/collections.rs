@@ -7,7 +7,7 @@ use crate::api::schema::{
     PaneMoveDestination, PaneMoveParams, PanePlacementInfo, PaneTarget, ResponseResult,
 };
 use crate::app::App;
-use crate::delegation::DelegationId;
+use crate::delegation::{DelegationId, Delegations, SiblingPosition};
 use crate::layout::{CollectionId, LayoutLeaf, PanePlacement};
 
 use super::responses::{encode_error, encode_success};
@@ -356,15 +356,129 @@ impl App {
         let Some((pane_ws, pane_id)) = self.parse_pane_id(&params.pane_id) else {
             return encode_error(id, "pane_not_found", "pane not found");
         };
-        if pane_ws != ws_idx
-            || !self.state.workspaces[ws_idx].tabs[tab_idx]
-                .layout
-                .reorder_collection_member(collection_id, pane_id, params.index)
+        let Some(collection) =
+            self.state.workspaces[ws_idx].tabs[tab_idx].collection(collection_id)
+        else {
+            return collection_not_found(id, &params.collection_id);
+        };
+        if pane_ws != ws_idx || !collection.members().contains(&pane_id) {
+            return encode_error(id, "collection_reorder_failed", "pane is not a member");
+        }
+
+        if let Some(record) = self.state.delegations.delegation_for_pane(pane_id).cloned() {
+            let displayed = self.canonical_collection_member_order(collection);
+            let Some(current) = displayed.iter().position(|candidate| *candidate == pane_id) else {
+                return encode_error(id, "collection_reorder_failed", "pane is not displayed");
+            };
+            let mut subtree_ids = self
+                .state
+                .delegations
+                .descendants(record.id)
+                .unwrap_or_default()
+                .into_iter()
+                .collect::<std::collections::HashSet<_>>();
+            subtree_ids.insert(record.id);
+            let moving_subtree = displayed
+                .iter()
+                .copied()
+                .filter(|candidate| {
+                    self.state
+                        .delegations
+                        .delegation_for_pane(*candidate)
+                        .is_some_and(|delegation| subtree_ids.contains(&delegation.id))
+                })
+                .collect::<std::collections::HashSet<_>>();
+            let remaining = displayed
+                .iter()
+                .copied()
+                .filter(|candidate| !moving_subtree.contains(candidate))
+                .collect::<Vec<_>>();
+            if params.index > remaining.len() {
+                return encode_error(
+                    id,
+                    "collection_reorder_failed",
+                    format!(
+                        "final displayed index {} is out of range after removing the moving subtree (valid range: 0..={}); choose the final index of the subtree root",
+                        params.index,
+                        remaining.len()
+                    ),
+                );
+            }
+            if params.index != current {
+                let archived = collection.is_archived(pane_id);
+                let visible_siblings = displayed.iter().filter_map(|candidate| {
+                    let sibling = self.state.delegations.delegation_for_pane(*candidate)?;
+                    (sibling.id != record.id
+                        && sibling.parent_id == record.parent_id
+                        && collection.is_archived(*candidate) == archived)
+                        .then_some(sibling.id)
+                });
+                let mut positions = vec![SiblingPosition::First, SiblingPosition::Last];
+                for sibling in visible_siblings {
+                    positions.push(SiblingPosition::Before(sibling));
+                    positions.push(SiblingPosition::After(sibling));
+                }
+
+                let mut valid_indices = std::collections::BTreeSet::new();
+                let mut selected_position = None;
+                for position in positions {
+                    let mut candidate_delegations = self.state.delegations.clone();
+                    if candidate_delegations.reorder(record.id, position).is_err() {
+                        continue;
+                    }
+                    let candidate_order = Self::canonical_collection_member_order_with(
+                        collection,
+                        &candidate_delegations,
+                    );
+                    let Some(candidate_index) = candidate_order
+                        .iter()
+                        .position(|candidate| *candidate == pane_id)
+                    else {
+                        continue;
+                    };
+                    valid_indices.insert(candidate_index);
+                    if candidate_index == params.index {
+                        selected_position = Some(position);
+                        break;
+                    }
+                }
+                let Some(position) = selected_position else {
+                    return encode_error(
+                        id,
+                        "collection_reorder_requires_reparent",
+                        format!(
+                            "final displayed index {} is not a same-parent, same-section sibling-subtree boundary (valid final indices: {}); target another visible sibling boundary or use delegation.reparent to change parentage",
+                            params.index,
+                            valid_indices
+                                .iter()
+                                .map(usize::to_string)
+                                .collect::<Vec<_>>()
+                                .join(", ")
+                        ),
+                    );
+                };
+                if let Err(err) = self.state.delegations.reorder(record.id, position) {
+                    return encode_error(id, "collection_reorder_failed", err.to_string());
+                }
+                let delegation = self.delegation_info(
+                    self.state
+                        .delegations
+                        .get(record.id)
+                        .expect("reordered delegation exists"),
+                );
+                self.emit_event(EventEnvelope {
+                    event: EventKind::DelegationReordered,
+                    data: EventData::DelegationReordered { delegation },
+                });
+            }
+        } else if !self.state.workspaces[ws_idx].tabs[tab_idx]
+            .layout
+            .reorder_collection_member(collection_id, pane_id, params.index)
         {
             return encode_error(
                 id,
                 "collection_reorder_failed",
-                "pane is not a member or index is out of range",
+                "index is out of range for the collection member vector",
             );
         }
         self.state.mark_session_dirty();
@@ -902,6 +1016,38 @@ impl App {
         )
     }
 
+    fn canonical_collection_member_order(
+        &self,
+        collection: &crate::layout::PaneCollection,
+    ) -> Vec<crate::layout::PaneId> {
+        Self::canonical_collection_member_order_with(collection, &self.state.delegations)
+    }
+
+    fn canonical_collection_member_order_with(
+        collection: &crate::layout::PaneCollection,
+        delegations: &Delegations,
+    ) -> Vec<crate::layout::PaneId> {
+        let mut ordered = Vec::with_capacity(collection.members().len());
+        for archived in [false, true] {
+            let section = collection
+                .members()
+                .iter()
+                .copied()
+                .filter(|pane| collection.is_archived(*pane) == archived)
+                .collect::<Vec<_>>();
+            let section_set = section.iter().copied().collect();
+            let mut included = std::collections::HashSet::new();
+            for entry in delegations.preorder_for_panes(&section_set) {
+                if let Some(pane) = delegations.get(entry.id).and_then(|record| record.pane_id) {
+                    included.insert(pane);
+                    ordered.push(pane);
+                }
+            }
+            ordered.extend(section.into_iter().filter(|pane| !included.contains(pane)));
+        }
+        ordered
+    }
+
     pub(super) fn collection_info(
         &self,
         ws_idx: usize,
@@ -911,16 +1057,16 @@ impl App {
         let ws = self.state.workspaces.get(ws_idx)?;
         let tab = ws.tabs.get(tab_idx)?;
         let collection = tab.collection(collection_id)?;
-        let members: Vec<_> = collection
-            .members()
-            .iter()
+        let members: Vec<_> = self
+            .canonical_collection_member_order(collection)
+            .into_iter()
             .enumerate()
             .filter_map(|(index, pane)| {
                 Some(CollectionMemberInfo {
-                    pane_id: self.public_pane_id(ws_idx, *pane)?,
+                    pane_id: self.public_pane_id(ws_idx, pane)?,
                     index,
-                    archived: collection.is_archived(*pane),
-                    selected: collection.selected() == Some(*pane),
+                    archived: collection.is_archived(pane),
+                    selected: collection.selected() == Some(pane),
                 })
             })
             .collect();
@@ -1289,6 +1435,358 @@ mod tests {
         );
         assert_eq!(response["id"], "test");
         assert_eq!(response["error"]["code"], "collection_move_unchanged");
+    }
+
+    #[test]
+    fn collection_reorder_uses_delegation_display_order_and_preserves_plain_vector_order() {
+        let (mut app, root, second, third) = app_with_panes();
+        let fourth = app.state.workspaces[0].test_split(ratatui::layout::Direction::Horizontal);
+        app.state.ensure_test_terminals();
+        let collection_id = create_collection(&mut app, root);
+        for pane in [second, third, fourth, root] {
+            let pane_id = app.public_pane_id(0, pane).expect("public pane");
+            let response = request(
+                &mut app,
+                Method::CollectionAdd(CollectionAddParams {
+                    collection_id: collection_id.clone(),
+                    pane_id,
+                }),
+            );
+            assert!(response.get("error").is_none(), "{response}");
+        }
+        let parent = app
+            .state
+            .delegations
+            .create(Some(second), None, Some("parent".into()))
+            .expect("parent delegation");
+        app.state
+            .delegations
+            .create(Some(third), Some(parent), Some("child".into()))
+            .expect("child delegation");
+        let sibling = app
+            .state
+            .delegations
+            .create(Some(fourth), None, Some("sibling".into()))
+            .expect("sibling delegation");
+        let second_public = app.public_pane_id(0, second).expect("public pane");
+        let third_public = app.public_pane_id(0, third).expect("public pane");
+        let fourth_public = app.public_pane_id(0, fourth).expect("public pane");
+        let root_public = app.public_pane_id(0, root).expect("public pane");
+
+        let reordered = request(
+            &mut app,
+            Method::CollectionReorder(CollectionReorderParams {
+                collection_id: collection_id.clone(),
+                pane_id: fourth_public.clone(),
+                index: 0,
+            }),
+        );
+        let displayed = reordered["result"]["collection"]["members"]
+            .as_array()
+            .expect("members")
+            .iter()
+            .map(|member| member["pane_id"].as_str().expect("pane id"))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            displayed,
+            vec![
+                fourth_public.clone(),
+                second_public.clone(),
+                third_public.clone(),
+                root_public.clone(),
+            ]
+        );
+        assert_eq!(
+            app.state
+                .delegations
+                .get(sibling)
+                .map(|record| record.sibling_rank),
+            Some(0)
+        );
+        let emitted = app.event_hub.events_after(0);
+        let collection_event = emitted
+            .iter()
+            .rev()
+            .find_map(|(_, event)| match &event.data {
+                EventData::CollectionMembersReordered { collection } => Some(collection),
+                _ => None,
+            })
+            .expect("collection reorder event");
+        assert_eq!(
+            serde_json::to_value(&collection_event.members).expect("event members"),
+            reordered["result"]["collection"]["members"]
+        );
+
+        let rejected = request(
+            &mut app,
+            Method::CollectionReorder(CollectionReorderParams {
+                collection_id: collection_id.clone(),
+                pane_id: third_public.clone(),
+                index: 0,
+            }),
+        );
+        assert_eq!(
+            rejected["error"]["code"],
+            "collection_reorder_requires_reparent"
+        );
+        assert!(rejected["error"]["message"]
+            .as_str()
+            .expect("message")
+            .contains("delegation.reparent"));
+
+        let plain = request(
+            &mut app,
+            Method::CollectionReorder(CollectionReorderParams {
+                collection_id: collection_id.clone(),
+                pane_id: root_public.clone(),
+                index: 0,
+            }),
+        );
+        let collection = parse_collection_id(&collection_id).expect("collection id");
+        assert_eq!(
+            app.state.workspaces[0].tabs[0]
+                .collection(collection)
+                .expect("collection")
+                .members()[0],
+            root
+        );
+        assert_eq!(
+            plain["result"]["collection"]["members"][3]["pane_id"],
+            root_public
+        );
+    }
+
+    #[test]
+    fn delegated_reorder_uses_final_subtree_root_indices_at_sibling_boundaries() {
+        let (mut app, root, a, a_child) = app_with_panes();
+        let a_grandchild =
+            app.state.workspaces[0].test_split(ratatui::layout::Direction::Horizontal);
+        let b = app.state.workspaces[0].test_split(ratatui::layout::Direction::Horizontal);
+        let b_child = app.state.workspaces[0].test_split(ratatui::layout::Direction::Horizontal);
+        let c = app.state.workspaces[0].test_split(ratatui::layout::Direction::Horizontal);
+        let a_peer = app.state.workspaces[0].test_split(ratatui::layout::Direction::Horizontal);
+        app.state.ensure_test_terminals();
+        let collection_id = create_collection(&mut app, root);
+        for pane in [a, a_child, a_grandchild, b, b_child, c, a_peer, root] {
+            let pane_id = app.public_pane_id(0, pane).expect("public pane");
+            let added = request(
+                &mut app,
+                Method::CollectionAdd(CollectionAddParams {
+                    collection_id: collection_id.clone(),
+                    pane_id,
+                }),
+            );
+            assert!(added.get("error").is_none(), "{added}");
+        }
+        let a_id = app.state.delegations.create(Some(a), None, None).unwrap();
+        let a_child_id = app
+            .state
+            .delegations
+            .create(Some(a_child), Some(a_id), None)
+            .unwrap();
+        app.state
+            .delegations
+            .create(Some(a_grandchild), Some(a_child_id), None)
+            .unwrap();
+        app.state
+            .delegations
+            .create(Some(a_peer), Some(a_id), None)
+            .unwrap();
+        let b_id = app.state.delegations.create(Some(b), None, None).unwrap();
+        app.state
+            .delegations
+            .create(Some(b_child), Some(b_id), None)
+            .unwrap();
+        app.state.delegations.create(Some(c), None, None).unwrap();
+        let public = [a, a_child, a_grandchild, b, b_child, c, a_peer, root]
+            .into_iter()
+            .map(|pane| app.public_pane_id(0, pane).unwrap())
+            .collect::<Vec<_>>();
+
+        let reorder = |app: &mut App, pane_id: String, index| {
+            request(
+                app,
+                Method::CollectionReorder(CollectionReorderParams {
+                    collection_id: collection_id.clone(),
+                    pane_id,
+                    index,
+                }),
+            )
+        };
+        let forward = reorder(&mut app, public[0].clone(), 2);
+        assert_eq!(
+            forward["result"]["collection"]["members"][2]["pane_id"],
+            public[0]
+        );
+        assert_eq!(forward["result"]["collection"]["members"][2]["index"], 2);
+        assert_eq!(
+            forward["result"]["collection"]["members"][6]["pane_id"],
+            public[5]
+        );
+
+        let backward = reorder(&mut app, public[5].clone(), 0);
+        assert_eq!(
+            backward["result"]["collection"]["members"][0]["pane_id"],
+            public[5]
+        );
+        assert_eq!(
+            backward["result"]["collection"]["members"][3]["pane_id"],
+            public[0]
+        );
+
+        let nested_forward = reorder(&mut app, public[1].clone(), 5);
+        assert_eq!(
+            nested_forward["result"]["collection"]["members"][4]["pane_id"],
+            public[6]
+        );
+        assert_eq!(
+            nested_forward["result"]["collection"]["members"][5]["pane_id"],
+            public[1]
+        );
+        let nested_backward = reorder(&mut app, public[1].clone(), 4);
+        assert_eq!(
+            nested_backward["result"]["collection"]["members"][4]["pane_id"],
+            public[1]
+        );
+        assert_eq!(
+            nested_backward["result"]["collection"]["members"][4]["index"],
+            4
+        );
+        assert_eq!(
+            nested_backward["result"]["collection"]["members"][6]["pane_id"],
+            public[6]
+        );
+
+        let inside_other_subtree = reorder(&mut app, public[5].clone(), 4);
+        assert_eq!(
+            inside_other_subtree["error"]["code"],
+            "collection_reorder_requires_reparent"
+        );
+        let message = inside_other_subtree["error"]["message"].as_str().unwrap();
+        assert!(message.contains("sibling-subtree boundary"), "{message}");
+        assert!(message.contains("valid final indices"), "{message}");
+
+        let inside_moving_subtree = reorder(&mut app, public[0].clone(), 6);
+        assert_eq!(
+            inside_moving_subtree["error"]["code"],
+            "collection_reorder_failed"
+        );
+        assert!(inside_moving_subtree["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("after removing the moving subtree"));
+
+        let event = app
+            .event_hub
+            .events_after(0)
+            .into_iter()
+            .rev()
+            .find_map(|(_, event)| match event.data {
+                EventData::CollectionMembersReordered { collection } => Some(collection),
+                _ => None,
+            })
+            .expect("reorder event");
+        let event_members = serde_json::to_value(event.members).unwrap();
+        assert_eq!(
+            event_members,
+            nested_backward["result"]["collection"]["members"]
+        );
+        assert_eq!(event_members[4]["pane_id"], public[1]);
+        assert_eq!(event_members[4]["index"], 4);
+    }
+
+    #[test]
+    fn tui_and_api_delegated_reorder_produce_the_same_display_order() {
+        let build = || {
+            let (mut app, root, second, third) = app_with_panes();
+            let collection_id = create_collection(&mut app, root);
+            for pane in [second, third, root] {
+                let pane_id = app.public_pane_id(0, pane).expect("public pane");
+                request(
+                    &mut app,
+                    Method::CollectionAdd(CollectionAddParams {
+                        collection_id: collection_id.clone(),
+                        pane_id,
+                    }),
+                );
+            }
+            let first = app
+                .state
+                .delegations
+                .create(Some(second), None, None)
+                .expect("first sibling");
+            app.state
+                .delegations
+                .create(Some(root), Some(first), None)
+                .expect("first sibling child");
+            app.state
+                .delegations
+                .create(Some(third), None, None)
+                .expect("second sibling");
+            (app, collection_id, first, second, third)
+        };
+        let (mut api, collection_id, _, second, third) = build();
+        let third_public = api.public_pane_id(0, third).expect("public pane");
+        let api_result = request(
+            &mut api,
+            Method::CollectionReorder(CollectionReorderParams {
+                collection_id: collection_id.clone(),
+                pane_id: third_public,
+                index: 0,
+            }),
+        );
+        let api_order = api_result["result"]["collection"]["members"]
+            .as_array()
+            .expect("API members")
+            .iter()
+            .map(|member| {
+                member["pane_id"]
+                    .as_str()
+                    .expect("pane id")
+                    .split(':')
+                    .next_back()
+                    .expect("public pane suffix")
+                    .to_string()
+            })
+            .collect::<Vec<_>>();
+
+        let (mut tui, tui_collection_id, _, _, tui_third) = build();
+        let collection = parse_collection_id(&tui_collection_id).expect("collection id");
+        tui.state.active = Some(0);
+        tui.state.workspaces[0].tabs[0]
+            .layout
+            .focus_leaf(LayoutLeaf::Collection(collection));
+        tui.state.workspaces[0].tabs[0]
+            .layout
+            .select_collection_member(collection, tui_third);
+        tui.reorder_relative(collection, -1);
+        let tui_info = tui
+            .collection_info(0, 0, collection)
+            .expect("collection info");
+        let tui_order = tui_info
+            .members
+            .iter()
+            .map(|member| {
+                member
+                    .pane_id
+                    .split(':')
+                    .next_back()
+                    .expect("public pane suffix")
+                    .to_string()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(tui_order, api_order);
+        assert_eq!(
+            api.collection_info(
+                0,
+                0,
+                parse_collection_id(&collection_id).expect("collection id")
+            )
+            .expect("api info")
+            .members[1]
+                .pane_id,
+            api.public_pane_id(0, second).expect("public pane")
+        );
     }
 
     #[tokio::test]

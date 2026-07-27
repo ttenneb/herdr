@@ -16,6 +16,18 @@ enum ScrollbarClickTarget {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PaneUrlClickTarget {
+    pane_id: crate::layout::PaneId,
+    /// Visible screen rectangle that may activate the link.
+    screen_rect: ratatui::layout::Rect,
+    /// Full logical terminal dimensions, independent of screen clipping.
+    logical_rows: u16,
+    logical_cols: u16,
+    /// Logical row represented by the top of `screen_rect`.
+    logical_row_offset: u16,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[cfg(test)]
 enum WheelRouting {
     HostScroll,
@@ -337,7 +349,7 @@ impl App {
             }
         }
 
-        if self.handle_collection_mouse(mouse) {
+        if self.handle_collection_mouse_from(source_id, mouse) {
             return;
         }
 
@@ -550,18 +562,61 @@ impl App {
         let Some(info) = self.state.pane_at(mouse.column, mouse.row).cloned() else {
             return false;
         };
-        let viewport_row = mouse.row.saturating_sub(info.inner_rect.y);
-        let col = mouse.column.saturating_sub(info.inner_rect.x);
-        let Some(url) =
-            self.state
-                .url_at_pane_cell(&self.terminal_runtimes, info.id, viewport_row, col)
-        else {
+        self.handle_modified_url_click_at(
+            source_id,
+            mouse,
+            PaneUrlClickTarget {
+                pane_id: info.id,
+                screen_rect: info.inner_rect,
+                logical_rows: info.inner_rect.height,
+                logical_cols: info.inner_rect.width,
+                logical_row_offset: 0,
+            },
+        )
+    }
+
+    fn handle_modified_url_click_at(
+        &mut self,
+        source_id: super::InputSourceId,
+        mouse: MouseEvent,
+        target: PaneUrlClickTarget,
+    ) -> bool {
+        if self.state.mode != Mode::Terminal
+            || !matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left))
+            || !mouse.modifiers.contains(modified_url_click_modifier())
+        {
+            return false;
+        }
+        if mouse.column < target.screen_rect.x
+            || mouse.column >= target.screen_rect.right()
+            || mouse.row < target.screen_rect.y
+            || mouse.row >= target.screen_rect.bottom()
+        {
+            return false;
+        }
+        let logical_row = mouse
+            .row
+            .saturating_sub(target.screen_rect.y)
+            .saturating_add(target.logical_row_offset);
+        let logical_col = mouse.column.saturating_sub(target.screen_rect.x);
+        let Some(ws_idx) = self.state.active else {
+            return false;
+        };
+        let Some(url) = self.state.url_at_pane_cell_with_geometry(
+            &self.terminal_runtimes,
+            ws_idx,
+            target.pane_id,
+            target.logical_rows,
+            target.logical_cols,
+            logical_row,
+            logical_col,
+        ) else {
             return false;
         };
 
         self.last_pane_click = None;
         self.pending_url_click_sources.insert(source_id);
-        match self.invoke_plugin_link_handler_for_url(&url, info.id) {
+        match self.invoke_plugin_link_handler_for_url(&url, target.pane_id) {
             Ok(true) => return true,
             Ok(false) => {}
             Err(err) => {

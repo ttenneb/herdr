@@ -24,11 +24,22 @@ impl App {
         let Some((ws_idx, tab_idx)) = self.resolve_layout_export_target(&params) else {
             return encode_error(id, "layout_not_found", "layout target not found");
         };
-        let Some(layout) = self.layout_description(ws_idx, tab_idx) else {
-            return encode_error(id, "layout_not_found", "layout unavailable");
-        };
-
-        encode_success(id, ResponseResult::LayoutExport { layout })
+        if self.state.workspaces[ws_idx].tabs[tab_idx]
+            .layout
+            .collection_ids()
+            .is_empty()
+        {
+            let Some(layout) = self.layout_description(ws_idx, tab_idx) else {
+                return encode_error(id, "layout_not_found", "layout unavailable");
+            };
+            encode_success(id, ResponseResult::LayoutExport { layout })
+        } else {
+            encode_error(
+                id,
+                "layout_contains_collections",
+                "layout.export does not support collection leaves; remove or close each collection leaf before exporting, promoting or moving its members first if needed",
+            )
+        }
     }
 
     pub(super) fn handle_layout_apply(&mut self, id: String, params: LayoutApplyParams) -> String {
@@ -209,6 +220,15 @@ impl App {
                             collection_id: super::collections::collection_id_string(collection_id),
                             workspace_id: workspace_id.clone(),
                             tab_id: closed_tab_id.clone(),
+                        },
+                    });
+                }
+                for (_, pane_id) in &public_panes {
+                    self.emit_event(EventEnvelope {
+                        event: EventKind::PaneClosed,
+                        data: EventData::PaneClosed {
+                            pane_id: pane_id.clone(),
+                            workspace_id: workspace_id.clone(),
                         },
                     });
                 }
@@ -722,6 +742,61 @@ mod tests {
     }
 
     #[test]
+    fn layout_export_rejects_empty_and_populated_collections_without_mutation() {
+        for populated in [false, true] {
+            let mut app = app_with_workspace();
+            let root = app.state.workspaces[0].tabs[0]
+                .root_pane
+                .expect("root pane");
+            let member =
+                populated.then(|| app.state.workspaces[0].test_split(Direction::Horizontal));
+            let collection = app.state.workspaces[0]
+                .create_collection_near(
+                    0,
+                    crate::layout::LayoutLeaf::Pane(root),
+                    Direction::Vertical,
+                    0.5,
+                    Some("helpers".into()),
+                )
+                .expect("collection");
+            if let Some(member) = member {
+                app.state.workspaces[0]
+                    .collect_pane(member, collection)
+                    .expect("collect member");
+            }
+            let before_leaves = app.state.workspaces[0].tabs[0].layout.leaves();
+            let before_focus = app.state.workspaces[0].tabs[0].layout.focused_leaf();
+
+            let response = app.handle_layout_export(
+                "req".into(),
+                LayoutExportParams {
+                    tab_id: None,
+                    pane_id: None,
+                },
+            );
+
+            let error: ErrorResponse = serde_json::from_str(&response).unwrap();
+            assert_eq!(error.error.code, "layout_contains_collections");
+            assert_eq!(
+                error.error.message,
+                "layout.export does not support collection leaves; remove or close each collection leaf before exporting, promoting or moving its members first if needed"
+            );
+            assert_eq!(
+                app.state.workspaces[0].tabs[0].layout.leaves(),
+                before_leaves
+            );
+            assert_eq!(
+                app.state.workspaces[0].tabs[0].layout.focused_leaf(),
+                before_focus
+            );
+            let restored = app.state.workspaces[0].tabs[0]
+                .collection(collection)
+                .expect("collection retained");
+            assert_eq!(restored.members(), member.as_slice());
+        }
+    }
+
+    #[test]
     fn layout_set_split_ratio_updates_existing_split() {
         let mut app = app_with_workspace();
         app.state.workspaces[0].test_split(Direction::Horizontal);
@@ -922,6 +997,97 @@ mod tests {
         assert!(matches!(success.result, ResponseResult::LayoutApply { .. }));
         assert!(!app.state.plugin_panes.contains_key(&replaced_pane));
         app.state.assert_invariants_for_test();
+    }
+
+    #[tokio::test]
+    async fn layout_apply_replacement_emits_canonical_bulk_destruction_order() {
+        let mut app = app_with_workspace();
+        let root = app.state.workspaces[0].tabs[0]
+            .root_pane
+            .expect("root pane");
+        let grouped = app.state.workspaces[0].test_split(Direction::Horizontal);
+        let tiled = app.state.workspaces[0].test_split(Direction::Vertical);
+        app.state.ensure_test_terminals();
+        let collection = app.state.workspaces[0]
+            .create_collection_near(
+                0,
+                crate::layout::LayoutLeaf::Pane(root),
+                Direction::Horizontal,
+                0.5,
+                None,
+            )
+            .expect("collection");
+        app.state.workspaces[0]
+            .collect_pane(grouped, collection)
+            .expect("group pane");
+        app.state
+            .delegations
+            .create(Some(grouped), None, Some("helper".into()))
+            .expect("delegation");
+        let old_tab_id = app.public_tab_id(0, 0).expect("tab id");
+        let old_public_panes = [root, grouped, tiled]
+            .into_iter()
+            .map(|pane| app.public_pane_id(0, pane).expect("public pane"))
+            .collect::<std::collections::HashSet<_>>();
+        let sequence = app.event_hub.current_sequence();
+
+        let response = app.handle_layout_apply(
+            "req".into(),
+            LayoutApplyParams {
+                workspace_id: None,
+                tab_id: Some(old_tab_id),
+                tab_label: None,
+                focus: false,
+                root: LayoutNode::Pane {
+                    pane: LayoutPane::default(),
+                },
+            },
+        );
+        assert!(serde_json::from_str::<SuccessResponse>(&response).is_ok());
+
+        let events = app.event_hub.events_after(sequence);
+        let tab_closed = events
+            .iter()
+            .position(|(_, event)| event.event == EventKind::TabClosed)
+            .expect("tab.closed");
+        let collection_removed = events
+            .iter()
+            .position(|(_, event)| event.event == EventKind::CollectionMemberRemoved)
+            .expect("collection.member_removed");
+        let collection_closed = events
+            .iter()
+            .position(|(_, event)| event.event == EventKind::CollectionClosed)
+            .expect("collection.closed");
+        let pane_closed = events
+            .iter()
+            .enumerate()
+            .filter_map(|(index, (_, event))| match &event.data {
+                EventData::PaneClosed { pane_id, .. } => Some((index, pane_id.clone())),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            pane_closed
+                .iter()
+                .map(|(_, pane)| pane.clone())
+                .collect::<std::collections::HashSet<_>>(),
+            old_public_panes
+        );
+        assert_eq!(pane_closed.len(), 3);
+        assert!(collection_removed < collection_closed);
+        assert!(collection_closed < pane_closed[0].0);
+        assert!(pane_closed.iter().all(|(index, _)| *index < tab_closed));
+        let delegation_tombstoned = events
+            .iter()
+            .position(|(_, event)| event.event == EventKind::DelegationTombstoned)
+            .expect("delegation.tombstoned");
+        let delegation_gc = events
+            .iter()
+            .position(|(_, event)| event.event == EventKind::DelegationGarbageCollected)
+            .expect("delegation.garbage_collected");
+        assert!(pane_closed.last().expect("pane close").0 < delegation_tombstoned);
+        assert!(delegation_tombstoned < delegation_gc && delegation_gc < tab_closed);
+        shutdown_test_runtimes(&mut app);
     }
 
     #[tokio::test]

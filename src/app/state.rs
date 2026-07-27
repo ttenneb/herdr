@@ -90,6 +90,9 @@ pub(crate) struct SelectionAutoscroll {
 pub(crate) struct RightClickPassthroughGesture {
     pub pane_info: PaneInfo,
     pub modifiers: KeyModifiers,
+    /// Screen-to-logical terminal translation captured when the gesture starts.
+    pub logical_row_offset: u16,
+    pub logical_column_offset: u16,
 }
 use crate::terminal_theme::{HostAppearance, TerminalTheme};
 use crate::workspace::Workspace;
@@ -2123,6 +2126,7 @@ impl AppState {
         let mut workspace_ids = std::collections::HashSet::new();
         let mut workspace_id_to_idx = std::collections::HashMap::new();
         let mut pane_ids = std::collections::HashSet::new();
+        let mut collection_ids = std::collections::HashSet::new();
         let mut attached_terminal_ids = std::collections::HashSet::new();
         for (ws_idx, ws) in self.workspaces.iter().enumerate() {
             assert!(
@@ -2135,6 +2139,13 @@ impl AppState {
             ws.assert_invariants_for_test();
 
             for tab in &ws.tabs {
+                for collection_id in tab.layout.collection_ids() {
+                    assert!(
+                        collection_ids.insert(collection_id),
+                        "collection {:?} appears in more than one tab or workspace",
+                        collection_id
+                    );
+                }
                 for (pane_id, pane) in &tab.panes {
                     assert!(
                         pane_ids.insert(*pane_id),
@@ -2396,6 +2407,32 @@ mod tests {
         assert_ne!(ws.active_tab + 1, active_public);
         let new_pane = ws.test_split(ratatui::layout::Direction::Horizontal);
         assert!(ws.public_pane_number(new_pane).is_some());
+        state.ensure_test_terminals();
+
+        state.assert_invariants_for_test();
+    }
+
+    #[test]
+    #[should_panic(expected = "appears in more than one tab or workspace")]
+    fn app_invariant_rejects_session_wide_duplicate_collection_ids() {
+        let mut state = AppState::test_new();
+        let collection = crate::layout::CollectionId::alloc().expect("collection id");
+        let mut workspaces = [
+            crate::workspace::Workspace::test_new("first"),
+            crate::workspace::Workspace::test_new("second"),
+        ];
+        for workspace in &mut workspaces {
+            let root = workspace.tabs[0].root_pane.expect("root pane");
+            assert!(workspace.tabs[0].layout.insert_collection_near(
+                crate::layout::LayoutLeaf::Pane(root),
+                collection,
+                ratatui::layout::Direction::Horizontal,
+                0.5,
+            ));
+        }
+        state.workspaces = workspaces.into();
+        state.active = Some(0);
+        state.selected = 0;
         state.ensure_test_terminals();
 
         state.assert_invariants_for_test();

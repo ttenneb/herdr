@@ -78,7 +78,44 @@ impl AppState {
         if self.mode != Mode::Terminal || !self.focused_collection_terminal_entered() {
             return;
         }
-        let Some(info) = self.pane_at(mouse.column, mouse.row).cloned() else {
+        let target = self
+            .pane_at(mouse.column, mouse.row)
+            .cloned()
+            .map(|info| (info, mouse))
+            .or_else(|| {
+                let hit = self
+                    .view
+                    .collection_layouts
+                    .iter()
+                    .find_map(|layout| layout.hit_at(mouse.column, mouse.row))?;
+                let pane = hit.pane_id?;
+                let entered = hit.kind == crate::app::collection_view::CollectionHitKind::Preview
+                    && self
+                        .collection_views
+                        .get(&hit.collection_id)
+                        .is_some_and(|view| {
+                            view.mode
+                                == crate::app::collection_view::CollectionInteractionMode::Terminal
+                                && view.entered == Some(pane)
+                        });
+                entered.then(|| {
+                    (
+                        PaneInfo {
+                            id: pane,
+                            rect: hit.rect,
+                            inner_rect: hit.rect,
+                            scrollbar_rect: None,
+                            borders: ratatui::widgets::Borders::NONE,
+                            is_focused: true,
+                        },
+                        MouseEvent {
+                            row: mouse.row.saturating_add(hit.terminal_row_offset),
+                            ..mouse
+                        },
+                    )
+                })
+            });
+        let Some((info, mouse)) = target else {
             return;
         };
 
@@ -190,7 +227,7 @@ impl AppState {
             && mouse.row >= sidebar.y
             && mouse.row < sidebar.y + sidebar.height;
 
-        if self.handle_right_click_passthrough(terminal_runtimes, mouse, in_sidebar) {
+        if self.handle_right_click_passthrough(terminal_runtimes, mouse, in_sidebar, None) {
             return None;
         }
 
@@ -1521,18 +1558,25 @@ impl AppState {
             .and_then(crate::terminal::TerminalRuntime::scroll_metrics)
     }
 
-    fn handle_right_click_passthrough(
+    pub(super) fn handle_right_click_passthrough(
         &mut self,
         terminal_runtimes: &TerminalRuntimeRegistry,
         mouse: MouseEvent,
         in_sidebar: bool,
+        explicit_target: Option<(PaneInfo, u16, u16)>,
     ) -> bool {
         if let Some(gesture) = self.right_click_passthrough.clone() {
             match mouse.kind {
                 MouseEventKind::Drag(MouseButton::Right)
                 | MouseEventKind::Up(MouseButton::Right) => {
-                    let forwarded_mouse =
-                        self.strip_right_click_passthrough_modifiers(mouse, gesture.modifiers);
+                    let forwarded_mouse = self.strip_right_click_passthrough_modifiers(
+                        MouseEvent {
+                            row: mouse.row.saturating_add(gesture.logical_row_offset),
+                            column: mouse.column.saturating_add(gesture.logical_column_offset),
+                            ..mouse
+                        },
+                        gesture.modifiers,
+                    );
                     let _ = self.forward_pane_mouse_button(
                         terminal_runtimes,
                         &gesture.pane_info,
@@ -1563,7 +1607,12 @@ impl AppState {
             return false;
         }
 
-        let Some(info) = self.pane_at(mouse.column, mouse.row).cloned() else {
+        let target = explicit_target.or_else(|| {
+            self.pane_at(mouse.column, mouse.row)
+                .cloned()
+                .map(|info| (info, 0, 0))
+        });
+        let Some((info, logical_row_offset, logical_column_offset)) = target else {
             return false;
         };
 
@@ -1582,6 +1631,8 @@ impl AppState {
         self.right_click_passthrough = Some(RightClickPassthroughGesture {
             pane_info: info,
             modifiers,
+            logical_row_offset,
+            logical_column_offset,
         });
         true
     }
@@ -1695,7 +1746,7 @@ impl AppState {
         true
     }
 
-    fn forward_pane_reported_wheel(
+    pub(super) fn forward_pane_reported_wheel(
         &self,
         terminal_runtimes: &TerminalRuntimeRegistry,
         info: &PaneInfo,

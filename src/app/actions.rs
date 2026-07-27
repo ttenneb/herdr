@@ -2205,6 +2205,7 @@ impl AppState {
         true
     }
 
+    #[cfg(test)]
     pub(crate) fn url_at_pane_cell(
         &self,
         terminal_runtimes: &crate::terminal::TerminalRuntimeRegistry,
@@ -2216,17 +2217,36 @@ impl AppState {
             .active
             .filter(|idx| self.workspaces.get(*idx).is_some())?;
         let info = self.pane_info_by_id(pane_id)?;
-        if viewport_row >= info.inner_rect.height || col >= info.inner_rect.width {
+        self.url_at_pane_cell_with_geometry(
+            terminal_runtimes,
+            ws_idx,
+            info.id,
+            info.inner_rect.height,
+            info.inner_rect.width,
+            viewport_row,
+            col,
+        )
+    }
+
+    pub(crate) fn url_at_pane_cell_with_geometry(
+        &self,
+        terminal_runtimes: &crate::terminal::TerminalRuntimeRegistry,
+        ws_idx: usize,
+        pane_id: crate::layout::PaneId,
+        logical_rows: u16,
+        logical_cols: u16,
+        logical_row: u16,
+        logical_col: u16,
+    ) -> Option<String> {
+        if logical_row >= logical_rows || logical_col >= logical_cols {
             return None;
         }
-
         let rt = self.runtime_for_pane_in_workspace(terminal_runtimes, ws_idx, pane_id)?;
-        let screen_col = info.inner_rect.x.saturating_add(col);
-        let screen_row = info.inner_rect.y.saturating_add(viewport_row);
+        let logical_rect = ratatui::layout::Rect::new(0, 0, logical_cols, logical_rows);
         if let Some((_, _, uri)) = rt
-            .visible_hyperlinks(info.inner_rect)
+            .visible_hyperlinks(logical_rect)
             .into_iter()
-            .find(|((x, y), _, _)| *x == screen_col && *y == screen_row)
+            .find(|((x, y), _, _)| *x == logical_col && *y == logical_row)
         {
             return safe_web_url(&uri).map(str::to_owned);
         }
@@ -2235,12 +2255,12 @@ impl AppState {
         let visible_selection = Selection::line_range(
             pane_id,
             Selection::absolute_row_for_viewport(0, metrics),
-            Selection::absolute_row_for_viewport(info.inner_rect.height.saturating_sub(1), metrics),
-            info.inner_rect.width.saturating_sub(1),
+            Selection::absolute_row_for_viewport(logical_rows.saturating_sub(1), metrics),
+            logical_cols.saturating_sub(1),
         );
         let visible_text = rt.extract_selection(&visible_selection)?;
         let logical_cell =
-            logical_cell_for_visible_cell(&visible_text, info.inner_rect.width, viewport_row, col)?;
+            logical_cell_for_visible_cell(&visible_text, logical_cols, logical_row, logical_col)?;
         let line_start = visible_text[..logical_cell.byte_index]
             .rfind('\n')
             .map_or(0, |idx| idx + 1);

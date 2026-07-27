@@ -201,7 +201,11 @@ when the platform exposes them.
 
 `layout.export` returns a portable tab layout tree. Omit `tab_id` and `pane_id`
 to export the active tab, pass `tab_id` to export that tab, or pass `pane_id` to
-export the tab containing that pane.
+export the tab containing that pane. Tabs containing any collection leaf are
+rejected with `layout_contains_collections`. Remove or close each collection
+leaf before exporting. For populated collections, you may first promote or move
+their members to ordinary tiled panes; member promotion cannot remove an empty
+collection leaf. Session snapshots and live handoff still preserve collections.
 
 ```json
 {"id":"req_export","method":"layout.export","params":{"tab_id":"w1:t1"}}
@@ -751,7 +755,13 @@ Pane collections use `collection.list`, `collection.get`, `collection.create`,
 `disposition: "cascade_close"` or `"promote_members"`; cascade close can return
 `confirmation_required` when it would close a worktree group. Collection
 responses include stable IDs, ordered members, archive/selection state,
-lifecycle counts, and advisory warnings.
+lifecycle counts, and advisory warnings. For delegated members,
+`collection.reorder.index` is the requested final canonical displayed index of
+the moved subtree root. The moving subtree is removed before that index is
+interpreted, and the target must be a sibling-subtree boundary in the same
+active/archive section under the same delegation parent. Use
+`delegation.reparent` to change parentage. Nondelegated members retain direct
+member-vector reordering.
 
 Delegation metadata is independent of placement. Use `delegation.create`,
 `delegation.get`, `delegation.tree`, `delegation.root`,
@@ -764,7 +774,12 @@ rejects cycles atomically.
 `PaneLayoutSnapshot.collections` describes collection leaves, while `focused`
 is typed as a pane or collection (with an optional selected pane).
 `focused_pane_id` remains optional for compatibility with empty collections.
-Portable layout roots can likewise contain collection leaves.
+Portable layout roots do not support collection leaves. `layout.export` rejects
+both empty and populated collections rather than silently dropping collection
+structure or members. Every collection leaf must be removed or closed before
+exporting; populated collections may first promote or move their members, while
+empty leaves still require removal or closure. Snapshot and session persistence
+remain collection-aware.
 
 ## Event subscriptions
 

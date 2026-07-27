@@ -12,11 +12,13 @@ use crate::{
     app::{
         collection_view::{CollectionHitKind, CollectionInteractionMode},
         state::{ContextMenuKind, ContextMenuState, MenuListState, Mode},
-        App,
+        App, InputSourceId,
     },
     input::TerminalKey,
     layout::{CollectionId, LayoutLeaf, PaneId, PaneInfo},
 };
+
+use super::PaneUrlClickTarget;
 
 impl App {
     fn focused_collection(&self) -> Option<(usize, CollectionId, Option<PaneId>)> {
@@ -570,7 +572,7 @@ impl App {
         }
     }
 
-    fn reorder_relative(&mut self, collection_id: CollectionId, delta: isize) {
+    pub(crate) fn reorder_relative(&mut self, collection_id: CollectionId, delta: isize) {
         let Some(ws_idx) = self.state.active else {
             return;
         };
@@ -778,7 +780,7 @@ impl App {
         &self,
         collection_id: CollectionId,
         pane_id: PaneId,
-    ) -> Option<(Rect, u16, u16)> {
+    ) -> Option<(Rect, u16, u16, u16)> {
         let layout = self
             .state
             .view
@@ -787,14 +789,11 @@ impl App {
             .find(|layout| layout.id == collection_id)?;
         if layout.maximized == Some(pane_id) {
             let rect = layout.maximized_preview_rect.unwrap_or(layout.inner_rect);
-            return Some((rect, 0, rect.height));
+            return Some((rect, 0, rect.height, rect.width));
         }
         let row = layout.rows.iter().find(|row| row.pane_id == pane_id)?;
-        Some((
-            row.preview_rect?,
-            row.preview_row_offset,
-            row.preview_size?.0,
-        ))
+        let (rows, cols) = row.preview_size?;
+        Some((row.preview_rect?, row.preview_row_offset, rows, cols))
     }
 
     fn set_collection_scrollbar_from_row(
@@ -849,7 +848,7 @@ impl App {
         allow_terminal_routing: bool,
     ) {
         self.restore_archived_member_for_input(ws_idx, pane_id);
-        let Some((rect, row_offset, _)) =
+        let Some((rect, row_offset, _, _)) =
             self.collection_child_preview_info(collection_id, pane_id)
         else {
             return;
@@ -894,7 +893,7 @@ impl App {
         screen_row: u16,
         grab_row_offset: Option<u16>,
     ) -> Option<u16> {
-        let (_, clipped_row_offset, logical_rows) =
+        let (_, clipped_row_offset, logical_rows, _) =
             self.collection_child_preview_info(collection_id, pane_id)?;
         let layout = self
             .state
@@ -937,7 +936,29 @@ impl App {
         None
     }
 
+    #[cfg(test)]
     pub(crate) fn handle_collection_mouse(&mut self, mouse: MouseEvent) -> bool {
+        self.handle_collection_mouse_from(crate::app::LOCAL_INPUT_SOURCE, mouse)
+    }
+
+    pub(crate) fn handle_collection_mouse_from(
+        &mut self,
+        source_id: InputSourceId,
+        mouse: MouseEvent,
+    ) -> bool {
+        // A passthrough gesture remains owned by the pane where it started. Continue it before
+        // collection hit-testing so clipped-preview coordinates survive chrome and off-layout
+        // drag/up events.
+        if self.state.right_click_passthrough.is_some()
+            && self.state.handle_right_click_passthrough(
+                &self.terminal_runtimes,
+                mouse,
+                false,
+                None,
+            )
+        {
+            return true;
+        }
         let hit = self
             .state
             .view
@@ -1058,18 +1079,58 @@ impl App {
         let Some(ws_idx) = self.state.active else {
             return true;
         };
+        let entered_preview = hit.kind == CollectionHitKind::Preview
+            && self
+                .state
+                .collection_views
+                .get(&hit.collection_id)
+                .is_some_and(|v| {
+                    v.mode == CollectionInteractionMode::Terminal && v.entered == hit.pane_id
+                });
+        let preview_geometry = entered_preview
+            .then(|| {
+                let pane = hit.pane_id?;
+                let (screen_rect, logical_row_offset, logical_rows, logical_cols) =
+                    self.collection_child_preview_info(hit.collection_id, pane)?;
+                Some((
+                    PaneInfo {
+                        id: pane,
+                        rect: screen_rect,
+                        inner_rect: screen_rect,
+                        scrollbar_rect: None,
+                        borders: Borders::NONE,
+                        is_focused: true,
+                    },
+                    PaneUrlClickTarget {
+                        pane_id: pane,
+                        screen_rect,
+                        logical_rows,
+                        logical_cols,
+                        logical_row_offset,
+                    },
+                ))
+            })
+            .flatten();
+        let preview_info = preview_geometry.as_ref().map(|(info, _)| info.clone());
+        if self.state.handle_right_click_passthrough(
+            &self.terminal_runtimes,
+            terminal_mouse,
+            false,
+            preview_info
+                .clone()
+                .map(|info| (info, hit.terminal_row_offset, 0)),
+        ) {
+            return true;
+        }
+        if preview_geometry
+            .as_ref()
+            .is_some_and(|(_, target)| self.handle_modified_url_click_at(source_id, mouse, *target))
+        {
+            return true;
+        }
         match mouse.kind {
             MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => {
                 let child_scrollbar = hit.kind == CollectionHitKind::PreviewScrollbar;
-                let entered_preview = hit.kind == CollectionHitKind::Preview
-                    && self
-                        .state
-                        .collection_views
-                        .get(&hit.collection_id)
-                        .is_some_and(|v| {
-                            v.mode == CollectionInteractionMode::Terminal
-                                && v.entered == hit.pane_id
-                        });
                 if child_scrollbar || entered_preview {
                     if let Some(pane) = hit.pane_id {
                         // A scrollbar gutter is host UI, so wheel input there must always move
@@ -1102,6 +1163,16 @@ impl App {
                     } else {
                         view.scroll.saturating_add(3).min(max_scroll)
                     };
+                }
+                true
+            }
+            MouseEventKind::ScrollLeft | MouseEventKind::ScrollRight if entered_preview => {
+                if let Some(info) = preview_info.as_ref() {
+                    let _ = self.state.forward_pane_reported_wheel(
+                        &self.terminal_runtimes,
+                        info,
+                        terminal_mouse,
+                    );
                 }
                 true
             }
@@ -1239,6 +1310,19 @@ impl App {
                 }
                 true
             }
+            MouseEventKind::Down(MouseButton::Middle) if entered_preview => {
+                if let Some(pane) = hit.pane_id {
+                    self.restore_archived_member_for_input(ws_idx, pane);
+                }
+                if let Some(info) = preview_info.as_ref() {
+                    let _ = self.state.forward_pane_mouse_button(
+                        &self.terminal_runtimes,
+                        info,
+                        terminal_mouse,
+                    );
+                }
+                true
+            }
             MouseEventKind::Moved | MouseEventKind::Up(_) | MouseEventKind::Drag(_) => {
                 if hit.kind == CollectionHitKind::Preview
                     && self
@@ -1284,7 +1368,10 @@ impl App {
 
 #[cfg(test)]
 mod tests {
+    use bytes::Bytes;
     use crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+
+    use super::CollectionHitKind;
     use ratatui::layout::Rect;
     use tokio::sync::mpsc;
 
@@ -1355,6 +1442,46 @@ mod tests {
             row,
             modifiers: KeyModifiers::NONE,
         }
+    }
+
+    #[cfg(unix)]
+    fn install_test_link_handler(app: &mut crate::app::App) {
+        let plugin_root = std::env::temp_dir();
+        app.state.installed_plugins = std::collections::HashMap::from([(
+            "example.links".to_string(),
+            crate::api::schema::InstalledPluginInfo {
+                plugin_id: "example.links".into(),
+                name: "Links".into(),
+                version: "0.1.0".into(),
+                min_herdr_version: "0.6.10".into(),
+                description: None,
+                manifest_path: plugin_root.join("herdr-plugin.toml").display().to_string(),
+                plugin_root: plugin_root.display().to_string(),
+                enabled: true,
+                platforms: None,
+                build: Vec::new(),
+                startup: Vec::new(),
+                actions: vec![crate::api::schema::PluginManifestAction {
+                    id: "open".into(),
+                    title: "Open link".into(),
+                    description: None,
+                    contexts: Vec::new(),
+                    platforms: None,
+                    command: vec!["sh".into(), "-c".into(), ":".into()],
+                }],
+                events: Vec::new(),
+                panes: Vec::new(),
+                link_handlers: vec![crate::api::schema::PluginManifestLinkHandler {
+                    id: "github-issue".into(),
+                    title: "Open GitHub issue".into(),
+                    pattern: "^https://github\\.com/[^/]+/[^/]+/issues/[0-9]+$".into(),
+                    action: "open".into(),
+                    platforms: None,
+                }],
+                source: crate::api::schema::PluginSourceInfo::default(),
+                warnings: Vec::new(),
+            },
+        )]);
     }
 
     #[tokio::test]
@@ -1472,6 +1599,257 @@ mod tests {
                 );
             }
         }
+    }
+
+    fn clip_entered_preview(
+        app: &mut crate::app::App,
+        child: crate::layout::PaneId,
+        logical_row_offset: u16,
+        visible_height: u16,
+    ) -> Rect {
+        let layout = &mut app.state.view.collection_layouts[0];
+        let row = layout
+            .rows
+            .iter_mut()
+            .find(|row| row.pane_id == child)
+            .expect("child row");
+        let mut rect = row.preview_rect.expect("preview");
+        rect.height = visible_height;
+        row.preview_rect = Some(rect);
+        row.preview_row_offset = logical_row_offset;
+        let hit = layout
+            .hits
+            .iter_mut()
+            .find(|hit| {
+                hit.pane_id == Some(child)
+                    && hit.kind == crate::app::collection_view::CollectionHitKind::Preview
+            })
+            .expect("preview hit");
+        hit.rect = rect;
+        hit.terminal_row_offset = logical_row_offset;
+        rect
+    }
+
+    fn ctrl_click(app: &mut crate::app::App, source_id: u64, column: u16, row: u16) {
+        let mut down = mouse(MouseEventKind::Down(MouseButton::Left), column, row);
+        down.modifiers = KeyModifiers::CONTROL;
+        app.handle_mouse_from_input_source(source_id, down);
+        app.handle_mouse_from_input_source(
+            source_id,
+            mouse(MouseEventKind::Up(MouseButton::Left), column, row),
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn entered_preview_ctrl_click_finds_plain_urls_in_top_and_bottom_clipped_previews() {
+        let (mut app, _collection, child, mut rx) = collection_scroll_app(b"", 0);
+        install_test_link_handler(&mut app);
+        app.state.mode = crate::app::state::Mode::Terminal;
+
+        for (source_id, row_offset, logical_row, issue) in [(77, 0, 1, 398), (78, 6, 6, 399)] {
+            let line = format!("see https://github.com/ogulcancelik/herdr/issues/{issue}");
+            app.state.workspaces[0].tabs[0].runtimes[&child].test_process_pty_bytes(
+                format!("\x1b[2J\x1b[{};1H{line}", logical_row + 1).as_bytes(),
+            );
+            let preview = clip_entered_preview(&mut app, child, row_offset, 2);
+            let commands_before = app.state.plugin_command_logs.len();
+
+            ctrl_click(
+                &mut app,
+                source_id,
+                preview.x + line.find("github").expect("host") as u16,
+                preview.y + logical_row - row_offset,
+            );
+
+            assert_eq!(app.state.plugin_command_logs.len(), commands_before + 1);
+            assert_eq!(
+                app.state
+                    .plugin_command_logs
+                    .last()
+                    .map(|log| log.plugin_id.as_str()),
+                Some("example.links")
+            );
+            assert!(rx.try_recv().is_err(), "URL gesture must not reach the PTY");
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn entered_preview_ctrl_click_finds_osc_links_in_top_and_bottom_clipped_previews() {
+        let (mut app, _collection, child, mut rx) = collection_scroll_app(b"", 0);
+        install_test_link_handler(&mut app);
+        app.state.mode = crate::app::state::Mode::Terminal;
+
+        for (source_id, row_offset, logical_row, issue) in [(79, 0, 1, 400), (80, 6, 6, 401)] {
+            let uri = format!("https://github.com/ogulcancelik/herdr/issues/{issue}");
+            app.state.workspaces[0].tabs[0].runtimes[&child].test_process_pty_bytes(
+                format!(
+                    "\x1b[2J\x1b[{};1H\x1b]8;;{uri}\x1b\\label\x1b]8;;\x1b\\",
+                    logical_row + 1
+                )
+                .as_bytes(),
+            );
+            let preview = clip_entered_preview(&mut app, child, row_offset, 2);
+            let commands_before = app.state.plugin_command_logs.len();
+
+            ctrl_click(
+                &mut app,
+                source_id,
+                preview.x,
+                preview.y + logical_row - row_offset,
+            );
+
+            assert_eq!(app.state.plugin_command_logs.len(), commands_before + 1);
+            assert_eq!(
+                app.state
+                    .plugin_command_logs
+                    .last()
+                    .map(|log| log.plugin_id.as_str()),
+                Some("example.links")
+            );
+            assert!(rx.try_recv().is_err(), "URL gesture must not reach the PTY");
+        }
+    }
+
+    #[tokio::test]
+    async fn entered_preview_routes_horizontal_motion_buttons_and_right_passthrough() {
+        let (mut app, _collection, child, mut rx) =
+            collection_scroll_app(b"\x1b[?1003h\x1b[?1006h", 0);
+        let preview = app.state.view.collection_layouts[0].rows[0]
+            .preview_rect
+            .expect("preview");
+
+        for kind in [
+            MouseEventKind::Moved,
+            MouseEventKind::Down(MouseButton::Middle),
+            MouseEventKind::Up(MouseButton::Middle),
+            MouseEventKind::ScrollLeft,
+        ] {
+            assert!(app.handle_collection_mouse(mouse(kind, preview.x, preview.y)));
+            assert!(rx.try_recv().is_ok(), "{kind:?} must reach the child PTY");
+        }
+
+        app.state.right_click_passthrough_modifiers = Some(KeyModifiers::CONTROL);
+        for kind in [
+            MouseEventKind::Down(MouseButton::Right),
+            MouseEventKind::Drag(MouseButton::Right),
+            MouseEventKind::Up(MouseButton::Right),
+        ] {
+            let mut event = mouse(kind, preview.x, preview.y);
+            event.modifiers = KeyModifiers::CONTROL;
+            assert!(app.handle_collection_mouse(event));
+            assert!(rx.try_recv().is_ok(), "{kind:?} must reach the child PTY");
+        }
+        assert!(app.state.right_click_passthrough.is_none());
+        assert!(app.state.context_menu.is_none());
+        assert_eq!(
+            app.state.workspaces[0].focused_pane_id(),
+            Some(child),
+            "preview routing must retain typed child focus"
+        );
+    }
+
+    #[tokio::test]
+    async fn clipped_preview_right_passthrough_keeps_transform_over_preview_chrome_and_outside() {
+        let (mut app, _collection, child, mut rx) =
+            collection_scroll_app(b"\x1b[?1003h\x1b[?1006h", 0);
+        let preview = clip_entered_preview(&mut app, child, 5, 2);
+        let chrome = app.state.view.collection_layouts[0]
+            .hits
+            .iter()
+            .find(|hit| hit.kind == CollectionHitKind::Chrome)
+            .map(|hit| (hit.rect.x, hit.rect.y))
+            .expect("collection chrome");
+        let logical_rows = app.state.view.collection_layouts[0].rows[0]
+            .preview_size
+            .expect("logical preview size")
+            .0;
+        let layout_rect = app.state.view.collection_layouts[0].rect;
+        let outside = (preview.x + 3, layout_rect.bottom().saturating_add(2));
+        app.state.right_click_passthrough_modifiers = Some(KeyModifiers::CONTROL);
+
+        let events = [
+            (
+                MouseEventKind::Down(MouseButton::Right),
+                preview.x + 1,
+                preview.y,
+            ),
+            (
+                MouseEventKind::Drag(MouseButton::Right),
+                preview.x + 2,
+                preview.y + 1,
+            ),
+            (MouseEventKind::Drag(MouseButton::Right), chrome.0, chrome.1),
+            (MouseEventKind::Up(MouseButton::Right), outside.0, outside.1),
+        ];
+        for (kind, column, row) in events {
+            let mut event = mouse(kind, column, row);
+            event.modifiers = KeyModifiers::CONTROL;
+            app.handle_mouse_from_input_source(91, event);
+        }
+
+        let expected_cell = |column: u16, row: u16| {
+            (
+                column.saturating_sub(preview.x).saturating_add(1),
+                row.saturating_add(5)
+                    .saturating_sub(preview.y)
+                    .saturating_add(1)
+                    .min(logical_rows),
+            )
+        };
+        let preview_down = expected_cell(preview.x + 1, preview.y);
+        let preview_drag = expected_cell(preview.x + 2, preview.y + 1);
+        let chrome_drag = expected_cell(chrome.0, chrome.1);
+        let outside_up = expected_cell(outside.0, outside.1);
+        assert_eq!(
+            rx.try_recv().expect("preview down"),
+            Bytes::from(format!("\x1b[<2;{};{}M", preview_down.0, preview_down.1))
+        );
+        assert_eq!(
+            rx.try_recv().expect("preview drag"),
+            Bytes::from(format!("\x1b[<34;{};{}M", preview_drag.0, preview_drag.1))
+        );
+        assert_eq!(
+            rx.try_recv().expect("chrome drag"),
+            Bytes::from(format!("\x1b[<34;{};{}M", chrome_drag.0, chrome_drag.1))
+        );
+        assert_eq!(
+            rx.try_recv().expect("outside up"),
+            Bytes::from(format!("\x1b[<2;{};{}m", outside_up.0, outside_up.1))
+        );
+        assert!(rx.try_recv().is_err());
+        assert!(app.state.right_click_passthrough.is_none());
+        assert!(app.state.context_menu.is_none());
+    }
+
+    #[tokio::test]
+    async fn pane_only_mouse_path_routes_entered_preview_but_not_collection_chrome() {
+        let (mut app, collection, _child, mut rx) =
+            collection_scroll_app(b"\x1b[?1003h\x1b[?1006h", 0);
+        let layout = &app.state.view.collection_layouts[0];
+        let preview = layout.rows[0].preview_rect.expect("preview");
+        let chrome = layout.rows[0].row_rect;
+
+        app.state.handle_pane_mouse_only(
+            &app.terminal_runtimes,
+            mouse(MouseEventKind::Moved, preview.x, preview.y),
+        );
+        assert!(rx.try_recv().is_ok());
+        app.state.handle_pane_mouse_only(
+            &app.terminal_runtimes,
+            mouse(MouseEventKind::ScrollRight, preview.x, preview.y),
+        );
+        assert!(rx.try_recv().is_ok());
+        app.state.handle_pane_mouse_only(
+            &app.terminal_runtimes,
+            mouse(MouseEventKind::Moved, chrome.x, chrome.y),
+        );
+        assert!(
+            rx.try_recv().is_err(),
+            "collection row chrome must stay isolated"
+        );
+        assert_eq!(app.state.collection_views[&collection].scroll, 0);
     }
 
     #[tokio::test]

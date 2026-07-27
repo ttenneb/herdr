@@ -275,6 +275,7 @@ fn restore_with_imports_and_failures(
     let mut terminals = HashMap::new();
     let mut terminal_runtimes = HashMap::new();
     let mut resumed_agent_sessions = HashSet::new();
+    let mut claimed_collection_ids = HashSet::new();
     let mut pane_id_map = HashMap::new();
     let mut failed_imports = 0;
     for (idx, ws_snap) in snapshot.workspaces.iter().enumerate() {
@@ -293,6 +294,7 @@ fn restore_with_imports_and_failures(
             cols,
             &runtime_context,
             &mut resumed_agent_sessions,
+            &mut claimed_collection_ids,
             imported_panes,
         );
         failed_imports += workspace_failed_imports;
@@ -366,6 +368,7 @@ fn restore_workspace(
     cols: u16,
     runtime_context: &RestoreRuntimeContext<'_>,
     resumed_agent_sessions: &mut HashSet<String>,
+    claimed_collection_ids: &mut HashSet<CollectionId>,
     imported_panes: &mut HashMap<u32, crate::handoff_runtime::ImportedHandoffRuntime>,
 ) -> RestoreFailures<Option<RestoredWorkspace>> {
     let mut tabs = Vec::new();
@@ -421,6 +424,7 @@ fn restore_workspace(
             cols,
             runtime_context,
             resumed_agent_sessions,
+            claimed_collection_ids,
             imported_panes,
             &public_pane_ids_by_old_raw,
         );
@@ -512,6 +516,7 @@ fn restore_tab(
     cols: u16,
     runtime_context: &RestoreRuntimeContext<'_>,
     resumed_agent_sessions: &mut HashSet<String>,
+    claimed_collection_ids: &mut HashSet<CollectionId>,
     imported_panes: &mut HashMap<u32, crate::handoff_runtime::ImportedHandoffRuntime>,
     public_pane_ids_by_old_raw: &HashMap<u32, String>,
 ) -> RestoreFailures<Option<RestoredTab>> {
@@ -747,7 +752,13 @@ fn restore_tab(
     }
 
     let surviving: HashSet<PaneId> = panes.keys().copied().collect();
-    let Some(layout) = recover_typed_layout(snap, typed_node, &id_map, &surviving) else {
+    let Some(layout) = recover_typed_layout_with_claims(
+        snap,
+        typed_node,
+        &id_map,
+        &surviving,
+        claimed_collection_ids,
+    ) else {
         warn!(
             tab = ?snap.custom_name,
             "restored tab lost all panes and collections while recovering typed layout"
@@ -916,11 +927,22 @@ fn restore_typed_node_remapped(snap: &TabSnapshot) -> (TypedNode, HashMap<u32, P
     (remap(&snap.layout, &id_map), id_map)
 }
 
+#[cfg(test)]
 fn recover_typed_layout(
     snap: &TabSnapshot,
     node: TypedNode,
     id_map: &HashMap<u32, PaneId>,
     surviving: &HashSet<PaneId>,
+) -> Option<TileLayout> {
+    recover_typed_layout_with_claims(snap, node, id_map, surviving, &mut HashSet::new())
+}
+
+fn recover_typed_layout_with_claims(
+    snap: &TabSnapshot,
+    node: TypedNode,
+    id_map: &HashMap<u32, PaneId>,
+    surviving: &HashSet<PaneId>,
+    claimed_collection_ids: &mut HashSet<CollectionId>,
 ) -> Option<TileLayout> {
     let mut records: HashMap<CollectionId, &CollectionSnapshot> = HashMap::new();
     for record in &snap.collections {
@@ -932,12 +954,15 @@ fn recover_typed_layout(
         surviving: &HashSet<PaneId>,
         records: &HashMap<CollectionId, &CollectionSnapshot>,
         collection_leaves: &mut HashSet<CollectionId>,
+        claimed_collection_ids: &mut HashSet<CollectionId>,
     ) -> Option<TypedNode> {
         match node {
             TypedNode::Leaf(LayoutLeaf::Pane(id)) => surviving
                 .contains(&id)
                 .then_some(TypedNode::Leaf(LayoutLeaf::Pane(id))),
             TypedNode::Leaf(LayoutLeaf::Collection(id)) => (records.contains_key(&id)
+                && !collection_leaves.contains(&id)
+                && claimed_collection_ids.insert(id)
                 && collection_leaves.insert(id))
             .then_some(TypedNode::Leaf(LayoutLeaf::Collection(id))),
             TypedNode::Split {
@@ -946,8 +971,20 @@ fn recover_typed_layout(
                 first,
                 second,
             } => match (
-                prune(*first, surviving, records, collection_leaves),
-                prune(*second, surviving, records, collection_leaves),
+                prune(
+                    *first,
+                    surviving,
+                    records,
+                    collection_leaves,
+                    claimed_collection_ids,
+                ),
+                prune(
+                    *second,
+                    surviving,
+                    records,
+                    collection_leaves,
+                    claimed_collection_ids,
+                ),
             ) {
                 (Some(first), Some(second)) => Some(TypedNode::Split {
                     direction,
@@ -961,7 +998,13 @@ fn recover_typed_layout(
         }
     }
 
-    let mut root = prune(node, surviving, &records, &mut collection_leaves);
+    let mut root = prune(
+        node,
+        surviving,
+        &records,
+        &mut collection_leaves,
+        claimed_collection_ids,
+    );
     let mut placed = HashSet::new();
     fn collect_tiled(node: &TypedNode, placed: &mut HashSet<PaneId>) {
         match node {
@@ -1287,6 +1330,94 @@ mod tests {
         assert_eq!(layout.pane_ids().len(), 2);
         assert_eq!(layout.tiled_pane_ids().len(), 2);
         assert_eq!(layout.collections().count(), 0);
+    }
+
+    #[tokio::test]
+    async fn duplicate_collection_ids_across_tabs_and_workspaces_promote_conflicting_members() {
+        let cwd = std::env::current_dir().unwrap();
+        let collection = CollectionId::alloc().expect("collection id");
+        let collection_tab = |old_pane| {
+            tab_snapshot(
+                LayoutSnapshot::Collection(collection),
+                vec![CollectionSnapshot {
+                    id: collection,
+                    label: Some(format!("helpers-{old_pane}")),
+                    members: vec![old_pane],
+                    selected: Some(old_pane),
+                    archived: Vec::new(),
+                }],
+                HashMap::from([(old_pane, pane_snapshot(&cwd))]),
+            )
+        };
+        let workspace = |id: &str, tabs: Vec<TabSnapshot>| WorkspaceSnapshot {
+            id: Some(id.into()),
+            custom_name: None,
+            identity_cwd: cwd.clone(),
+            worktree_space: None,
+            public_pane_numbers: HashMap::new(),
+            next_public_pane_number: 1,
+            public_tab_numbers: (1..=tabs.len()).collect(),
+            next_public_tab_number: tabs.len() + 1,
+            tabs,
+            active_tab: 0,
+        };
+        let snapshot = SessionSnapshot {
+            version: super::super::snapshot::SNAPSHOT_VERSION,
+            workspaces: vec![
+                workspace(
+                    "duplicate-tabs",
+                    vec![collection_tab(10), collection_tab(20)],
+                ),
+                workspace("duplicate-workspace", vec![collection_tab(30)]),
+            ],
+            active: Some(0),
+            selected: 0,
+            sidebar_width: None,
+            sidebar_section_split: None,
+            collapsed_space_keys: Default::default(),
+            delegations: Vec::new(),
+            collection_archive_times: Vec::new(),
+        };
+        let (events, _event_rx) = mpsc::channel(4);
+
+        let (workspaces, _delegations, _archive_times, terminals, runtimes) = restore(
+            &snapshot,
+            None,
+            24,
+            80,
+            0,
+            test_restore_shell(),
+            crate::config::ShellModeConfig::NonLogin,
+            false,
+            events,
+            Arc::new(Notify::new()),
+            Arc::new(AtomicBool::new(false)),
+        );
+
+        assert_eq!(workspaces.len(), 2);
+        assert_eq!(workspaces[0].tabs.len(), 2);
+        assert!(workspaces[0].tabs[0].collection(collection).is_some());
+        assert_eq!(workspaces[0].tabs[0].layout.tiled_pane_ids().len(), 0);
+        for tab in [&workspaces[0].tabs[1], &workspaces[1].tabs[0]] {
+            assert!(tab.collection(collection).is_none());
+            assert_eq!(tab.panes.len(), 1);
+            assert_eq!(tab.layout.tiled_pane_ids().len(), 1);
+        }
+        assert_eq!(terminals.len(), 3);
+        assert_eq!(runtimes.len(), 3);
+        let collection_count = workspaces
+            .iter()
+            .flat_map(|workspace| &workspace.tabs)
+            .flat_map(|tab| tab.layout.collection_ids())
+            .count();
+        assert_eq!(collection_count, 1);
+
+        let mut state = crate::app::AppState::test_new();
+        state.workspaces = workspaces;
+        state.active = Some(0);
+        state.selected = 0;
+        state.terminals = terminals;
+        state.assert_invariants_for_test();
     }
 
     #[test]
