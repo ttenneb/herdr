@@ -52,6 +52,16 @@ pub(crate) struct ClientConnection {
     pub(crate) raw_input: crate::raw_input::RawInputFramer,
     /// Monotonic activity stamp used to choose the fallback foreground client.
     pub(crate) last_activity: u64,
+    /// Full-app presentation state local to this attached client.
+    pub(crate) collection_views: std::collections::HashMap<
+        crate::layout::CollectionId,
+        crate::app::collection_view::CollectionViewState,
+    >,
+    /// Destructive collection prompt state belongs to the client that opened it.
+    pub(crate) pending_collection_close:
+        Option<crate::app::collection_view::PendingCollectionClose>,
+    /// Modal mode paired with `pending_collection_close` while this client is backgrounded.
+    pub(crate) collection_close_mode: Option<crate::app::Mode>,
     /// Render baseline for the negotiated client encoding.
     pub(crate) render_state: ClientRenderState,
     /// Client-local host Kitty graphics cache.
@@ -123,6 +133,9 @@ impl ClientConnection {
             outer_terminal_focus,
             raw_input: crate::raw_input::RawInputFramer::default(),
             last_activity,
+            collection_views: Default::default(),
+            pending_collection_close: None,
+            collection_close_mode: None,
             render_state: ClientRenderState::new(render_encoding),
             graphics_cache: crate::kitty_graphics::HostGraphicsCache::default(),
             graphics_surface_reset_pending: false,

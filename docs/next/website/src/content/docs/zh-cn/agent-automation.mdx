@@ -5,11 +5,13 @@ description: 使用 Herdr 的布局、窗格和智能体原语,从脚本或其�
 
 Herdr 可以作为编码智能体的自动化层。脚本可以控制智能体,一个智能体也可以给其他智能体分配工作、检查状态并收集结果。关键是为任务选择正确的原语。
 
-## 三种原语
+## 编排原语
 
 | 原语 | 职责 |
 | --- | --- |
 | 布局（`workspace`、`tab` 和窗格拓扑） | 创建和组织终端位置。 |
+| 集合 | 把多个真实窗格放进一个可滚动叶节点。 |
+| 委派 | 独立于位置记录父级、用途和兄弟顺序。 |
 | 窗格 | 控制原始终端:运行命令、发送输入、读取输出和等待输出。 |
 | 智能体 | 按名称或窗格以及生命周期状态控制已识别的编码智能体。 |
 
@@ -75,11 +77,27 @@ herdr agent rename w1:p2 reviewer
 
 `agent prompt --wait` 会立即提交提示。智能体从非 working 状态开始时，Herdr 首先要求在五秒内观察到生命周期变化。如果状态序列没有前进，它会返回 `agent_prompt_stalled`，而不是无限等待；调用方设置的 `--timeout` 不超过五秒时，仍返回普通的 `timeout` 错误。观察到活动后，它会等待请求的稳定状态。它不会跟踪单独的轮次。如果智能体已经处于 working，当前轮次的完成可能满足等待。独立的 `agent wait` 会观察当前智能体；如果状态已经匹配，就会立即返回。两者默认匹配 `idle`、`done` 或 `blocked`。可以重复使用 `--until` 接受多个精确状态，例如 `--until idle --until done`；需要 `unknown` 时请明确使用 `--until unknown`。在 `agent prompt` 中，`--until` 必须与 `--wait` 一起使用。
 
-`idle` 表示智能体正等待输入,且其标签页已在聚焦的 Herdr 界面中显示。`done` 是相同的底层 idle 状态,但用于后台工作完成后,直到该标签页获得焦点或 `pane focus` / `agent focus` 指向它。仅通过 CLI 读取不会把它标记为已查看。`blocked` 表示 Herdr 识别到了审批或提问界面。`unknown` 表示智能体存在,但 Herdr 无法可靠判断其生命周期;它不代表工作成功完成。区别重要时,请指定精确的 `--until` 状态。
+`idle` 表示智能体正等待输入,且已被前台的人类用户查看。`done` 是未查看工作后的相同底层 idle 状态。普通窗格只有在其标签页实际显示于前台 Herdr 界面时才会标记为已查看。CLI 的 `pane focus`、`agent focus`、读取和等待都不会确认它。`blocked` 表示 Herdr 识别到了审批或提问界面。`unknown` 表示智能体存在,但 Herdr 无法可靠判断其生命周期;它不代表工作成功完成。区别重要时,请指定精确的 `--until` 状态。
 
 `pane wait-output` 不解释智能体生命周期。它轮询选定的终端快照并立即进行第一次搜索,所以已经存在的文本也会匹配。默认来源名是 `recent`;匹配时会把最近 80 个已渲染终端行作为未折行输出处理。`--lines` 可以修改这个行数限制;`--regex` 使用 Rust 正则表达式语法并逐行匹配。
 
 在 CLI 中,`pane read` 和 `agent read` 都直接打印终端文本。默认输出去除 ANSI 转义的 UTF-8 文本;来源包含样式时,使用 `--format ansi` 或 `--ansi` 保留终端转义。`detection` 来源始终是纯文本。对 recent 类来源,`--lines N` 会在可选的取消折行之前选择最后 N 个已渲染终端行;省略时默认读取 80 行。对 `visible` 和 `detection`,省略 `--lines` 会返回完整快照,指定时保留按换行分隔的最后 N 行。socket API 在 `.result.read.text` 返回文本。
+
+## 分组智能体编排
+
+用集合避免每个辅助智能体占一个顶层分割窗格;用委派让父子关系在移动与归档后保留。
+
+```bash
+parent=$(herdr delegation create --pane "$HERDR_PANE_ID" --purpose primary)
+parent_id=$(printf '%s\n' "$parent" | jq -r '.result.delegation.delegation_id')
+created=$(herdr collection create --target-pane "$HERDR_PANE_ID" --direction right --label helpers --no-focus)
+collection_id=$(printf '%s\n' "$created" | jq -r '.result.collection.collection_id')
+child=$(herdr collection member-create "$collection_id" --cwd "$PWD" --parent "$parent_id" --purpose review)
+child_pane=$(printf '%s\n' "$child" | jq -r '.result.created.pane.pane_id')
+herdr agent start reviewer --kind codex --pane "$child_pane"
+```
+
+复用同一集合,不要从 `done` / `idle` / 退出推断成功,只在验证结果后显式归档。读取、等待、选择和 API 聚焦不会确认子成员。移除时选择保留进程的 `--promote-members` 或关闭全部 PTY 的 `--cascade-close`;不要只因 idle 或 done 就级联关闭。
 
 ## 已知注意事项:备用屏幕输出
 

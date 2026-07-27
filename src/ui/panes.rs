@@ -6,7 +6,9 @@ use ratatui::{
     Frame,
 };
 
-use super::scrollbar::{render_pane_scrollbar, should_show_scrollbar};
+use super::scrollbar::{
+    render_pane_scrollbar, reserve_terminal_scrollbar_gutter, should_show_scrollbar,
+};
 #[cfg(test)]
 use super::text::display_width;
 use super::text::truncate_end;
@@ -32,16 +34,7 @@ fn pane_border_title(label: &str, pane_width: u16, _focused: bool) -> Option<Str
 }
 
 fn stable_terminal_inner_rect(pane_inner: Rect) -> Rect {
-    if pane_inner.width <= 4 {
-        return pane_inner;
-    }
-
-    Rect::new(
-        pane_inner.x,
-        pane_inner.y,
-        pane_inner.width.saturating_sub(1),
-        pane_inner.height,
-    )
+    reserve_terminal_scrollbar_gutter(pane_inner).0
 }
 
 pub(crate) fn pane_inner_rect(area: Rect, borders: Borders) -> Rect {
@@ -144,20 +137,11 @@ fn runtime_for_tab_pane<'a>(
 }
 
 fn stable_scrollbar_gutter(rt: &TerminalRuntime, pane_inner: Rect) -> (Rect, Option<Rect>) {
-    let inner_rect = stable_terminal_inner_rect(pane_inner);
-    if inner_rect == pane_inner {
-        return (inner_rect, None);
-    }
-    let gutter = Rect::new(
-        pane_inner.x + pane_inner.width.saturating_sub(1),
-        pane_inner.y,
-        1,
-        pane_inner.height,
-    );
+    let (inner_rect, gutter) = reserve_terminal_scrollbar_gutter(pane_inner);
     let scrollbar_rect = rt
         .scroll_metrics()
         .filter(|metrics| should_show_scrollbar(*metrics))
-        .map(|_| gutter);
+        .and(gutter);
 
     (inner_rect, scrollbar_rect)
 }
@@ -170,9 +154,17 @@ pub(super) fn resize_tab_panes(
     area: Rect,
     cell_size: crate::kitty_graphics::HostCellSize,
 ) {
-    let multi_pane = tab.layout.pane_count() > 1;
+    let multi_pane = tab.layout.leaf_count() > 1;
 
     if tab.zoomed {
+        if matches!(
+            tab.layout.focused_leaf(),
+            crate::layout::LayoutLeaf::Collection(_)
+        ) {
+            // A collection owns its own foreground preview geometry. Background tabs keep the
+            // last accepted member sizes instead of treating a selected member as a tiled pane.
+            return;
+        }
         let focused_id = tab.layout.focused();
         if let Some((terminal_id, rt)) = runtime_for_tab_pane(terminal_runtimes, tab, focused_id) {
             let borders = if multi_pane && app.pane_borders {
@@ -226,9 +218,15 @@ pub(super) fn compute_pane_infos(
         return Vec::new();
     };
 
-    let multi_pane = ws.layout.pane_count() > 1;
+    let multi_pane = ws.layout.leaf_count() > 1;
 
     if ws.zoomed {
+        if matches!(
+            ws.layout.focused_leaf(),
+            crate::layout::LayoutLeaf::Collection(_)
+        ) {
+            return Vec::new();
+        }
         let focused_id = ws.layout.focused();
         let borders = if multi_pane && app.pane_borders {
             Borders::ALL
@@ -307,7 +305,7 @@ pub(super) fn render_panes(
         return;
     };
 
-    let multi_pane = ws.layout.pane_count() > 1;
+    let multi_pane = ws.layout.leaf_count() > 1;
     let terminal_active = app.mode == Mode::Terminal;
 
     for info in pane_infos {
@@ -1010,7 +1008,7 @@ mod tests {
         app.mode = Mode::Terminal;
         app.view.terminal_area = Rect::new(0, 0, 12, 3);
         let ws = Workspace::test_new("test");
-        let pane_id = ws.tabs[0].root_pane;
+        let pane_id = ws.tabs[0].root_pane.expect("test tab has root pane");
         app.view.pane_infos = vec![PaneInfo {
             id: pane_id,
             rect: Rect::new(0, 0, 12, 3),
@@ -1040,7 +1038,7 @@ mod tests {
     #[test]
     fn default_horizontal_split_uses_one_shared_divider_column() {
         let mut workspace = Workspace::test_new("test");
-        let root = workspace.tabs[0].root_pane;
+        let root = workspace.tabs[0].root_pane.expect("test tab has root pane");
         let right = workspace.test_split(ratatui::layout::Direction::Horizontal);
         workspace.tabs[0].layout.focus_pane(root);
 
@@ -1060,7 +1058,7 @@ mod tests {
     #[test]
     fn default_vertical_split_uses_one_shared_divider_row() {
         let mut workspace = Workspace::test_new("test");
-        let root = workspace.tabs[0].root_pane;
+        let root = workspace.tabs[0].root_pane.expect("test tab has root pane");
         let bottom = workspace.test_split(ratatui::layout::Direction::Vertical);
         workspace.tabs[0].layout.focus_pane(root);
 
@@ -1080,7 +1078,7 @@ mod tests {
     #[test]
     fn pane_gaps_keep_independent_bordered_panes() {
         let mut workspace = Workspace::test_new("test");
-        let root = workspace.tabs[0].root_pane;
+        let root = workspace.tabs[0].root_pane.expect("test tab has root pane");
         let right = workspace.test_split(ratatui::layout::Direction::Horizontal);
         workspace.tabs[0].layout.focus_pane(root);
 
@@ -1100,7 +1098,7 @@ mod tests {
     #[test]
     fn borderless_pane_gaps_add_one_empty_cell_between_panes() {
         let mut workspace = Workspace::test_new("test");
-        let root = workspace.tabs[0].root_pane;
+        let root = workspace.tabs[0].root_pane.expect("test tab has root pane");
         let right = workspace.test_split(ratatui::layout::Direction::Horizontal);
         workspace.tabs[0].layout.focus_pane(root);
 
@@ -1246,7 +1244,7 @@ mod tests {
     async fn pane_scrollbar_gutter_is_reserved_before_scrollback_exists() {
         let mut app = AppState::test_new();
         let mut workspace = Workspace::test_new("test");
-        let root_pane = workspace.tabs[0].root_pane;
+        let root_pane = workspace.tabs[0].root_pane.expect("test tab has root pane");
         workspace.tabs[0].runtimes.insert(
             root_pane,
             TerminalRuntime::test_with_scrollback_bytes(40, 8, 1024, b"ready\n"),
@@ -1275,7 +1273,7 @@ mod tests {
         let mut app = AppState::test_new();
         let mut workspace = Workspace::test_new("test");
         workspace.zoomed = true;
-        let root_pane = workspace.tabs[0].root_pane;
+        let root_pane = workspace.tabs[0].root_pane.expect("test tab has root pane");
         workspace.tabs[0].runtimes.insert(
             root_pane,
             TerminalRuntime::test_with_scrollback_bytes(40, 8, 1024, b"ready\n"),
@@ -1333,7 +1331,7 @@ mod tests {
     async fn tiny_pane_does_not_reserve_scrollbar_gutter() {
         let mut app = AppState::test_new();
         let mut workspace = Workspace::test_new("test");
-        let root_pane = workspace.tabs[0].root_pane;
+        let root_pane = workspace.tabs[0].root_pane.expect("test tab has root pane");
         workspace.tabs[0].runtimes.insert(
             root_pane,
             TerminalRuntime::test_with_scrollback_bytes(4, 8, 1024, b"ready\n"),
@@ -1361,7 +1359,7 @@ mod tests {
     async fn pane_scrollbar_reserves_last_column_from_terminal_area() {
         let mut app = AppState::test_new();
         let mut workspace = Workspace::test_new("test");
-        let root_pane = workspace.tabs[0].root_pane;
+        let root_pane = workspace.tabs[0].root_pane.expect("test tab has root pane");
         workspace.tabs[0].runtimes.insert(
             root_pane,
             TerminalRuntime::test_with_scrollback_bytes(

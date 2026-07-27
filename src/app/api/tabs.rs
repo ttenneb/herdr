@@ -93,9 +93,9 @@ impl App {
             Ok((tab_idx, terminal, runtime)) => {
                 self.terminal_runtimes.insert(terminal.id.clone(), runtime);
                 self.state.terminals.insert(terminal.id.clone(), terminal);
-                self.state.remove_alias_shadowed_by_new_pane(
-                    self.state.workspaces[ws_idx].tabs[tab_idx].root_pane,
-                );
+                if let Some(root_pane) = self.state.workspaces[ws_idx].tabs[tab_idx].root_pane {
+                    self.state.remove_alias_shadowed_by_new_pane(root_pane);
+                }
                 if let Some(label) = label {
                     let workspace_id = self.state.workspaces[ws_idx].id.clone();
                     let tab_id = self.public_tab_id(ws_idx, tab_idx).unwrap_or_else(|| {
@@ -238,6 +238,23 @@ impl App {
             .and_then(|ws| ws.tabs.get(tab_idx))
             .map(|tab| tab.layout.pane_ids())
             .unwrap_or_default();
+        let public_panes = pane_ids
+            .iter()
+            .filter_map(|pane_id| {
+                self.public_pane_id(ws_idx, *pane_id)
+                    .map(|id| (*pane_id, id))
+            })
+            .collect::<Vec<_>>();
+        let closed_collections = self.state.workspaces[ws_idx].tabs[tab_idx]
+            .layout
+            .collection_ids()
+            .into_iter()
+            .filter_map(|collection_id| {
+                self.state.workspaces[ws_idx].tabs[tab_idx]
+                    .collection(collection_id)
+                    .map(|collection| (collection_id, collection.members().to_vec()))
+            })
+            .collect::<Vec<_>>();
         let Some(ws) = self.state.workspaces.get_mut(ws_idx) else {
             return tab_not_found(id, &target.tab_id);
         };
@@ -255,10 +272,41 @@ impl App {
                 format!("tab {} could not be closed", target.tab_id),
             );
         }
-        self.state.remove_plugin_pane_records(pane_ids);
+        let destruction = self.state.finalize_pane_destruction(pane_ids);
         self.state.remove_unattached_terminal_ids(terminal_ids);
         self.shutdown_detached_terminal_runtimes();
         self.schedule_session_save();
+        for (collection_id, members) in closed_collections {
+            for pane_id in members {
+                if let Some((_, public)) = public_panes.iter().find(|(id, _)| *id == pane_id) {
+                    self.emit_event(EventEnvelope {
+                        event: EventKind::CollectionMemberRemoved,
+                        data: EventData::CollectionMemberRemoved {
+                            collection_id: super::collections::collection_id_string(collection_id),
+                            pane_id: public.clone(),
+                        },
+                    });
+                }
+            }
+            self.emit_event(EventEnvelope {
+                event: EventKind::CollectionClosed,
+                data: EventData::CollectionClosed {
+                    collection_id: super::collections::collection_id_string(collection_id),
+                    workspace_id: workspace_id.clone(),
+                    tab_id: tab_id.clone(),
+                },
+            });
+        }
+        for (_, pane_id) in &public_panes {
+            self.emit_event(EventEnvelope {
+                event: EventKind::PaneClosed,
+                data: EventData::PaneClosed {
+                    pane_id: pane_id.clone(),
+                    workspace_id: workspace_id.clone(),
+                },
+            });
+        }
+        self.emit_pane_destruction_events(destruction, &public_panes);
         self.emit_event(EventEnvelope {
             event: EventKind::TabClosed,
             data: EventData::TabClosed {
@@ -316,7 +364,9 @@ mod tests {
         app.state.workspaces = vec![workspace];
         app.state.active = Some(0);
         app.state.selected = 0;
-        let moved_root = app.state.workspaces[0].tabs[0].root_pane;
+        let moved_root = app.state.workspaces[0].tabs[0]
+            .root_pane
+            .expect("test tab has root pane");
         let moved_id = app.public_tab_id(0, 0).unwrap();
 
         let response = app.handle_tab_move(
@@ -331,7 +381,12 @@ mod tests {
         let ResponseResult::TabList { tabs } = success.result else {
             panic!("expected tab list");
         };
-        assert_eq!(app.state.workspaces[0].tabs[2].root_pane, moved_root);
+        assert_eq!(
+            app.state.workspaces[0].tabs[2]
+                .root_pane
+                .expect("test tab has root pane"),
+            moved_root
+        );
         assert_eq!(tabs[2].tab_id, app.public_tab_id(0, 2).unwrap());
         let events = event_hub.events_after(0);
         assert!(events.iter().any(|(_, event)| {
@@ -347,6 +402,77 @@ mod tests {
                     && tabs[2].tab_id == moved_id
             )
         }));
+    }
+
+    #[test]
+    fn tab_close_emits_every_pane_and_child_lifecycle_before_tab_closed() {
+        let event_hub = crate::api::EventHub::default();
+        let (_api_tx, api_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = App::new(&Config::default(), true, None, api_rx, event_hub.clone());
+        let mut workspace = Workspace::test_new("tab-close-events");
+        let tiled = workspace.tabs[0].root_pane.expect("root pane");
+        let collected = workspace.test_split(ratatui::layout::Direction::Horizontal);
+        let collection = workspace
+            .create_collection_near(
+                0,
+                crate::layout::LayoutLeaf::Pane(tiled),
+                ratatui::layout::Direction::Vertical,
+                0.5,
+                None,
+            )
+            .expect("collection");
+        workspace
+            .collect_pane(collected, collection)
+            .expect("collect pane");
+        workspace.test_add_tab(Some("keep"));
+        app.state.workspaces = vec![workspace];
+        app.state.ensure_test_terminals();
+        app.state
+            .delegations
+            .create(Some(collected), None, Some("child".into()))
+            .expect("delegation");
+        let tab_id = app.public_tab_id(0, 0).expect("tab id");
+        let expected_panes = [tiled, collected]
+            .into_iter()
+            .map(|pane| app.public_pane_id(0, pane).expect("pane id"))
+            .collect::<std::collections::HashSet<_>>();
+
+        let response = app.handle_tab_close("close".into(), TabTarget { tab_id });
+
+        let _: SuccessResponse = serde_json::from_str(&response).expect("success");
+        let events = event_hub.events_after(0);
+        let tab_closed = events
+            .iter()
+            .position(|(_, event)| event.event == EventKind::TabClosed)
+            .expect("tab.closed");
+        let closed_panes = events
+            .iter()
+            .enumerate()
+            .filter_map(|(position, (_, event))| match &event.data {
+                EventData::PaneClosed { pane_id, .. } => Some((position, pane_id.clone())),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            closed_panes
+                .iter()
+                .map(|(_, pane)| pane.clone())
+                .collect::<std::collections::HashSet<_>>(),
+            expected_panes
+        );
+        assert!(closed_panes
+            .iter()
+            .all(|(position, _)| *position < tab_closed));
+        for kind in [
+            EventKind::CollectionMemberRemoved,
+            EventKind::CollectionClosed,
+            EventKind::DelegationTombstoned,
+            EventKind::DelegationGarbageCollected,
+        ] {
+            assert!(events[..tab_closed]
+                .iter()
+                .any(|(_, event)| event.event == kind));
+        }
     }
 
     #[test]
@@ -388,7 +514,7 @@ mod tests {
         app.state.default_shell = exiting_test_command().into();
         app.state.shell_mode = ShellModeConfig::NonLogin;
         let workspace = Workspace::test_new("tabs");
-        let focused_pane = workspace.tabs[0].root_pane;
+        let focused_pane = workspace.tabs[0].root_pane.expect("test tab has root pane");
         app.state.workspaces = vec![workspace];
         app.state.active = Some(0);
         app.state.selected = 0;
@@ -414,7 +540,9 @@ mod tests {
         let success: SuccessResponse = serde_json::from_str(&response).unwrap();
         assert!(matches!(success.result, ResponseResult::TabCreated { .. }));
         let created = &app.state.workspaces[0].tabs[1];
-        let created_terminal_id = created.terminal_id(created.root_pane).unwrap();
+        let created_terminal_id = created
+            .terminal_id(created.root_pane.expect("test tab has root pane"))
+            .unwrap();
         let created_cwd = &app.state.terminals.get(created_terminal_id).unwrap().cwd;
         assert_eq!(
             crate::worktree::canonical_or_original(created_cwd),

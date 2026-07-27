@@ -42,6 +42,8 @@ impl App {
         } else {
             let snapshot = crate::persist::capture(
                 &self.state.workspaces,
+                &self.state.delegations,
+                &self.state.collection_archive_times,
                 &self.state.terminals,
                 &self.terminal_runtimes,
                 self.state.active,

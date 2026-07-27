@@ -91,7 +91,9 @@ mod tests {
             .workspaces
             .push(crate::workspace::Workspace::test_new("stale"));
         state.ensure_test_terminals();
-        let root = state.workspaces[0].tabs[0].root_pane;
+        let root = state.workspaces[0].tabs[0]
+            .root_pane
+            .expect("test tab has root pane");
         let terminal_id = state.workspaces[0].terminal_id(root).cloned().unwrap();
         let temp_root = std::env::temp_dir().join(format!(
             "herdr-forwarded-toast-context-{}-{}",

@@ -638,7 +638,7 @@ mod tests {
             crate::api::EventHub::default(),
         );
         let ws = Workspace::test_new("test");
-        let pane_id = ws.tabs[0].root_pane;
+        let pane_id = ws.tabs[0].root_pane.expect("test tab has root pane");
         app.state.workspaces.push(ws);
         app.state.active = Some(0);
         app.state.view.pane_infos.push(crate::layout::PaneInfo {
@@ -747,7 +747,7 @@ mod tests {
             crate::api::EventHub::default(),
         );
         let mut ws = Workspace::test_new("test");
-        let pane_id = ws.tabs[0].root_pane;
+        let pane_id = ws.tabs[0].root_pane.expect("test tab has root pane");
         let runtime =
             crate::terminal::TerminalRuntime::test_with_scrollback_bytes(cols, rows, 0, bytes);
         ws.tabs[0].runtimes.insert(pane_id, runtime);

@@ -1121,6 +1121,9 @@ impl App {
     }
 
     pub(super) fn confirm_close_accept_via_api(&mut self) {
+        if self.confirm_pending_collection_group_close() {
+            return;
+        }
         let ws_idx = self.state.selected;
         if ws_idx < self.state.workspaces.len() {
             self.close_workspace_idx_via_api(ws_idx);
@@ -1171,7 +1174,10 @@ impl App {
             Some(ModalAction::Confirm) => {
                 self.confirm_close_accept_via_api();
             }
-            Some(ModalAction::Cancel) => confirm_close_cancel(&mut self.state),
+            Some(ModalAction::Cancel) if !self.cancel_pending_collection_group_close() => {
+                confirm_close_cancel(&mut self.state);
+            }
+            Some(ModalAction::Cancel) => {}
             _ => {}
         }
     }
@@ -1257,6 +1263,26 @@ impl App {
                     source_pane_id: *source_pane_id,
                     has_manual_label: *has_manual_label,
                 })
+            }),
+            (
+                ContextMenuKind::CollectionMember { collection_id, .. },
+                crate::app::state::ContextMenuTarget::Pane(id),
+            ) => self.parse_pane_id(id).and_then(|(ws_idx, pane_id)| {
+                let collection = self
+                    .state
+                    .workspaces
+                    .get(ws_idx)?
+                    .tabs
+                    .iter()
+                    .find_map(|tab| tab.collection(*collection_id))?;
+                collection.members().contains(&pane_id).then_some(
+                    ContextMenuKind::CollectionMember {
+                        ws_idx,
+                        collection_id: *collection_id,
+                        pane_id,
+                        archived: collection.is_archived(pane_id),
+                    },
+                )
             }),
             _ => None,
         }
@@ -1363,6 +1389,56 @@ impl App {
                 self.focus_tab_idx_via_api(tab_idx);
                 if !self.close_active_tab_via_api_requires_confirmation() {
                     leave_modal(&mut self.state);
+                }
+            }
+            (
+                ContextMenuKind::CollectionMember {
+                    ws_idx,
+                    collection_id,
+                    pane_id,
+                    ..
+                },
+                Some("Maximize"),
+            ) => {
+                self.select_collection_member_via_runtime(ws_idx, collection_id, pane_id, true);
+                self.toggle_collection_maximize(collection_id);
+                self.state.mode = Mode::Terminal;
+            }
+            (
+                ContextMenuKind::CollectionMember {
+                    ws_idx,
+                    collection_id,
+                    pane_id,
+                    ..
+                },
+                Some("Archive" | "Restore"),
+            ) => {
+                self.select_collection_member_via_runtime(ws_idx, collection_id, pane_id, true);
+                self.toggle_selected_archive(ws_idx, collection_id);
+                self.state.mode = Mode::Terminal;
+            }
+            (
+                ContextMenuKind::CollectionMember {
+                    ws_idx,
+                    collection_id,
+                    pane_id,
+                    ..
+                },
+                Some("Move out"),
+            ) => {
+                self.select_collection_member_via_runtime(ws_idx, collection_id, pane_id, true);
+                self.promote_selected(ws_idx, collection_id);
+                self.state.mode = Mode::Terminal;
+            }
+            (
+                ContextMenuKind::CollectionMember {
+                    ws_idx, pane_id, ..
+                },
+                Some("Close pane"),
+            ) => {
+                self.focus_pane_internal_via_api(ws_idx, pane_id);
+                if !self.close_focused_pane_via_api_requires_confirmation() {
+                    self.state.mode = Mode::Terminal;
                 }
             }
             (ContextMenuKind::Pane { pane_id, .. }, Some("Rename pane")) => {
@@ -2326,7 +2402,9 @@ mod tests {
             checkout_path: "/repo/herdr-issue".into(),
             is_linked_worktree: true,
         });
-        let pane_id = state.workspaces[0].tabs[0].root_pane;
+        let pane_id = state.workspaces[0].tabs[0]
+            .root_pane
+            .expect("test tab has root pane");
         let menu = ContextMenuState {
             kind: ContextMenuKind::Pane {
                 ws_idx: 0,
@@ -2398,7 +2476,9 @@ mod tests {
         app.state.active = Some(0);
         app.state.selected = 1;
         app.state.mode = Mode::ContextMenu;
-        let pane_id = app.state.workspaces[0].tabs[0].root_pane;
+        let pane_id = app.state.workspaces[0].tabs[0]
+            .root_pane
+            .expect("test tab has root pane");
         let mut menu = ContextMenuState {
             kind: ContextMenuKind::Pane {
                 ws_idx: 0,

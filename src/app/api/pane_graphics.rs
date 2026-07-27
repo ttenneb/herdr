@@ -279,7 +279,9 @@ mod tests {
         );
         app.state.workspaces = vec![Workspace::test_new("pane-graphics")];
         app.state.ensure_test_terminals();
-        let pane_id = app.state.workspaces[0].tabs[0].root_pane;
+        let pane_id = app.state.workspaces[0].tabs[0]
+            .root_pane
+            .expect("test tab has root pane");
         let public_pane_id = app.public_pane_id(0, pane_id).unwrap();
         (app, public_pane_id)
     }

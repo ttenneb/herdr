@@ -4,12 +4,13 @@ use std::path::PathBuf;
 use ratatui::layout::Direction;
 use serde::{Deserialize, Serialize};
 
+#[cfg(test)]
 use crate::layout::Node;
 use crate::terminal::TerminalRuntimeRegistry;
 use crate::workspace::Workspace;
 
 /// Current snapshot format version.
-pub(super) const SNAPSHOT_VERSION: u32 = 3;
+pub(super) const SNAPSHOT_VERSION: u32 = 4;
 
 /// Serializable snapshot of the entire herdr session.
 #[derive(Serialize, Deserialize)]
@@ -26,6 +27,20 @@ pub struct SessionSnapshot {
     pub sidebar_section_split: Option<f32>,
     #[serde(default)]
     pub collapsed_space_keys: std::collections::HashSet<String>,
+    /// Session-wide delegation provenance. Pane IDs use the pre-restore raw IDs.
+    #[serde(default)]
+    pub delegations: Vec<crate::delegation::DelegationRecord>,
+    /// Archive ages for collection members. Pane IDs use the pre-restore raw IDs.
+    #[serde(default)]
+    pub collection_archive_times: Vec<CollectionArchiveTimeSnapshot>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub struct CollectionArchiveTimeSnapshot {
+    pub pane_id: u32,
+    pub unix_seconds: u64,
+    #[serde(default)]
+    pub subsec_nanos: u32,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -86,12 +101,37 @@ pub struct TabSnapshot {
     #[serde(default)]
     pub custom_name: Option<String>,
     pub layout: LayoutSnapshot,
+    #[serde(default)]
+    pub collections: Vec<CollectionSnapshot>,
     pub panes: HashMap<u32, PaneSnapshot>,
     pub zoomed: bool,
+    /// Legacy pane-only focus, retained for snapshots before version 4.
     #[serde(default)]
     pub focused: Option<u32>,
     #[serde(default)]
+    pub focused_leaf: Option<LayoutLeafSnapshot>,
+    #[serde(default)]
     pub root_pane: Option<u32>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CollectionSnapshot {
+    pub id: crate::layout::CollectionId,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
+    #[serde(default)]
+    pub members: Vec<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub selected: Option<u32>,
+    #[serde(default)]
+    pub archived: Vec<u32>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", content = "id", rename_all = "snake_case")]
+pub enum LayoutLeafSnapshot {
+    Pane(u32),
+    Collection(crate::layout::CollectionId),
 }
 
 #[derive(Serialize, Deserialize)]
@@ -127,6 +167,7 @@ pub struct PaneHistorySnapshot {
 #[derive(Serialize, Deserialize)]
 pub enum LayoutSnapshot {
     Pane(u32),
+    Collection(crate::layout::CollectionId),
     Split {
         direction: DirectionSnapshot,
         ratio: f32,
@@ -147,9 +188,11 @@ impl From<LegacyWorkspaceSnapshot> for WorkspaceSnapshot {
         let tab = TabSnapshot {
             custom_name: None,
             layout: snap.layout,
+            collections: Vec::new(),
             panes: snap.panes,
             zoomed: snap.zoomed,
             focused: snap.focused,
+            focused_leaf: None,
             root_pane: snap.root_pane,
         };
 
@@ -184,6 +227,10 @@ struct RawSessionSnapshot {
     sidebar_section_split: Option<f32>,
     #[serde(default)]
     collapsed_space_keys: std::collections::HashSet<String>,
+    #[serde(default)]
+    delegations: Vec<crate::delegation::DelegationRecord>,
+    #[serde(default)]
+    collection_archive_times: Vec<CollectionArchiveTimeSnapshot>,
 }
 
 fn migrate_snapshot(raw: RawSessionSnapshot) -> Result<SessionSnapshot, String> {
@@ -199,6 +246,8 @@ fn migrate_snapshot(raw: RawSessionSnapshot) -> Result<SessionSnapshot, String> 
         sidebar_width: raw.sidebar_width,
         sidebar_section_split: raw.sidebar_section_split,
         collapsed_space_keys: raw.collapsed_space_keys,
+        delegations: raw.delegations,
+        collection_archive_times: raw.collection_archive_times,
     })
 }
 
@@ -242,6 +291,7 @@ fn legacy_identity_cwd(snap: &LegacyWorkspaceSnapshot) -> PathBuf {
 fn first_pane_id_in_layout(layout: &LayoutSnapshot) -> Option<u32> {
     match layout {
         LayoutSnapshot::Pane(id) => Some(*id),
+        LayoutSnapshot::Collection(_) => None,
         LayoutSnapshot::Split { first, second, .. } => {
             first_pane_id_in_layout(first).or_else(|| first_pane_id_in_layout(second))
         }
@@ -251,6 +301,11 @@ fn first_pane_id_in_layout(layout: &LayoutSnapshot) -> Option<u32> {
 /// Capture the current app state into a serializable snapshot.
 pub fn capture(
     workspaces: &[Workspace],
+    delegations: &crate::delegation::Delegations,
+    collection_archive_times: &std::collections::HashMap<
+        crate::layout::PaneId,
+        std::time::SystemTime,
+    >,
     terminals: &std::collections::HashMap<
         crate::terminal::TerminalId,
         crate::terminal::TerminalState,
@@ -273,6 +328,28 @@ pub fn capture(
         sidebar_width: Some(sidebar_width),
         sidebar_section_split: Some(sidebar_section_split),
         collapsed_space_keys,
+        delegations: {
+            let mut records: Vec<_> = delegations.records().values().cloned().collect();
+            records.sort_by_key(|record| record.id);
+            records
+        },
+        collection_archive_times: {
+            let mut records: Vec<_> = collection_archive_times
+                .iter()
+                .filter_map(|(pane_id, archived_at)| {
+                    let elapsed = archived_at
+                        .duration_since(std::time::SystemTime::UNIX_EPOCH)
+                        .ok()?;
+                    Some(CollectionArchiveTimeSnapshot {
+                        pane_id: pane_id.raw(),
+                        unix_seconds: elapsed.as_secs(),
+                        subsec_nanos: elapsed.subsec_nanos(),
+                    })
+                })
+                .collect();
+            records.sort_by_key(|record| record.pane_id);
+            records
+        },
     }
 }
 
@@ -371,13 +448,27 @@ fn capture_tab(
             },
         );
     }
+    let mut collections: Vec<_> = tab
+        .layout
+        .collections()
+        .map(|collection| CollectionSnapshot {
+            id: collection.id,
+            label: collection.label.clone(),
+            members: collection.members().iter().map(|id| id.raw()).collect(),
+            selected: collection.selected().map(|id| id.raw()),
+            archived: collection.archived_members().map(|id| id.raw()).collect(),
+        })
+        .collect();
+    collections.sort_by_key(|collection| collection.id.raw());
     TabSnapshot {
         custom_name: tab.custom_name.clone(),
-        layout: capture_node(tab.layout.root()),
+        layout: capture_typed_node(tab.layout.typed_root()),
+        collections,
         panes,
         zoomed: tab.zoomed,
-        focused: Some(tab.layout.focused().raw()),
-        root_pane: Some(tab.root_pane.raw()),
+        focused: None,
+        focused_leaf: Some(capture_layout_leaf(tab.layout.focused_leaf())),
+        root_pane: tab.root_pane.map(|pane| pane.raw()),
     }
 }
 
@@ -427,6 +518,37 @@ fn capture_pane_history(
     Some(PaneHistorySnapshot { ansi, lines })
 }
 
+fn capture_layout_leaf(leaf: crate::layout::LayoutLeaf) -> LayoutLeafSnapshot {
+    match leaf {
+        crate::layout::LayoutLeaf::Pane(id) => LayoutLeafSnapshot::Pane(id.raw()),
+        crate::layout::LayoutLeaf::Collection(id) => LayoutLeafSnapshot::Collection(id),
+    }
+}
+
+fn capture_typed_node(node: &crate::layout::TypedNode) -> LayoutSnapshot {
+    match node {
+        crate::layout::TypedNode::Leaf(leaf) => match leaf {
+            crate::layout::LayoutLeaf::Pane(id) => LayoutSnapshot::Pane(id.raw()),
+            crate::layout::LayoutLeaf::Collection(id) => LayoutSnapshot::Collection(*id),
+        },
+        crate::layout::TypedNode::Split {
+            direction,
+            ratio,
+            first,
+            second,
+        } => LayoutSnapshot::Split {
+            direction: match direction {
+                Direction::Horizontal => DirectionSnapshot::Horizontal,
+                Direction::Vertical => DirectionSnapshot::Vertical,
+            },
+            ratio: *ratio,
+            first: Box::new(capture_typed_node(first)),
+            second: Box::new(capture_typed_node(second)),
+        },
+    }
+}
+
+#[cfg(test)]
 pub(super) fn capture_node(node: &Node) -> LayoutSnapshot {
     match node {
         Node::Pane(id) => LayoutSnapshot::Pane(id.raw()),
@@ -534,6 +656,8 @@ mod tests {
     ) -> SessionSnapshot {
         capture(
             &state.workspaces,
+            &state.delegations,
+            &state.collection_archive_times,
             &state.terminals,
             terminal_runtimes,
             state.active,
@@ -554,14 +678,16 @@ mod tests {
     fn root_split_ratio(tab: &TabSnapshot) -> Option<f32> {
         match &tab.layout {
             LayoutSnapshot::Split { ratio, .. } => Some(*ratio),
-            LayoutSnapshot::Pane(_) => None,
+            LayoutSnapshot::Pane(_) | LayoutSnapshot::Collection(_) => None,
         }
     }
 
     #[test]
     fn managed_agent_snapshot_omits_pending_and_persists_active_ownership() {
         let mut state = state_with_workspaces(&["managed-snapshot"]);
-        let root = state.workspaces[0].tabs[0].root_pane;
+        let root = state.workspaces[0].tabs[0]
+            .root_pane
+            .expect("test tab has root pane");
         let terminal_id = state.workspaces[0].tabs[0].panes[&root]
             .attached_terminal_id
             .clone();
@@ -605,6 +731,9 @@ mod tests {
             sidebar_width: Some(26),
             sidebar_section_split: Some(0.5),
             collapsed_space_keys: std::collections::HashSet::new(),
+
+            delegations: Vec::new(),
+            collection_archive_times: Vec::new(),
         };
         let json = serde_json::to_string(&snap).unwrap();
         let restored = parse_snapshot(&json).unwrap();
@@ -634,6 +763,114 @@ mod tests {
             LayoutSnapshot::Split { ratio, .. } => assert!((ratio - 0.6).abs() < 0.01),
             _ => panic!("expected split"),
         }
+    }
+
+    #[test]
+    fn typed_collection_snapshot_round_trips_membership_focus_and_archive_state() {
+        let mut state = state_with_workspaces(&["typed"]);
+        let root = state.workspaces[0].tabs[0]
+            .root_pane
+            .expect("test tab has root pane");
+        let member = state.workspaces[0].test_split(Direction::Horizontal);
+        let collection = state.workspaces[0]
+            .create_collection_near(
+                0,
+                crate::layout::LayoutLeaf::Pane(root),
+                Direction::Vertical,
+                0.4,
+                Some("helpers".into()),
+            )
+            .expect("create collection");
+        state.workspaces[0]
+            .collect_pane(member, collection)
+            .expect("collect member");
+        state.workspaces[0]
+            .set_collection_member_archived(member, collection, true)
+            .expect("archive member");
+        let archived_at = std::time::SystemTime::UNIX_EPOCH
+            + std::time::Duration::new(1_700_000_000, 123_456_789);
+        state.collection_archive_times.insert(member, archived_at);
+        assert!(state.workspaces[0].tabs[0]
+            .layout
+            .focus_leaf(crate::layout::LayoutLeaf::Collection(collection)));
+
+        let encoded = serde_json::to_string(&capture_from_state(&state)).unwrap();
+        let restored = parse_snapshot(&encoded).unwrap();
+        let tab = &restored.workspaces[0].tabs[0];
+
+        assert!(matches!(
+            tab.focused_leaf,
+            Some(LayoutLeafSnapshot::Collection(id)) if id == collection
+        ));
+        assert!(matches!(
+            &tab.layout,
+            LayoutSnapshot::Split {
+                second,
+                ..
+            } if matches!(**second, LayoutSnapshot::Collection(id) if id == collection)
+        ));
+        assert_eq!(tab.collections.len(), 1);
+        assert_eq!(tab.collections[0].members, vec![member.raw()]);
+        assert_eq!(tab.collections[0].selected, Some(member.raw()));
+        assert_eq!(tab.collections[0].archived, vec![member.raw()]);
+        assert_eq!(tab.collections[0].label.as_deref(), Some("helpers"));
+        assert_eq!(restored.collection_archive_times.len(), 1);
+        assert_eq!(restored.collection_archive_times[0].pane_id, member.raw());
+        assert_eq!(
+            restored.collection_archive_times[0].unix_seconds,
+            1_700_000_000
+        );
+        assert_eq!(
+            restored.collection_archive_times[0].subsec_nanos,
+            123_456_789
+        );
+    }
+
+    #[test]
+    fn version_three_snapshot_preserves_legacy_pane_focus_for_migration() {
+        let snap = parse_snapshot(session_fixture("current-herdr")).unwrap();
+        let tab = &snap.workspaces[0].tabs[0];
+
+        assert_eq!(snap.version, 3);
+        assert!(tab.focused.is_some());
+        assert_eq!(tab.focused_leaf, None);
+        assert!(tab.collections.is_empty());
+        assert!(snap.collection_archive_times.is_empty());
+    }
+
+    #[test]
+    fn optional_root_pane_persists_for_empty_collection_tab() {
+        let mut state = state_with_workspaces(&["empty-collection"]);
+        let root = state.workspaces[0].tabs[0]
+            .root_pane
+            .expect("test tab has root pane");
+        let collection = state.workspaces[0]
+            .create_collection_near(
+                0,
+                crate::layout::LayoutLeaf::Pane(root),
+                Direction::Horizontal,
+                0.5,
+                Some("helpers".into()),
+            )
+            .expect("create collection");
+        let taken = state.workspaces[0]
+            .take_pane_for_move(root)
+            .expect("detach sole pane");
+        state.workspaces[0].unregister_moved_pane(taken.moved.pane_id);
+        state.workspaces[0].assert_invariants_for_test();
+
+        let encoded = serde_json::to_string(&capture_from_state(&state)).unwrap();
+        let restored = parse_snapshot(&encoded).unwrap();
+        let tab = &restored.workspaces[0].tabs[0];
+
+        assert_eq!(tab.root_pane, None);
+        assert!(tab.panes.is_empty());
+        assert!(matches!(
+            &tab.layout,
+            LayoutSnapshot::Collection(id) if *id == collection
+        ));
+        assert_eq!(tab.collections.len(), 1);
+        assert!(tab.collections[0].members.is_empty());
     }
 
     #[test]
@@ -684,6 +921,9 @@ mod tests {
                     zoomed: false,
                     focused: Some(0),
                     root_pane: Some(0),
+
+                    collections: Vec::new(),
+                    focused_leaf: None,
                 }],
                 active_tab: 0,
             }],
@@ -693,6 +933,9 @@ mod tests {
             sidebar_section_split: Some(0.5),
             collapsed_space_keys: std::collections::HashSet::new(),
             version: SNAPSHOT_VERSION,
+
+            delegations: Vec::new(),
+            collection_archive_times: Vec::new(),
         };
 
         let json = serde_json::to_string_pretty(&snap).unwrap();
@@ -901,7 +1144,9 @@ mod tests {
     #[test]
     fn capture_contract_tracks_layout_focus_zoom_and_root_pane() {
         let mut state = state_with_workspaces(&["one"]);
-        let root = state.workspaces[0].tabs[0].root_pane;
+        let root = state.workspaces[0].tabs[0]
+            .root_pane
+            .expect("test tab has root pane");
         let second = state.workspaces[0].test_split(Direction::Horizontal);
         state.workspaces[0].tabs[0].layout.focus_pane(second);
         state.toggle_zoom();
@@ -909,7 +1154,11 @@ mod tests {
         let snapshot = capture_from_state(&state);
         let tab = &snapshot.workspaces[0].tabs[0];
         assert!(matches!(tab.layout, LayoutSnapshot::Split { .. }));
-        assert_eq!(tab.focused, Some(second.raw()));
+        assert_eq!(tab.focused, None);
+        assert_eq!(
+            tab.focused_leaf,
+            Some(LayoutLeafSnapshot::Pane(second.raw()))
+        );
         assert_eq!(tab.root_pane, Some(root.raw()));
         assert!(tab.zoomed);
         assert_eq!(tab.panes.len(), 2);
@@ -918,21 +1167,30 @@ mod tests {
     #[test]
     fn capture_contract_tracks_focus_navigation() {
         let mut state = state_with_workspaces(&["one"]);
-        let root = state.workspaces[0].tabs[0].root_pane;
+        let root = state.workspaces[0].tabs[0]
+            .root_pane
+            .expect("test tab has root pane");
         let second = state.workspaces[0].test_split(Direction::Horizontal);
         crate::ui::compute_view(&mut state, Rect::new(0, 0, 106, 20));
 
         state.navigate_pane(NavDirection::Right);
 
         let snapshot = capture_from_state(&state);
-        assert_eq!(snapshot.workspaces[0].tabs[0].focused, Some(second.raw()));
-        assert_ne!(snapshot.workspaces[0].tabs[0].focused, Some(root.raw()));
+        let tab = &snapshot.workspaces[0].tabs[0];
+        assert_eq!(tab.focused, None);
+        assert_eq!(
+            tab.focused_leaf,
+            Some(LayoutLeafSnapshot::Pane(second.raw()))
+        );
+        assert_ne!(tab.focused_leaf, Some(LayoutLeafSnapshot::Pane(root.raw())));
     }
 
     #[test]
     fn capture_contract_tracks_resize_ratio_changes() {
         let mut state = state_with_workspaces(&["one"]);
-        let root = state.workspaces[0].tabs[0].root_pane;
+        let root = state.workspaces[0].tabs[0]
+            .root_pane
+            .expect("test tab has root pane");
         state.workspaces[0].test_split(Direction::Horizontal);
         state.workspaces[0].layout.focus_pane(root);
         crate::ui::compute_view(&mut state, Rect::new(0, 0, 106, 20));
@@ -989,9 +1247,21 @@ mod tests {
         assert_eq!(
             workspace.public_pane_numbers,
             HashMap::from([
-                (state.workspaces[0].tabs[0].root_pane.raw(), 1),
+                (
+                    state.workspaces[0].tabs[0]
+                        .root_pane
+                        .expect("test tab has root pane")
+                        .raw(),
+                    1
+                ),
                 (third.raw(), 3),
-                (state.workspaces[0].tabs[second_tab].root_pane.raw(), 4),
+                (
+                    state.workspaces[0].tabs[second_tab]
+                        .root_pane
+                        .expect("test tab has root pane")
+                        .raw(),
+                    4
+                ),
             ])
         );
         assert_eq!(workspace.next_public_pane_number, 5);
@@ -1002,7 +1272,9 @@ mod tests {
     #[test]
     fn capture_contract_tracks_workspace_identity_and_pane_cwds() {
         let mut state = state_with_workspaces(&["one"]);
-        let root = state.workspaces[0].tabs[0].root_pane;
+        let root = state.workspaces[0].tabs[0]
+            .root_pane
+            .expect("test tab has root pane");
         state.workspaces[0].identity_cwd = PathBuf::from("/tmp/pion");
         let second = state.workspaces[0].test_split(Direction::Horizontal);
         state.ensure_test_terminals();
@@ -1026,7 +1298,9 @@ mod tests {
     #[tokio::test]
     async fn capture_contract_tracks_pane_history_from_runtime() {
         let state = state_with_workspaces(&["one"]);
-        let root = state.workspaces[0].tabs[0].root_pane;
+        let root = state.workspaces[0].tabs[0]
+            .root_pane
+            .expect("test tab has root pane");
         let terminal_id = state.workspaces[0].tabs[0].panes[&root]
             .attached_terminal_id
             .clone();
@@ -1057,7 +1331,9 @@ mod tests {
     #[tokio::test]
     async fn capture_contract_tracks_history_for_each_pane() {
         let mut state = state_with_workspaces(&["one"]);
-        let first = state.workspaces[0].tabs[0].root_pane;
+        let first = state.workspaces[0].tabs[0]
+            .root_pane
+            .expect("test tab has root pane");
         let second = state.workspaces[0].test_split(Direction::Horizontal);
         let first_terminal_id = state.workspaces[0].tabs[0].panes[&first]
             .attached_terminal_id
@@ -1103,7 +1379,9 @@ mod tests {
     fn capture_contract_tracks_hook_authority_agent_session() {
         let mut state = state_with_workspaces(&["one"]);
         let session_path = test_session_path("pi-session.jsonl");
-        let root = state.workspaces[0].tabs[0].root_pane;
+        let root = state.workspaces[0].tabs[0]
+            .root_pane
+            .expect("test tab has root pane");
         state.ensure_test_terminals();
         let terminal_id = state.workspaces[0].tabs[0].panes[&root]
             .attached_terminal_id
@@ -1145,7 +1423,9 @@ mod tests {
     #[test]
     fn capture_contract_preserves_restored_agent_session() {
         let mut state = state_with_workspaces(&["one"]);
-        let root = state.workspaces[0].tabs[0].root_pane;
+        let root = state.workspaces[0].tabs[0]
+            .root_pane
+            .expect("test tab has root pane");
         state.ensure_test_terminals();
         let terminal_id = state.workspaces[0].tabs[0].panes[&root]
             .attached_terminal_id
@@ -1246,6 +1526,9 @@ mod tests {
                     zoomed: false,
                     focused: Some(0),
                     root_pane: Some(0),
+
+                    collections: Vec::new(),
+                    focused_leaf: None,
                 }],
                 active_tab: 0,
             }],
@@ -1254,6 +1537,9 @@ mod tests {
             sidebar_width: Some(26),
             sidebar_section_split: Some(0.5),
             collapsed_space_keys: std::collections::HashSet::new(),
+
+            delegations: Vec::new(),
+            collection_archive_times: Vec::new(),
         };
 
         let json = serde_json::to_string(&snap).unwrap();

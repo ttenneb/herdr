@@ -199,7 +199,9 @@ impl App {
             crate::pane::PaneShellConfig::new(&self.state.default_shell, self.state.shell_mode),
             Vec::new(),
         )?;
-        let root_pane = ws.tabs[idx].root_pane;
+        let root_pane = ws.tabs[idx]
+            .root_pane
+            .ok_or_else(|| std::io::Error::other("new tab has no root pane"))?;
         self.terminal_runtimes.insert(terminal.id.clone(), runtime);
         self.state.terminals.insert(terminal.id.clone(), terminal);
         self.state.remove_alias_shadowed_by_new_pane(root_pane);
@@ -211,7 +213,7 @@ impl App {
         let tab_id = self
             .public_tab_id(ws_idx, idx)
             .unwrap_or_else(|| crate::workspace::public_tab_id_for_number(&workspace_id, idx + 1));
-        let root_pane = self.state.workspaces[ws_idx].tabs[idx].root_pane.raw();
+        let root_pane = root_pane.raw();
         crate::logging::tab_created(&workspace_id, &tab_id, root_pane);
         self.schedule_session_save();
         Ok(idx)
@@ -259,10 +261,12 @@ impl App {
         self.state.terminals.insert(terminal.id.clone(), terminal);
         self.state.workspaces.push(ws);
         let idx = self.state.workspaces.len() - 1;
-        self.state
-            .remove_alias_shadowed_by_new_pane(self.state.workspaces[idx].tabs[0].root_pane);
+        let root_pane = self.state.workspaces[idx].tabs[0]
+            .root_pane
+            .ok_or_else(|| std::io::Error::other("new workspace has no root pane"))?;
+        self.state.remove_alias_shadowed_by_new_pane(root_pane);
         let workspace_id = self.state.workspaces[idx].id.clone();
-        let root_pane = self.state.workspaces[idx].tabs[0].root_pane.raw();
+        let root_pane = root_pane.raw();
         crate::logging::workspace_created(&workspace_id, root_pane);
         if focus || self.state.active.is_none() {
             self.state.switch_workspace(idx);
@@ -413,7 +417,7 @@ impl App {
     ) -> Option<crate::api::schema::PaneInfo> {
         let ws = self.state.workspaces.get(ws_idx)?;
         let tab = ws.tabs.get(tab_idx)?;
-        self.pane_info(ws_idx, tab.root_pane)
+        self.pane_info(ws_idx, tab.root_pane?)
     }
 
     pub(super) fn pane_info(
@@ -446,6 +450,7 @@ impl App {
             workspace_id: self.public_workspace_id(ws_idx),
             tab_id: self.public_tab_id(ws_idx, tab_idx)?,
             focused,
+            placement: self.pane_placement_info(ws_idx, tab_idx, pane_id)?,
             cwd: ws.tabs[tab_idx]
                 .cwd_for_pane(pane_id, &self.state.terminals, &self.terminal_runtimes)
                 .map(|cwd| cwd.display().to_string()),

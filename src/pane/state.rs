@@ -3,6 +3,7 @@ use crate::terminal::TerminalId;
 /// Viewport state for a pane.
 ///
 /// Terminal identity, cwd, labels, and agent metadata live in TerminalState.
+#[derive(Clone)]
 pub struct PaneState {
     pub attached_terminal_id: TerminalId,
     /// Whether the user has seen this pane since its last state change to Idle.

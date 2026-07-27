@@ -231,32 +231,122 @@ impl App {
         if self.state.workspaces.get(index).is_none() {
             return workspace_not_found(id, &target.workspace_id);
         }
-        let workspace_id = self.public_workspace_id(index);
-        let workspace = self.workspace_info(index);
-        let pane_ids = self
-            .state
-            .workspaces
-            .get(index)
-            .map(|ws| {
-                ws.tabs
+        self.close_workspace_group_with_lifecycle(index);
+        encode_success(id, ResponseResult::Ok {})
+    }
+
+    /// Close one workspace or its parent worktree group and emit a complete lifecycle snapshot.
+    /// Capture happens before the centralized state close so implicit pane/collection/tab removal
+    /// has the same observable events as explicit close operations.
+    pub(super) fn close_workspace_group_with_lifecycle(&mut self, index: usize) {
+        let close_indices = self.state.workspaces[index]
+            .worktree_space()
+            .filter(|space| !space.is_linked_worktree)
+            .map(|space| {
+                self.state
+                    .workspaces
                     .iter()
-                    .flat_map(|tab| tab.layout.pane_ids())
+                    .enumerate()
+                    .filter_map(|(idx, workspace)| {
+                        workspace
+                            .worktree_space()
+                            .is_some_and(|member| member.key == space.key)
+                            .then_some(idx)
+                    })
                     .collect::<Vec<_>>()
             })
-            .unwrap_or_default();
-        self.state.selected = index;
-        self.state.close_selected_workspace();
-        self.state.remove_plugin_pane_records(pane_ids);
-        self.shutdown_detached_terminal_runtimes();
-        self.emit_event(EventEnvelope {
-            event: EventKind::WorkspaceClosed,
-            data: EventData::WorkspaceClosed {
-                workspace_id,
-                workspace: Some(workspace),
-            },
-        });
+            .filter(|indices| indices.len() >= 2)
+            .unwrap_or_else(|| vec![index]);
+        let workspace_snapshots = close_indices
+            .iter()
+            .map(|idx| (self.public_workspace_id(*idx), self.workspace_info(*idx)))
+            .collect::<Vec<_>>();
+        let mut public_panes = Vec::new();
+        let mut closed_collections = Vec::new();
+        let mut closed_tabs = Vec::new();
+        for ws_idx in &close_indices {
+            let workspace_id = self.public_workspace_id(*ws_idx);
+            for (tab_idx, tab) in self.state.workspaces[*ws_idx].tabs.iter().enumerate() {
+                let tab_id = self.public_tab_id(*ws_idx, tab_idx).unwrap_or_default();
+                closed_tabs.push((workspace_id.clone(), tab_id.clone()));
+                for pane_id in tab.layout.pane_ids() {
+                    if let Some(public) = self.public_pane_id(*ws_idx, pane_id) {
+                        public_panes.push((pane_id, public, workspace_id.clone()));
+                    }
+                }
+                for collection_id in tab.layout.collection_ids() {
+                    if let Some(collection) = tab.collection(collection_id) {
+                        closed_collections.push((
+                            workspace_id.clone(),
+                            tab_id.clone(),
+                            collection_id,
+                            collection.members().to_vec(),
+                        ));
+                    }
+                }
+            }
+        }
 
-        encode_success(id, ResponseResult::Ok {})
+        self.state.selected = index;
+        let destruction = self.state.close_selected_workspace();
+        self.shutdown_detached_terminal_runtimes();
+
+        for (workspace_id, tab_id, collection_id, members) in closed_collections {
+            for pane_id in members {
+                if let Some((_, public, _)) = public_panes
+                    .iter()
+                    .find(|(id, _, owner)| *id == pane_id && owner == &workspace_id)
+                {
+                    self.emit_event(EventEnvelope {
+                        event: EventKind::CollectionMemberRemoved,
+                        data: EventData::CollectionMemberRemoved {
+                            collection_id: super::collections::collection_id_string(collection_id),
+                            pane_id: public.clone(),
+                        },
+                    });
+                }
+            }
+            self.emit_event(EventEnvelope {
+                event: EventKind::CollectionClosed,
+                data: EventData::CollectionClosed {
+                    collection_id: super::collections::collection_id_string(collection_id),
+                    workspace_id,
+                    tab_id,
+                },
+            });
+        }
+        for (_, pane_id, workspace_id) in &public_panes {
+            self.emit_event(EventEnvelope {
+                event: EventKind::PaneClosed,
+                data: EventData::PaneClosed {
+                    pane_id: pane_id.clone(),
+                    workspace_id: workspace_id.clone(),
+                },
+            });
+        }
+        let public_pairs = public_panes
+            .iter()
+            .map(|(pane, public, _)| (*pane, public.clone()))
+            .collect::<Vec<_>>();
+        self.emit_pane_destruction_events(destruction, &public_pairs);
+        for (workspace_id, tab_id) in closed_tabs {
+            self.emit_event(EventEnvelope {
+                event: EventKind::TabClosed,
+                data: EventData::TabClosed {
+                    tab_id,
+                    workspace_id,
+                },
+            });
+        }
+        for (workspace_id, workspace) in workspace_snapshots {
+            self.emit_event(EventEnvelope {
+                event: EventKind::WorkspaceClosed,
+                data: EventData::WorkspaceClosed {
+                    workspace_id,
+                    workspace: Some(workspace),
+                },
+            });
+        }
     }
 
     fn workspace_list_info(&self) -> Vec<crate::api::schema::WorkspaceInfo> {
@@ -332,7 +422,10 @@ mod tests {
         let ws = &app.state.workspaces[0];
         let root_cwd = ws.identity_cwd.clone();
         let focused_pane = ws.focused_pane_id().unwrap();
-        assert_ne!(focused_pane, ws.tabs[0].root_pane);
+        assert_ne!(
+            focused_pane,
+            ws.tabs[0].root_pane.expect("test tab has root pane")
+        );
         let terminal_id = ws.terminal_id(focused_pane).cloned().unwrap();
         app.state.terminals.get_mut(&terminal_id).unwrap().cwd = focused_cwd.clone();
 

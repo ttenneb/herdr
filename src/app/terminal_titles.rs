@@ -70,7 +70,9 @@ mod tests {
         let mut app = App::new(&Config::default(), true, None, api_rx, event_hub.clone());
         app.state.workspaces = vec![Workspace::test_new("one")];
         app.state.ensure_test_terminals();
-        let pane_id = app.state.workspaces[0].tabs[0].root_pane;
+        let pane_id = app.state.workspaces[0].tabs[0]
+            .root_pane
+            .expect("test tab has root pane");
         let terminal_id = app.state.workspaces[0].tabs[0].panes[&pane_id]
             .attached_terminal_id
             .clone();

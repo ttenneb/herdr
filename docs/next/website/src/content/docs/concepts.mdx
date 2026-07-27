@@ -23,6 +23,16 @@ A pane is a real terminal. Herdr renders the terminal output, sends input back t
 
 Panes can be split right or down. They can be renamed manually, read from the CLI, sent input, and closed.
 
+## Pane collection
+
+A pane collection presents several ordinary panes as a nested, scrollable list in one typed layout leaf. Every member keeps its own pane ID, PTY, process, history, agent state, and API access. Collections support multiple inline previews, collection-local maximize, and active/archive sections.
+
+Archiving is explicit organization: it neither stops the process nor proves success. Input or `working`/`blocked` state restores an archived member. Panes move between tiled placement and collections without restarting. Closing a non-empty collection requires cascade-closing every member PTY or promoting members back to ordinary placement.
+
+## Delegation
+
+Delegation records parentage and purpose independently of placement and agent detection. Stable IDs such as `d1` survive movement and archival; parent provenance remains while descendants exist after a parent pane closes. Collections also work for unrelated shells, tests, and logs without delegation metadata.
+
 ## Mouse UI
 
 Herdr is mouse-native. You can click panes, tabs, workspaces, and agents. You can drag split borders, select text, and use right-click menus. Everything below is also reachable by mouse; keyboard bindings are an optional layer.
@@ -47,6 +57,8 @@ Agent states are:
 | `done` | The agent finished and you have not looked at it yet. |
 | `idle` | The agent is finished or waiting and has been seen. |
 | `unknown` | Herdr cannot confidently classify the state. |
+
+Tiled panes are acknowledged by viewing their active tab. A grouped child is marked seen only when a foreground human enters its terminal; row selection, API focus, reads, and passive observation do not acknowledge it.
 
 ## Session
 

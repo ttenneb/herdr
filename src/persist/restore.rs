@@ -9,13 +9,16 @@ use tracing::{error, warn};
 
 use crate::detect::AgentState;
 use crate::events::AppEvent;
-use crate::layout::{Node, PaneId, TileLayout};
+#[cfg(test)]
+use crate::layout::Node;
+use crate::layout::{CollectionId, LayoutLeaf, PaneCollection, PaneId, TileLayout, TypedNode};
 use crate::pane::{PaneLaunchEnv, PaneState};
 use crate::terminal::{TerminalId, TerminalRuntime, TerminalState};
 use crate::workspace::Workspace;
 
 use super::snapshot::{
-    PaneAgentSessionSnapshot, PaneHistorySnapshot, TabHistorySnapshot, WorkspaceHistorySnapshot,
+    CollectionSnapshot, LayoutLeafSnapshot, PaneAgentSessionSnapshot, PaneHistorySnapshot,
+    TabHistorySnapshot, WorkspaceHistorySnapshot,
 };
 use super::{
     DirectionSnapshot, LayoutSnapshot, SessionHistorySnapshot, SessionSnapshot, TabSnapshot,
@@ -45,6 +48,8 @@ struct RestoreRuntimeContext<'a> {
 
 type RestoredSession = (
     Vec<Workspace>,
+    crate::delegation::Delegations,
+    HashMap<PaneId, std::time::SystemTime>,
     HashMap<TerminalId, TerminalState>,
     HashMap<TerminalId, TerminalRuntime>,
 );
@@ -52,6 +57,7 @@ type RestoredWorkspace = (
     Workspace,
     Vec<TerminalState>,
     HashMap<TerminalId, TerminalRuntime>,
+    HashMap<u32, PaneId>,
 );
 type RestoredTab = (
     crate::workspace::Tab,
@@ -124,35 +130,32 @@ pub fn handoff_pane_aliases(
 ) -> HashMap<u32, PaneId> {
     let mut aliases = HashMap::new();
     for (ws_snap, workspace) in snapshot.workspaces.iter().zip(workspaces) {
-        for (tab_snap, tab) in ws_snap.tabs.iter().zip(&workspace.tabs) {
-            let old_ids = collect_snapshot_pane_ids(&tab_snap.layout);
-            let new_ids = tab.layout.pane_ids();
-            for (old_id, new_id) in old_ids.into_iter().zip(new_ids) {
-                if old_id != new_id.raw() {
-                    aliases.insert(old_id, new_id);
+        for (old_id, public_number) in &ws_snap.public_pane_numbers {
+            if let Some(new_id) = workspace
+                .public_pane_numbers
+                .iter()
+                .find_map(|(pane, number)| (number == public_number).then_some(*pane))
+            {
+                if *old_id != new_id.raw() {
+                    aliases.insert(*old_id, new_id);
+                }
+            }
+        }
+        if ws_snap.public_pane_numbers.is_empty() {
+            for (tab_snap, tab) in ws_snap.tabs.iter().zip(&workspace.tabs) {
+                let mut old_ids: Vec<_> = tab_snap.panes.keys().copied().collect();
+                old_ids.sort_unstable();
+                let mut new_ids = tab.layout.pane_ids();
+                new_ids.sort_by_key(|id| id.raw());
+                for (old_id, new_id) in old_ids.into_iter().zip(new_ids) {
+                    if old_id != new_id.raw() {
+                        aliases.insert(old_id, new_id);
+                    }
                 }
             }
         }
     }
     aliases
-}
-
-#[cfg(unix)]
-fn collect_snapshot_pane_ids(node: &LayoutSnapshot) -> Vec<u32> {
-    let mut ids = Vec::new();
-    collect_snapshot_ids_inner(node, &mut ids);
-    ids
-}
-
-#[cfg(unix)]
-fn collect_snapshot_ids_inner(node: &LayoutSnapshot, ids: &mut Vec<u32>) {
-    match node {
-        LayoutSnapshot::Pane(id) => ids.push(*id),
-        LayoutSnapshot::Split { first, second, .. } => {
-            collect_snapshot_ids_inner(first, ids);
-            collect_snapshot_ids_inner(second, ids);
-        }
-    }
 }
 
 fn migrated_public_pane_numbers_by_old_raw(
@@ -177,6 +180,7 @@ fn migrated_public_pane_numbers_by_old_raw(
 fn collect_layout_snapshot_pane_ids(node: &LayoutSnapshot, ids: &mut Vec<u32>) {
     match node {
         LayoutSnapshot::Pane(id) => ids.push(*id),
+        LayoutSnapshot::Collection(_) => {}
         LayoutSnapshot::Split { first, second, .. } => {
             collect_layout_snapshot_pane_ids(first, ids);
             collect_layout_snapshot_pane_ids(second, ids);
@@ -271,6 +275,8 @@ fn restore_with_imports_and_failures(
     let mut terminals = HashMap::new();
     let mut terminal_runtimes = HashMap::new();
     let mut resumed_agent_sessions = HashSet::new();
+    let mut claimed_collection_ids = HashSet::new();
+    let mut pane_id_map = HashMap::new();
     let mut failed_imports = 0;
     for (idx, ws_snap) in snapshot.workspaces.iter().enumerate() {
         let runtime_context = RestoreRuntimeContext {
@@ -288,19 +294,71 @@ fn restore_with_imports_and_failures(
             cols,
             &runtime_context,
             &mut resumed_agent_sessions,
+            &mut claimed_collection_ids,
             imported_panes,
         );
         failed_imports += workspace_failed_imports;
-        if let Some((workspace, restored_terminals, restored_runtimes)) = restored {
+        if let Some((workspace, restored_terminals, restored_runtimes, workspace_id_map)) = restored
+        {
             for terminal in restored_terminals {
                 terminals.insert(terminal.id.clone(), terminal);
             }
             terminal_runtimes.extend(restored_runtimes);
+            pane_id_map.extend(workspace_id_map);
             workspaces.push(workspace);
         }
     }
     crate::workspace::reserve_workspace_ids(&workspaces);
-    ((workspaces, terminals, terminal_runtimes), failed_imports)
+    let delegation_records = snapshot.delegations.iter().cloned().map(|mut record| {
+        if let Some(old_pane) = record.pane_id {
+            record.pane_id = pane_id_map.get(&old_pane.raw()).copied();
+            if record.pane_id.is_none() {
+                record.tombstone = true;
+            }
+        }
+        record
+    });
+    let delegations = crate::delegation::Delegations::repair_records(delegation_records);
+    let mut collection_archive_times = HashMap::new();
+    for record in &snapshot.collection_archive_times {
+        if record.subsec_nanos >= 1_000_000_000 {
+            continue;
+        }
+        let Some(pane_id) = pane_id_map.get(&record.pane_id).copied() else {
+            continue;
+        };
+        let archived = workspaces.iter().any(|workspace| {
+            workspace.tabs.iter().any(|tab| {
+                tab.pane_placement(pane_id)
+                    .and_then(|placement| match placement {
+                        crate::layout::PanePlacement::Collection(collection_id) => {
+                            tab.collection(collection_id)
+                        }
+                        crate::layout::PanePlacement::Tiled => None,
+                    })
+                    .is_some_and(|collection| collection.is_archived(pane_id))
+            })
+        });
+        if !archived {
+            continue;
+        }
+        let duration = std::time::Duration::new(record.unix_seconds, record.subsec_nanos);
+        if let Some(archived_at) = std::time::SystemTime::UNIX_EPOCH.checked_add(duration) {
+            collection_archive_times
+                .entry(pane_id)
+                .or_insert(archived_at);
+        }
+    }
+    (
+        (
+            workspaces,
+            delegations,
+            collection_archive_times,
+            terminals,
+            terminal_runtimes,
+        ),
+        failed_imports,
+    )
 }
 
 fn restore_workspace(
@@ -310,11 +368,13 @@ fn restore_workspace(
     cols: u16,
     runtime_context: &RestoreRuntimeContext<'_>,
     resumed_agent_sessions: &mut HashSet<String>,
+    claimed_collection_ids: &mut HashSet<CollectionId>,
     imported_panes: &mut HashMap<u32, crate::handoff_runtime::ImportedHandoffRuntime>,
 ) -> RestoreFailures<Option<RestoredWorkspace>> {
     let mut tabs = Vec::new();
     let mut terminals = Vec::new();
     let mut terminal_runtimes = HashMap::new();
+    let mut workspace_id_map = HashMap::new();
     let workspace_id = snap
         .id
         .clone()
@@ -364,6 +424,7 @@ fn restore_workspace(
             cols,
             runtime_context,
             resumed_agent_sessions,
+            claimed_collection_ids,
             imported_panes,
             &public_pane_ids_by_old_raw,
         );
@@ -376,6 +437,9 @@ fn restore_workspace(
             tab.number = public_tab_number;
         }
         next_public_tab_number = next_public_tab_number.max(tab.number + 1);
+        for (new_id, old_id) in &reverse_id_map {
+            workspace_id_map.insert(*old_id, *new_id);
+        }
         for pane_id in tab.layout.pane_ids() {
             let public_number = public_pane_numbers_by_old_raw
                 .get(
@@ -428,7 +492,7 @@ fn restore_workspace(
             #[cfg(test)]
             test_runtimes: HashMap::new(),
         })
-        .map(|workspace| (workspace, terminals, terminal_runtimes)),
+        .map(|workspace| (workspace, terminals, terminal_runtimes, workspace_id_map)),
         failed_imports,
     )
 }
@@ -452,15 +516,18 @@ fn restore_tab(
     cols: u16,
     runtime_context: &RestoreRuntimeContext<'_>,
     resumed_agent_sessions: &mut HashSet<String>,
+    claimed_collection_ids: &mut HashSet<CollectionId>,
     imported_panes: &mut HashMap<u32, crate::handoff_runtime::ImportedHandoffRuntime>,
     public_pane_ids_by_old_raw: &HashMap<u32, String>,
 ) -> RestoreFailures<Option<RestoredTab>> {
-    let (node, id_map) = restore_node_remapped(&snap.layout);
+    let (typed_node, id_map) = restore_typed_node_remapped(snap);
     let reverse_id_map: HashMap<PaneId, u32> = id_map
         .iter()
         .map(|(&old_id, &new_id)| (new_id, old_id))
         .collect();
-    let pane_ids = collect_pane_ids(&node);
+    let mut pane_ids: Vec<_> = id_map.iter().map(|(old, new)| (*old, *new)).collect();
+    pane_ids.sort_by_key(|(old, _)| *old);
+    let pane_ids: Vec<_> = pane_ids.into_iter().map(|(_, new)| new).collect();
 
     let mut panes = HashMap::new();
     let mut terminals = Vec::new();
@@ -684,31 +751,25 @@ fn restore_tab(
         }
     }
 
-    if panes.is_empty() {
+    let surviving: HashSet<PaneId> = panes.keys().copied().collect();
+    let Some(layout) = recover_typed_layout_with_claims(
+        snap,
+        typed_node,
+        &id_map,
+        &surviving,
+        claimed_collection_ids,
+    ) else {
         warn!(
             tab = ?snap.custom_name,
-            "no panes could be restored for tab, dropping it"
+            "restored tab lost all panes and collections while recovering typed layout"
         );
+        return (None, failed_imports);
+    };
+    let pane_ids = layout.pane_ids();
+    let root_pane = resolve_restored_pane(snap.root_pane, &id_map, &surviving, &pane_ids);
+    if !panes.is_empty() && root_pane.is_none() {
         return (None, failed_imports);
     }
-
-    let surviving: HashSet<PaneId> = panes.keys().copied().collect();
-    let Some(node) = prune_restored_node(node, &surviving) else {
-        warn!(
-            tab = ?snap.custom_name,
-            "restored tab lost all panes after pruning missing layout nodes"
-        );
-        return (None, failed_imports);
-    };
-    let pane_ids = collect_pane_ids(&node);
-    let Some(focus) = resolve_restored_pane(snap.focused, &id_map, &surviving, &pane_ids) else {
-        return (None, failed_imports);
-    };
-    let Some(root_pane) = resolve_restored_pane(snap.root_pane, &id_map, &surviving, &pane_ids)
-    else {
-        return (None, failed_imports);
-    };
-    let layout = TileLayout::from_saved(node, focus);
 
     (
         Some((
@@ -820,6 +881,240 @@ fn take_restore_plan_for_snapshot(
         .filter(|plan| resumed_agent_sessions.insert(plan.dedupe_key.clone()))
 }
 
+fn restore_typed_node_remapped(snap: &TabSnapshot) -> (TypedNode, HashMap<u32, PaneId>) {
+    let mut old_ids: HashSet<u32> = snap.panes.keys().copied().collect();
+    fn collect(node: &LayoutSnapshot, ids: &mut HashSet<u32>) {
+        match node {
+            LayoutSnapshot::Pane(id) => {
+                ids.insert(*id);
+            }
+            LayoutSnapshot::Collection(_) => {}
+            LayoutSnapshot::Split { first, second, .. } => {
+                collect(first, ids);
+                collect(second, ids);
+            }
+        }
+    }
+    collect(&snap.layout, &mut old_ids);
+    let mut ordered: Vec<_> = old_ids.into_iter().collect();
+    ordered.sort_unstable();
+    let id_map: HashMap<_, _> = ordered
+        .into_iter()
+        .map(|old| (old, PaneId::alloc()))
+        .collect();
+    fn remap(node: &LayoutSnapshot, ids: &HashMap<u32, PaneId>) -> TypedNode {
+        match node {
+            LayoutSnapshot::Pane(old) => TypedNode::Leaf(LayoutLeaf::Pane(
+                ids.get(old).copied().unwrap_or_else(PaneId::alloc),
+            )),
+            LayoutSnapshot::Collection(id) => TypedNode::Leaf(LayoutLeaf::Collection(*id)),
+            LayoutSnapshot::Split {
+                direction,
+                ratio,
+                first,
+                second,
+            } => TypedNode::Split {
+                direction: match direction {
+                    DirectionSnapshot::Horizontal => Direction::Horizontal,
+                    DirectionSnapshot::Vertical => Direction::Vertical,
+                },
+                ratio: *ratio,
+                first: Box::new(remap(first, ids)),
+                second: Box::new(remap(second, ids)),
+            },
+        }
+    }
+    (remap(&snap.layout, &id_map), id_map)
+}
+
+#[cfg(test)]
+fn recover_typed_layout(
+    snap: &TabSnapshot,
+    node: TypedNode,
+    id_map: &HashMap<u32, PaneId>,
+    surviving: &HashSet<PaneId>,
+) -> Option<TileLayout> {
+    recover_typed_layout_with_claims(snap, node, id_map, surviving, &mut HashSet::new())
+}
+
+fn recover_typed_layout_with_claims(
+    snap: &TabSnapshot,
+    node: TypedNode,
+    id_map: &HashMap<u32, PaneId>,
+    surviving: &HashSet<PaneId>,
+    claimed_collection_ids: &mut HashSet<CollectionId>,
+) -> Option<TileLayout> {
+    let mut records: HashMap<CollectionId, &CollectionSnapshot> = HashMap::new();
+    for record in &snap.collections {
+        records.entry(record.id).or_insert(record);
+    }
+    let mut collection_leaves = HashSet::new();
+    fn prune(
+        node: TypedNode,
+        surviving: &HashSet<PaneId>,
+        records: &HashMap<CollectionId, &CollectionSnapshot>,
+        collection_leaves: &mut HashSet<CollectionId>,
+        claimed_collection_ids: &mut HashSet<CollectionId>,
+    ) -> Option<TypedNode> {
+        match node {
+            TypedNode::Leaf(LayoutLeaf::Pane(id)) => surviving
+                .contains(&id)
+                .then_some(TypedNode::Leaf(LayoutLeaf::Pane(id))),
+            TypedNode::Leaf(LayoutLeaf::Collection(id)) => (records.contains_key(&id)
+                && !collection_leaves.contains(&id)
+                && claimed_collection_ids.insert(id)
+                && collection_leaves.insert(id))
+            .then_some(TypedNode::Leaf(LayoutLeaf::Collection(id))),
+            TypedNode::Split {
+                direction,
+                ratio,
+                first,
+                second,
+            } => match (
+                prune(
+                    *first,
+                    surviving,
+                    records,
+                    collection_leaves,
+                    claimed_collection_ids,
+                ),
+                prune(
+                    *second,
+                    surviving,
+                    records,
+                    collection_leaves,
+                    claimed_collection_ids,
+                ),
+            ) {
+                (Some(first), Some(second)) => Some(TypedNode::Split {
+                    direction,
+                    ratio,
+                    first: Box::new(first),
+                    second: Box::new(second),
+                }),
+                (Some(node), None) | (None, Some(node)) => Some(node),
+                (None, None) => None,
+            },
+        }
+    }
+
+    let mut root = prune(
+        node,
+        surviving,
+        &records,
+        &mut collection_leaves,
+        claimed_collection_ids,
+    );
+    let mut placed = HashSet::new();
+    fn collect_tiled(node: &TypedNode, placed: &mut HashSet<PaneId>) {
+        match node {
+            TypedNode::Leaf(LayoutLeaf::Pane(id)) => {
+                placed.insert(*id);
+            }
+            TypedNode::Leaf(LayoutLeaf::Collection(_)) => {}
+            TypedNode::Split { first, second, .. } => {
+                collect_tiled(first, placed);
+                collect_tiled(second, placed);
+            }
+        }
+    }
+    if let Some(node) = root.as_ref() {
+        collect_tiled(node, &mut placed);
+    }
+
+    let mut collections = Vec::new();
+    let mut collection_ids: Vec<_> = collection_leaves.into_iter().collect();
+    collection_ids.sort_by_key(|id| id.raw());
+    for id in collection_ids {
+        let Some(saved) = records.get(&id) else {
+            continue;
+        };
+        let mut members = Vec::new();
+        for old in &saved.members {
+            let Some(member) = id_map.get(old).copied() else {
+                continue;
+            };
+            if surviving.contains(&member) && placed.insert(member) {
+                members.push(member);
+            }
+        }
+        let selected = saved
+            .selected
+            .and_then(|old| id_map.get(&old).copied())
+            .filter(|pane| members.contains(pane))
+            .or_else(|| members.first().copied());
+        let archived: HashSet<_> = saved
+            .archived
+            .iter()
+            .filter_map(|old| id_map.get(old).copied())
+            .filter(|pane| members.contains(pane))
+            .collect();
+        if let Some(collection) =
+            PaneCollection::from_saved(id, saved.label.clone(), members, selected, archived)
+        {
+            collections.push(collection);
+        }
+    }
+
+    let mut unplaced: Vec<_> = surviving
+        .iter()
+        .copied()
+        .filter(|pane| !placed.contains(pane))
+        .collect();
+    unplaced.sort_by_key(|pane| {
+        id_map
+            .iter()
+            .find_map(|(old, new)| (*new == *pane).then_some(*old))
+            .unwrap_or(u32::MAX)
+    });
+    for pane in unplaced {
+        let leaf = TypedNode::Leaf(LayoutLeaf::Pane(pane));
+        root = Some(match root {
+            Some(existing) => TypedNode::Split {
+                direction: Direction::Horizontal,
+                ratio: 0.5,
+                first: Box::new(existing),
+                second: Box::new(leaf),
+            },
+            None => leaf,
+        });
+        placed.insert(pane);
+    }
+    let root = root?;
+
+    let saved_focus = snap.focused_leaf.and_then(|leaf| match leaf {
+        LayoutLeafSnapshot::Pane(old) => id_map.get(&old).copied().map(LayoutLeaf::Pane),
+        LayoutLeafSnapshot::Collection(id) => Some(LayoutLeaf::Collection(id)),
+    });
+    let legacy_focus = snap
+        .focused
+        .and_then(|old| id_map.get(&old).copied())
+        .map(|pane| {
+            collections
+                .iter()
+                .find(|collection| collection.members().contains(&pane))
+                .map(|collection| LayoutLeaf::Collection(collection.id))
+                .unwrap_or(LayoutLeaf::Pane(pane))
+        });
+    let mut restored_leaves = Vec::new();
+    fn collect_leaves(node: &TypedNode, output: &mut Vec<LayoutLeaf>) {
+        match node {
+            TypedNode::Leaf(leaf) => output.push(*leaf),
+            TypedNode::Split { first, second, .. } => {
+                collect_leaves(first, output);
+                collect_leaves(second, output);
+            }
+        }
+    }
+    collect_leaves(&root, &mut restored_leaves);
+    let focus = saved_focus
+        .or(legacy_focus)
+        .filter(|focus| restored_leaves.contains(focus))
+        .or_else(|| restored_leaves.first().copied())?;
+    TileLayout::from_typed_saved(root, focus, collections)
+}
+
+#[cfg(test)]
 pub(super) fn prune_restored_node(node: Node, surviving: &HashSet<PaneId>) -> Option<Node> {
     match node {
         Node::Pane(id) => surviving.contains(&id).then_some(Node::Pane(id)),
@@ -859,12 +1154,14 @@ pub(super) fn resolve_restored_pane(
 
 /// Restore a layout tree, remapping every pane ID to a fresh globally unique one.
 /// Returns the new tree and a map of old_raw_id → new PaneId.
+#[cfg(test)]
 pub(super) fn restore_node_remapped(snap: &LayoutSnapshot) -> (Node, HashMap<u32, PaneId>) {
     let mut id_map = HashMap::new();
     let node = remap_inner(snap, &mut id_map);
     (node, id_map)
 }
 
+#[cfg(test)]
 fn remap_inner(snap: &LayoutSnapshot, id_map: &mut HashMap<u32, PaneId>) -> Node {
     match snap {
         LayoutSnapshot::Pane(old_id) => {
@@ -872,6 +1169,7 @@ fn remap_inner(snap: &LayoutSnapshot, id_map: &mut HashMap<u32, PaneId>) -> Node
             id_map.insert(*old_id, new_id);
             Node::Pane(new_id)
         }
+        LayoutSnapshot::Collection(_) => Node::Pane(PaneId::alloc()),
         LayoutSnapshot::Split {
             direction,
             ratio,
@@ -894,12 +1192,14 @@ fn remap_inner(snap: &LayoutSnapshot, id_map: &mut HashMap<u32, PaneId>) -> Node
     }
 }
 
+#[cfg(test)]
 pub(super) fn collect_pane_ids(node: &Node) -> Vec<PaneId> {
     let mut ids = Vec::new();
     collect_ids_inner(node, &mut ids);
     ids
 }
 
+#[cfg(test)]
 fn collect_ids_inner(node: &Node, ids: &mut Vec<PaneId>) {
     match node {
         Node::Pane(id) => ids.push(*id),
@@ -920,6 +1220,62 @@ mod tests {
             .join(name)
             .display()
             .to_string()
+    }
+
+    fn pane_snapshot(cwd: &std::path::Path) -> super::super::snapshot::PaneSnapshot {
+        super::super::snapshot::PaneSnapshot {
+            cwd: cwd.to_path_buf(),
+            label: None,
+            agent_name: None,
+            managed_agent_kind: None,
+            agent_session: None,
+            launch_argv: None,
+        }
+    }
+
+    fn tab_snapshot(
+        layout: LayoutSnapshot,
+        collections: Vec<CollectionSnapshot>,
+        panes: HashMap<u32, super::super::snapshot::PaneSnapshot>,
+    ) -> TabSnapshot {
+        TabSnapshot {
+            custom_name: None,
+            layout,
+            collections,
+            panes,
+            zoomed: false,
+            focused: None,
+            focused_leaf: None,
+            root_pane: None,
+        }
+    }
+
+    fn session_snapshot_with_tab(
+        tab: TabSnapshot,
+        delegations: Vec<crate::delegation::DelegationRecord>,
+    ) -> SessionSnapshot {
+        SessionSnapshot {
+            version: super::super::snapshot::SNAPSHOT_VERSION,
+            workspaces: vec![WorkspaceSnapshot {
+                id: Some("restore-test".into()),
+                custom_name: None,
+                identity_cwd: std::env::current_dir().unwrap(),
+                worktree_space: None,
+                public_pane_numbers: HashMap::new(),
+                next_public_pane_number: 0,
+                public_tab_numbers: vec![1],
+                next_public_tab_number: 2,
+                tabs: vec![tab],
+                active_tab: 0,
+            }],
+            active: Some(0),
+            selected: 0,
+            sidebar_width: None,
+            sidebar_section_split: None,
+            collapsed_space_keys: Default::default(),
+            delegations,
+            collection_archive_times: Vec::new(),
+        }
     }
 
     #[cfg(windows)]
@@ -954,6 +1310,168 @@ mod tests {
         assert_eq!(ids.len(), 3);
         let unique: std::collections::HashSet<u32> = ids.iter().map(|id| id.raw()).collect();
         assert_eq!(unique.len(), 3);
+    }
+
+    #[test]
+    fn malformed_collection_state_promotes_every_surviving_pane() {
+        let cwd = std::env::current_dir().unwrap();
+        let collection = CollectionId::alloc().expect("collection id");
+        let snap = tab_snapshot(
+            LayoutSnapshot::Collection(collection),
+            Vec::new(),
+            HashMap::from([(10, pane_snapshot(&cwd)), (20, pane_snapshot(&cwd))]),
+        );
+        let (node, id_map) = restore_typed_node_remapped(&snap);
+        let surviving: HashSet<_> = id_map.values().copied().collect();
+
+        let layout = recover_typed_layout(&snap, node, &id_map, &surviving)
+            .expect("surviving panes should be promoted");
+
+        assert_eq!(layout.pane_ids().len(), 2);
+        assert_eq!(layout.tiled_pane_ids().len(), 2);
+        assert_eq!(layout.collections().count(), 0);
+    }
+
+    #[tokio::test]
+    async fn duplicate_collection_ids_across_tabs_and_workspaces_promote_conflicting_members() {
+        let cwd = std::env::current_dir().unwrap();
+        let collection = CollectionId::alloc().expect("collection id");
+        let collection_tab = |old_pane| {
+            tab_snapshot(
+                LayoutSnapshot::Collection(collection),
+                vec![CollectionSnapshot {
+                    id: collection,
+                    label: Some(format!("helpers-{old_pane}")),
+                    members: vec![old_pane],
+                    selected: Some(old_pane),
+                    archived: Vec::new(),
+                }],
+                HashMap::from([(old_pane, pane_snapshot(&cwd))]),
+            )
+        };
+        let workspace = |id: &str, tabs: Vec<TabSnapshot>| WorkspaceSnapshot {
+            id: Some(id.into()),
+            custom_name: None,
+            identity_cwd: cwd.clone(),
+            worktree_space: None,
+            public_pane_numbers: HashMap::new(),
+            next_public_pane_number: 1,
+            public_tab_numbers: (1..=tabs.len()).collect(),
+            next_public_tab_number: tabs.len() + 1,
+            tabs,
+            active_tab: 0,
+        };
+        let snapshot = SessionSnapshot {
+            version: super::super::snapshot::SNAPSHOT_VERSION,
+            workspaces: vec![
+                workspace(
+                    "duplicate-tabs",
+                    vec![collection_tab(10), collection_tab(20)],
+                ),
+                workspace("duplicate-workspace", vec![collection_tab(30)]),
+            ],
+            active: Some(0),
+            selected: 0,
+            sidebar_width: None,
+            sidebar_section_split: None,
+            collapsed_space_keys: Default::default(),
+            delegations: Vec::new(),
+            collection_archive_times: Vec::new(),
+        };
+        let (events, _event_rx) = mpsc::channel(4);
+
+        let (workspaces, _delegations, _archive_times, terminals, runtimes) = restore(
+            &snapshot,
+            None,
+            24,
+            80,
+            0,
+            test_restore_shell(),
+            crate::config::ShellModeConfig::NonLogin,
+            false,
+            events,
+            Arc::new(Notify::new()),
+            Arc::new(AtomicBool::new(false)),
+        );
+
+        assert_eq!(workspaces.len(), 2);
+        assert_eq!(workspaces[0].tabs.len(), 2);
+        assert!(workspaces[0].tabs[0].collection(collection).is_some());
+        assert_eq!(workspaces[0].tabs[0].layout.tiled_pane_ids().len(), 0);
+        for tab in [&workspaces[0].tabs[1], &workspaces[1].tabs[0]] {
+            assert!(tab.collection(collection).is_none());
+            assert_eq!(tab.panes.len(), 1);
+            assert_eq!(tab.layout.tiled_pane_ids().len(), 1);
+        }
+        assert_eq!(terminals.len(), 3);
+        assert_eq!(runtimes.len(), 3);
+        let collection_count = workspaces
+            .iter()
+            .flat_map(|workspace| &workspace.tabs)
+            .flat_map(|tab| tab.layout.collection_ids())
+            .count();
+        assert_eq!(collection_count, 1);
+
+        let mut state = crate::app::AppState::test_new();
+        state.workspaces = workspaces;
+        state.active = Some(0);
+        state.selected = 0;
+        state.terminals = terminals;
+        state.assert_invariants_for_test();
+    }
+
+    #[test]
+    fn failed_collection_member_recovery_keeps_survivor_and_repairs_selection() {
+        let cwd = std::env::current_dir().unwrap();
+        let collection = CollectionId::alloc().expect("collection id");
+        let snap = tab_snapshot(
+            LayoutSnapshot::Split {
+                direction: DirectionSnapshot::Horizontal,
+                ratio: 0.5,
+                first: Box::new(LayoutSnapshot::Pane(10)),
+                second: Box::new(LayoutSnapshot::Collection(collection)),
+            },
+            vec![CollectionSnapshot {
+                id: collection,
+                label: Some("helpers".into()),
+                members: vec![20, 30],
+                selected: Some(30),
+                archived: vec![20, 30],
+            }],
+            HashMap::from([
+                (10, pane_snapshot(&cwd)),
+                (20, pane_snapshot(&cwd)),
+                (30, pane_snapshot(&cwd)),
+            ]),
+        );
+        let (node, id_map) = restore_typed_node_remapped(&snap);
+        let surviving = HashSet::from([id_map[&10], id_map[&20]]);
+
+        let layout = recover_typed_layout(&snap, node, &id_map, &surviving)
+            .expect("remaining member should preserve collection");
+        let restored = layout.collection(collection).expect("collection survives");
+
+        assert_eq!(restored.members(), &[id_map[&20]]);
+        assert_eq!(restored.selected(), Some(id_map[&20]));
+        assert!(restored.is_archived(id_map[&20]));
+        assert_eq!(layout.pane_ids().len(), 2);
+    }
+
+    #[test]
+    fn legacy_version_three_focus_migrates_to_typed_pane_focus() {
+        let snapshot = super::super::snapshot::parse_snapshot(include_str!(
+            "../../tests/fixtures/session/current-herdr-session.json"
+        ))
+        .expect("v3 fixture parses");
+        let snap = &snapshot.workspaces[0].tabs[0];
+        let (node, id_map) = restore_typed_node_remapped(snap);
+        let surviving: HashSet<_> = id_map.values().copied().collect();
+
+        let layout = recover_typed_layout(snap, node, &id_map, &surviving)
+            .expect("legacy pane layout recovers");
+        let old_focus = snap.focused.expect("fixture has pane focus");
+
+        assert_eq!(layout.focused_leaf(), LayoutLeaf::Pane(id_map[&old_focus]));
     }
 
     #[test]
@@ -1200,6 +1718,9 @@ mod tests {
                     zoomed: false,
                     focused: Some(0),
                     root_pane: Some(0),
+
+                    collections: Vec::new(),
+                    focused_leaf: None,
                 }],
                 active_tab: 0,
             }],
@@ -1208,10 +1729,13 @@ mod tests {
             sidebar_width: None,
             sidebar_section_split: None,
             collapsed_space_keys: Default::default(),
+
+            delegations: Vec::new(),
+            collection_archive_times: Vec::new(),
         };
         let (events, _event_rx) = mpsc::channel(4);
 
-        let (_workspaces, terminals, _runtimes) = restore(
+        let (_workspaces, _delegations, _archive_times, terminals, _runtimes) = restore(
             &snapshot,
             None,
             24,
@@ -1293,6 +1817,9 @@ mod tests {
                     zoomed: false,
                     focused: Some(10),
                     root_pane: Some(10),
+
+                    collections: Vec::new(),
+                    focused_leaf: None,
                 }],
                 active_tab: 0,
             }],
@@ -1301,10 +1828,13 @@ mod tests {
             sidebar_width: None,
             sidebar_section_split: None,
             collapsed_space_keys: Default::default(),
+
+            delegations: Vec::new(),
+            collection_archive_times: Vec::new(),
         };
         let (events, _event_rx) = mpsc::channel(4);
 
-        let (workspaces, _terminals, _runtimes) = restore(
+        let (workspaces, _delegations, _archive_times, _terminals, _runtimes) = restore(
             &snapshot,
             None,
             24,
@@ -1325,6 +1855,230 @@ mod tests {
         assert_eq!(workspace.next_public_pane_number, 4);
         assert_eq!(workspace.tabs[0].number, 5);
         assert_eq!(workspace.next_public_tab_number, 6);
+    }
+
+    #[tokio::test]
+    async fn archive_times_remap_and_discard_malformed_or_unarchived_entries() {
+        let cwd = std::env::current_dir().unwrap();
+        let root_old = 4_100_010;
+        let archived_old = 4_100_020;
+        let active_old = 4_100_030;
+        let missing_old = 4_100_040;
+        let collection = CollectionId::alloc().expect("collection id");
+        let mut snapshot = session_snapshot_with_tab(
+            tab_snapshot(
+                LayoutSnapshot::Split {
+                    direction: DirectionSnapshot::Horizontal,
+                    ratio: 0.5,
+                    first: Box::new(LayoutSnapshot::Pane(root_old)),
+                    second: Box::new(LayoutSnapshot::Collection(collection)),
+                },
+                vec![CollectionSnapshot {
+                    id: collection,
+                    label: None,
+                    members: vec![archived_old, active_old],
+                    selected: Some(archived_old),
+                    archived: vec![archived_old],
+                }],
+                HashMap::from([
+                    (root_old, pane_snapshot(&cwd)),
+                    (archived_old, pane_snapshot(&cwd)),
+                    (active_old, pane_snapshot(&cwd)),
+                ]),
+            ),
+            Vec::new(),
+        );
+        snapshot.collection_archive_times = vec![
+            super::super::snapshot::CollectionArchiveTimeSnapshot {
+                pane_id: archived_old,
+                unix_seconds: 1,
+                subsec_nanos: 1_000_000_000,
+            },
+            super::super::snapshot::CollectionArchiveTimeSnapshot {
+                pane_id: archived_old,
+                unix_seconds: 1_700_000_000,
+                subsec_nanos: 123,
+            },
+            super::super::snapshot::CollectionArchiveTimeSnapshot {
+                pane_id: active_old,
+                unix_seconds: 1_600_000_000,
+                subsec_nanos: 0,
+            },
+            super::super::snapshot::CollectionArchiveTimeSnapshot {
+                pane_id: missing_old,
+                unix_seconds: 1_500_000_000,
+                subsec_nanos: 0,
+            },
+        ];
+        let (events, _event_rx) = mpsc::channel(4);
+
+        let (workspaces, _delegations, archive_times, _terminals, _runtimes) = restore(
+            &snapshot,
+            None,
+            24,
+            80,
+            0,
+            test_restore_shell(),
+            crate::config::ShellModeConfig::NonLogin,
+            false,
+            events,
+            Arc::new(Notify::new()),
+            Arc::new(AtomicBool::new(false)),
+        );
+
+        let restored_collection = workspaces[0].tabs[0]
+            .collection(collection)
+            .expect("collection restored");
+        let archived = restored_collection
+            .archived_members()
+            .next()
+            .expect("archived member restored");
+        assert_ne!(archived.raw(), archived_old);
+        assert_eq!(archive_times.len(), 1);
+        let expected =
+            std::time::SystemTime::UNIX_EPOCH + std::time::Duration::new(1_700_000_000, 123);
+        assert_eq!(archive_times.get(&archived), Some(&expected));
+
+        #[cfg(unix)]
+        {
+            let mut imports = HashMap::new();
+            let (handoff_workspaces, _delegations, handoff_times, _terminals, _runtimes) =
+                restore_handoff(
+                    &snapshot,
+                    0,
+                    test_restore_shell(),
+                    crate::config::ShellModeConfig::NonLogin,
+                    &mut imports,
+                    mpsc::channel(4).0,
+                    Arc::new(Notify::new()),
+                    Arc::new(AtomicBool::new(false)),
+                )
+                .expect("live handoff restore should preserve archive age");
+            let handoff_archived = handoff_workspaces[0].tabs[0]
+                .collection(collection)
+                .and_then(|collection| collection.archived_members().next())
+                .expect("handoff archived member restored");
+            assert_eq!(handoff_times.len(), 1);
+            assert_eq!(handoff_times.get(&handoff_archived), Some(&expected));
+        }
+    }
+
+    #[tokio::test]
+    async fn delegation_pane_ids_remap_while_relationship_ids_remain_stable() {
+        let cwd = std::env::current_dir().unwrap();
+        let parent_old = 4_000_010;
+        let child_old = 4_000_020;
+        let parent_id = crate::delegation::DelegationId::alloc().expect("delegation id");
+        let child_id = crate::delegation::DelegationId::alloc().expect("delegation id");
+        let mut tab = tab_snapshot(
+            LayoutSnapshot::Split {
+                direction: DirectionSnapshot::Horizontal,
+                ratio: 0.5,
+                first: Box::new(LayoutSnapshot::Pane(parent_old)),
+                second: Box::new(LayoutSnapshot::Pane(child_old)),
+            },
+            Vec::new(),
+            HashMap::from([
+                (parent_old, pane_snapshot(&cwd)),
+                (child_old, pane_snapshot(&cwd)),
+            ]),
+        );
+        tab.root_pane = Some(parent_old);
+        tab.focused = Some(child_old);
+        let snapshot = session_snapshot_with_tab(
+            tab,
+            vec![
+                crate::delegation::DelegationRecord {
+                    id: parent_id,
+                    pane_id: Some(PaneId::from_raw(parent_old)),
+                    parent_id: None,
+                    purpose: Some("parent".into()),
+                    sibling_rank: 0,
+                    tombstone: false,
+                },
+                crate::delegation::DelegationRecord {
+                    id: child_id,
+                    pane_id: Some(PaneId::from_raw(child_old)),
+                    parent_id: Some(parent_id),
+                    purpose: Some("child".into()),
+                    sibling_rank: 0,
+                    tombstone: false,
+                },
+            ],
+        );
+        let (events, _event_rx) = mpsc::channel(4);
+
+        let (workspaces, delegations, _archive_times, _terminals, _runtimes) = restore(
+            &snapshot,
+            None,
+            24,
+            80,
+            0,
+            test_restore_shell(),
+            crate::config::ShellModeConfig::NonLogin,
+            false,
+            events,
+            Arc::new(Notify::new()),
+            Arc::new(AtomicBool::new(false)),
+        );
+
+        let restored_panes: HashSet<_> = workspaces[0].tabs[0].panes.keys().copied().collect();
+        let parent = delegations.get(parent_id).expect("parent delegation");
+        let child = delegations.get(child_id).expect("child delegation");
+        assert!(parent
+            .pane_id
+            .is_some_and(|pane| restored_panes.contains(&pane)));
+        assert!(child
+            .pane_id
+            .is_some_and(|pane| restored_panes.contains(&pane)));
+        assert_eq!(child.parent_id, Some(parent_id));
+        assert!(!parent.tombstone);
+        assert!(!child.tombstone);
+    }
+
+    #[tokio::test]
+    async fn empty_collection_tab_round_trips_with_optional_root_pane() {
+        let collection = CollectionId::alloc().expect("collection id");
+        let snapshot = session_snapshot_with_tab(
+            tab_snapshot(
+                LayoutSnapshot::Collection(collection),
+                vec![CollectionSnapshot {
+                    id: collection,
+                    label: Some("helpers".into()),
+                    members: Vec::new(),
+                    selected: None,
+                    archived: Vec::new(),
+                }],
+                HashMap::new(),
+            ),
+            Vec::new(),
+        );
+        let encoded = serde_json::to_string(&snapshot).unwrap();
+        let snapshot = super::super::snapshot::parse_snapshot(&encoded).unwrap();
+        let (events, _event_rx) = mpsc::channel(4);
+
+        let (workspaces, _delegations, _archive_times, terminals, runtimes) = restore(
+            &snapshot,
+            None,
+            24,
+            80,
+            0,
+            test_restore_shell(),
+            crate::config::ShellModeConfig::NonLogin,
+            false,
+            events,
+            Arc::new(Notify::new()),
+            Arc::new(AtomicBool::new(false)),
+        );
+
+        assert_eq!(workspaces.len(), 1);
+        assert_eq!(workspaces[0].tabs.len(), 1);
+        assert_eq!(workspaces[0].tabs[0].root_pane, None);
+        assert!(workspaces[0].tabs[0].panes.is_empty());
+        assert!(workspaces[0].tabs[0].collection(collection).is_some());
+        assert!(terminals.is_empty());
+        assert!(runtimes.is_empty());
+        workspaces[0].assert_invariants_for_test();
     }
 
     #[tokio::test]
@@ -1375,6 +2129,9 @@ mod tests {
                         zoomed: false,
                         focused: Some(10),
                         root_pane: Some(10),
+
+                        collections: Vec::new(),
+                        focused_leaf: None,
                     },
                     TabSnapshot {
                         custom_name: None,
@@ -1383,6 +2140,9 @@ mod tests {
                         zoomed: false,
                         focused: Some(11),
                         root_pane: Some(11),
+
+                        collections: Vec::new(),
+                        focused_leaf: None,
                     },
                     TabSnapshot {
                         custom_name: None,
@@ -1391,6 +2151,9 @@ mod tests {
                         zoomed: false,
                         focused: Some(12),
                         root_pane: Some(12),
+
+                        collections: Vec::new(),
+                        focused_leaf: None,
                     },
                     TabSnapshot {
                         custom_name: None,
@@ -1399,6 +2162,9 @@ mod tests {
                         zoomed: false,
                         focused: Some(13),
                         root_pane: Some(13),
+
+                        collections: Vec::new(),
+                        focused_leaf: None,
                     },
                 ],
                 active_tab: 3,
@@ -1408,10 +2174,13 @@ mod tests {
             sidebar_width: None,
             sidebar_section_split: None,
             collapsed_space_keys: Default::default(),
+
+            delegations: Vec::new(),
+            collection_archive_times: Vec::new(),
         };
         let (events, _event_rx) = mpsc::channel(4);
 
-        let (workspaces, terminals, _runtimes) = restore(
+        let (workspaces, _delegations, _archive_times, terminals, _runtimes) = restore(
             &snapshot,
             None,
             24,
@@ -1428,7 +2197,7 @@ mod tests {
         let workspace = workspaces.first().expect("workspace should restore");
         assert_eq!(workspace.active_tab, 3);
         assert_eq!(workspace.tabs[3].number, 5);
-        let agent_pane = workspace.tabs[3].root_pane;
+        let agent_pane = workspace.tabs[3].root_pane.expect("test tab has root pane");
         let terminal_id = &workspace.tabs[3].panes[&agent_pane].attached_terminal_id;
         assert!(terminals[terminal_id].agent_name.is_none());
         assert_eq!(terminals[terminal_id].managed_agent_kind(), None);
@@ -1462,6 +2231,9 @@ mod tests {
                 zoomed: false,
                 focused: Some(10),
                 root_pane: Some(10),
+
+                collections: Vec::new(),
+                focused_leaf: None,
             }],
             active_tab: 0,
         };
@@ -1511,6 +2283,9 @@ mod tests {
                     zoomed: false,
                     focused: Some(0),
                     root_pane: Some(0),
+
+                    collections: Vec::new(),
+                    focused_leaf: None,
                 }],
                 active_tab: 0,
             }],
@@ -1519,10 +2294,13 @@ mod tests {
             sidebar_width: None,
             sidebar_section_split: None,
             collapsed_space_keys: Default::default(),
+
+            delegations: Vec::new(),
+            collection_archive_times: Vec::new(),
         };
         let (events, _event_rx) = mpsc::channel(4);
 
-        let (_workspaces, terminals, runtimes) = restore(
+        let (_workspaces, _delegations, _archive_times, terminals, runtimes) = restore(
             &snapshot,
             None,
             24,
@@ -1553,7 +2331,13 @@ mod tests {
             "native agent restore should not spawn a fallback-size runtime during snapshot restore"
         );
         let mut imports = HashMap::new();
-        let (_handoff_workspaces, handoff_terminals, handoff_runtimes) = restore_handoff(
+        let (
+            _handoff_workspaces,
+            _handoff_delegations,
+            _archive_times,
+            handoff_terminals,
+            handoff_runtimes,
+        ) = restore_handoff(
             &snapshot,
             0,
             test_restore_shell(),
@@ -1585,7 +2369,7 @@ mod tests {
         let render_notify = Arc::new(Notify::new());
         let render_dirty = Arc::new(AtomicBool::new(false));
 
-        let (_workspaces, _terminals, runtimes) = restore(
+        let (_workspaces, _delegations, _archive_times, _terminals, runtimes) = restore(
             &snapshot,
             Some(&history),
             5,
@@ -1623,7 +2407,7 @@ mod tests {
         let render_notify = Arc::new(Notify::new());
         let render_dirty = Arc::new(AtomicBool::new(false));
 
-        let (_workspaces, _terminals, runtimes) = restore(
+        let (_workspaces, _delegations, _archive_times, _terminals, runtimes) = restore(
             &snapshot,
             None,
             5,
@@ -1705,6 +2489,9 @@ mod tests {
                     zoomed: false,
                     focused: Some(0),
                     root_pane: Some(0),
+
+                    collections: Vec::new(),
+                    focused_leaf: None,
                 }],
                 active_tab: 0,
             }],
@@ -1713,6 +2500,9 @@ mod tests {
             sidebar_width: Some(26),
             sidebar_section_split: Some(0.5),
             collapsed_space_keys: Default::default(),
+
+            delegations: Vec::new(),
+            collection_archive_times: Vec::new(),
         };
         (snapshot, history)
     }

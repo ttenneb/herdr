@@ -681,6 +681,24 @@
           ]
         },
         {
+          "key": "ui.collections.archive_age_days",
+          "type": "integer",
+          "default": "7",
+          "description": "Warn when a collection contains a member archived for at least this many days. Zero disables this advisory warning; Herdr never closes panes automatically."
+        },
+        {
+          "key": "ui.collections.archive_count",
+          "type": "integer",
+          "default": "20",
+          "description": "Warn when a collection has more than this many archived members. Zero disables this advisory warning; Herdr never closes panes automatically."
+        },
+        {
+          "key": "ui.collections.concurrency",
+          "type": "integer",
+          "default": "8",
+          "description": "Warn when a collection has more than this many working or blocked members. Zero disables this advisory warning; Herdr never stops panes automatically."
+        },
+        {
           "key": "ui.sidebar.agents.row_gap",
           "type": "integer",
           "default": "0",

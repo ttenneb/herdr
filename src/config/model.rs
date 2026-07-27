@@ -772,6 +772,27 @@ pub struct WorktreesConfig {
     pub directory: String,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(default)]
+pub struct CollectionLifecycleConfig {
+    /// Warn when an archived member has been retained this many days. Zero disables the warning.
+    pub archive_age_days: u64,
+    /// Warn when one collection has more archived members than this. Zero disables the warning.
+    pub archive_count: usize,
+    /// Warn when one collection has more live working/blocked members than this. Zero disables it.
+    pub concurrency: usize,
+}
+
+impl Default for CollectionLifecycleConfig {
+    fn default() -> Self {
+        Self {
+            archive_age_days: 7,
+            archive_count: 20,
+            concurrency: 8,
+        }
+    }
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(default)]
 pub struct UiConfig {
@@ -814,6 +835,8 @@ pub struct UiConfig {
     pub hide_tab_bar_when_single_tab: bool,
     /// Agent sidebar ordering. Saved values are "spaces" or "priority". Default: "spaces".
     pub agent_panel_sort: AgentPanelSortConfig,
+    /// Advisory collection retention and concurrency thresholds. These never close panes.
+    pub collections: CollectionLifecycleConfig,
     /// Expanded sidebar row composition.
     pub sidebar: SidebarConfig,
     /// Accent color for highlights, borders, and navigation UI.
@@ -1015,6 +1038,7 @@ impl Default for UiConfig {
             show_agent_labels_on_pane_borders: false,
             hide_tab_bar_when_single_tab: false,
             agent_panel_sort: AgentPanelSortConfig::Spaces,
+            collections: CollectionLifecycleConfig::default(),
             sidebar: SidebarConfig::default(),
             accent: "cyan".into(),
             toast: ToastConfig::default(),

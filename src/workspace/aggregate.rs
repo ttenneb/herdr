@@ -147,7 +147,7 @@ mod tests {
     fn aggregate_state_all_unknown() {
         let ws = Workspace::test_new("test");
         let mut terminals = HashMap::new();
-        let root = ws.tabs[0].root_pane;
+        let root = ws.tabs[0].root_pane.expect("test tab has root pane");
         let terminal = terminal_for_pane(&ws, root);
         terminals.insert(terminal.id.clone(), terminal);
         let (state, seen) = ws.aggregate_state(&terminals);
@@ -208,7 +208,7 @@ mod tests {
     #[test]
     fn pane_details_prefers_agent_name_over_detected_agent_label() {
         let ws = Workspace::test_new("test");
-        let root_pane = ws.tabs[0].root_pane;
+        let root_pane = ws.tabs[0].root_pane.expect("test tab has root pane");
         let mut terminals = HashMap::new();
         let mut terminal = terminal_for_pane(&ws, root_pane);
         terminal.set_detected_state(Some(Agent::Pi), AgentState::Working);
@@ -231,9 +231,11 @@ mod tests {
     fn pane_details_includes_tab_context_for_multi_tab_workspace() {
         let mut ws = Workspace::test_new("test");
         ws.tabs[0].custom_name = Some("main".into());
-        let root_pane = ws.tabs[0].root_pane;
+        let root_pane = ws.tabs[0].root_pane.expect("test tab has root pane");
         let second_tab = ws.test_add_tab(Some("review"));
-        let review_pane = ws.tabs[second_tab].root_pane;
+        let review_pane = ws.tabs[second_tab]
+            .root_pane
+            .expect("test tab has root pane");
         let mut terminals = HashMap::new();
         let mut root_terminal = terminal_for_pane(&ws, root_pane);
         root_terminal.set_hook_authority(
@@ -274,7 +276,9 @@ mod tests {
         let mut ws = Workspace::test_new("test");
         let removed_tab = ws.test_add_tab(Some("removed"));
         let survivor_tab = ws.test_add_tab(Some("survivor"));
-        let survivor_pane = ws.tabs[survivor_tab].root_pane;
+        let survivor_pane = ws.tabs[survivor_tab]
+            .root_pane
+            .expect("test tab has root pane");
         assert!(ws.close_tab(removed_tab));
 
         let mut terminals = HashMap::new();

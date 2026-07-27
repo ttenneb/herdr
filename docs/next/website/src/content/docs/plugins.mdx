@@ -298,8 +298,9 @@ choices_command = ["node", "list-targets.js"]
 ```
 
 `choices_command` is optional and, like `command`, must be a nonempty argv array.
-It is eligible only when a workspace, tab, or pane context menu matches one of
-the action's `contexts`; `global` and `selection` do not provide choices. The
+It is eligible only when a workspace, tab, pane, or collection-member context
+menu matches one of the action's `contexts`; collection-member menus use the
+member's `pane` context. `global` and `selection` do not provide choices. The
 current choices consumer is the native TUI context menu. There is no public
 socket request for resolving action choices.
 
@@ -339,7 +340,8 @@ duplicate ids, or any invalid choice rejects that provider's entire result.
 
 Herdr captures the invocation context when the target menu opens. A workspace
 menu captures its active tab and focused pane, a tab menu captures that tab and
-its focused pane, and a pane menu captures the targeted pane. The compact
+its focused pane, and pane and collection-member menus capture the targeted
+pane (the collection member for the latter). The compact
 `HERDR_PLUGIN_CONTEXT_JSON` supplied unchanged to both the provider and the
 selected action contains the available fields from this exact snapshot:
 `workspace_id`, `workspace_label`, `workspace_cwd`, `worktree` (`repo_key`,

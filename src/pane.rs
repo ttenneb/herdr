@@ -2585,6 +2585,28 @@ impl PaneRuntime {
         self.terminal.render(frame, area, show_cursor);
     }
 
+    #[allow(clippy::too_many_arguments)]
+    pub fn render_clipped(
+        &self,
+        frame: &mut Frame,
+        visible: Rect,
+        logical_rows: u16,
+        logical_cols: u16,
+        source_row: u16,
+        source_col: u16,
+        show_cursor: bool,
+    ) {
+        self.terminal.render_clipped(
+            frame,
+            visible,
+            logical_rows,
+            logical_cols,
+            source_row,
+            source_col,
+            show_cursor,
+        );
+    }
+
     pub(crate) fn collect_dirty_patch(
         &self,
         area_width: u16,

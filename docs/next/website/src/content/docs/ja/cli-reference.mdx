@@ -264,6 +264,39 @@ herdr pane report-metadata <pane_id> \
 
 `--source` と `--applies-to-source` は 80 文字以下で、ASCII の英字、数字、コロン、ドット、アンダースコア、ハイフンのみを含められます。`--ttl-ms` はメタデータを自動失効させ、`1` から `86400000` ミリ秒の間でなければなりません。置き換え・クリア・ペインまたはワークスペースのクローズまで残るべきメタデータでは省略してください。`--seq` により、Herdr は同じ `--source` からの古い報告を無視できます。古い報告は API には受理されますが、ペイン状態には無視されます。ペインまたはワークスペースが存続する間、シーケンス付きトークン報告を送れる異なるソースは最大 32 個で、クリアや失効でもその枠は解放されません。
 
+## コレクション
+
+```bash
+herdr collection list [--workspace ID] [--tab ID]
+herdr collection get <collection_id>
+herdr collection create --target-pane ID --direction right|down [--ratio FLOAT] [--label TEXT] [--focus|--no-focus]
+herdr collection add <collection_id> <tiled_pane_id>
+herdr collection move <member_pane_id> <collection_id>
+herdr collection member-create <collection_id> [--cwd PATH] [--env KEY=VALUE] [--parent DELEGATION_ID] [--purpose TEXT]
+herdr collection select <collection_id> <pane_id> [--focus|--no-focus]
+herdr collection reorder <collection_id> <pane_id> --index N
+herdr collection archive <collection_id> <pane_id>
+herdr collection restore <collection_id> <pane_id>
+herdr collection promote <pane_id> --target-pane ID --direction right|down [--ratio FLOAT] [--focus|--no-focus]
+herdr collection close <collection_id> [--cascade-close|--promote-members] [--target-pane ID] [--focus-promoted]
+```
+
+メンバーは通常のペインと PTY のままです。`member-create` の `.result.created.pane.pane_id` を `agent start --pane` に使います。選択や API フォーカスは確認済みにしません。アーカイブは入力または `working` / `blocked` で復元され、制限は警告だけです。空でないクローズには `--cascade-close` または `--promote-members` が必須です。
+
+## デリゲーション
+
+```bash
+herdr delegation create [--pane ID] [--parent ID] [--purpose TEXT]
+herdr delegation get <delegation_id>
+herdr delegation tree
+herdr delegation root <delegation_id>
+herdr delegation descendants <delegation_id>
+herdr delegation reparent <delegation_id> (--parent ID|--root)
+herdr delegation reorder <delegation_id> (--first|--last|--before ID|--after ID)
+```
+
+デリゲーションは `d1` 形式の安定した来歴です。親更新は欠落、自分自身、循環を拒否します。`reorder` は兄弟順、`reparent` は関係を変更します。親クローズ後も子孫がある間は tombstone が残ります。正確な socket スキーマは `herdr api schema --json` を参照してください。
+
 ## エージェント
 
 ペインとエージェントの使い分けや一連の連携例は、[エージェント自動化](/ja/docs/agent-automation/) を参照してください。
@@ -291,7 +324,7 @@ start は、期待したエージェントが同じターミナルを所有し�
 
 `agent prompt` は現在の bracketed paste モードを尊重し、working 中でもテキストとエンコード済み Enter をアトミックに送信します。`--wait` を使う場合、non-working 状態から送信したプロンプトは 5 秒以内に観測可能なライフサイクル変化を起こす必要があり、変化がなければ Herdr は `agent_prompt_stalled` を返します。呼び出し側のタイムアウトが 5 秒以下なら、通常の `timeout` エラーを維持します。活動を観測した後、要求された安定状態を待ちます。個々のターンは追跡しません。すでに working の場合、進行中ターンの完了が待機を満たすことがあります。`--until` は一致状態を絞り込み、`--wait` なしでは拒否されます。単独の `agent wait` は現在の状態が一致すれば即座に返ります。どちらもデフォルトは `idle`、`done`、`blocked` です。
 
-`idle` は入力待ちで、そのタブがフォーカス中の Herdr UI ですでに表示済みの状態です。`done` は同じ基礎的な idle 状態ですが、表示していないバックグラウンド作業が完了したときに使われます。そのタブをフォーカスするか `pane focus` / `agent focus` で対象にすると表示済みになりますが、CLI で読み取るだけでは変わりません。`blocked` は承認または質問 UI を Herdr が認識した状態です。`unknown` はエージェントが存在するものの確実に分類できない状態で、作業の成功を意味しません。
+`idle` は確認済み、`done` は未確認の同じ基礎的な idle 状態です。通常ペインは、そのタブがフォアグラウンドの Herdr UI で実際に表示されたときだけ確認済みになります。CLI の `pane focus` と `agent focus` はフォーカスを変えますが、確認済みにはしません。コレクションメンバーは人間が子ターミナルへ入ったときだけ確認済みになります。CLI の読み取りや待機でも変わりません。`unknown` は成功を意味しません。
 
 `agent send-keys` は `enter`、`up`、`esc`、`ctrl+c` などの論理キーを送ります。Herdr は 1 バイトも書き込む前に全キーを検証します。`agent read` は解決されたターミナルストリームを読み、`agent rename` は検出済みエージェントに名前を付けます。
 

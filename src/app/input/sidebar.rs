@@ -651,9 +651,11 @@ mod tests {
         let mut app = app_for_mouse_test();
         let mut ws = Workspace::test_new("test");
         ws.tabs[0].set_custom_name("main".into());
-        let first_pane = ws.tabs[0].root_pane;
+        let first_pane = ws.tabs[0].root_pane.expect("test tab has root pane");
         let first_tab = ws.test_add_tab(Some("logs"));
-        let second_pane = ws.tabs[first_tab].root_pane;
+        let second_pane = ws.tabs[first_tab]
+            .root_pane
+            .expect("test tab has root pane");
         app.state.workspaces = vec![ws];
         app.state.ensure_test_terminals();
         let first_terminal_id = app.state.workspaces[0].tabs[0].panes[&first_pane]
@@ -686,19 +688,19 @@ mod tests {
         assert_eq!(app.state.mode, Mode::Terminal);
         let snapshot = capture_snapshot(&app.state);
         assert_eq!(snapshot.workspaces[0].active_tab, first_tab);
-        assert_eq!(
-            snapshot.workspaces[0].tabs[first_tab].focused,
-            Some(second_pane.raw())
-        );
+        assert_eq!(snapshot.workspaces[0].tabs[first_tab].focused, None);
+        assert!(snapshot.workspaces[0].tabs[first_tab]
+            .focused_leaf
+            .is_some());
     }
 
     #[test]
     fn per_agent_row_heights_preserve_card_gaps_and_trailing_mouse_targets() {
         let mut app = app_for_mouse_test();
         let first = Workspace::test_new("one");
-        let first_pane = first.tabs[0].root_pane;
+        let first_pane = first.tabs[0].root_pane.expect("test tab has root pane");
         let second = Workspace::test_new("two");
-        let second_pane = second.tabs[0].root_pane;
+        let second_pane = second.tabs[0].root_pane.expect("test tab has root pane");
         app.state.workspaces = vec![first, second];
         app.state.ensure_test_terminals();
         for (ws_idx, pane_id, agent) in
@@ -750,9 +752,9 @@ mod tests {
     fn agent_hit_testing_clamps_scroll_after_dynamic_filter_shrink() {
         let mut app = app_for_mouse_test();
         let first = Workspace::test_new("one");
-        let first_pane = first.tabs[0].root_pane;
+        let first_pane = first.tabs[0].root_pane.expect("test tab has root pane");
         let second = Workspace::test_new("two");
-        let second_pane = second.tabs[0].root_pane;
+        let second_pane = second.tabs[0].root_pane.expect("test tab has root pane");
         app.state.workspaces = vec![first, second];
         app.state.ensure_test_terminals();
         app.state.active = Some(0);
@@ -818,10 +820,10 @@ mod tests {
     fn clicking_all_workspaces_agent_row_switches_to_correct_workspace() {
         let mut app = app_for_mouse_test();
         let first = Workspace::test_new("one");
-        let first_pane = first.tabs[0].root_pane;
+        let first_pane = first.tabs[0].root_pane.expect("test tab has root pane");
 
         let second = Workspace::test_new("two");
-        let second_pane = second.tabs[0].root_pane;
+        let second_pane = second.tabs[0].root_pane.expect("test tab has root pane");
 
         app.state.workspaces = vec![first, second];
         app.state.ensure_test_terminals();
@@ -868,7 +870,7 @@ mod tests {
     fn scrolling_agent_panel_with_wheel_updates_agent_panel_scroll() {
         let mut app = app_for_mouse_test();
         let mut ws = Workspace::test_new("test");
-        let first_pane = ws.tabs[0].root_pane;
+        let first_pane = ws.tabs[0].root_pane.expect("test tab has root pane");
 
         let mut tabs = Vec::new();
         for (tab_name, agent) in [
@@ -877,7 +879,7 @@ mod tests {
             ("ops", Agent::Gemini),
         ] {
             let tab_idx = ws.test_add_tab(Some(tab_name));
-            let pane_id = ws.tabs[tab_idx].root_pane;
+            let pane_id = ws.tabs[tab_idx].root_pane.expect("test tab has root pane");
             tabs.push((tab_idx, pane_id, agent));
         }
 
@@ -924,13 +926,15 @@ mod tests {
     fn clicking_scrolled_agent_detail_row_switches_to_correct_tab_and_pane() {
         let mut app = app_for_mouse_test();
         let mut ws = Workspace::test_new("test");
-        let first_pane = ws.tabs[0].root_pane;
+        let first_pane = ws.tabs[0].root_pane.expect("test tab has root pane");
         let second_tab = ws.test_add_tab(Some("logs"));
-        let second_pane = ws.tabs[second_tab].root_pane;
+        let second_pane = ws.tabs[second_tab]
+            .root_pane
+            .expect("test tab has root pane");
         let mut extra_tabs = Vec::new();
         for (tab_name, agent) in [("review", Agent::Codex), ("ops", Agent::Gemini)] {
             let tab_idx = ws.test_add_tab(Some(tab_name));
-            let pane_id = ws.tabs[tab_idx].root_pane;
+            let pane_id = ws.tabs[tab_idx].root_pane.expect("test tab has root pane");
             extra_tabs.push((tab_idx, pane_id, agent));
         }
 
@@ -995,9 +999,11 @@ mod tests {
     fn clicking_collapsed_agent_row_switches_to_correct_tab_and_pane() {
         let mut app = app_for_mouse_test();
         let mut ws = Workspace::test_new("test");
-        let first_pane = ws.tabs[0].root_pane;
+        let first_pane = ws.tabs[0].root_pane.expect("test tab has root pane");
         let second_tab = ws.test_add_tab(Some("logs"));
-        let second_pane = ws.tabs[second_tab].root_pane;
+        let second_pane = ws.tabs[second_tab]
+            .root_pane
+            .expect("test tab has root pane");
         app.state.workspaces = vec![ws];
         app.state.ensure_test_terminals();
         let first_terminal_id = app.state.workspaces[0].tabs[0].panes[&first_pane]
@@ -1043,9 +1049,9 @@ mod tests {
     fn clicking_collapsed_priority_agent_row_switches_to_matching_workspace() {
         let mut app = app_for_mouse_test();
         let first = Workspace::test_new("one");
-        let first_pane = first.tabs[0].root_pane;
+        let first_pane = first.tabs[0].root_pane.expect("test tab has root pane");
         let second = Workspace::test_new("two");
-        let second_pane = second.tabs[0].root_pane;
+        let second_pane = second.tabs[0].root_pane.expect("test tab has root pane");
 
         app.state.workspaces = vec![first, second];
         app.state.ensure_test_terminals();
@@ -1406,7 +1412,7 @@ mod tests {
         let mut ws = Workspace::test_new("test");
         ws.test_add_tab(Some("foo"));
         ws.test_add_tab(None);
-        let moved_root = ws.tabs[0].root_pane;
+        let moved_root = ws.tabs[0].root_pane.expect("test tab has root pane");
         app.state.workspaces = vec![ws];
         app.state.active = Some(0);
         app.state.selected = 0;
@@ -1456,7 +1462,12 @@ mod tests {
         assert_eq!(app.state.workspaces[0].tabs[0].number, 2);
         assert_eq!(app.state.workspaces[0].tabs[1].number, 3);
         assert_eq!(app.state.workspaces[0].tabs[2].number, 1);
-        assert_eq!(app.state.workspaces[0].tabs[2].root_pane, moved_root);
+        assert_eq!(
+            app.state.workspaces[0].tabs[2]
+                .root_pane
+                .expect("test tab has root pane"),
+            moved_root
+        );
         assert_eq!(app.state.workspaces[0].active_tab, 2);
     }
 
@@ -1490,12 +1501,12 @@ mod tests {
         let second_repo = temp_git_repo("main");
 
         let mut first = Workspace::test_new("a");
-        let first_root = first.tabs[0].root_pane;
+        let first_root = first.tabs[0].root_pane.expect("test tab has root pane");
         first.identity_cwd = first_repo.clone();
         first.refresh_git_ahead_behind();
 
         let mut second = Workspace::test_new("b");
-        let second_root = second.tabs[0].root_pane;
+        let second_root = second.tabs[0].root_pane.expect("test tab has root pane");
         second.identity_cwd = second_repo.clone();
         second.refresh_git_ahead_behind();
 

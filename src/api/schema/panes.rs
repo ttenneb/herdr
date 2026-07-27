@@ -6,6 +6,7 @@ pub(crate) const PANE_GRAPHICS_SET_MAX_BYTES: usize = 512 * 1024;
 pub(crate) const PANE_GRAPHICS_STREAM_MAX_BYTES: usize = 16 * 1024 * 1024;
 
 use super::agents::AgentSessionInfo;
+use super::collections::{CollectionInfo, PanePlacementInfo};
 use super::common::{AgentStatus, PaneAgentState, ReadFormat, ReadSource, SplitDirection};
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
@@ -57,6 +58,9 @@ pub struct PaneMoveParams {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum PaneMoveDestination {
+    Collection {
+        collection_id: String,
+    },
     Tab {
         tab_id: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -146,7 +150,10 @@ pub struct LayoutDescription {
     pub workspace_id: String,
     pub tab_id: String,
     pub zoomed: bool,
-    pub focused_pane_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub focused_pane_id: Option<String>,
+    #[serde(default = "default_layout_focus")]
+    pub focused: LayoutFocusInfo,
     pub root: LayoutNode,
 }
 
@@ -398,6 +405,8 @@ pub struct PaneInfo {
     pub workspace_id: String,
     pub tab_id: String,
     pub focused: bool,
+    #[serde(default)]
+    pub placement: PanePlacementInfo,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cwd: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -469,7 +478,8 @@ pub struct PaneSwapResult {
     pub source_pane_id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub target_pane_id: Option<String>,
-    pub focused_pane_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub focused_pane_id: Option<String>,
     pub layout: PaneLayoutSnapshot,
 }
 
@@ -502,7 +512,8 @@ pub struct PaneMoveResult {
     pub closed_workspace_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub closed_tab_id: Option<String>,
-    pub focused_pane_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub focused_pane_id: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
@@ -520,7 +531,8 @@ pub struct PaneZoomResult {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reason: Option<PaneZoomReason>,
     pub pane_id: String,
-    pub focused_pane_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub focused_pane_id: Option<String>,
     pub zoomed: bool,
     pub layout: PaneLayoutSnapshot,
 }
@@ -539,9 +551,33 @@ pub struct PaneLayoutSnapshot {
     pub tab_id: String,
     pub zoomed: bool,
     pub area: PaneLayoutRect,
-    pub focused_pane_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub focused_pane_id: Option<String>,
+    #[serde(default = "default_layout_focus")]
+    pub focused: LayoutFocusInfo,
     pub panes: Vec<PaneLayoutPane>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub collections: Vec<CollectionInfo>,
     pub splits: Vec<PaneLayoutSplit>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum LayoutFocusInfo {
+    Pane {
+        pane_id: String,
+    },
+    Collection {
+        collection_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        selected_pane_id: Option<String>,
+    },
+}
+
+fn default_layout_focus() -> LayoutFocusInfo {
+    LayoutFocusInfo::Pane {
+        pane_id: String::new(),
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
@@ -556,6 +592,8 @@ pub struct PaneLayoutRect {
 pub struct PaneLayoutPane {
     pub pane_id: String,
     pub focused: bool,
+    #[serde(default)]
+    pub placement: PanePlacementInfo,
     pub rect: PaneLayoutRect,
 }
 
@@ -609,7 +647,8 @@ pub struct PaneResizeResult {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reason: Option<PaneResizeReason>,
     pub pane_id: String,
-    pub focused_pane_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub focused_pane_id: Option<String>,
     pub layout: PaneLayoutSnapshot,
 }
 

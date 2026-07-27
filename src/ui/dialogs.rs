@@ -15,6 +15,134 @@ use crate::app::{state::WorktreeOpenState, AppState, Mode};
 use crate::terminal::TerminalRuntimeRegistry;
 
 const NEW_LINKED_WORKTREE_POPUP_WIDTH: u16 = 68;
+const COLLECTION_CLOSE_POPUP_WIDTH: u16 = 76;
+const COLLECTION_CLOSE_POPUP_HEIGHT: u16 = 12;
+
+pub(crate) fn collection_close_popup_rect(area: Rect) -> Option<Rect> {
+    centered_popup_rect(
+        area,
+        COLLECTION_CLOSE_POPUP_WIDTH,
+        COLLECTION_CLOSE_POPUP_HEIGHT,
+    )
+}
+
+pub(crate) fn collection_close_button_rects(inner: Rect) -> (Rect, Rect, Rect) {
+    let rects = action_button_row_rects(
+        inner,
+        &[
+            ActionButtonSpec {
+                hint: Some("p"),
+                label: "promote members",
+            },
+            ActionButtonSpec {
+                hint: Some("c"),
+                label: "cascade close",
+            },
+            ActionButtonSpec {
+                hint: Some("esc"),
+                label: "cancel",
+            },
+        ],
+        2,
+        inner.height.saturating_sub(1),
+    );
+    (rects[0], rects[1], rects[2])
+}
+
+pub(super) fn render_collection_close_overlay(app: &AppState, frame: &mut Frame, area: Rect) {
+    let Some(pending) = app.pending_collection_close.as_ref() else {
+        return;
+    };
+    super::dim_background(frame, area);
+    let Some(inner) = render_modal_shell(
+        frame,
+        area,
+        COLLECTION_CLOSE_POPUP_WIDTH,
+        COLLECTION_CLOSE_POPUP_HEIGHT,
+        &app.palette,
+    ) else {
+        return;
+    };
+    render_modal_header(
+        frame,
+        Rect::new(inner.x, inner.y, inner.width, 1),
+        if pending.cleanup_archive {
+            "clear collection archive"
+        } else {
+            "close terminal collection"
+        },
+        &app.palette,
+    );
+    let counts = format!(
+        "{} active · {} archived · {} live · {} exited",
+        pending.active, pending.archived, pending.live, pending.exited
+    );
+    frame.render_widget(
+        Paragraph::new(counts).style(Style::default().fg(app.palette.text)),
+        Rect::new(inner.x, inner.y.saturating_add(2), inner.width, 1),
+    );
+    let warning = if pending.working > 0 || pending.blocked > 0 {
+        format!(
+            "Warning: {} working and {} blocked terminal(s) would be terminated.",
+            pending.working, pending.blocked
+        )
+    } else if pending.live > 0 {
+        format!(
+            "Warning: cascade close terminates {} live terminal(s).",
+            pending.live
+        )
+    } else {
+        "Cascade close permanently removes all member terminals.".to_owned()
+    };
+    frame.render_widget(
+        Paragraph::new(warning)
+            .style(Style::default().fg(app.palette.peach))
+            .wrap(Wrap { trim: true }),
+        Rect::new(inner.x, inner.y.saturating_add(4), inner.width, 2),
+    );
+    frame.render_widget(
+        Paragraph::new(if pending.cleanup_archive {
+            "Only archived members are closed; active members and the collection remain."
+        } else {
+            "Promote keeps processes running as ordinary panes."
+        })
+        .style(Style::default().fg(app.palette.subtext0)),
+        Rect::new(inner.x, inner.y.saturating_add(7), inner.width, 1),
+    );
+    let (promote, cascade, cancel) = collection_close_button_rects(inner);
+    if !pending.cleanup_archive {
+        render_action_button(
+            frame,
+            promote,
+            Some("p"),
+            "promote members",
+            Style::default()
+                .fg(panel_contrast_fg(&app.palette))
+                .bg(app.palette.accent)
+                .add_modifier(Modifier::BOLD),
+        );
+    }
+    render_action_button(
+        frame,
+        cascade,
+        Some("c"),
+        "cascade close",
+        Style::default()
+            .fg(app.palette.text)
+            .bg(app.palette.red)
+            .add_modifier(Modifier::BOLD),
+    );
+    render_action_button(
+        frame,
+        cancel,
+        Some("esc"),
+        "cancel",
+        Style::default()
+            .fg(app.palette.text)
+            .bg(app.palette.surface0)
+            .add_modifier(Modifier::BOLD),
+    );
+}
 const NEW_LINKED_WORKTREE_POPUP_HEIGHT: u16 = 12;
 
 pub(crate) fn rename_button_rects(inner: Rect) -> (Rect, Rect, Rect) {
@@ -767,12 +895,52 @@ pub(crate) fn confirm_close_button_rects(inner: Rect) -> (Rect, Rect) {
 #[cfg(test)]
 mod tests {
     use crate::{
-        app::{state::WorktreeCreateState, AppState},
+        app::{state::WorktreeCreateState, AppState, Mode},
         workspace::Workspace,
     };
     use ratatui::{backend::TestBackend, layout::Rect, Terminal};
 
-    use super::{confirm_close_overlay_text, render_new_linked_worktree_overlay};
+    use super::{
+        confirm_close_overlay_text, render_collection_close_overlay,
+        render_new_linked_worktree_overlay,
+    };
+
+    #[test]
+    fn collection_close_dialog_shows_disposition_counts_and_state_warning() {
+        let mut app = AppState::test_new();
+        app.pending_collection_close = Some(crate::app::collection_view::PendingCollectionClose {
+            workspace_id: "w1".into(),
+            tab_id: "w1:t1".into(),
+            collection_id: crate::layout::CollectionId::from_raw(1).expect("valid collection id"),
+            member_ids: Vec::new(),
+            collection_revision: 0,
+            group_close: None,
+            cleanup_archive: false,
+            active: 3,
+            archived: 2,
+            live: 4,
+            exited: 1,
+            working: 2,
+            blocked: 1,
+        });
+        app.mode = Mode::CollectionClose;
+        let backend = ratatui::backend::TestBackend::new(100, 24);
+        let mut terminal = ratatui::Terminal::new(backend).expect("terminal");
+        terminal
+            .draw(|frame| render_collection_close_overlay(&app, frame, frame.area()))
+            .expect("draw");
+        let text = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(text.contains("3 active · 2 archived · 4 live · 1 exited"));
+        assert!(text.contains("2 working and 1 blocked"));
+        assert!(text.contains("promote members"));
+        assert!(text.contains("cascade close"));
+    }
 
     #[test]
     fn confirm_close_text_uses_live_workspace_cwd_label() {
@@ -780,7 +948,7 @@ mod tests {
         let mut workspace = Workspace::test_new("initial");
         workspace.custom_name = None;
         workspace.identity_cwd = "/projects/original".into();
-        let root_pane = workspace.tabs[0].root_pane;
+        let root_pane = workspace.tabs[0].root_pane.expect("test tab has root pane");
         let terminal_id = workspace.tabs[0].panes[&root_pane]
             .attached_terminal_id
             .clone();
@@ -811,7 +979,7 @@ mod tests {
         let mut workspace = Workspace::test_new("initial");
         workspace.custom_name = None;
         workspace.identity_cwd = stale_cwd.clone();
-        let root_pane = workspace.tabs[0].root_pane;
+        let root_pane = workspace.tabs[0].root_pane.expect("test tab has root pane");
         let terminal_id = workspace.tabs[0].panes[&root_pane]
             .attached_terminal_id
             .clone();
@@ -850,7 +1018,7 @@ mod tests {
         let mut app = AppState::test_new();
         let active = Workspace::test_new("active");
         let selected = Workspace::test_new("selected");
-        let selected_root = selected.tabs[0].root_pane;
+        let selected_root = selected.tabs[0].root_pane.expect("test tab has root pane");
         let selected_terminal_id = selected.tabs[0].panes[&selected_root]
             .attached_terminal_id
             .clone();

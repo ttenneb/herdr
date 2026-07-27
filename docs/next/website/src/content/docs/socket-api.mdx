@@ -104,6 +104,8 @@ Raw socket method names use dot notation:
 | Worktree | `worktree.list`, `worktree.create`, `worktree.open`, `worktree.remove` |
 | Tab | `tab.create`, `tab.list`, `tab.get`, `tab.focus`, `tab.rename`, `tab.move`, `tab.close` |
 | Pane | `pane.split`, `pane.swap`, `pane.move`, `pane.zoom`, `pane.layout`, `pane.process_info`, `pane.neighbor`, `pane.edges`, `pane.focus_direction`, `pane.resize`, `pane.list`, `pane.current`, `pane.get`, `pane.rename`, `pane.send_text`, `pane.send_keys`, `pane.send_input`, `pane.read`, `pane.graphics.info`, `pane.graphics.set`, `pane.graphics.clear`, `pane.graphics.stream`, `pane.report_agent`, `pane.report_agent_session`, `pane.report_metadata`, `pane.clear_agent_authority`, `pane.release_agent`, `pane.close`, `pane.wait_for_output` |
+| Collection | `collection.list`, `collection.get`, `collection.create`, `collection.add`, `collection.move`, `collection.promote`, `collection.select`, `collection.reorder`, `collection.archive`, `collection.restore`, `collection.member_create`, `collection.close` |
+| Delegation | `delegation.create`, `delegation.get`, `delegation.tree`, `delegation.root`, `delegation.descendants`, `delegation.reparent`, `delegation.reorder` |
 | Popup | `popup.close` |
 | Layout | `layout.export`, `layout.apply`, `layout.set_split_ratio` |
 | Agent | `agent.list`, `agent.get`, `agent.read`, `agent.explain`, `agent.send_keys`, `agent.prompt`, `agent.wait`, `agent.rename`, `agent.focus`, `agent.start`, `agent.view.set`, `agent.view.clear` |
@@ -199,7 +201,11 @@ when the platform exposes them.
 
 `layout.export` returns a portable tab layout tree. Omit `tab_id` and `pane_id`
 to export the active tab, pass `tab_id` to export that tab, or pass `pane_id` to
-export the tab containing that pane.
+export the tab containing that pane. Tabs containing any collection leaf are
+rejected with `layout_contains_collections`. Remove or close each collection
+leaf before exporting. For populated collections, you may first promote or move
+their members to ordinary tiled panes; member promotion cannot remove an empty
+collection leaf. Session snapshots and live handoff still preserve collections.
 
 ```json
 {"id":"req_export","method":"layout.export","params":{"tab_id":"w1:t1"}}
@@ -740,6 +746,41 @@ Use `ttl_ms` for short-lived metadata. It must be between `1` and `86400000` mil
 
 Use `seq` when a hook may send updates out of order. For the same `source`, reports with a sequence number less than or equal to the last accepted sequence are accepted by the API but ignored by the pane state. A pane or workspace accepts sequenced token reports from at most 32 distinct sources during its lifetime; clearing or expiry does not release those source slots.
 
+## Collections and delegation
+
+Pane collections use `collection.list`, `collection.get`, `collection.create`,
+`collection.add`, `collection.move`, `collection.promote`, `collection.select`,
+`collection.reorder`, `collection.archive`, `collection.restore`,
+`collection.member_create`, and `collection.close`. A non-empty close requires
+`disposition: "cascade_close"` or `"promote_members"`; cascade close can return
+`confirmation_required` when it would close a worktree group. Collection
+responses include stable IDs, ordered members, archive/selection state,
+lifecycle counts, and advisory warnings. For delegated members,
+`collection.reorder.index` is the requested final canonical displayed index of
+the moved subtree root. The moving subtree is removed before that index is
+interpreted, and the target must be a sibling-subtree boundary in the same
+active/archive section under the same delegation parent. Use
+`delegation.reparent` to change parentage. Nondelegated members retain direct
+member-vector reordering.
+
+Delegation metadata is independent of placement. Use `delegation.create`,
+`delegation.get`, `delegation.tree`, `delegation.root`,
+`delegation.descendants`, `delegation.reparent`, and `delegation.reorder` to
+record/query parentage, purpose, derived roots, and sibling order. Reparenting
+rejects cycles atomically.
+
+`PaneInfo.placement` and each `PaneLayoutPane.placement` are either `tiled` or
+`collection` with `collection_id`, `member_index`, `archived`, and `selected`.
+`PaneLayoutSnapshot.collections` describes collection leaves, while `focused`
+is typed as a pane or collection (with an optional selected pane).
+`focused_pane_id` remains optional for compatibility with empty collections.
+Portable layout roots do not support collection leaves. `layout.export` rejects
+both empty and populated collections rather than silently dropping collection
+structure or members. Every collection leaf must be removed or closed before
+exporting; populated collections may first promote or move their members, while
+empty leaves still require removal or closure. Snapshot and session persistence
+remain collection-aware.
+
 ## Event subscriptions
 
 Subscribe to events when you need a long-lived stream:
@@ -774,6 +815,15 @@ Layout event subscriptions include `layout.updated`. The event carries the
 updated `PaneLayoutSnapshot` for one tab. Clients that bootstrap with
 `session.snapshot` should replace the cached layout with the same
 `workspace_id` and `tab_id`.
+Collection subscriptions are `collection.created`, `collection.member_added`,
+`collection.member_moved`, `collection.member_removed`,
+`collection.member_promoted`, `collection.member_selected`,
+`collection.members_reordered`, `collection.member_archived`,
+`collection.member_restored`, and `collection.closed`. Delegation subscriptions
+are `delegation.created`, `delegation.reparented`, `delegation.reordered`,
+`delegation.tombstoned`, and `delegation.garbage_collected`. Mutation events
+carry the resulting collection/delegation where available; removal and closure
+events carry the stable IDs needed to invalidate cached records.
 
 Worktree event subscriptions include `worktree.created`, `worktree.opened`, and `worktree.removed`. Worktree events describe Git checkout lifecycle. `worktree.created` includes the opened `workspace` and created `worktree`. `worktree.opened` includes the target `workspace`, opened `worktree`, and `already_open`. `worktree.removed` includes the `workspace_id`, removed `worktree`, and `forced`.
 

@@ -179,6 +179,7 @@ impl App {
                     context.focused_pane_id = Some(pane_id.clone());
                     context
                 }),
+            _ => empty_plugin_context(correlation_id),
         }
     }
 
@@ -233,8 +234,13 @@ impl App {
         let ws = self.state.workspaces.get(ws_idx)?;
         let workspace = self.workspace_info(ws_idx);
         let tab = ws.tabs.get(tab_idx)?;
-        let pane_id = tab.layout.focused();
-        let focused_pane = self.pane_info(ws_idx, pane_id);
+        let focused_pane = match tab.layout.focused_leaf() {
+            crate::layout::LayoutLeaf::Pane(pane_id) => self.pane_info(ws_idx, pane_id),
+            crate::layout::LayoutLeaf::Collection(collection_id) => tab
+                .collection(collection_id)
+                .and_then(|collection| collection.selected())
+                .and_then(|pane_id| self.pane_info(ws_idx, pane_id)),
+        };
         Some(self.plugin_context_from_parts(
             ws_idx,
             workspace,

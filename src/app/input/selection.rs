@@ -181,7 +181,7 @@ mod autoscroll_tests {
     fn make_state_with_pane() -> (AppState, crate::layout::PaneId) {
         let mut state = AppState::test_new();
         let ws = Workspace::test_new("test");
-        let pane_id = ws.tabs[0].root_pane;
+        let pane_id = ws.tabs[0].root_pane.expect("test tab has root pane");
         state.workspaces.push(ws);
         state.active = Some(0);
         state.view.pane_infos.push(PaneInfo {
@@ -200,7 +200,7 @@ mod autoscroll_tests {
         // Build state with pane starting at row 5 so we can drag above it
         let mut state = AppState::test_new();
         let ws = Workspace::test_new("test");
-        let pane_id = ws.tabs[0].root_pane;
+        let pane_id = ws.tabs[0].root_pane.expect("test tab has root pane");
         state.workspaces.push(ws);
         state.active = Some(0);
         state.view.pane_infos.push(PaneInfo {

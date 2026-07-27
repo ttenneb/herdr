@@ -16,6 +16,18 @@ enum ScrollbarClickTarget {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PaneUrlClickTarget {
+    pane_id: crate::layout::PaneId,
+    /// Visible screen rectangle that may activate the link.
+    screen_rect: ratatui::layout::Rect,
+    /// Full logical terminal dimensions, independent of screen clipping.
+    logical_rows: u16,
+    logical_cols: u16,
+    /// Logical row represented by the top of `screen_rect`.
+    logical_row_offset: u16,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[cfg(test)]
 enum WheelRouting {
     HostScroll,
@@ -37,6 +49,7 @@ fn modified_url_click_modifier_matches_terminal_mouse_reporting() {
 }
 
 mod clipboard;
+mod collection;
 mod copy_mode;
 mod modal;
 mod mouse;
@@ -89,7 +102,12 @@ impl App {
         }
 
         match self.state.mode {
-            Mode::Terminal => return self.handle_terminal_key(key).await,
+            Mode::Terminal => {
+                if self.handle_collection_key(key) {
+                    return None;
+                }
+                return self.handle_terminal_key(key).await;
+            }
             Mode::Prefix => self.handle_prefix_key(key),
             Mode::Navigate => self.handle_navigate_key(key),
             Mode::Copy => self.handle_copy_mode_key(key),
@@ -106,6 +124,7 @@ impl App {
                 Mode::ConfirmRemoveWorktree => self.handle_worktree_remove_key(key_event),
                 Mode::Resize => self.handle_resize_key_via_api(key),
                 Mode::ConfirmClose => self.handle_confirm_close_key_via_api(key_event),
+                Mode::CollectionClose => self.handle_collection_close_key(key_event),
                 Mode::ContextMenu => {
                     self.handle_context_menu_key_via_api(key_event);
                 }
@@ -134,13 +153,25 @@ impl App {
             self.paste_into_active_text_input(&text);
             return;
         }
+        if !self.collection_accepts_terminal_input() {
+            return;
+        }
 
         if let Some(ws_idx) = self.state.active {
-            if let Some(rt) = self
+            let pane_id = self
                 .state
-                .focused_runtime_in_workspace(&self.terminal_runtimes, ws_idx)
-            {
-                let _ = rt.send_paste(text).await;
+                .workspaces
+                .get(ws_idx)
+                .and_then(|ws| ws.focused_pane_id());
+            if let Some(pane_id) = pane_id {
+                self.restore_archived_member_for_input(ws_idx, pane_id);
+                if let Some(rt) = self.state.runtime_for_pane_in_workspace(
+                    &self.terminal_runtimes,
+                    ws_idx,
+                    pane_id,
+                ) {
+                    let _ = rt.send_paste(text).await;
+                }
             }
         }
     }
@@ -318,6 +349,36 @@ impl App {
             }
         }
 
+        let previous_context_menu_generation = self
+            .state
+            .context_menu
+            .as_ref()
+            .and_then(|menu| menu.plugin.as_ref())
+            .map(|plugin| plugin.generation);
+        if self.handle_collection_mouse_from(source_id, mouse) {
+            let current_context_menu_generation = self
+                .state
+                .context_menu
+                .as_ref()
+                .and_then(|menu| menu.plugin.as_ref())
+                .map(|plugin| plugin.generation);
+            if previous_context_menu_generation != current_context_menu_generation {
+                if let Some(generation) = previous_context_menu_generation {
+                    self.cancel_context_menu_plugin_generation(generation);
+                }
+            }
+            if self.state.mode == crate::app::state::Mode::ContextMenu
+                && self
+                    .state
+                    .context_menu
+                    .as_ref()
+                    .is_some_and(|menu| menu.plugin.is_none())
+            {
+                self.initialize_context_menu_plugins();
+            }
+            return;
+        }
+
         if self.handle_modified_url_click(source_id, mouse) {
             return;
         }
@@ -329,12 +390,6 @@ impl App {
 
         let previous_agent_panel_sort = self.state.agent_panel_sort;
         let previous_settings_section = self.state.settings.section;
-        let previous_context_menu_generation = self
-            .state
-            .context_menu
-            .as_ref()
-            .and_then(|menu| menu.plugin.as_ref())
-            .map(|plugin| plugin.generation);
         if !handled_pane_double_click {
             if let Some(action) = self.state.handle_mouse(&mut self.terminal_runtimes, mouse) {
                 match action {
@@ -384,6 +439,23 @@ impl App {
                         self.apply_rename_mouse_action_via_api(action)
                     }
                     MouseAction::ConfirmCloseAccept => self.confirm_close_accept_via_api(),
+                    MouseAction::ConfirmCloseCancel => {
+                        if !self.cancel_pending_collection_group_close() {
+                            modal::confirm_close_cancel(&mut self.state);
+                        }
+                    }
+                    MouseAction::CollectionClosePromote => {
+                        self.handle_collection_close_key(crossterm::event::KeyEvent::new(
+                            crossterm::event::KeyCode::Char('p'),
+                            crossterm::event::KeyModifiers::NONE,
+                        ))
+                    }
+                    MouseAction::CollectionCloseCascade => {
+                        self.handle_collection_close_key(crossterm::event::KeyEvent::new(
+                            crossterm::event::KeyCode::Char('c'),
+                            crossterm::event::KeyModifiers::NONE,
+                        ))
+                    }
                     MouseAction::ContextMenu { menu, idx } => {
                         self.apply_context_menu_action_via_api(*menu, idx)
                     }
@@ -536,18 +608,61 @@ impl App {
         let Some(info) = self.state.pane_at(mouse.column, mouse.row).cloned() else {
             return false;
         };
-        let viewport_row = mouse.row.saturating_sub(info.inner_rect.y);
-        let col = mouse.column.saturating_sub(info.inner_rect.x);
-        let Some(url) =
-            self.state
-                .url_at_pane_cell(&self.terminal_runtimes, info.id, viewport_row, col)
-        else {
+        self.handle_modified_url_click_at(
+            source_id,
+            mouse,
+            PaneUrlClickTarget {
+                pane_id: info.id,
+                screen_rect: info.inner_rect,
+                logical_rows: info.inner_rect.height,
+                logical_cols: info.inner_rect.width,
+                logical_row_offset: 0,
+            },
+        )
+    }
+
+    fn handle_modified_url_click_at(
+        &mut self,
+        source_id: super::InputSourceId,
+        mouse: MouseEvent,
+        target: PaneUrlClickTarget,
+    ) -> bool {
+        if self.state.mode != Mode::Terminal
+            || !matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left))
+            || !mouse.modifiers.contains(modified_url_click_modifier())
+        {
+            return false;
+        }
+        if mouse.column < target.screen_rect.x
+            || mouse.column >= target.screen_rect.right()
+            || mouse.row < target.screen_rect.y
+            || mouse.row >= target.screen_rect.bottom()
+        {
+            return false;
+        }
+        let logical_row = mouse
+            .row
+            .saturating_sub(target.screen_rect.y)
+            .saturating_add(target.logical_row_offset);
+        let logical_col = mouse.column.saturating_sub(target.screen_rect.x);
+        let Some(ws_idx) = self.state.active else {
+            return false;
+        };
+        let Some(url) = self.state.url_at_pane_cell_with_geometry(
+            &self.terminal_runtimes,
+            ws_idx,
+            target.pane_id,
+            target.logical_rows,
+            target.logical_cols,
+            logical_row,
+            logical_col,
+        ) else {
             return false;
         };
 
         self.last_pane_click = None;
         self.pending_url_click_sources.insert(source_id);
-        match self.invoke_plugin_link_handler_for_url(&url, info.id) {
+        match self.invoke_plugin_link_handler_for_url(&url, target.pane_id) {
             Ok(true) => return true,
             Ok(false) => {}
             Err(err) => {
@@ -813,6 +928,8 @@ fn capture_snapshot(state: &AppState) -> crate::persist::SessionSnapshot {
     let terminal_runtimes = crate::terminal::TerminalRuntimeRegistry::new();
     crate::persist::capture(
         &state.workspaces,
+        &state.delegations,
+        &state.collection_archive_times,
         &state.terminals,
         &terminal_runtimes,
         state.active,
@@ -827,7 +944,9 @@ fn capture_snapshot(state: &AppState) -> crate::persist::SessionSnapshot {
 fn root_layout_ratio(snapshot: &crate::persist::SessionSnapshot) -> Option<f32> {
     match &snapshot.workspaces.first()?.tabs.first()?.layout {
         crate::persist::LayoutSnapshot::Split { ratio, .. } => Some(*ratio),
-        crate::persist::LayoutSnapshot::Pane(_) => None,
+        crate::persist::LayoutSnapshot::Pane(_) | crate::persist::LayoutSnapshot::Collection(_) => {
+            None
+        }
     }
 }
 

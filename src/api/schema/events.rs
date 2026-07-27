@@ -46,6 +46,36 @@ pub enum Subscription {
     TabRenamed {},
     #[serde(rename = "tab.moved")]
     TabMoved {},
+    #[serde(rename = "collection.created")]
+    CollectionCreated {},
+    #[serde(rename = "collection.member_added")]
+    CollectionMemberAdded {},
+    #[serde(rename = "collection.member_moved")]
+    CollectionMemberMoved {},
+    #[serde(rename = "collection.member_removed")]
+    CollectionMemberRemoved {},
+    #[serde(rename = "collection.member_promoted")]
+    CollectionMemberPromoted {},
+    #[serde(rename = "collection.member_selected")]
+    CollectionMemberSelected {},
+    #[serde(rename = "collection.members_reordered")]
+    CollectionMembersReordered {},
+    #[serde(rename = "collection.member_archived")]
+    CollectionMemberArchived {},
+    #[serde(rename = "collection.member_restored")]
+    CollectionMemberRestored {},
+    #[serde(rename = "collection.closed")]
+    CollectionClosed {},
+    #[serde(rename = "delegation.created")]
+    DelegationCreated {},
+    #[serde(rename = "delegation.reparented")]
+    DelegationReparented {},
+    #[serde(rename = "delegation.reordered")]
+    DelegationReordered {},
+    #[serde(rename = "delegation.tombstoned")]
+    DelegationTombstoned {},
+    #[serde(rename = "delegation.garbage_collected")]
+    DelegationGarbageCollected {},
     #[serde(rename = "pane.created")]
     PaneCreated {},
     #[serde(rename = "pane.closed")]
@@ -205,6 +235,21 @@ pub enum EventKind {
     TabRenamed,
     TabMoved,
     TabFocused,
+    CollectionCreated,
+    CollectionMemberAdded,
+    CollectionMemberMoved,
+    CollectionMemberRemoved,
+    CollectionMemberPromoted,
+    CollectionMemberSelected,
+    CollectionMembersReordered,
+    CollectionMemberArchived,
+    CollectionMemberRestored,
+    CollectionClosed,
+    DelegationCreated,
+    DelegationReparented,
+    DelegationReordered,
+    DelegationTombstoned,
+    DelegationGarbageCollected,
     PaneCreated,
     PaneClosed,
     PaneUpdated,
@@ -235,6 +280,21 @@ impl EventKind {
             EventKind::TabRenamed => "tab.renamed",
             EventKind::TabMoved => "tab.moved",
             EventKind::TabFocused => "tab.focused",
+            EventKind::CollectionCreated => "collection.created",
+            EventKind::CollectionMemberAdded => "collection.member_added",
+            EventKind::CollectionMemberMoved => "collection.member_moved",
+            EventKind::CollectionMemberRemoved => "collection.member_removed",
+            EventKind::CollectionMemberPromoted => "collection.member_promoted",
+            EventKind::CollectionMemberSelected => "collection.member_selected",
+            EventKind::CollectionMembersReordered => "collection.members_reordered",
+            EventKind::CollectionMemberArchived => "collection.member_archived",
+            EventKind::CollectionMemberRestored => "collection.member_restored",
+            EventKind::CollectionClosed => "collection.closed",
+            EventKind::DelegationCreated => "delegation.created",
+            EventKind::DelegationReparented => "delegation.reparented",
+            EventKind::DelegationReordered => "delegation.reordered",
+            EventKind::DelegationTombstoned => "delegation.tombstoned",
+            EventKind::DelegationGarbageCollected => "delegation.garbage_collected",
             EventKind::PaneCreated => "pane.created",
             EventKind::PaneClosed => "pane.closed",
             EventKind::PaneUpdated => "pane.updated",
@@ -266,6 +326,21 @@ pub const KNOWN_EVENT_KINDS: &[EventKind] = &[
     EventKind::TabRenamed,
     EventKind::TabMoved,
     EventKind::TabFocused,
+    EventKind::CollectionCreated,
+    EventKind::CollectionMemberAdded,
+    EventKind::CollectionMemberMoved,
+    EventKind::CollectionMemberRemoved,
+    EventKind::CollectionMemberPromoted,
+    EventKind::CollectionMemberSelected,
+    EventKind::CollectionMembersReordered,
+    EventKind::CollectionMemberArchived,
+    EventKind::CollectionMemberRestored,
+    EventKind::CollectionClosed,
+    EventKind::DelegationCreated,
+    EventKind::DelegationReparented,
+    EventKind::DelegationReordered,
+    EventKind::DelegationTombstoned,
+    EventKind::DelegationGarbageCollected,
     EventKind::PaneCreated,
     EventKind::PaneClosed,
     EventKind::PaneUpdated,
@@ -293,6 +368,21 @@ pub const PLUGIN_HOOK_EVENT_KINDS: &[EventKind] = &[
     EventKind::TabRenamed,
     EventKind::TabMoved,
     EventKind::TabFocused,
+    EventKind::CollectionCreated,
+    EventKind::CollectionMemberAdded,
+    EventKind::CollectionMemberMoved,
+    EventKind::CollectionMemberRemoved,
+    EventKind::CollectionMemberPromoted,
+    EventKind::CollectionMemberSelected,
+    EventKind::CollectionMembersReordered,
+    EventKind::CollectionMemberArchived,
+    EventKind::CollectionMemberRestored,
+    EventKind::CollectionClosed,
+    EventKind::DelegationCreated,
+    EventKind::DelegationReparented,
+    EventKind::DelegationReordered,
+    EventKind::DelegationTombstoned,
+    EventKind::DelegationGarbageCollected,
     EventKind::PaneCreated,
     EventKind::PaneClosed,
     EventKind::PaneFocused,
@@ -477,6 +567,64 @@ pub enum EventData {
     TabFocused {
         tab_id: String,
         workspace_id: String,
+    },
+    CollectionCreated {
+        collection: super::CollectionInfo,
+    },
+    CollectionMemberAdded {
+        collection: super::CollectionInfo,
+        pane: PaneInfo,
+    },
+    CollectionMemberMoved {
+        previous_collection_id: String,
+        collection: super::CollectionInfo,
+        pane: PaneInfo,
+    },
+    CollectionMemberRemoved {
+        collection_id: String,
+        pane_id: String,
+    },
+    CollectionMemberPromoted {
+        collection_id: String,
+        pane: PaneInfo,
+    },
+    CollectionMemberSelected {
+        collection: super::CollectionInfo,
+        pane_id: String,
+    },
+    CollectionMembersReordered {
+        collection: super::CollectionInfo,
+    },
+    CollectionMemberArchived {
+        collection: super::CollectionInfo,
+        pane_id: String,
+    },
+    CollectionMemberRestored {
+        collection: super::CollectionInfo,
+        pane_id: String,
+    },
+    CollectionClosed {
+        collection_id: String,
+        workspace_id: String,
+        tab_id: String,
+    },
+    DelegationCreated {
+        delegation: super::DelegationInfo,
+    },
+    DelegationReparented {
+        delegation: super::DelegationInfo,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        previous_parent_id: Option<String>,
+    },
+    DelegationReordered {
+        delegation: super::DelegationInfo,
+    },
+    DelegationTombstoned {
+        delegation_id: String,
+        pane_id: String,
+    },
+    DelegationGarbageCollected {
+        delegation_id: String,
     },
     PaneCreated {
         pane: PaneInfo,

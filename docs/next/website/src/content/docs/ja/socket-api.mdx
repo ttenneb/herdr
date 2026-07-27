@@ -100,6 +100,8 @@ herdr pane read w1:p2 --source recent --lines 50
 | Worktree | `worktree.list`、`worktree.create`、`worktree.open`、`worktree.remove` |
 | タブ | `tab.create`、`tab.list`、`tab.get`、`tab.focus`、`tab.rename`、`tab.move`、`tab.close` |
 | ペイン | `pane.split`、`pane.swap`、`pane.move`、`pane.zoom`、`pane.layout`、`pane.process_info`、`pane.neighbor`、`pane.edges`、`pane.focus_direction`、`pane.resize`、`pane.list`、`pane.current`、`pane.get`、`pane.rename`、`pane.send_text`、`pane.send_keys`、`pane.send_input`、`pane.read`、`pane.graphics.info`、`pane.graphics.set`、`pane.graphics.clear`、`pane.graphics.stream`、`pane.report_agent`、`pane.report_agent_session`、`pane.report_metadata`、`pane.clear_agent_authority`、`pane.release_agent`、`pane.close`、`pane.wait_for_output` |
+| コレクション | `collection.list`、`collection.get`、`collection.create`、`collection.add`、`collection.move`、`collection.promote`、`collection.select`、`collection.reorder`、`collection.archive`、`collection.restore`、`collection.member_create`、`collection.close` |
+| 委譲 | `delegation.create`、`delegation.get`、`delegation.tree`、`delegation.root`、`delegation.descendants`、`delegation.reparent`、`delegation.reorder` |
 | ポップアップ | `popup.close` |
 | レイアウト | `layout.export`、`layout.apply`、`layout.set_split_ratio` |
 | エージェント | `agent.list`、`agent.get`、`agent.read`、`agent.explain`、`agent.send_keys`、`agent.prompt`、`agent.wait`、`agent.rename`、`agent.focus`、`agent.start` |
@@ -164,7 +166,7 @@ CLI の `herdr api snapshot` は、クライアントやエージェントが簡
 
 `pane.process_info` は、ペインのシェル pid、利用可能な場合はフォアグラウンドプロセスグループ id、そしてプラットフォームが公開している場合は pid、名前、argv/cmdline、cwd を含むフォアグラウンドプロセスを返します。
 
-`layout.export` は移植可能なタブレイアウトツリーを返します。アクティブなタブをエクスポートするには `tab_id` と `pane_id` の両方を省略し、特定のタブなら `tab_id` を、そのペインを含むタブなら `pane_id` を渡します。
+`layout.export` は移植可能なタブレイアウトツリーを返します。アクティブなタブをエクスポートするには `tab_id` と `pane_id` の両方を省略し、特定のタブなら `tab_id` を、そのペインを含むタブなら `pane_id` を渡します。コレクション葉を 1 つでも含むタブは `layout_contains_collections` で拒否されます。エクスポート前に、各コレクション葉を削除または閉じてください。メンバーがいるコレクションでは、先にメンバーを通常のタイルペインへ昇格または移動できますが、空のコレクション葉はメンバーの昇格では解消できず、削除またはクローズが必要です。セッションスナップショットとライブハンドオフでは、引き続きコレクションが保持されます。
 
 ```json
 {"id":"req_export","method":"layout.export","params":{"tab_id":"w1:t1"}}
@@ -617,6 +619,27 @@ workspace の get/list 応答は結果の `tokens` マップを公開し、ス�
 
 フックが順不同で更新を送る可能性がある場合は `seq` を使ってください。同じ `source` について、最後に受理されたシーケンス以下のシーケンス番号を持つ報告は、API には受理されますがペイン状態には無視されます。ペインまたはワークスペースが存続する間、シーケンス付きトークン報告を送れる異なるソースは最大 32 個です。クリアや失効でもそのソース枠は解放されません。
 
+## コレクションと委譲
+
+ペインコレクションには `collection.list`、`collection.get`、`collection.create`、
+`collection.add`、`collection.move`、`collection.promote`、`collection.select`、
+`collection.reorder`、`collection.archive`、`collection.restore`、
+`collection.member_create`、`collection.close` を使います。空でないコレクションを閉じる場合は
+`disposition` に `cascade_close` または `promote_members` が必要です。ワークツリーグループを
+閉じる操作では `confirmation_required` が返ることがあります。レスポンスには安定 ID、順序付きメンバー、
+アーカイブ/選択状態、ライフサイクル集計、警告が含まれます。委譲されたメンバーでは `collection.reorder.index` は、移動するサブツリーのルートに要求する最終的な正規表示インデックスです。このインデックスは移動するサブツリーを除外した後に解釈され、移動先は同じ委譲親かつ同じアクティブ/アーカイブ区分にある兄弟サブツリーの境界でなければなりません。親を変更するには `delegation.reparent` を使います。委譲されていないメンバーは、従来どおりメンバーベクターを直接並べ替えます。
+
+委譲メタデータは配置とは独立しています。`delegation.create`、`delegation.get`、
+`delegation.tree`、`delegation.root`、`delegation.descendants`、
+`delegation.reparent`、`delegation.reorder` で親子関係、目的、導出ルート、兄弟順を扱います。
+循環する再親設定は原子的に拒否されます。
+
+`PaneInfo.placement` と各 `PaneLayoutPane.placement` は `tiled`、または
+`collection_id`、`member_index`、`archived`、`selected` を持つ `collection` です。
+`PaneLayoutSnapshot.collections` はコレクション葉を表し、`focused` はペインまたはコレクションの
+型付きフォーカスです。空のコレクションに対応するため `focused_pane_id` は任意です。
+移植可能なレイアウトのルートはコレクション葉をサポートしません。`layout.export` はコレクション構造やメンバーを暗黙に失わないよう、空かどうかにかかわらずコレクションを拒否します。エクスポート前にすべてのコレクション葉を削除または閉じる必要があります。メンバーがいるコレクションでは先にメンバーを昇格または移動できますが、空の葉には引き続き削除またはクローズが必要です。スナップショットとセッション永続化は引き続きコレクションに対応します。
+
 ## イベント購読
 
 長寿命のストリームが必要なときはイベントを購読します:
@@ -639,6 +662,8 @@ workspace の get/list 応答は結果の `tokens` マップを公開し、ス�
 タブのイベント購読には `tab.created`、`tab.closed`、`tab.focused`、`tab.renamed`、`tab.moved` があります。`tab.moved` は、移動した `tab_id`、`workspace_id`、要求された `insert_index`、そのワークスペースの更新済みの順序付き `tabs` リストを含みます。
 ペインのイベント購読には `pane.created`、`pane.updated`、`pane.closed`、`pane.focused`、`pane.moved`、`pane.exited`、`pane.agent_detected`、`pane.output_matched`、`pane.agent_status_changed`、`pane.scroll_changed` があります。ターミナルタイトルの変更は `pane.updated` を発行することがありますが、生のタイトルでスピナーだけが変化し、`terminal_title_stripped` が変わらない場合は発行しません。`pane.scroll_changed` は 1 つの `pane_id` を対象とし、Herdr がスクロールスナップショットの変化を検出するたびに `pane_id`、`workspace_id`、現在の `scroll` 情報を発行します。
 レイアウトのイベント購読には `layout.updated` があります。このイベントは 1 つのタブについて更新済みの `PaneLayoutSnapshot` を運びます。`session.snapshot` でブートストラップするクライアントは、同じ `workspace_id` と `tab_id` のキャッシュ済みレイアウトを置き換えてください。
+
+コレクションイベントは `collection.created`、`collection.member_added`、`collection.member_moved`、`collection.member_removed`、`collection.member_promoted`、`collection.member_selected`、`collection.members_reordered`、`collection.member_archived`、`collection.member_restored`、`collection.closed` です。委譲イベントは `delegation.created`、`delegation.reparented`、`delegation.reordered`、`delegation.tombstoned`、`delegation.garbage_collected` です。利用可能な場合は変更後のレコードを含み、削除/終了イベントはキャッシュ破棄用の安定 ID を含みます。
 
 worktree のイベント購読には `worktree.created`、`worktree.opened`、`worktree.removed` があります。worktree イベントは Git チェックアウトのライフサイクルを記述します。`worktree.created` は開かれた `workspace` と作成された `worktree` を含みます。`worktree.opened` は対象の `workspace`、開かれた `worktree`、`already_open` を含みます。`worktree.removed` は `workspace_id`、削除された `worktree`、`forced` を含みます。
 

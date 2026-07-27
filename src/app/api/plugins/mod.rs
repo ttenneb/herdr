@@ -299,6 +299,9 @@ impl App {
             }
             ContextMenuKind::Pane {
                 ws_idx, pane_id, ..
+            }
+            | ContextMenuKind::CollectionMember {
+                ws_idx, pane_id, ..
             } => {
                 let Some(pane_public_id) = self.public_pane_id(ws_idx, pane_id) else {
                     return;
@@ -1477,6 +1480,71 @@ choices_command = ["sh", "-c", "printf '%s' '{{\"version\":1,\"choices\":[{{\"id
     }
 
     #[test]
+    fn collection_member_context_menu_uses_the_member_pane_context() {
+        use crate::app::state::{ContextMenuKind, ContextMenuState, ContextMenuTarget};
+        use crate::layout::LayoutLeaf;
+        use ratatui::layout::Direction;
+
+        let mut app = test_app();
+        let mut workspace = crate::workspace::Workspace::test_new("collection");
+        let pane_id = workspace.tabs[0].root_pane.expect("test tab has root pane");
+        let collection_id = workspace
+            .create_collection_near(
+                0,
+                LayoutLeaf::Pane(pane_id),
+                Direction::Horizontal,
+                0.5,
+                None,
+            )
+            .expect("create collection");
+        workspace
+            .collect_pane(pane_id, collection_id)
+            .expect("collect pane");
+        app.state.workspaces = vec![workspace];
+        app.state.ensure_test_terminals();
+        app.state.active = Some(0);
+        let pane_public_id = app.public_pane_id(0, pane_id).expect("public pane id");
+        app.state.context_menu = Some(ContextMenuState::new(
+            ContextMenuKind::CollectionMember {
+                ws_idx: 0,
+                collection_id,
+                pane_id,
+                archived: false,
+            },
+            0,
+            0,
+        ));
+
+        app.initialize_context_menu_plugins();
+
+        let plugin = app
+            .state
+            .context_menu
+            .as_ref()
+            .and_then(|menu| menu.plugin.as_ref())
+            .expect("initialized plugin state");
+        assert_eq!(
+            plugin.target,
+            ContextMenuTarget::Pane(pane_public_id.clone())
+        );
+        assert_eq!(
+            plugin.context.focused_pane_id.as_deref(),
+            Some(pane_public_id.as_str())
+        );
+        assert_eq!(
+            plugin.context.tab_id,
+            app.public_tab_id(0, 0),
+            "the collection member retains its containing tab context"
+        );
+        let menu = app.state.context_menu.take().expect("open collection menu");
+        app.apply_context_menu_action_via_api(menu, 1);
+        assert!(app.state.workspaces[0].tabs[0]
+            .collection(collection_id)
+            .expect("collection remains")
+            .is_archived(pane_id));
+    }
+
+    #[test]
     fn context_menu_aggregation_is_provider_ordered_and_rejects_stale_generation() {
         use crate::app::state::{
             ContextMenuEntry, ContextMenuKind, ContextMenuPluginProvider, ContextMenuPluginState,
@@ -2557,7 +2625,9 @@ platforms = ["linux", "macos"]
         app.state.ensure_test_terminals();
         app.state.active = Some(0);
         app.state.selected = 0;
-        let root_pane = app.state.workspaces[0].tabs[0].root_pane;
+        let root_pane = app.state.workspaces[0].tabs[0]
+            .root_pane
+            .expect("test tab has root pane");
         let root = unique_temp_path("plugin-popup-ui-busy");
         write_manifest(&root);
         link_manifest(&mut app, &root);
@@ -2619,7 +2689,7 @@ platforms = ["linux", "macos"]
         let mut app = test_app();
         let mut workspace = crate::workspace::Workspace::test_new("plugin-target");
         workspace.custom_name = None;
-        let root_pane = workspace.tabs[0].root_pane;
+        let root_pane = workspace.tabs[0].root_pane.expect("test tab has root pane");
         let root_terminal = workspace.terminal_id(root_pane).cloned().unwrap();
         app.state.workspaces = vec![workspace];
         app.state.ensure_test_terminals();
@@ -3087,7 +3157,9 @@ command = ["sh", "-c", "sleep 1"]
         app.state.active = Some(0);
         app.state.selected = 0;
         app.state.mode = crate::app::Mode::Terminal;
-        let root_pane = app.state.workspaces[0].tabs[0].root_pane;
+        let root_pane = app.state.workspaces[0].tabs[0]
+            .root_pane
+            .expect("test tab has root pane");
         let root_public = app.public_pane_id(0, root_pane).unwrap();
 
         let root = unique_temp_path("plugin-pane-popup");
@@ -3341,7 +3413,7 @@ command = ["sh", "-c", "printf %s ${{HERDR_PANE_ID-unset}} > '{}'; sleep 1"]
         let mut app = test_app();
         app.no_session = false;
         let workspace = crate::workspace::Workspace::test_new("plugin-refresh");
-        let pane_id = workspace.tabs[0].root_pane;
+        let pane_id = workspace.tabs[0].root_pane.expect("test tab has root pane");
         app.state.workspaces = vec![workspace];
         app.state.ensure_test_terminals();
         app.state.active = Some(0);
@@ -3577,7 +3649,7 @@ command = ["sh", "-c", "printf '%s\n%s\n%s' \"$HERDR_PLUGIN_ROOT\" \"$HERDR_PLUG
     async fn current_plugin_context_includes_selected_text_for_focused_pane() {
         let mut app = test_app();
         let workspace = crate::workspace::Workspace::test_new("plugin-selection");
-        let pane_id = workspace.tabs[0].root_pane;
+        let pane_id = workspace.tabs[0].root_pane.expect("test tab has root pane");
         let terminal_id = workspace.terminal_id(pane_id).cloned().unwrap();
         app.state.workspaces = vec![workspace];
         app.state.ensure_test_terminals();
@@ -3740,7 +3812,9 @@ command = ["sh", "-c", "printf '%s' \"$HERDR_PLUGIN_CONTEXT_JSON\" > {}"]
         app.state.ensure_test_terminals();
         app.state.active = Some(0);
         app.state.selected = 0;
-        let active_pane_id = app.state.workspaces[0].tabs[0].root_pane;
+        let active_pane_id = app.state.workspaces[0].tabs[0]
+            .root_pane
+            .expect("test tab has root pane");
         let active_public_pane_id = app.public_pane_id(0, active_pane_id).unwrap();
         let workspace_id = app.public_workspace_id(0);
         let closed_tab_id = format!("{workspace_id}:t99");
@@ -3865,7 +3939,9 @@ command = ["sh", "-c", "printf '%s' \"$HERDR_PLUGIN_CONTEXT_JSON\" > {}"]
         app.state.ensure_test_terminals();
         app.state.active = Some(0);
         app.state.selected = 0;
-        let pane_id = app.state.workspaces[0].tabs[0].root_pane;
+        let pane_id = app.state.workspaces[0].tabs[0]
+            .root_pane
+            .expect("test tab has root pane");
         let root = unique_temp_path("plugin-link-handler");
         write_manifest_content(
             &root,
@@ -4077,7 +4153,9 @@ action = "missing"
             checkout_path: "/repo/herdr-issue".into(),
             is_linked_worktree: true,
         });
-        let pane_id = app.state.workspaces[0].tabs[0].root_pane;
+        let pane_id = app.state.workspaces[0].tabs[0]
+            .root_pane
+            .expect("test tab has root pane");
         let pane_public = app.public_pane_id(0, pane_id).unwrap();
         let tab_public = app.public_tab_id(0, 0).unwrap();
         let workspace_public = app.public_workspace_id(0);
@@ -4352,7 +4430,9 @@ command = ["sh", "-c", "echo ok"]
         app.state.ensure_test_terminals();
         app.state.active = Some(0);
         app.state.selected = 0;
-        let pane_id = app.state.workspaces[0].tabs[0].root_pane;
+        let pane_id = app.state.workspaces[0].tabs[0]
+            .root_pane
+            .expect("test tab has root pane");
         let public_pane_id = app.public_pane_id(0, pane_id).unwrap();
         app.state.plugin_panes.insert(
             pane_id,
@@ -4399,7 +4479,9 @@ command = ["sh", "-c", "echo ok"]
         app.state.ensure_test_terminals();
         app.state.active = Some(0);
         app.state.selected = 0;
-        let pane_id = app.state.workspaces[0].tabs[0].root_pane;
+        let pane_id = app.state.workspaces[0].tabs[0]
+            .root_pane
+            .expect("test tab has root pane");
         app.state.plugin_panes.insert(
             pane_id,
             crate::app::state::PluginPaneRecord {

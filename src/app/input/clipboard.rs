@@ -70,7 +70,7 @@ mod tests {
     ) {
         let mut app = app_for_mouse_test();
         let mut ws = Workspace::test_new("test");
-        let pane_id = ws.tabs[0].root_pane;
+        let pane_id = ws.tabs[0].root_pane.expect("test tab has root pane");
         let pane_infos = ws.tabs[0].layout.panes(Rect::new(26, 2, 80, 18));
         let info = pane_infos[0].clone();
         let (runtime, input_rx) =
@@ -199,7 +199,9 @@ mod tests {
     #[tokio::test]
     async fn retained_selection_copy_shortcut_is_disabled_with_copy_on_select() {
         let (mut app, _info, mut input_rx) = app_with_screen_bytes_and_input(b"alpha beta");
-        let pane_id = app.state.workspaces[0].tabs[0].root_pane;
+        let pane_id = app.state.workspaces[0].tabs[0]
+            .root_pane
+            .expect("test tab has root pane");
         let mut selection = crate::selection::Selection::range(
             pane_id,
             0,

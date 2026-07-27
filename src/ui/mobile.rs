@@ -1160,6 +1160,10 @@ mod tests {
             ws_idx: 0,
             tab_idx: 0,
             pane_id: PaneId::from_raw(1),
+            depth: 0,
+            is_delegation_root: false,
+            external_parent: false,
+            hidden_descendants: 0,
             primary_label: "herdr".into(),
             primary_tab_label: primary_tab_label.map(str::to_string),
             pane_label: None,
@@ -1185,7 +1189,9 @@ mod tests {
         ];
         app.ensure_test_terminals();
         for (ws_idx, state) in [(0, AgentState::Blocked), (1, AgentState::Working)] {
-            let pane_id = app.workspaces[ws_idx].tabs[0].root_pane;
+            let pane_id = app.workspaces[ws_idx].tabs[0]
+                .root_pane
+                .expect("test tab has root pane");
             let terminal_id = app.workspaces[ws_idx].tabs[0].panes[&pane_id]
                 .attached_terminal_id
                 .clone();
@@ -1460,7 +1466,7 @@ mod tests {
         let mut workspace = crate::workspace::Workspace::test_new("stale-name");
         workspace.custom_name = None;
         workspace.identity_cwd = stale_cwd.clone();
-        let pane = workspace.tabs[0].root_pane;
+        let pane = workspace.tabs[0].root_pane.expect("test tab has root pane");
 
         app.workspaces = vec![workspace];
         app.ensure_test_terminals();

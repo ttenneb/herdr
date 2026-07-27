@@ -1,7 +1,7 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "protocol": 18,
-  "schema_version": 1,
+  "schema_version": 2,
   "schemas": {
     "error_response": {
       "$defs": {
@@ -78,6 +78,165 @@
             "unknown"
           ],
           "type": "string"
+        },
+        "CollectionInfo": {
+          "properties": {
+            "collection_id": {
+              "type": "string"
+            },
+            "focused": {
+              "type": "boolean"
+            },
+            "label": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "lifecycle": {
+              "$ref": "#/schemas/event/$defs/CollectionLifecycleSummary"
+            },
+            "members": {
+              "items": {
+                "$ref": "#/schemas/event/$defs/CollectionMemberInfo"
+              },
+              "type": "array"
+            },
+            "selected_pane_id": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "tab_id": {
+              "type": "string"
+            },
+            "warnings": {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            "workspace_id": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "collection_id",
+            "workspace_id",
+            "tab_id",
+            "focused",
+            "members",
+            "lifecycle"
+          ],
+          "type": "object"
+        },
+        "CollectionLifecycleSummary": {
+          "properties": {
+            "active": {
+              "format": "uint",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "archived": {
+              "format": "uint",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "blocked": {
+              "format": "uint",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "exited": {
+              "format": "uint",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "live": {
+              "format": "uint",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "working": {
+              "format": "uint",
+              "minimum": 0,
+              "type": "integer"
+            }
+          },
+          "required": [
+            "active",
+            "archived",
+            "live",
+            "working",
+            "blocked",
+            "exited"
+          ],
+          "type": "object"
+        },
+        "CollectionMemberInfo": {
+          "properties": {
+            "archived": {
+              "type": "boolean"
+            },
+            "index": {
+              "format": "uint",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "pane_id": {
+              "type": "string"
+            },
+            "selected": {
+              "type": "boolean"
+            }
+          },
+          "required": [
+            "pane_id",
+            "index",
+            "archived",
+            "selected"
+          ],
+          "type": "object"
+        },
+        "DelegationInfo": {
+          "properties": {
+            "delegation_id": {
+              "type": "string"
+            },
+            "pane_id": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "parent_id": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "purpose": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "sibling_rank": {
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "tombstone": {
+              "type": "boolean"
+            }
+          },
+          "required": [
+            "delegation_id",
+            "sibling_rank",
+            "tombstone"
+          ],
+          "type": "object"
         },
         "EventData": {
           "oneOf": [
@@ -413,6 +572,296 @@
             },
             {
               "properties": {
+                "collection": {
+                  "$ref": "#/schemas/event/$defs/CollectionInfo"
+                },
+                "type": {
+                  "const": "collection_created",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type",
+                "collection"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "collection": {
+                  "$ref": "#/schemas/event/$defs/CollectionInfo"
+                },
+                "pane": {
+                  "$ref": "#/schemas/event/$defs/PaneInfo"
+                },
+                "type": {
+                  "const": "collection_member_added",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type",
+                "collection",
+                "pane"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "collection": {
+                  "$ref": "#/schemas/event/$defs/CollectionInfo"
+                },
+                "pane": {
+                  "$ref": "#/schemas/event/$defs/PaneInfo"
+                },
+                "previous_collection_id": {
+                  "type": "string"
+                },
+                "type": {
+                  "const": "collection_member_moved",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type",
+                "previous_collection_id",
+                "collection",
+                "pane"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "collection_id": {
+                  "type": "string"
+                },
+                "pane_id": {
+                  "type": "string"
+                },
+                "type": {
+                  "const": "collection_member_removed",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type",
+                "collection_id",
+                "pane_id"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "collection_id": {
+                  "type": "string"
+                },
+                "pane": {
+                  "$ref": "#/schemas/event/$defs/PaneInfo"
+                },
+                "type": {
+                  "const": "collection_member_promoted",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type",
+                "collection_id",
+                "pane"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "collection": {
+                  "$ref": "#/schemas/event/$defs/CollectionInfo"
+                },
+                "pane_id": {
+                  "type": "string"
+                },
+                "type": {
+                  "const": "collection_member_selected",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type",
+                "collection",
+                "pane_id"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "collection": {
+                  "$ref": "#/schemas/event/$defs/CollectionInfo"
+                },
+                "type": {
+                  "const": "collection_members_reordered",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type",
+                "collection"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "collection": {
+                  "$ref": "#/schemas/event/$defs/CollectionInfo"
+                },
+                "pane_id": {
+                  "type": "string"
+                },
+                "type": {
+                  "const": "collection_member_archived",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type",
+                "collection",
+                "pane_id"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "collection": {
+                  "$ref": "#/schemas/event/$defs/CollectionInfo"
+                },
+                "pane_id": {
+                  "type": "string"
+                },
+                "type": {
+                  "const": "collection_member_restored",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type",
+                "collection",
+                "pane_id"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "collection_id": {
+                  "type": "string"
+                },
+                "tab_id": {
+                  "type": "string"
+                },
+                "type": {
+                  "const": "collection_closed",
+                  "type": "string"
+                },
+                "workspace_id": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type",
+                "collection_id",
+                "workspace_id",
+                "tab_id"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "delegation": {
+                  "$ref": "#/schemas/event/$defs/DelegationInfo"
+                },
+                "type": {
+                  "const": "delegation_created",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type",
+                "delegation"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "delegation": {
+                  "$ref": "#/schemas/event/$defs/DelegationInfo"
+                },
+                "previous_parent_id": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "type": {
+                  "const": "delegation_reparented",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type",
+                "delegation"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "delegation": {
+                  "$ref": "#/schemas/event/$defs/DelegationInfo"
+                },
+                "type": {
+                  "const": "delegation_reordered",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type",
+                "delegation"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "delegation_id": {
+                  "type": "string"
+                },
+                "pane_id": {
+                  "type": "string"
+                },
+                "type": {
+                  "const": "delegation_tombstoned",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type",
+                "delegation_id",
+                "pane_id"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "delegation_id": {
+                  "type": "string"
+                },
+                "type": {
+                  "const": "delegation_garbage_collected",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type",
+                "delegation_id"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
                 "pane": {
                   "$ref": "#/schemas/event/$defs/PaneInfo"
                 },
@@ -711,6 +1160,21 @@
             "tab_renamed",
             "tab_moved",
             "tab_focused",
+            "collection_created",
+            "collection_member_added",
+            "collection_member_moved",
+            "collection_member_removed",
+            "collection_member_promoted",
+            "collection_member_selected",
+            "collection_members_reordered",
+            "collection_member_archived",
+            "collection_member_restored",
+            "collection_closed",
+            "delegation_created",
+            "delegation_reparented",
+            "delegation_reordered",
+            "delegation_tombstoned",
+            "delegation_garbage_collected",
             "pane_created",
             "pane_closed",
             "pane_updated",
@@ -723,6 +1187,48 @@
             "layout_updated"
           ],
           "type": "string"
+        },
+        "LayoutFocusInfo": {
+          "oneOf": [
+            {
+              "properties": {
+                "pane_id": {
+                  "type": "string"
+                },
+                "type": {
+                  "const": "pane",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type",
+                "pane_id"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "collection_id": {
+                  "type": "string"
+                },
+                "selected_pane_id": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "type": {
+                  "const": "collection",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type",
+                "collection_id"
+              ],
+              "type": "object"
+            }
+          ]
         },
         "PaneInfo": {
           "properties": {
@@ -774,6 +1280,12 @@
             },
             "pane_id": {
               "type": "string"
+            },
+            "placement": {
+              "$ref": "#/schemas/event/$defs/PanePlacementInfo",
+              "default": {
+                "type": "tiled"
+              }
             },
             "revision": {
               "format": "uint64",
@@ -853,6 +1365,12 @@
             "pane_id": {
               "type": "string"
             },
+            "placement": {
+              "$ref": "#/schemas/event/$defs/PanePlacementInfo",
+              "default": {
+                "type": "tiled"
+              }
+            },
             "rect": {
               "$ref": "#/schemas/event/$defs/PaneLayoutRect"
             }
@@ -904,8 +1422,24 @@
             "area": {
               "$ref": "#/schemas/event/$defs/PaneLayoutRect"
             },
+            "collections": {
+              "items": {
+                "$ref": "#/schemas/event/$defs/CollectionInfo"
+              },
+              "type": "array"
+            },
+            "focused": {
+              "$ref": "#/schemas/event/$defs/LayoutFocusInfo",
+              "default": {
+                "pane_id": "",
+                "type": "pane"
+              }
+            },
             "focused_pane_id": {
-              "type": "string"
+              "type": [
+                "string",
+                "null"
+              ]
             },
             "panes": {
               "items": {
@@ -934,7 +1468,6 @@
             "tab_id",
             "zoomed",
             "area",
-            "focused_pane_id",
             "panes",
             "splits"
           ],
@@ -963,6 +1496,52 @@
             "rect"
           ],
           "type": "object"
+        },
+        "PanePlacementInfo": {
+          "oneOf": [
+            {
+              "properties": {
+                "type": {
+                  "const": "tiled",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "archived": {
+                  "type": "boolean"
+                },
+                "collection_id": {
+                  "type": "string"
+                },
+                "member_index": {
+                  "format": "uint",
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                "selected": {
+                  "type": "boolean"
+                },
+                "type": {
+                  "const": "collection",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type",
+                "collection_id",
+                "member_index",
+                "archived",
+                "selected"
+              ],
+              "type": "object"
+            }
+          ]
         },
         "PaneScrollInfo": {
           "properties": {
@@ -1664,6 +2243,380 @@
           },
           "required": [
             "title"
+          ],
+          "type": "object"
+        },
+        "CollectionAddParams": {
+          "properties": {
+            "collection_id": {
+              "type": "string"
+            },
+            "pane_id": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "collection_id",
+            "pane_id"
+          ],
+          "type": "object"
+        },
+        "CollectionCloseDisposition": {
+          "enum": [
+            "cascade_close",
+            "promote_members"
+          ],
+          "type": "string"
+        },
+        "CollectionCloseParams": {
+          "properties": {
+            "collection_id": {
+              "type": "string"
+            },
+            "disposition": {
+              "anyOf": [
+                {
+                  "$ref": "#/schemas/request/$defs/CollectionCloseDisposition"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "focus_promoted": {
+              "default": false,
+              "type": "boolean"
+            },
+            "target_pane_id": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          "required": [
+            "collection_id"
+          ],
+          "type": "object"
+        },
+        "CollectionCreateMemberParams": {
+          "properties": {
+            "collection_id": {
+              "type": "string"
+            },
+            "cwd": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "delegation_parent_id": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "env": {
+              "additionalProperties": {
+                "type": "string"
+              },
+              "type": "object"
+            },
+            "purpose": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          "required": [
+            "collection_id"
+          ],
+          "type": "object"
+        },
+        "CollectionCreateParams": {
+          "properties": {
+            "direction": {
+              "$ref": "#/schemas/request/$defs/SplitDirection"
+            },
+            "focus": {
+              "default": false,
+              "type": "boolean"
+            },
+            "label": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "ratio": {
+              "format": "float",
+              "type": [
+                "number",
+                "null"
+              ]
+            },
+            "target_pane_id": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "target_pane_id",
+            "direction"
+          ],
+          "type": "object"
+        },
+        "CollectionListParams": {
+          "properties": {
+            "tab_id": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "workspace_id": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          "type": "object"
+        },
+        "CollectionMemberTarget": {
+          "properties": {
+            "collection_id": {
+              "type": "string"
+            },
+            "pane_id": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "collection_id",
+            "pane_id"
+          ],
+          "type": "object"
+        },
+        "CollectionMoveParams": {
+          "properties": {
+            "collection_id": {
+              "type": "string"
+            },
+            "pane_id": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "pane_id",
+            "collection_id"
+          ],
+          "type": "object"
+        },
+        "CollectionPromoteParams": {
+          "properties": {
+            "direction": {
+              "$ref": "#/schemas/request/$defs/SplitDirection"
+            },
+            "focus": {
+              "default": false,
+              "type": "boolean"
+            },
+            "pane_id": {
+              "type": "string"
+            },
+            "ratio": {
+              "format": "float",
+              "type": [
+                "number",
+                "null"
+              ]
+            },
+            "target_pane_id": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "pane_id",
+            "target_pane_id",
+            "direction"
+          ],
+          "type": "object"
+        },
+        "CollectionReorderParams": {
+          "properties": {
+            "collection_id": {
+              "type": "string"
+            },
+            "index": {
+              "format": "uint",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "pane_id": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "collection_id",
+            "pane_id",
+            "index"
+          ],
+          "type": "object"
+        },
+        "CollectionSelectParams": {
+          "properties": {
+            "collection_id": {
+              "type": "string"
+            },
+            "focus": {
+              "default": false,
+              "type": "boolean"
+            },
+            "pane_id": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "collection_id",
+            "pane_id"
+          ],
+          "type": "object"
+        },
+        "CollectionTarget": {
+          "properties": {
+            "collection_id": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "collection_id"
+          ],
+          "type": "object"
+        },
+        "DelegationCreateParams": {
+          "properties": {
+            "pane_id": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "parent_id": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "purpose": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          "type": "object"
+        },
+        "DelegationReorderParams": {
+          "properties": {
+            "delegation_id": {
+              "type": "string"
+            },
+            "position": {
+              "$ref": "#/schemas/request/$defs/DelegationSiblingPosition"
+            }
+          },
+          "required": [
+            "delegation_id",
+            "position"
+          ],
+          "type": "object"
+        },
+        "DelegationReparentParams": {
+          "properties": {
+            "delegation_id": {
+              "type": "string"
+            },
+            "parent_id": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          "required": [
+            "delegation_id"
+          ],
+          "type": "object"
+        },
+        "DelegationSiblingPosition": {
+          "oneOf": [
+            {
+              "properties": {
+                "type": {
+                  "const": "first",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "type": {
+                  "const": "last",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "delegation_id": {
+                  "type": "string"
+                },
+                "type": {
+                  "const": "before",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type",
+                "delegation_id"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "delegation_id": {
+                  "type": "string"
+                },
+                "type": {
+                  "const": "after",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type",
+                "delegation_id"
+              ],
+              "type": "object"
+            }
+          ]
+        },
+        "DelegationTarget": {
+          "properties": {
+            "delegation_id": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "delegation_id"
           ],
           "type": "object"
         },
@@ -2526,6 +3479,22 @@
         },
         "PaneMoveDestination": {
           "oneOf": [
+            {
+              "properties": {
+                "collection_id": {
+                  "type": "string"
+                },
+                "type": {
+                  "const": "collection",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type",
+                "collection_id"
+              ],
+              "type": "object"
+            },
             {
               "properties": {
                 "ratio": {
@@ -3785,6 +4754,186 @@
             {
               "properties": {
                 "type": {
+                  "const": "collection.created",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "type": {
+                  "const": "collection.member_added",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "type": {
+                  "const": "collection.member_moved",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "type": {
+                  "const": "collection.member_removed",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "type": {
+                  "const": "collection.member_promoted",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "type": {
+                  "const": "collection.member_selected",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "type": {
+                  "const": "collection.members_reordered",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "type": {
+                  "const": "collection.member_archived",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "type": {
+                  "const": "collection.member_restored",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "type": {
+                  "const": "collection.closed",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "type": {
+                  "const": "delegation.created",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "type": {
+                  "const": "delegation.reparented",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "type": {
+                  "const": "delegation.reordered",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "type": {
+                  "const": "delegation.tombstoned",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "type": {
+                  "const": "delegation.garbage_collected",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "type": {
                   "const": "pane.created",
                   "type": "string"
                 }
@@ -4964,6 +6113,310 @@
             },
             "params": {
               "$ref": "#/schemas/request/$defs/AgentWaitParams"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "method": {
+              "const": "collection.list",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/schemas/request/$defs/CollectionListParams"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "method": {
+              "const": "collection.get",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/schemas/request/$defs/CollectionTarget"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "method": {
+              "const": "collection.create",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/schemas/request/$defs/CollectionCreateParams"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "method": {
+              "const": "collection.add",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/schemas/request/$defs/CollectionAddParams"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "method": {
+              "const": "collection.move",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/schemas/request/$defs/CollectionMoveParams"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "method": {
+              "const": "collection.promote",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/schemas/request/$defs/CollectionPromoteParams"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "method": {
+              "const": "collection.select",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/schemas/request/$defs/CollectionSelectParams"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "method": {
+              "const": "collection.reorder",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/schemas/request/$defs/CollectionReorderParams"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "method": {
+              "const": "collection.archive",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/schemas/request/$defs/CollectionMemberTarget"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "method": {
+              "const": "collection.restore",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/schemas/request/$defs/CollectionMemberTarget"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "method": {
+              "const": "collection.member_create",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/schemas/request/$defs/CollectionCreateMemberParams"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "method": {
+              "const": "collection.close",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/schemas/request/$defs/CollectionCloseParams"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "method": {
+              "const": "delegation.create",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/schemas/request/$defs/DelegationCreateParams"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "method": {
+              "const": "delegation.get",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/schemas/request/$defs/DelegationTarget"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "method": {
+              "const": "delegation.tree",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/schemas/request/$defs/EmptyParams"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "method": {
+              "const": "delegation.root",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/schemas/request/$defs/DelegationTarget"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "method": {
+              "const": "delegation.descendants",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/schemas/request/$defs/DelegationTarget"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "method": {
+              "const": "delegation.reparent",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/schemas/request/$defs/DelegationReparentParams"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "method": {
+              "const": "delegation.reorder",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/schemas/request/$defs/DelegationReorderParams"
             }
           },
           "required": [
@@ -6202,6 +7655,147 @@
           ],
           "type": "string"
         },
+        "CollectionCreateMemberResult": {
+          "properties": {
+            "collection": {
+              "$ref": "#/schemas/success_response/$defs/CollectionInfo"
+            },
+            "delegation_id": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "pane": {
+              "$ref": "#/schemas/success_response/$defs/PaneInfo"
+            }
+          },
+          "required": [
+            "collection",
+            "pane"
+          ],
+          "type": "object"
+        },
+        "CollectionInfo": {
+          "properties": {
+            "collection_id": {
+              "type": "string"
+            },
+            "focused": {
+              "type": "boolean"
+            },
+            "label": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "lifecycle": {
+              "$ref": "#/schemas/success_response/$defs/CollectionLifecycleSummary"
+            },
+            "members": {
+              "items": {
+                "$ref": "#/schemas/success_response/$defs/CollectionMemberInfo"
+              },
+              "type": "array"
+            },
+            "selected_pane_id": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "tab_id": {
+              "type": "string"
+            },
+            "warnings": {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            "workspace_id": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "collection_id",
+            "workspace_id",
+            "tab_id",
+            "focused",
+            "members",
+            "lifecycle"
+          ],
+          "type": "object"
+        },
+        "CollectionLifecycleSummary": {
+          "properties": {
+            "active": {
+              "format": "uint",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "archived": {
+              "format": "uint",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "blocked": {
+              "format": "uint",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "exited": {
+              "format": "uint",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "live": {
+              "format": "uint",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "working": {
+              "format": "uint",
+              "minimum": 0,
+              "type": "integer"
+            }
+          },
+          "required": [
+            "active",
+            "archived",
+            "live",
+            "working",
+            "blocked",
+            "exited"
+          ],
+          "type": "object"
+        },
+        "CollectionMemberInfo": {
+          "properties": {
+            "archived": {
+              "type": "boolean"
+            },
+            "index": {
+              "format": "uint",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "pane_id": {
+              "type": "string"
+            },
+            "selected": {
+              "type": "boolean"
+            }
+          },
+          "required": [
+            "pane_id",
+            "index",
+            "archived",
+            "selected"
+          ],
+          "type": "object"
+        },
         "ConfigReloadStatus": {
           "enum": [
             "applied",
@@ -6209,6 +7803,90 @@
             "failed"
           ],
           "type": "string"
+        },
+        "DelegationInfo": {
+          "properties": {
+            "delegation_id": {
+              "type": "string"
+            },
+            "pane_id": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "parent_id": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "purpose": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "sibling_rank": {
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "tombstone": {
+              "type": "boolean"
+            }
+          },
+          "required": [
+            "delegation_id",
+            "sibling_rank",
+            "tombstone"
+          ],
+          "type": "object"
+        },
+        "DelegationTreeEntry": {
+          "properties": {
+            "delegation_id": {
+              "type": "string"
+            },
+            "depth": {
+              "format": "uint",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "pane_id": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "parent_id": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "purpose": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "sibling_rank": {
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "tombstone": {
+              "type": "boolean"
+            }
+          },
+          "required": [
+            "delegation_id",
+            "sibling_rank",
+            "tombstone",
+            "depth"
+          ],
+          "type": "object"
         },
         "EventData": {
           "oneOf": [
@@ -6544,6 +8222,296 @@
             },
             {
               "properties": {
+                "collection": {
+                  "$ref": "#/schemas/success_response/$defs/CollectionInfo"
+                },
+                "type": {
+                  "const": "collection_created",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type",
+                "collection"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "collection": {
+                  "$ref": "#/schemas/success_response/$defs/CollectionInfo"
+                },
+                "pane": {
+                  "$ref": "#/schemas/success_response/$defs/PaneInfo"
+                },
+                "type": {
+                  "const": "collection_member_added",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type",
+                "collection",
+                "pane"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "collection": {
+                  "$ref": "#/schemas/success_response/$defs/CollectionInfo"
+                },
+                "pane": {
+                  "$ref": "#/schemas/success_response/$defs/PaneInfo"
+                },
+                "previous_collection_id": {
+                  "type": "string"
+                },
+                "type": {
+                  "const": "collection_member_moved",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type",
+                "previous_collection_id",
+                "collection",
+                "pane"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "collection_id": {
+                  "type": "string"
+                },
+                "pane_id": {
+                  "type": "string"
+                },
+                "type": {
+                  "const": "collection_member_removed",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type",
+                "collection_id",
+                "pane_id"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "collection_id": {
+                  "type": "string"
+                },
+                "pane": {
+                  "$ref": "#/schemas/success_response/$defs/PaneInfo"
+                },
+                "type": {
+                  "const": "collection_member_promoted",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type",
+                "collection_id",
+                "pane"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "collection": {
+                  "$ref": "#/schemas/success_response/$defs/CollectionInfo"
+                },
+                "pane_id": {
+                  "type": "string"
+                },
+                "type": {
+                  "const": "collection_member_selected",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type",
+                "collection",
+                "pane_id"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "collection": {
+                  "$ref": "#/schemas/success_response/$defs/CollectionInfo"
+                },
+                "type": {
+                  "const": "collection_members_reordered",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type",
+                "collection"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "collection": {
+                  "$ref": "#/schemas/success_response/$defs/CollectionInfo"
+                },
+                "pane_id": {
+                  "type": "string"
+                },
+                "type": {
+                  "const": "collection_member_archived",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type",
+                "collection",
+                "pane_id"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "collection": {
+                  "$ref": "#/schemas/success_response/$defs/CollectionInfo"
+                },
+                "pane_id": {
+                  "type": "string"
+                },
+                "type": {
+                  "const": "collection_member_restored",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type",
+                "collection",
+                "pane_id"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "collection_id": {
+                  "type": "string"
+                },
+                "tab_id": {
+                  "type": "string"
+                },
+                "type": {
+                  "const": "collection_closed",
+                  "type": "string"
+                },
+                "workspace_id": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type",
+                "collection_id",
+                "workspace_id",
+                "tab_id"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "delegation": {
+                  "$ref": "#/schemas/success_response/$defs/DelegationInfo"
+                },
+                "type": {
+                  "const": "delegation_created",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type",
+                "delegation"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "delegation": {
+                  "$ref": "#/schemas/success_response/$defs/DelegationInfo"
+                },
+                "previous_parent_id": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "type": {
+                  "const": "delegation_reparented",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type",
+                "delegation"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "delegation": {
+                  "$ref": "#/schemas/success_response/$defs/DelegationInfo"
+                },
+                "type": {
+                  "const": "delegation_reordered",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type",
+                "delegation"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "delegation_id": {
+                  "type": "string"
+                },
+                "pane_id": {
+                  "type": "string"
+                },
+                "type": {
+                  "const": "delegation_tombstoned",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type",
+                "delegation_id",
+                "pane_id"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "delegation_id": {
+                  "type": "string"
+                },
+                "type": {
+                  "const": "delegation_garbage_collected",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type",
+                "delegation_id"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
                 "pane": {
                   "$ref": "#/schemas/success_response/$defs/PaneInfo"
                 },
@@ -6857,6 +8825,21 @@
             "tab_renamed",
             "tab_moved",
             "tab_focused",
+            "collection_created",
+            "collection_member_added",
+            "collection_member_moved",
+            "collection_member_removed",
+            "collection_member_promoted",
+            "collection_member_selected",
+            "collection_members_reordered",
+            "collection_member_archived",
+            "collection_member_restored",
+            "collection_closed",
+            "delegation_created",
+            "delegation_reparented",
+            "delegation_reordered",
+            "delegation_tombstoned",
+            "delegation_garbage_collected",
             "pane_created",
             "pane_closed",
             "pane_updated",
@@ -7019,8 +9002,18 @@
         },
         "LayoutDescription": {
           "properties": {
+            "focused": {
+              "$ref": "#/schemas/success_response/$defs/LayoutFocusInfo",
+              "default": {
+                "pane_id": "",
+                "type": "pane"
+              }
+            },
             "focused_pane_id": {
-              "type": "string"
+              "type": [
+                "string",
+                "null"
+              ]
             },
             "root": {
               "$ref": "#/schemas/success_response/$defs/LayoutNode"
@@ -7039,10 +9032,51 @@
             "workspace_id",
             "tab_id",
             "zoomed",
-            "focused_pane_id",
             "root"
           ],
           "type": "object"
+        },
+        "LayoutFocusInfo": {
+          "oneOf": [
+            {
+              "properties": {
+                "pane_id": {
+                  "type": "string"
+                },
+                "type": {
+                  "const": "pane",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type",
+                "pane_id"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "collection_id": {
+                  "type": "string"
+                },
+                "selected_pane_id": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "type": {
+                  "const": "collection",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type",
+                "collection_id"
+              ],
+              "type": "object"
+            }
+          ]
         },
         "LayoutNode": {
           "oneOf": [
@@ -7264,6 +9298,12 @@
             "pane_id": {
               "type": "string"
             },
+            "placement": {
+              "$ref": "#/schemas/success_response/$defs/PanePlacementInfo",
+              "default": {
+                "type": "tiled"
+              }
+            },
             "revision": {
               "format": "uint64",
               "minimum": 0,
@@ -7342,6 +9382,12 @@
             "pane_id": {
               "type": "string"
             },
+            "placement": {
+              "$ref": "#/schemas/success_response/$defs/PanePlacementInfo",
+              "default": {
+                "type": "tiled"
+              }
+            },
             "rect": {
               "$ref": "#/schemas/success_response/$defs/PaneLayoutRect"
             }
@@ -7393,8 +9439,24 @@
             "area": {
               "$ref": "#/schemas/success_response/$defs/PaneLayoutRect"
             },
+            "collections": {
+              "items": {
+                "$ref": "#/schemas/success_response/$defs/CollectionInfo"
+              },
+              "type": "array"
+            },
+            "focused": {
+              "$ref": "#/schemas/success_response/$defs/LayoutFocusInfo",
+              "default": {
+                "pane_id": "",
+                "type": "pane"
+              }
+            },
             "focused_pane_id": {
-              "type": "string"
+              "type": [
+                "string",
+                "null"
+              ]
             },
             "panes": {
               "items": {
@@ -7423,7 +9485,6 @@
             "tab_id",
             "zoomed",
             "area",
-            "focused_pane_id",
             "panes",
             "splits"
           ],
@@ -7498,7 +9559,10 @@
               ]
             },
             "focused_pane_id": {
-              "type": "string"
+              "type": [
+                "string",
+                "null"
+              ]
             },
             "pane": {
               "$ref": "#/schemas/success_response/$defs/PaneInfo"
@@ -7542,8 +9606,7 @@
             "previous_workspace_id",
             "previous_tab_id",
             "pane",
-            "target_layout",
-            "focused_pane_id"
+            "target_layout"
           ],
           "type": "object"
         },
@@ -7571,6 +9634,52 @@
             "layout"
           ],
           "type": "object"
+        },
+        "PanePlacementInfo": {
+          "oneOf": [
+            {
+              "properties": {
+                "type": {
+                  "const": "tiled",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "archived": {
+                  "type": "boolean"
+                },
+                "collection_id": {
+                  "type": "string"
+                },
+                "member_index": {
+                  "format": "uint",
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                "selected": {
+                  "type": "boolean"
+                },
+                "type": {
+                  "const": "collection",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type",
+                "collection_id",
+                "member_index",
+                "archived",
+                "selected"
+              ],
+              "type": "object"
+            }
+          ]
         },
         "PaneProcessInfo": {
           "properties": {
@@ -7708,7 +9817,10 @@
               "type": "boolean"
             },
             "focused_pane_id": {
-              "type": "string"
+              "type": [
+                "string",
+                "null"
+              ]
             },
             "layout": {
               "$ref": "#/schemas/success_response/$defs/PaneLayoutSnapshot"
@@ -7730,7 +9842,6 @@
           "required": [
             "changed",
             "pane_id",
-            "focused_pane_id",
             "layout"
           ],
           "type": "object"
@@ -7775,7 +9886,10 @@
               "type": "boolean"
             },
             "focused_pane_id": {
-              "type": "string"
+              "type": [
+                "string",
+                "null"
+              ]
             },
             "layout": {
               "$ref": "#/schemas/success_response/$defs/PaneLayoutSnapshot"
@@ -7803,7 +9917,6 @@
           "required": [
             "changed",
             "source_pane_id",
-            "focused_pane_id",
             "layout"
           ],
           "type": "object"
@@ -7825,7 +9938,10 @@
               "type": "boolean"
             },
             "focused_pane_id": {
-              "type": "string"
+              "type": [
+                "string",
+                "null"
+              ]
             },
             "layout": {
               "$ref": "#/schemas/success_response/$defs/PaneLayoutSnapshot"
@@ -7855,7 +9971,6 @@
             "zoom_changed",
             "focus_changed",
             "pane_id",
-            "focused_pane_id",
             "zoomed",
             "layout"
           ],
@@ -8832,6 +10947,111 @@
               "required": [
                 "type",
                 "active"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "collection": {
+                  "$ref": "#/schemas/success_response/$defs/CollectionInfo"
+                },
+                "type": {
+                  "const": "collection_info",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type",
+                "collection"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "collections": {
+                  "items": {
+                    "$ref": "#/schemas/success_response/$defs/CollectionInfo"
+                  },
+                  "type": "array"
+                },
+                "type": {
+                  "const": "collection_list",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type",
+                "collections"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "created": {
+                  "$ref": "#/schemas/success_response/$defs/CollectionCreateMemberResult"
+                },
+                "type": {
+                  "const": "collection_member_created",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type",
+                "created"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "delegation": {
+                  "$ref": "#/schemas/success_response/$defs/DelegationInfo"
+                },
+                "type": {
+                  "const": "delegation_info",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type",
+                "delegation"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "delegations": {
+                  "items": {
+                    "$ref": "#/schemas/success_response/$defs/DelegationTreeEntry"
+                  },
+                  "type": "array"
+                },
+                "type": {
+                  "const": "delegation_tree",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type",
+                "delegations"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "delegations": {
+                  "items": {
+                    "$ref": "#/schemas/success_response/$defs/DelegationInfo"
+                  },
+                  "type": "array"
+                },
+                "type": {
+                  "const": "delegation_list",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type",
+                "delegations"
               ],
               "type": "object"
             },
