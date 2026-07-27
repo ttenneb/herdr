@@ -567,6 +567,7 @@ mod tests {
                     contexts: Vec::new(),
                     platforms: None,
                     command: vec!["sh".into(), "-c".into(), ":".into()],
+                    choices_command: None,
                 }],
                 events: Vec::new(),
                 panes: Vec::new(),

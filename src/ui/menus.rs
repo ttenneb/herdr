@@ -297,9 +297,16 @@ pub(super) fn render_context_menu(app: &AppState, frame: &mut Frame) {
     };
 
     let items: Vec<ListItem> = menu
-        .items()
-        .iter()
-        .map(|item| ListItem::new(Line::from(*item)))
+        .entry_indices()
+        .filter_map(|index| {
+            let label = menu.entry_label(index)?;
+            let style = if menu.entry_enabled(index) {
+                Style::default()
+            } else {
+                Style::default().fg(p.overlay0)
+            };
+            Some(ListItem::new(Line::from(Span::styled(label, style))))
+        })
         .collect();
     let list = List::new(items)
         .style(Style::default().fg(p.text))
@@ -310,6 +317,8 @@ pub(super) fn render_context_menu(app: &AppState, frame: &mut Frame) {
                 .add_modifier(Modifier::BOLD),
         )
         .highlight_symbol(" ");
-    let mut state = ListState::default().with_selected(Some(menu.list.highlighted));
+    let mut state = ListState::default()
+        .with_offset(menu.scroll_offset)
+        .with_selected(Some(menu.list.highlighted));
     frame.render_stateful_widget(list, inner, &mut state);
 }

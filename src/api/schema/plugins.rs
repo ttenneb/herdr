@@ -251,6 +251,8 @@ pub struct PluginManifestAction {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub platforms: Option<Vec<PluginPlatform>>,
     pub command: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub choices_command: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
@@ -405,7 +407,24 @@ pub struct PluginActionInfo {
     pub contexts: Vec<PluginActionContext>,
     pub command: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub choices_command: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub platforms: Option<Vec<PluginPlatform>>,
+}
+
+/// A versioned set of choices emitted by a plugin action choices provider.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct PluginActionChoices {
+    pub version: u32,
+    pub choices: Vec<PluginActionChoice>,
+}
+
+/// One opaque choice emitted by a plugin action choices provider.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct PluginActionChoice {
+    pub id: String,
+    pub label: String,
+    pub payload: serde_json::Value,
 }
 
 impl PluginActionInfo {

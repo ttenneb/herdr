@@ -9991,6 +9991,15 @@
             "action_id": {
               "type": "string"
             },
+            "choices_command": {
+              "items": {
+                "type": "string"
+              },
+              "type": [
+                "array",
+                "null"
+              ]
+            },
             "command": {
               "items": {
                 "type": "string"
@@ -10223,6 +10232,15 @@
         },
         "PluginManifestAction": {
           "properties": {
+            "choices_command": {
+              "items": {
+                "type": "string"
+              },
+              "type": [
+                "array",
+                "null"
+              ]
+            },
             "command": {
               "items": {
                 "type": "string"

@@ -1305,6 +1305,8 @@ impl App {
                         x: mouse.column,
                         y: mouse.row,
                         list: MenuListState::new(0),
+                        scroll_offset: 0,
+                        plugin: None,
                     });
                     self.state.mode = Mode::ContextMenu;
                 }
@@ -1468,6 +1470,7 @@ mod tests {
                     contexts: Vec::new(),
                     platforms: None,
                     command: vec!["sh".into(), "-c".into(), ":".into()],
+                    choices_command: None,
                 }],
                 events: Vec::new(),
                 panes: Vec::new(),
@@ -1482,6 +1485,40 @@ mod tests {
                 warnings: Vec::new(),
             },
         )]);
+    }
+
+    #[tokio::test]
+    async fn collection_member_right_click_initializes_plugin_context_through_mouse_router() {
+        let (mut app, collection, child, _rx) = collection_scroll_app(b"", 0);
+        let row = app.state.view.collection_layouts[0]
+            .rows
+            .iter()
+            .find(|row| row.pane_id == child)
+            .expect("child row")
+            .row_rect;
+
+        app.handle_mouse(mouse(
+            MouseEventKind::Down(MouseButton::Right),
+            row.x,
+            row.y,
+        ));
+
+        let menu = app.state.context_menu.as_ref().expect("context menu");
+        assert!(matches!(
+            menu.kind,
+            crate::app::state::ContextMenuKind::CollectionMember {
+                collection_id,
+                pane_id,
+                ..
+            } if collection_id == collection && pane_id == child
+        ));
+        let plugin = menu.plugin.as_ref().expect("plugin context initialized");
+        assert_eq!(
+            plugin.target,
+            crate::app::state::ContextMenuTarget::Pane(
+                app.public_pane_id(0, child).expect("public child pane")
+            )
+        );
     }
 
     #[tokio::test]

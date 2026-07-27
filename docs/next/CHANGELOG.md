@@ -6,6 +6,7 @@
 - Added pane collections: one nested, scrollable list leaf can hold multiple real terminal panes with inline previews, active/archive sections, collection and delegation CLI/socket APIs, and explicit promote-or-cascade close behavior.
 - Added session-wide delegation provenance with stable parent, purpose, sibling order, root, descendants, tombstones, persistence, and restore semantics.
 - Added advisory `ui.collections.archive_age_days`, `archive_count`, and `concurrency` thresholds that never automatically archive, stop, or close panes.
+- Plugin actions can now declare bounded asynchronous `choices_command` providers for workspace, tab, pane, and collection-member context menus.
 
 ### Changed
 - Grouped panes now count as seen only after a foreground human enters that child terminal; collection selection, API focus, reads, and passive observation do not acknowledge attention.
