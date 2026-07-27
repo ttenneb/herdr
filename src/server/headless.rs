@@ -7300,6 +7300,77 @@ next_tab = ""
         input_rx
     }
 
+    #[tokio::test]
+    async fn headless_double_prefix_only_reaches_entered_visible_collection_terminal() {
+        let mut server = test_headless_server();
+        let mut workspace = crate::workspace::Workspace::test_new("collection-prefix");
+        let root = workspace.tabs[0].root_pane.expect("root pane");
+        let child = workspace.test_split(ratatui::layout::Direction::Horizontal);
+        let collection = workspace
+            .create_collection_near(
+                0,
+                crate::layout::LayoutLeaf::Pane(root),
+                ratatui::layout::Direction::Horizontal,
+                0.5,
+                None,
+            )
+            .expect("collection");
+        workspace
+            .collect_pane(child, collection)
+            .expect("collect child");
+        workspace.tabs[0]
+            .layout
+            .focus_leaf(crate::layout::LayoutLeaf::Collection(collection));
+        let (runtime, mut input_rx) = crate::terminal::TerminalRuntime::test_with_channel(80, 24);
+        workspace.tabs[0].runtimes.insert(child, runtime);
+        server.app.state.workspaces = vec![workspace];
+        server.app.state.active = Some(0);
+        server.app.state.selected = 0;
+        server.app.state.mode = crate::app::Mode::Terminal;
+        let key_config: crate::config::Config =
+            toml::from_str("[keys]\nprefix = \"ctrl+l\"\n").expect("key config");
+        server.server_keybindings = key_config.live_keybinds().expect("live keybindings");
+        server.clients.insert(1, test_app_client(Some(true), 1));
+        server.foreground_client_id = Some(1);
+        server.sync_foreground_client_state();
+
+        assert!(server.handle_server_event(ServerEvent::ClientInput {
+            client_id: 1,
+            data: vec![0x0c, 0x0c],
+        }));
+        assert_eq!(server.app.state.mode, crate::app::Mode::Terminal);
+        let list_mode_input = input_rx.try_recv();
+        assert!(
+            matches!(
+                list_mode_input,
+                Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+            ),
+            "list mode must send zero bytes, got {list_mode_input:?}"
+        );
+
+        server
+            .app
+            .state
+            .enter_collection_terminal_from_foreground(0, collection, child);
+        assert!(server.app.state.focused_collection_terminal_entered());
+        assert!(server.handle_server_event(ServerEvent::ClientInput {
+            client_id: 1,
+            data: vec![0x0c, 0x0c],
+        }));
+        assert_eq!(
+            input_rx.recv().await.expect("literal prefix"),
+            Bytes::from_static(&[0x0c])
+        );
+        let extra_input = input_rx.try_recv();
+        assert!(
+            matches!(
+                extra_input,
+                Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+            ),
+            "entered mode must send exactly one literal prefix, got extra {extra_input:?}"
+        );
+    }
+
     #[test]
     fn foreground_clients_keep_independent_collection_presentation() {
         let mut server = test_headless_server();

@@ -5083,6 +5083,58 @@ last_pane = "prefix+tab"
     }
 
     #[tokio::test]
+    async fn route_client_input_double_prefix_only_reaches_entered_visible_collection_terminal() {
+        let mut app = test_app();
+        let mut workspace = Workspace::test_new("collection-prefix");
+        let root = workspace.tabs[0].root_pane.expect("root pane");
+        let child = workspace.test_split(ratatui::layout::Direction::Horizontal);
+        let collection = workspace
+            .create_collection_near(
+                0,
+                crate::layout::LayoutLeaf::Pane(root),
+                ratatui::layout::Direction::Horizontal,
+                0.5,
+                None,
+            )
+            .expect("collection");
+        workspace
+            .collect_pane(child, collection)
+            .expect("collect child");
+        workspace.tabs[0]
+            .layout
+            .focus_leaf(crate::layout::LayoutLeaf::Collection(collection));
+        let (runtime, mut rx) = TerminalRuntime::test_with_channel(80, 24);
+        workspace.tabs[0].runtimes.insert(child, runtime);
+        app.state.workspaces = vec![workspace];
+        app.state.active = Some(0);
+        app.state.selected = 0;
+        app.state.mode = Mode::Terminal;
+        app.state.prefix_code = KeyCode::Char('l');
+        app.state.prefix_mods = KeyModifiers::CONTROL;
+
+        app.route_client_input(vec![0x0c, 0x0c]);
+        assert_eq!(app.state.mode, Mode::Terminal);
+        assert!(matches!(
+            rx.try_recv(),
+            Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+        ));
+
+        app.state
+            .enter_collection_terminal_from_foreground(0, collection, child);
+        assert!(app.state.focused_collection_terminal_entered());
+        app.route_client_input(vec![0x0c, 0x0c]);
+        assert_eq!(app.state.mode, Mode::Terminal);
+        assert_eq!(
+            rx.recv().await.expect("literal prefix"),
+            bytes::Bytes::from(vec![0x0c])
+        );
+        assert!(matches!(
+            rx.try_recv(),
+            Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+        ));
+    }
+
+    #[tokio::test]
     async fn route_client_input_reencodes_terminal_keys_for_focused_pane_protocol() {
         let mut app = test_app();
         let mut workspace = Workspace::test_new("test");

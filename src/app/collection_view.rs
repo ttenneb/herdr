@@ -73,6 +73,8 @@ pub(crate) struct CollectionViewState {
     pub(crate) maximized: Option<PaneId>,
     pub(crate) resize_drag: Option<(PaneId, u16, u16)>,
     pub(crate) row_drag: Option<(PaneId, u16)>,
+    /// Outer collection scrollbar thumb currently being dragged.
+    pub(crate) collection_scrollbar_drag: Option<u16>,
     /// Child terminal scrollbar thumb currently being dragged.
     pub(crate) child_scrollbar_drag: Option<(PaneId, u16)>,
 }
@@ -130,6 +132,7 @@ pub(crate) enum CollectionHitKind {
     Disclosure,
     Preview,
     PreviewScrollbar,
+    CollectionScrollbar,
     ResizeHandle,
     Chrome,
 }

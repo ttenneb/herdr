@@ -797,6 +797,49 @@ impl App {
         ))
     }
 
+    fn set_collection_scrollbar_from_row(
+        &mut self,
+        collection_id: CollectionId,
+        screen_row: u16,
+        grab_row_offset: Option<u16>,
+    ) -> Option<u16> {
+        let layout = self
+            .state
+            .view
+            .collection_layouts
+            .iter()
+            .find(|layout| layout.id == collection_id)?;
+        let track = layout.scrollbar_rect?;
+        if track.width == 0 || track.height == 0 {
+            return None;
+        }
+        let max_scroll = layout.content_height.saturating_sub(layout.viewport_height);
+        if max_scroll == 0 {
+            return None;
+        }
+        let metrics = crate::pane::ScrollMetrics {
+            offset_from_bottom: max_scroll.saturating_sub(layout.scroll.min(max_scroll)),
+            max_offset_from_bottom: max_scroll,
+            viewport_rows: layout.viewport_height,
+        };
+        if grab_row_offset.is_none() {
+            if let Some(grab) = crate::ui::scrollbar_thumb_grab_offset(metrics, track, screen_row) {
+                return Some(grab);
+            }
+        }
+        let offset_from_bottom = if let Some(grab) = grab_row_offset {
+            crate::ui::scrollbar_offset_from_drag_row(metrics, track, screen_row, grab)
+        } else {
+            crate::ui::scrollbar_offset_from_row(metrics, track, screen_row)
+        };
+        self.state
+            .collection_views
+            .entry(collection_id)
+            .or_default()
+            .scroll = max_scroll.saturating_sub(offset_from_bottom);
+        None
+    }
+
     fn scroll_collection_child_wheel(
         &mut self,
         ws_idx: usize,
@@ -901,6 +944,30 @@ impl App {
             .collection_layouts
             .iter()
             .find_map(|layout| layout.hit_at(mouse.column, mouse.row));
+        if let Some((collection_id, grab_row_offset)) = self
+            .state
+            .collection_views
+            .iter()
+            .find_map(|(id, view)| view.collection_scrollbar_drag.map(|grab| (*id, grab)))
+        {
+            match mouse.kind {
+                MouseEventKind::Drag(MouseButton::Left) => {
+                    let _ = self.set_collection_scrollbar_from_row(
+                        collection_id,
+                        mouse.row,
+                        Some(grab_row_offset),
+                    );
+                    return true;
+                }
+                MouseEventKind::Up(MouseButton::Left) => {
+                    if let Some(view) = self.state.collection_views.get_mut(&collection_id) {
+                        view.collection_scrollbar_drag = None;
+                    }
+                    return true;
+                }
+                _ => {}
+            }
+        }
         if let Some((collection_id, pane, grab_row_offset)) =
             self.state.collection_views.iter().find_map(|(id, view)| {
                 view.child_scrollbar_drag
@@ -1017,21 +1084,47 @@ impl App {
                         );
                     }
                 } else {
+                    let max_scroll = self
+                        .state
+                        .view
+                        .collection_layouts
+                        .iter()
+                        .find(|layout| layout.id == hit.collection_id)
+                        .map(|layout| layout.content_height.saturating_sub(layout.viewport_height))
+                        .unwrap_or_default();
                     let view = self
                         .state
                         .collection_views
                         .entry(hit.collection_id)
                         .or_default();
-                    if matches!(mouse.kind, MouseEventKind::ScrollUp) {
-                        view.scroll = view.scroll.saturating_sub(3)
+                    view.scroll = if matches!(mouse.kind, MouseEventKind::ScrollUp) {
+                        view.scroll.saturating_sub(3)
                     } else {
-                        view.scroll = view.scroll.saturating_add(3)
+                        view.scroll.saturating_add(3).min(max_scroll)
                     };
                 }
                 true
             }
             MouseEventKind::Down(MouseButton::Left) => {
-                if let Some(pane) = hit.pane_id {
+                // A new left-button gesture owns exactly one drag surface, even if a malformed
+                // event stream omitted the previous release.
+                for view in self.state.collection_views.values_mut() {
+                    view.collection_scrollbar_drag = None;
+                    view.child_scrollbar_drag = None;
+                    view.resize_drag = None;
+                    view.row_drag = None;
+                }
+                if hit.kind == CollectionHitKind::CollectionScrollbar {
+                    let grab =
+                        self.set_collection_scrollbar_from_row(hit.collection_id, mouse.row, None);
+                    if let Some(grab_row_offset) = grab {
+                        self.state
+                            .collection_views
+                            .entry(hit.collection_id)
+                            .or_default()
+                            .collection_scrollbar_drag = Some(grab_row_offset);
+                    }
+                } else if let Some(pane) = hit.pane_id {
                     self.select_collection_member_via_runtime(
                         ws_idx,
                         hit.collection_id,
@@ -1471,6 +1564,140 @@ mod tests {
         assert!(app.state.collection_views[&collection]
             .child_scrollbar_drag
             .is_none());
+    }
+
+    #[tokio::test]
+    async fn collection_scrollbar_track_click_and_thumb_drag_only_move_collection() {
+        let (mut app, collection, child, _rx) = collection_scroll_app(b"", 16);
+        let child_offset = app.state.workspaces[0].tabs[0].runtimes[&child]
+            .scroll_metrics()
+            .expect("child metrics")
+            .offset_from_bottom;
+        let track = app.state.view.collection_layouts[0]
+            .scrollbar_rect
+            .expect("collection scrollbar");
+
+        app.handle_collection_mouse(mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            track.x,
+            track.bottom().saturating_sub(1),
+        ));
+        assert!(app.state.collection_views[&collection].scroll > 0);
+        assert_eq!(
+            app.state.workspaces[0].tabs[0].runtimes[&child]
+                .scroll_metrics()
+                .expect("child metrics")
+                .offset_from_bottom,
+            child_offset
+        );
+        assert!(app.state.collection_views[&collection]
+            .collection_scrollbar_drag
+            .is_none());
+        let layout = &app.state.view.collection_layouts[0];
+        let max_scroll = layout.content_height.saturating_sub(layout.viewport_height);
+        app.state
+            .collection_views
+            .get_mut(&collection)
+            .expect("collection view")
+            .scroll = max_scroll / 3;
+
+        let surface = crate::ui::compute_tab_surface(
+            &mut app.state,
+            &TerminalRuntimeRegistry::new(),
+            Rect::new(0, 0, 80, 20),
+            false,
+            Default::default(),
+        );
+        app.state.view.collection_layouts = surface.collection_layouts;
+        let layout = &app.state.view.collection_layouts[0];
+        let track = layout.scrollbar_rect.expect("collection scrollbar");
+        let max_scroll = layout.content_height.saturating_sub(layout.viewport_height);
+        let metrics = crate::pane::ScrollMetrics {
+            offset_from_bottom: max_scroll.saturating_sub(layout.scroll),
+            max_offset_from_bottom: max_scroll,
+            viewport_rows: layout.viewport_height,
+        };
+        let thumb = crate::ui::scrollbar_thumb(metrics, track).expect("collection thumb");
+        let before_drag = layout.scroll;
+
+        app.handle_collection_mouse(mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            track.x,
+            thumb.top,
+        ));
+        assert!(app.state.collection_views[&collection]
+            .collection_scrollbar_drag
+            .is_some());
+        assert!(app.state.collection_views[&collection]
+            .child_scrollbar_drag
+            .is_none());
+        assert!(app.state.collection_views[&collection].row_drag.is_none());
+        app.handle_collection_mouse(mouse(
+            MouseEventKind::Drag(MouseButton::Left),
+            track.x,
+            track.bottom().saturating_sub(1),
+        ));
+        app.handle_collection_mouse(mouse(
+            MouseEventKind::Up(MouseButton::Left),
+            track.x,
+            track.bottom().saturating_sub(1),
+        ));
+        assert!(app.state.collection_views[&collection].scroll > before_drag);
+        assert!(app.state.collection_views[&collection]
+            .collection_scrollbar_drag
+            .is_none());
+        assert_eq!(
+            app.state.workspaces[0].tabs[0].runtimes[&child]
+                .scroll_metrics()
+                .expect("child metrics")
+                .offset_from_bottom,
+            child_offset
+        );
+    }
+
+    #[tokio::test]
+    async fn collection_scrollbar_wheel_and_child_scrollbar_are_isolated() {
+        let (mut app, collection, child, _rx) = collection_scroll_app(b"", 12);
+        let layout = &app.state.view.collection_layouts[0];
+        let outer = layout.scrollbar_rect.expect("collection scrollbar");
+        let child_track = layout
+            .rows
+            .iter()
+            .find(|row| row.pane_id == child)
+            .and_then(|row| row.preview_scrollbar_rect)
+            .expect("child scrollbar");
+        let child_before = app.state.workspaces[0].tabs[0].runtimes[&child]
+            .scroll_metrics()
+            .expect("child metrics")
+            .offset_from_bottom;
+
+        app.handle_collection_mouse(mouse(MouseEventKind::ScrollDown, outer.x, outer.y));
+        let collection_after_outer = app.state.collection_views[&collection].scroll;
+        assert!(collection_after_outer > 0);
+        assert_eq!(
+            app.state.workspaces[0].tabs[0].runtimes[&child]
+                .scroll_metrics()
+                .expect("child metrics")
+                .offset_from_bottom,
+            child_before
+        );
+
+        app.handle_collection_mouse(mouse(
+            MouseEventKind::ScrollUp,
+            child_track.x,
+            child_track.y,
+        ));
+        assert_eq!(
+            app.state.collection_views[&collection].scroll,
+            collection_after_outer
+        );
+        assert!(
+            app.state.workspaces[0].tabs[0].runtimes[&child]
+                .scroll_metrics()
+                .expect("child metrics")
+                .offset_from_bottom
+                > child_before
+        );
     }
 
     fn group_membership(

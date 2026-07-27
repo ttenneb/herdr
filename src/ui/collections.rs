@@ -224,14 +224,17 @@ pub(crate) fn compute_collection_layouts(
             rect: inner,
             terminal_row_offset: 0,
         }];
-        if let Some(gutter) = collection_gutter {
-            hits.push(CollectionHitRegion {
-                collection_id: collection.id,
-                pane_id: None,
-                kind: CollectionHitKind::Chrome,
-                rect: gutter,
-                terminal_row_offset: 0,
-            });
+        if content_height > viewport_height {
+            if let Some(gutter) = collection_gutter.filter(|rect| rect.width > 0 && rect.height > 0)
+            {
+                hits.push(CollectionHitRegion {
+                    collection_id: collection.id,
+                    pane_id: None,
+                    kind: CollectionHitKind::CollectionScrollbar,
+                    rect: gutter,
+                    terminal_row_offset: 0,
+                });
+            }
         }
 
         let mut append_rows =
@@ -378,7 +381,8 @@ pub(crate) fn compute_collection_layouts(
             scroll,
             scrollbar_rect: (content_height > viewport_height)
                 .then_some(collection_gutter)
-                .flatten(),
+                .flatten()
+                .filter(|rect| rect.width > 0 && rect.height > 0),
             maximized: None,
             maximized_preview_rect: None,
             maximized_scrollbar_rect: None,
@@ -1025,6 +1029,49 @@ mod tests {
             terminal.backend().buffer()[(preview.right().saturating_sub(1), child_track.y)]
                 .symbol()
         );
+    }
+
+    #[test]
+    fn collection_scrollbar_hit_is_omitted_when_tiny_and_never_has_zero_extent() {
+        let mut ws = Workspace::test_new("tiny-collection-scrollbar");
+        let root = ws.tabs[0].root_pane.expect("root");
+        let id = ws
+            .create_collection_near(0, LayoutLeaf::Pane(root), Direction::Vertical, 0.5, None)
+            .expect("collection");
+        for _ in 0..12 {
+            let pane = ws.test_split(Direction::Horizontal);
+            ws.collect_pane(pane, id).expect("collect member");
+        }
+        let mut app = AppState::test_new();
+        app.workspaces = vec![ws];
+        app.active = Some(0);
+
+        for width in 0..=16 {
+            let layouts = compute_collection_layouts(
+                &mut app,
+                &TerminalRuntimeRegistry::new(),
+                Rect::new(0, 0, width, 8),
+                false,
+                Default::default(),
+            );
+            let layout = layouts
+                .iter()
+                .find(|layout| layout.id == id)
+                .expect("layout");
+            let scrollbar_hits: Vec<_> = layout
+                .hits
+                .iter()
+                .filter(|hit| hit.kind == CollectionHitKind::CollectionScrollbar)
+                .collect();
+            match layout.scrollbar_rect {
+                Some(track) => {
+                    assert!(track.width > 0 && track.height > 0);
+                    assert_eq!(scrollbar_hits.len(), 1);
+                    assert_eq!(scrollbar_hits[0].rect, track);
+                }
+                None => assert!(scrollbar_hits.is_empty()),
+            }
+        }
     }
 
     #[tokio::test]

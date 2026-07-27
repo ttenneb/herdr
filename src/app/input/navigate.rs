@@ -740,6 +740,12 @@ impl App {
     }
 
     fn pass_through_key_to_focused_pane(&mut self, key: TerminalKey) -> bool {
+        // A focused collection exposes its selected pane to shared focus APIs even while the
+        // foreground client is controlling the list. Literal-prefix passthrough is terminal input,
+        // so only an explicitly entered and currently visible child may receive it.
+        if !self.collection_accepts_terminal_input() {
+            return false;
+        }
         let Some(ws_idx) = self.state.active else {
             return false;
         };
