@@ -1732,6 +1732,15 @@ impl App {
             ws.close_pane(pane_id)
         };
         let destruction = self.state.finalize_pane_destruction([pane_id]);
+        if let Some(collection_id) = source_collection_id {
+            self.emit_event(EventEnvelope {
+                event: EventKind::CollectionMemberRemoved,
+                data: EventData::CollectionMemberRemoved {
+                    collection_id: super::collections::collection_id_string(collection_id),
+                    pane_id: public_pane_id.clone(),
+                },
+            });
+        }
         if should_close_workspace {
             self.state.selected = ws_idx;
             self.state.close_selected_workspace();
@@ -1766,15 +1775,6 @@ impl App {
             }
         }
 
-        if let Some(collection_id) = source_collection_id {
-            self.emit_event(EventEnvelope {
-                event: EventKind::CollectionMemberRemoved,
-                data: EventData::CollectionMemberRemoved {
-                    collection_id: super::collections::collection_id_string(collection_id),
-                    pane_id: target.pane_id.clone(),
-                },
-            });
-        }
         self.emit_pane_destruction_events(destruction, &[(pane_id, target.pane_id.clone())]);
 
         Ok(())
@@ -1985,15 +1985,9 @@ impl App {
             .workspaces
             .get(ws_idx)?
             .find_tab_index_for_pane(pane_id)?;
-        let pane_count = self
-            .state
-            .workspaces
-            .get(ws_idx)?
-            .tabs
-            .get(tab_idx)?
-            .layout
-            .pane_count();
-        (pane_count > 1).then_some((ws_idx, tab_idx))
+        let tab = self.state.workspaces.get(ws_idx)?.tabs.get(tab_idx)?;
+        let source_tab_survives = tab.layout.pane_count() > 1 || !tab.layout.is_single_pane_leaf();
+        source_tab_survives.then_some((ws_idx, tab_idx))
     }
 }
 
@@ -2480,6 +2474,114 @@ mod tests {
         assert_eq!(success.id, "req");
         assert_eq!(app.state.request_remove_linked_worktree, None);
         assert!(app.state.workspaces.is_empty());
+    }
+
+    #[test]
+    fn direct_member_close_emits_membership_then_pane_then_surviving_layout() {
+        let event_hub = crate::api::EventHub::default();
+        let (_api_tx, api_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = App::new(&Config::default(), true, None, api_rx, event_hub.clone());
+        let mut workspace = Workspace::test_new("collections");
+        let root = workspace.tabs[0].root_pane.expect("root pane");
+        let member_collection = workspace
+            .create_collection_near(
+                0,
+                crate::layout::LayoutLeaf::Pane(root),
+                ratatui::layout::Direction::Horizontal,
+                0.5,
+                Some("member".into()),
+            )
+            .expect("member collection");
+        workspace
+            .collect_pane(root, member_collection)
+            .expect("collect root");
+        workspace
+            .create_collection_near(
+                0,
+                crate::layout::LayoutLeaf::Collection(member_collection),
+                ratatui::layout::Direction::Horizontal,
+                0.5,
+                Some("empty peer".into()),
+            )
+            .expect("empty peer collection");
+        app.state.workspaces = vec![workspace];
+        app.state.ensure_test_terminals();
+        let public_root = app.public_pane_id(0, root).expect("public root");
+        let sequence = event_hub.current_sequence();
+
+        let response = app.handle_pane_close(
+            "close".into(),
+            PaneTarget {
+                pane_id: public_root.clone(),
+            },
+        );
+
+        let _: SuccessResponse = serde_json::from_str(&response).expect("success");
+        assert_eq!(app.state.workspaces[0].tabs.len(), 1);
+        assert_eq!(app.state.workspaces[0].tabs[0].layout.pane_count(), 0);
+        let events = event_hub.events_after(sequence);
+        let position = |kind| {
+            events
+                .iter()
+                .position(|(_, event)| event.event == kind)
+                .unwrap_or_else(|| panic!("missing {kind:?}"))
+        };
+        assert!(position(EventKind::CollectionMemberRemoved) < position(EventKind::PaneClosed));
+        assert!(position(EventKind::PaneClosed) < position(EventKind::LayoutUpdated));
+        let layout = events
+            .iter()
+            .find_map(|(_, event)| match &event.data {
+                EventData::LayoutUpdated { layout } => Some(layout),
+                _ => None,
+            })
+            .expect("layout update");
+        assert!(layout.panes.is_empty());
+        assert_eq!(layout.collections.len(), 2);
+    }
+
+    #[test]
+    fn closing_sole_tiled_pane_updates_surviving_empty_collection_layout() {
+        let event_hub = crate::api::EventHub::default();
+        let (_api_tx, api_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = App::new(&Config::default(), true, None, api_rx, event_hub.clone());
+        let mut workspace = Workspace::test_new("collections");
+        let root = workspace.tabs[0].root_pane.expect("root pane");
+        workspace
+            .create_collection_near(
+                0,
+                crate::layout::LayoutLeaf::Pane(root),
+                ratatui::layout::Direction::Horizontal,
+                0.5,
+                Some("empty".into()),
+            )
+            .expect("empty collection");
+        app.state.workspaces = vec![workspace];
+        app.state.ensure_test_terminals();
+        let public_root = app.public_pane_id(0, root).expect("public root");
+        let sequence = event_hub.current_sequence();
+
+        let response = app.handle_pane_close(
+            "close".into(),
+            PaneTarget {
+                pane_id: public_root,
+            },
+        );
+
+        let _: SuccessResponse = serde_json::from_str(&response).expect("success");
+        assert_eq!(app.state.workspaces[0].tabs.len(), 1);
+        let events = event_hub.events_after(sequence);
+        assert!(!events
+            .iter()
+            .any(|(_, event)| event.event == EventKind::CollectionMemberRemoved));
+        let layout = events
+            .iter()
+            .find_map(|(_, event)| match &event.data {
+                EventData::LayoutUpdated { layout } => Some(layout),
+                _ => None,
+            })
+            .expect("layout update");
+        assert!(layout.panes.is_empty());
+        assert_eq!(layout.collections.len(), 1);
     }
 
     #[test]
