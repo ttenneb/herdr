@@ -746,6 +746,7 @@ impl App {
                         });
                     }
                     if outcome.removed_tab_idx.is_some() {
+                        layout_update_tab_idx = None;
                         self.emit_event(EventEnvelope {
                             event: EventKind::TabClosed,
                             data: EventData::TabClosed {
@@ -2380,6 +2381,57 @@ mod tests {
         assert!(events
             .iter()
             .any(|(_, event)| event.event == EventKind::CollectionClosed));
+    }
+
+    #[test]
+    fn cascading_collection_only_tab_does_not_update_unaffected_tab_layout() {
+        let (mut app, root, second, third) = app_with_panes();
+        let collection_id = create_collection(&mut app, root);
+        for pane in [root, second, third] {
+            let pane_id = app.public_pane_id(0, pane).expect("public pane");
+            let added = request(
+                &mut app,
+                Method::CollectionAdd(CollectionAddParams {
+                    collection_id: collection_id.clone(),
+                    pane_id,
+                }),
+            );
+            assert!(added.get("error").is_none(), "{added}");
+        }
+        let source_tab_id = app.public_tab_id(0, 0).expect("source tab");
+        let unaffected_tab_idx = app.state.workspaces[0].test_add_tab(Some("unaffected"));
+        let unaffected_tab_id = app
+            .public_tab_id(0, unaffected_tab_idx)
+            .expect("unaffected tab");
+        app.state.ensure_test_terminals();
+        let sequence = app.event_hub.current_sequence();
+
+        let closed = request(
+            &mut app,
+            Method::CollectionClose(CollectionCloseParams {
+                collection_id,
+                disposition: Some(CollectionCloseDisposition::CascadeClose),
+                target_pane_id: None,
+                focus_promoted: false,
+            }),
+        );
+
+        assert_eq!(closed["result"]["type"], "ok");
+        assert_eq!(app.state.workspaces[0].tabs.len(), 1);
+        assert_eq!(
+            app.public_tab_id(0, 0).as_deref(),
+            Some(unaffected_tab_id.as_str())
+        );
+        let events = app.event_hub.events_after(sequence);
+        assert!(events.iter().any(|(_, event)| {
+            matches!(
+                &event.data,
+                EventData::TabClosed { tab_id, .. } if tab_id == &source_tab_id
+            )
+        }));
+        assert!(!events
+            .iter()
+            .any(|(_, event)| event.event == EventKind::LayoutUpdated));
     }
 
     #[test]
