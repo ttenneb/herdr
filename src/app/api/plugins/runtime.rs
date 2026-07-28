@@ -148,7 +148,8 @@ impl App {
         self.state.plugin_commands_in_flight += 1;
         let event_tx = self.event_tx.clone();
         std::thread::spawn(move || {
-            let mut command = crate::plugin_command::command_for_argv(&program, &args);
+            let mut command =
+                crate::plugin_command::command_for_argv_in_dir(&program, &args, &plugin_root);
             configure_plugin_command(&mut command, &plugin_root, &env);
             let child = command.spawn();
             let finished = match child {
@@ -301,7 +302,8 @@ impl App {
 
         let event_tx = self.event_tx.clone();
         std::thread::spawn(move || {
-            let mut command = crate::plugin_command::command_for_argv(&program, &args);
+            let mut command =
+                crate::plugin_command::command_for_argv_in_dir(&program, &args, &plugin_root);
             configure_plugin_command(&mut command, &plugin_root, &env);
             command.stdin(Stdio::null());
             let ChoicesProviderCompletion {

@@ -384,7 +384,7 @@ mod tests {
         workspace.cached_git_space = Some(crate::workspace::GitSpaceMetadata {
             key: "/repo/.git".into(),
             checkout_key: "/repo".into(),
-            label: "repo".into(),
+            repo_name: "repo".into(),
             repo_root: "/repo".into(),
             is_linked_worktree: false,
         });

@@ -61,7 +61,9 @@ fn root(name: &str) -> std::path::PathBuf {
 }
 
 fn shell(script: &str) -> ChoicesProviderCompletion {
-    let mut command = crate::plugin_command::command_for_argv("sh", &["-c".into(), script.into()]);
+    let cwd = std::env::current_dir().expect("current directory");
+    let mut command =
+        crate::plugin_command::command_for_argv_in_dir("sh", &["-c".into(), script.into()], &cwd);
     command
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -623,9 +625,10 @@ fn deferred_reaping_retains_admission_until_cleanup_event() {
 fn provider_cancelled_before_worker_start_never_executes_command() {
     let root = root("choices-pre-spawn-cancel");
     let marker = root.join("executed");
-    let mut command = crate::plugin_command::command_for_argv(
+    let mut command = crate::plugin_command::command_for_argv_in_dir(
         "sh",
         &["-c".into(), format!("touch {}", marker.display())],
+        &root,
     );
     command
         .stdin(Stdio::null())

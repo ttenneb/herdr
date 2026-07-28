@@ -4194,7 +4194,7 @@ mod tests {
         state.workspaces[0].cached_git_space = Some(crate::workspace::GitSpaceMetadata {
             key: "/repo/app/.git".into(),
             checkout_key: "/repo/app".into(),
-            label: "app".into(),
+            repo_name: "app".into(),
             repo_root: "/repo/app".into(),
             is_linked_worktree: false,
         });
@@ -4220,7 +4220,7 @@ mod tests {
             state.workspaces[index].cached_git_space = Some(crate::workspace::GitSpaceMetadata {
                 key: "/repo/app/.git".into(),
                 checkout_key: if linked { "/repo/feature" } else { "/repo/app" }.into(),
-                label: "app".into(),
+                repo_name: "app".into(),
                 repo_root: if linked { "/repo/feature" } else { "/repo/app" }.into(),
                 is_linked_worktree: linked,
             });
@@ -4892,7 +4892,7 @@ mod tests {
                 space: Some(crate::workspace::GitSpaceMetadata {
                     key: "other-repo-key".into(),
                     checkout_key: "/other/checkout".into(),
-                    label: "other".into(),
+                    repo_name: "other".into(),
                     repo_root: "/other/repo".into(),
                     is_linked_worktree: false,
                 }),
