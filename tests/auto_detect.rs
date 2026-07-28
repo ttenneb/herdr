@@ -31,6 +31,24 @@ fn unique_test_dir() -> PathBuf {
     ))
 }
 
+fn unique_named_session_test_dir() -> PathBuf {
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    // Named-session sockets live several directories below this base. Keep it
+    // short enough to stay within Unix-domain socket path limits on all hosts.
+    PathBuf::from(format!("/tmp/herdr-named-{}-{nanos}", std::process::id()))
+}
+
+fn app_config_dir_name() -> &'static str {
+    if cfg!(debug_assertions) {
+        "herdr-dev"
+    } else {
+        "herdr"
+    }
+}
+
 struct SpawnedHerdr {
     _master: Box<dyn MasterPty + Send>,
     child: Box<dyn Child + Send + Sync>,
@@ -154,6 +172,48 @@ fn spawn_herdr_auto(
     cmd.env("XDG_CONFIG_HOME", config_home);
     cmd.env("XDG_RUNTIME_DIR", runtime_dir);
     cmd.env("HERDR_SOCKET_PATH", api_socket_path);
+    cmd.env_remove("HERDR_CLIENT_SOCKET_PATH");
+    cmd.env("SHELL", "/bin/sh");
+    cmd.env_remove("HERDR_ENV");
+
+    let child = pair.slave.spawn_command(cmd).unwrap();
+    register_spawned_herdr_pid(child.process_id());
+    drop(pair.slave);
+
+    SpawnedHerdr {
+        _master: pair.master,
+        child,
+    }
+}
+
+/// Spawn `herdr --session <name>` with no socket overrides — the named-session cold-start path.
+fn spawn_herdr_named_session(
+    config_home: &Path,
+    runtime_dir: &Path,
+    session_name: &str,
+) -> SpawnedHerdr {
+    let app_config_dir = config_home.join(app_config_dir_name());
+    fs::create_dir_all(&app_config_dir).unwrap();
+    fs::create_dir_all(runtime_dir).unwrap();
+    register_runtime_dir(runtime_dir);
+    fs::write(app_config_dir.join("config.toml"), "onboarding = false\n").unwrap();
+
+    let pair = native_pty_system()
+        .openpty(PtySize {
+            rows: 24,
+            cols: 80,
+            pixel_width: 0,
+            pixel_height: 0,
+        })
+        .unwrap();
+
+    let mut cmd = CommandBuilder::new(env!("CARGO_BIN_EXE_herdr"));
+    cmd.arg("--session");
+    cmd.arg(session_name);
+    cmd.env("XDG_CONFIG_HOME", config_home);
+    cmd.env("XDG_RUNTIME_DIR", runtime_dir);
+    cmd.env_remove("HERDR_SESSION");
+    cmd.env_remove("HERDR_SOCKET_PATH");
     cmd.env_remove("HERDR_CLIENT_SOCKET_PATH");
     cmd.env("SHELL", "/bin/sh");
     cmd.env_remove("HERDR_ENV");
@@ -324,6 +384,55 @@ fn auto_detect_no_server_spawns_server_and_attaches() {
         process_exists(client_pid),
         "client process should be running"
     );
+
+    cleanup_spawned_herdr(herdr, base);
+}
+
+/// A fresh named session creates its own sockets and keeps its startup pane alive.
+#[test]
+fn named_session_cold_start_creates_sockets_and_keeps_startup_pane() {
+    let _lock = test_lock();
+    let base = unique_named_session_test_dir();
+    let config_home = base.join("config");
+    let runtime_dir = base.join("runtime");
+    let session_name = "cold-start";
+    let session_dir = config_home
+        .join(app_config_dir_name())
+        .join("sessions")
+        .join(session_name);
+    let api_socket = session_dir.join("herdr.sock");
+    let client_socket = session_dir.join("herdr-client.sock");
+
+    let mut herdr = spawn_herdr_named_session(&config_home, &runtime_dir, session_name);
+
+    wait_for_socket(&api_socket, Duration::from_secs(10));
+    wait_for_socket(&client_socket, Duration::from_secs(10));
+
+    assert!(
+        ping_socket(&api_socket).contains("pong"),
+        "named-session API should remain responsive"
+    );
+    let client_status = herdr
+        .child
+        .try_wait()
+        .expect("client status should be readable");
+    assert!(
+        client_status.is_none(),
+        "named-session client exited unexpectedly: {client_status:?}"
+    );
+
+    let panes = run_cli(&api_socket, &["pane", "list"]);
+    assert!(
+        panes.status.success(),
+        "pane list failed: {}",
+        String::from_utf8_lossy(&panes.stderr)
+    );
+    let panes: Value = serde_json::from_slice(&panes.stdout).unwrap();
+    let pane_count = panes
+        .pointer("/result/panes")
+        .and_then(Value::as_array)
+        .map_or(0, Vec::len);
+    assert_eq!(pane_count, 1, "fresh named session should retain one pane");
 
     cleanup_spawned_herdr(herdr, base);
 }
