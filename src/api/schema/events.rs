@@ -22,6 +22,8 @@ pub enum Subscription {
     WorkspaceUpdated {},
     #[serde(rename = "workspace.metadata_updated")]
     WorkspaceMetadataUpdated {},
+    #[serde(rename = "workspace.resources_updated")]
+    WorkspaceResourcesUpdated {},
     #[serde(rename = "workspace.renamed")]
     WorkspaceRenamed {},
     #[serde(rename = "workspace.moved")]
@@ -32,6 +34,26 @@ pub enum Subscription {
     WorkspaceClosed {},
     #[serde(rename = "workspace.focused")]
     WorkspaceFocused {},
+    #[serde(rename = "checkout.opened")]
+    CheckoutOpened {},
+    #[serde(rename = "checkout.renamed")]
+    CheckoutRenamed {},
+    #[serde(rename = "checkout.moved")]
+    CheckoutMoved {},
+    #[serde(rename = "checkout.closed")]
+    CheckoutClosed {},
+    #[serde(rename = "checkout.focused")]
+    CheckoutFocused {},
+    #[serde(rename = "repository.created")]
+    RepositoryCreated {},
+    #[serde(rename = "repository.renamed")]
+    RepositoryRenamed {},
+    #[serde(rename = "repository.moved")]
+    RepositoryMoved {},
+    #[serde(rename = "repository.closed")]
+    RepositoryClosed {},
+    #[serde(rename = "repository.focused")]
+    RepositoryFocused {},
     #[serde(rename = "worktree.created")]
     WorktreeCreated {},
     #[serde(rename = "worktree.opened")]
@@ -225,11 +247,22 @@ pub enum EventKind {
     WorkspaceCreated,
     WorkspaceUpdated,
     WorkspaceMetadataUpdated,
+    WorkspaceResourcesUpdated,
     WorkspaceClosed,
     WorkspaceRenamed,
     WorkspaceMoved,
     WorkspaceReordered,
     WorkspaceFocused,
+    CheckoutOpened,
+    CheckoutRenamed,
+    CheckoutMoved,
+    CheckoutClosed,
+    CheckoutFocused,
+    RepositoryCreated,
+    RepositoryRenamed,
+    RepositoryMoved,
+    RepositoryClosed,
+    RepositoryFocused,
     WorktreeCreated,
     WorktreeOpened,
     WorktreeRemoved,
@@ -271,11 +304,22 @@ impl EventKind {
             EventKind::WorkspaceCreated => "workspace.created",
             EventKind::WorkspaceUpdated => "workspace.updated",
             EventKind::WorkspaceMetadataUpdated => "workspace.metadata_updated",
+            EventKind::WorkspaceResourcesUpdated => "workspace.resources_updated",
             EventKind::WorkspaceClosed => "workspace.closed",
             EventKind::WorkspaceRenamed => "workspace.renamed",
             EventKind::WorkspaceMoved => "workspace.moved",
             EventKind::WorkspaceReordered => "workspace.reordered",
             EventKind::WorkspaceFocused => "workspace.focused",
+            EventKind::CheckoutOpened => "checkout.opened",
+            EventKind::CheckoutRenamed => "checkout.renamed",
+            EventKind::CheckoutMoved => "checkout.moved",
+            EventKind::CheckoutClosed => "checkout.closed",
+            EventKind::CheckoutFocused => "checkout.focused",
+            EventKind::RepositoryCreated => "repository.created",
+            EventKind::RepositoryRenamed => "repository.renamed",
+            EventKind::RepositoryMoved => "repository.moved",
+            EventKind::RepositoryClosed => "repository.closed",
+            EventKind::RepositoryFocused => "repository.focused",
             EventKind::WorktreeCreated => "worktree.created",
             EventKind::WorktreeOpened => "worktree.opened",
             EventKind::WorktreeRemoved => "worktree.removed",
@@ -318,11 +362,22 @@ pub const KNOWN_EVENT_KINDS: &[EventKind] = &[
     EventKind::WorkspaceCreated,
     EventKind::WorkspaceUpdated,
     EventKind::WorkspaceMetadataUpdated,
+    EventKind::WorkspaceResourcesUpdated,
     EventKind::WorkspaceClosed,
     EventKind::WorkspaceRenamed,
     EventKind::WorkspaceMoved,
     EventKind::WorkspaceReordered,
     EventKind::WorkspaceFocused,
+    EventKind::CheckoutOpened,
+    EventKind::CheckoutRenamed,
+    EventKind::CheckoutMoved,
+    EventKind::CheckoutClosed,
+    EventKind::CheckoutFocused,
+    EventKind::RepositoryCreated,
+    EventKind::RepositoryRenamed,
+    EventKind::RepositoryMoved,
+    EventKind::RepositoryClosed,
+    EventKind::RepositoryFocused,
     EventKind::WorktreeCreated,
     EventKind::WorktreeOpened,
     EventKind::WorktreeRemoved,
@@ -366,6 +421,16 @@ pub const PLUGIN_HOOK_EVENT_KINDS: &[EventKind] = &[
     EventKind::WorkspaceMoved,
     EventKind::WorkspaceReordered,
     EventKind::WorkspaceFocused,
+    EventKind::CheckoutOpened,
+    EventKind::CheckoutRenamed,
+    EventKind::CheckoutMoved,
+    EventKind::CheckoutClosed,
+    EventKind::CheckoutFocused,
+    EventKind::RepositoryCreated,
+    EventKind::RepositoryRenamed,
+    EventKind::RepositoryMoved,
+    EventKind::RepositoryClosed,
+    EventKind::RepositoryFocused,
     EventKind::WorktreeCreated,
     EventKind::WorktreeOpened,
     EventKind::WorktreeRemoved,
@@ -519,6 +584,9 @@ pub enum EventData {
     WorkspaceMetadataUpdated {
         workspace: WorkspaceInfo,
     },
+    WorkspaceResourcesUpdated {
+        workspace: WorkspaceInfo,
+    },
     WorkspaceClosed {
         workspace_id: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -541,6 +609,42 @@ pub enum EventData {
     },
     WorkspaceFocused {
         workspace_id: String,
+    },
+    CheckoutOpened {
+        checkout: WorkspaceInfo,
+    },
+    CheckoutRenamed {
+        workspace_id: String,
+        label: String,
+    },
+    CheckoutMoved {
+        workspace_id: String,
+        insert_index: usize,
+    },
+    CheckoutClosed {
+        workspace_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        checkout: Option<WorkspaceInfo>,
+    },
+    CheckoutFocused {
+        workspace_id: String,
+    },
+    RepositoryCreated {
+        repository: super::repositories::RepositoryInfo,
+    },
+    RepositoryRenamed {
+        repository_id: String,
+        label: String,
+    },
+    RepositoryMoved {
+        repository_id: String,
+        insert_index: usize,
+    },
+    RepositoryClosed {
+        repository_id: String,
+    },
+    RepositoryFocused {
+        repository_id: String,
     },
     WorktreeCreated {
         workspace: WorkspaceInfo,

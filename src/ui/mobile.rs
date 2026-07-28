@@ -32,10 +32,16 @@ pub(crate) struct MobileSwitcherAreas {
     pub viewport: Rect,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum MobileSwitcherTarget {
     NewWorkspace,
+    Repository(String),
     Workspace(usize),
+    WorkspaceResource {
+        workspace_id: String,
+        plugin_id: String,
+        resource_id: String,
+    },
     NewTab,
     Tab(usize),
     Agent {
@@ -105,19 +111,27 @@ fn mobile_agents_block_height(app: &AppState) -> usize {
     }
 }
 
+fn mobile_space_entry_height(entry: &WorkspaceListEntry) -> usize {
+    match entry {
+        WorkspaceListEntry::Workspace { depth: 0, .. } | WorkspaceListEntry::Repository { .. } => 2,
+        WorkspaceListEntry::Workspace { .. } | WorkspaceListEntry::Resource { .. } => 1,
+    }
+}
+
 pub(crate) fn mobile_switcher_workspace_doc_range(
     app: &AppState,
     idx: usize,
 ) -> std::ops::Range<usize> {
-    // Spaces render in grouped order, so a workspace's row position is its index
-    // in the entry list, not its raw array index.
-    let pos = workspace_list_entries_expanded(app)
-        .iter()
-        .position(|WorkspaceListEntry::Workspace { ws_idx, .. }| *ws_idx == idx)
-        .unwrap_or(idx);
-    // spaces sit after the agents block, then a title + "new workspace" row.
-    let start = mobile_agents_block_height(app) + 2 + pos * 2;
-    start..start + 2
+    let entries = workspace_list_entries_expanded(app);
+    let mut start = mobile_agents_block_height(app) + 2;
+    for entry in &entries {
+        let height = mobile_space_entry_height(entry);
+        if matches!(entry, WorkspaceListEntry::Workspace { ws_idx, .. } if *ws_idx == idx) {
+            return start..start + height;
+        }
+        start += height;
+    }
+    start..start
 }
 
 pub(crate) fn mobile_switcher_max_scroll(app: &AppState) -> usize {
@@ -173,14 +187,31 @@ pub(crate) fn mobile_switcher_target_at(
     // Spaces render in grouped (worktree-tree) order, which differs from raw
     // array order, so map the clicked row to the entry's real workspace index.
     let space_entries = workspace_list_entries_expanded(app);
-    let spaces_end = cursor + space_entries.len() * 2;
-    if doc_row >= cursor && doc_row < spaces_end {
-        let entry_idx = (doc_row - cursor) / 2;
-        return space_entries.get(entry_idx).map(
-            |WorkspaceListEntry::Workspace { ws_idx, .. }| MobileSwitcherTarget::Workspace(*ws_idx),
-        );
+    for entry in &space_entries {
+        let height = mobile_space_entry_height(entry);
+        if doc_row >= cursor && doc_row < cursor + height {
+            return Some(match entry {
+                WorkspaceListEntry::Repository { repository_id } => {
+                    // Repository entries are never projected; retain compatibility for stale callers.
+                    MobileSwitcherTarget::Repository(repository_id.clone())
+                }
+                WorkspaceListEntry::Workspace { ws_idx, .. } => {
+                    MobileSwitcherTarget::Workspace(*ws_idx)
+                }
+                WorkspaceListEntry::Resource {
+                    workspace_id,
+                    plugin_id,
+                    resource_id,
+                    ..
+                } => MobileSwitcherTarget::WorkspaceResource {
+                    workspace_id: workspace_id.clone(),
+                    plugin_id: plugin_id.clone(),
+                    resource_id: resource_id.clone(),
+                },
+            });
+        }
+        cursor += height;
     }
-    cursor = spaces_end;
 
     if let Some(ws) = app.active.and_then(|idx| app.workspaces.get(idx)) {
         cursor += 1; // tabs title
@@ -459,7 +490,10 @@ fn render_close_button(app: &AppState, frame: &mut Frame, area: Rect) {
 fn mobile_switcher_content_height(app: &AppState) -> usize {
     // Derive spaces height from the same entry list the render/hit-test use so
     // the three never disagree.
-    let spaces_h = 2 + workspace_list_entries_expanded(app).len() * 2;
+    let spaces_h = 2 + workspace_list_entries_expanded(app)
+        .iter()
+        .map(mobile_space_entry_height)
+        .sum::<usize>();
     let tabs_h = app
         .active
         .and_then(|idx| app.workspaces.get(idx))
@@ -587,28 +621,169 @@ fn render_mobile_switcher_content(
         content,
         doc_y,
         app.mobile_switcher_scroll,
-        "+ new workspace",
+        "+ new space",
         p,
     );
     doc_y += 1;
     let space_entries = workspace_list_entries_expanded(app);
-    for (entry_idx, WorkspaceListEntry::Workspace { ws_idx, indented }) in
-        space_entries.iter().enumerate()
-    {
+    for (entry_idx, entry) in space_entries.iter().enumerate() {
+        // Repository rows are retained only for stale internal callers and are never projected.
+        if let WorkspaceListEntry::Repository { repository_id } = entry {
+            let Some(repository) = app.repository(repository_id) else {
+                continue;
+            };
+            let selected = app.selected_repository_id.as_ref() == Some(repository_id);
+            let bg = mobile_item_bg(selected, false, p);
+            let (state, seen) = repository
+                .checkout_workspace_ids
+                .iter()
+                .filter_map(|id| app.workspaces.iter().find(|workspace| &workspace.id == id))
+                .map(|workspace| workspace.aggregate_state(&app.terminals))
+                .max_by_key(|(state, seen)| match (state, seen) {
+                    (crate::detect::AgentState::Blocked, _) => 4,
+                    (crate::detect::AgentState::Idle, false) => 3,
+                    (crate::detect::AgentState::Working, _) => 2,
+                    (crate::detect::AgentState::Idle, true) => 1,
+                    (crate::detect::AgentState::Unknown, _) => 0,
+                })
+                .unwrap_or((crate::detect::AgentState::Unknown, true));
+            let (dot, dot_style) = state_dot(state, seen, p);
+            render_two_line_item(
+                frame,
+                viewport,
+                content,
+                doc_y,
+                app.mobile_switcher_scroll,
+                bg,
+                Line::from(vec![
+                    Span::styled("  ", Style::default().bg(bg)),
+                    Span::styled(dot, dot_style.bg(bg)),
+                    Span::styled(" ", Style::default().bg(bg)),
+                    Span::styled(
+                        repository.display_label(),
+                        Style::default()
+                            .fg(p.text)
+                            .bg(bg)
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                ]),
+                "    repository".to_string(),
+                p.overlay0,
+            );
+            doc_y += 2;
+            continue;
+        }
+        if let WorkspaceListEntry::Resource {
+            ws_idx,
+            workspace_id,
+            plugin_id,
+            resource_id,
+            depth,
+        } = entry
+        {
+            let resource = app
+                .workspaces
+                .iter()
+                .find(|workspace| &workspace.id == workspace_id)
+                .and_then(|workspace| workspace.resources.find(plugin_id, resource_id));
+            if let Some(resource) = resource {
+                let resource_selected = app.selected_workspace_resource.as_ref()
+                    == Some(&(workspace_id.clone(), plugin_id.clone(), resource_id.clone()));
+                let owner_selected =
+                    app.selected_repository_id.is_none() && *ws_idx == app.selected;
+                let owner_active = Some(*ws_idx) == app.active;
+                // A clicked resource remains visually continuous with its focused Checkout.
+                let selected_bg = owner_selected || (resource_selected && !owner_active);
+                let bg = mobile_item_bg(selected_bg, owner_active, p);
+                let indent = if *depth >= 2 { "      " } else { "    " };
+                let mut spans = vec![
+                    Span::styled(indent, Style::default().bg(bg)),
+                    Span::styled(
+                        &resource.label,
+                        Style::default()
+                            .fg(if resource_selected || owner_selected || owner_active {
+                                p.text
+                            } else {
+                                p.subtext0
+                            })
+                            .bg(bg),
+                    ),
+                ];
+                if let Some(detail) = resource
+                    .detail
+                    .as_deref()
+                    .filter(|detail| !detail.is_empty())
+                {
+                    spans.push(Span::styled(
+                        format!("  {detail}"),
+                        Style::default().fg(p.overlay0).bg(bg),
+                    ));
+                }
+                render_one_line_item(
+                    frame,
+                    viewport,
+                    content,
+                    doc_y,
+                    app.mobile_switcher_scroll,
+                    bg,
+                    Line::from(spans),
+                );
+            }
+            doc_y += 1;
+            continue;
+        }
+        let WorkspaceListEntry::Workspace { ws_idx, depth } = entry else {
+            continue;
+        };
         let Some(ws) = app.workspaces.get(*ws_idx) else {
             continue;
         };
         let active = Some(*ws_idx) == app.active;
-        let selected = *ws_idx == app.selected;
+        let selected = app.selected_repository_id.is_none() && *ws_idx == app.selected;
         let bg = mobile_item_bg(selected, active, p);
-        let (state, seen) = ws.aggregate_state(&app.terminals);
-        let (dot, dot_style) = state_dot(state, seen, p);
+        let (state, seen) = if *depth == 0 {
+            ws.checkout
+                .as_ref()
+                .and_then(|checkout| app.repository(&checkout.repository_id))
+                .map(|repository| {
+                    repository
+                        .checkout_workspace_ids
+                        .iter()
+                        .filter_map(|id| {
+                            app.workspaces.iter().find(|workspace| &workspace.id == id)
+                        })
+                        .map(|workspace| workspace.aggregate_state(&app.terminals))
+                        .max_by_key(|(state, seen)| match (state, seen) {
+                            (crate::detect::AgentState::Blocked, _) => 4,
+                            (crate::detect::AgentState::Idle, false) => 3,
+                            (crate::detect::AgentState::Working, _) => 2,
+                            (crate::detect::AgentState::Idle, true) => 1,
+                            (crate::detect::AgentState::Unknown, _) => 0,
+                        })
+                        .unwrap_or((crate::detect::AgentState::Unknown, true))
+                })
+                .unwrap_or_else(|| ws.aggregate_state(&app.terminals))
+        } else {
+            ws.aggregate_state(&app.terminals)
+        };
+        let (dot, dot_style) = if *depth > 0 && ws.checkout.is_some() {
+            (
+                "",
+                Style::default().fg(if selected || active {
+                    p.mauve
+                } else {
+                    p.overlay0
+                }),
+            )
+        } else {
+            state_dot(state, seen, p)
+        };
 
         let mut title_spans = vec![Span::styled("  ", Style::default().bg(bg))];
         // Worktrees of the same space render as branches off their parent, so a
         // child gets an L/T connector on its name row and a matching vertical
         // continuation on its detail row.
-        let detail_prefix = if *indented {
+        let detail_prefix = if *depth > 0 {
             let last_child = !next_entry_is_indented_workspace(&space_entries, entry_idx);
             title_spans.push(Span::styled(
                 if last_child { "└─ " } else { "├─ " },
@@ -626,16 +801,24 @@ fn render_mobile_switcher_content(
         title_spans.push(Span::styled(dot, dot_style.bg(bg)));
         title_spans.push(Span::styled(" ", Style::default().bg(bg)));
         let raw_label = ws.display_name_from(&app.terminals, terminal_runtimes);
-        let name = if *indented {
+        let name = if *depth > 0 {
             grouped_child_display_label(
                 &raw_label,
                 ws.branch().as_deref(),
                 ws.custom_name.is_some(),
             )
+        } else if let Some(repository_id) = ws
+            .checkout
+            .as_ref()
+            .map(|checkout| checkout.repository_id.as_str())
+        {
+            app.repository(repository_id)
+                .map(|repository| repository.display_label().to_string())
+                .unwrap_or(raw_label)
         } else {
             raw_label
         };
-        let name_budget = content.width.saturating_sub(if *indented { 8 } else { 5 }) as usize;
+        let name_budget = content.width.saturating_sub(if *depth > 0 { 8 } else { 5 }) as usize;
         title_spans.push(Span::styled(
             truncate_end(&name, name_budget),
             Style::default()
@@ -649,18 +832,35 @@ fn render_mobile_switcher_content(
             ws.branch().unwrap_or_else(|| "shell".into()),
             mobile_tab_status(ws)
         );
-        render_two_line_item(
-            frame,
-            viewport,
-            content,
-            doc_y,
-            app.mobile_switcher_scroll,
-            bg,
-            Line::from(title_spans),
-            truncate_end(&detail, content.width as usize),
-            p.overlay0,
-        );
-        doc_y += 2;
+        if *depth > 0 {
+            title_spans.push(Span::styled(
+                format!("  {detail}"),
+                Style::default().fg(p.overlay0).bg(bg),
+            ));
+            render_one_line_item(
+                frame,
+                viewport,
+                content,
+                doc_y,
+                app.mobile_switcher_scroll,
+                bg,
+                Line::from(title_spans),
+            );
+            doc_y += 1;
+        } else {
+            render_two_line_item(
+                frame,
+                viewport,
+                content,
+                doc_y,
+                app.mobile_switcher_scroll,
+                bg,
+                Line::from(title_spans),
+                truncate_end(&detail, content.width as usize),
+                p.overlay0,
+            );
+            doc_y += 2;
+        }
     }
 
     if let Some(ws) = app.active.and_then(|idx| app.workspaces.get(idx)) {
@@ -1355,10 +1555,10 @@ mod tests {
         app.view.terminal_area = Rect::new(0, 2, 40, 18);
 
         // Grouped order pulls the worktree (idx 2) up under its parent (idx 0),
-        // ahead of the unrelated "other" workspace (idx 1): rows are main,
-        // feature, other.
-        assert_eq!(mobile_switcher_workspace_doc_range(&app, 2).start, 4);
-        assert_eq!(mobile_switcher_workspace_doc_range(&app, 1).start, 6);
+        // ahead of the unrelated "other" workspace (idx 1): the root uses
+        // two rows while the linked child is compact on one row.
+        assert_eq!(mobile_switcher_workspace_doc_range(&app, 2), 4..5);
+        assert_eq!(mobile_switcher_workspace_doc_range(&app, 1).start, 5);
 
         let viewport = mobile_switcher_areas(&app).viewport;
         // The second space row on screen is the worktree, not workspaces[1].
@@ -1371,6 +1571,84 @@ mod tests {
         assert_eq!(mobile_switcher_workspace_doc_range(&app, 2).start, 4);
         let hit = mobile_switcher_target_at(&app, viewport.x + 2, viewport.y + 4);
         assert_eq!(hit, Some(MobileSwitcherTarget::Workspace(2)));
+    }
+
+    #[test]
+    fn switcher_renders_checkout_and_resource_metadata_inline() {
+        let mut app = crate::app::state::AppState::test_new();
+        let primary = worktree_workspace("main", "repo-key", false);
+        let mut linked = worktree_workspace("feature", "repo-key", true);
+        linked.cached_git_branch = Some("demo/shared".into());
+        linked
+            .resources
+            .report(
+                "hs.jail".into(),
+                vec![crate::workspace_resources::WorkspaceResource {
+                    plugin_id: "hs.jail".into(),
+                    resource_id: "jail".into(),
+                    label: "🔒 shared-demo".into(),
+                    detail: Some("/tmp/root".into()),
+                    data: None,
+                }],
+                None,
+                None,
+                std::time::Instant::now(),
+            )
+            .expect("resource report");
+        app.workspaces = vec![primary, linked];
+        app.active = Some(0);
+        app.selected = 0;
+        app.view.mobile_header_rect = Rect::new(0, 0, 80, 2);
+        app.view.terminal_area = Rect::new(0, 2, 80, 18);
+
+        let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 20))
+            .expect("test terminal");
+        terminal
+            .draw(|frame| {
+                render_mobile_panel(
+                    &app,
+                    &TerminalRuntimeRegistry::new(),
+                    frame,
+                    Rect::new(0, 0, 80, 20),
+                )
+            })
+            .expect("mobile switcher should render");
+
+        let row = |y| {
+            (0..80)
+                .map(|x| terminal.backend().buffer()[(x, y)].symbol())
+                .collect::<String>()
+        };
+        let checkout_row = row(7);
+        assert!(
+            checkout_row.contains("feature"),
+            "checkout row: {checkout_row:?}"
+        );
+        assert!(
+            checkout_row.contains("demo/shared"),
+            "checkout row: {checkout_row:?}"
+        );
+        assert!(
+            checkout_row.contains("tab 1"),
+            "checkout row: {checkout_row:?}"
+        );
+        let resource_row = row(8);
+        assert!(
+            resource_row.contains("shared-demo"),
+            "resource row: {resource_row:?}"
+        );
+        assert!(
+            resource_row.contains("/tmp/root"),
+            "resource row: {resource_row:?}"
+        );
+        assert_eq!(
+            mobile_switcher_target_at(&app, 2, 8),
+            Some(MobileSwitcherTarget::WorkspaceResource {
+                workspace_id: app.workspaces[1].id.clone(),
+                plugin_id: "hs.jail".into(),
+                resource_id: "jail".into(),
+            })
+        );
     }
 
     #[test]

@@ -8,6 +8,7 @@ pub mod events;
 pub mod integrations;
 pub mod panes;
 pub mod plugins;
+pub mod repositories;
 pub mod response;
 pub mod server;
 pub mod session;
@@ -23,6 +24,7 @@ pub use events::*;
 pub use integrations::*;
 pub use panes::*;
 pub use plugins::*;
+pub use repositories::*;
 pub use response::*;
 pub use server::*;
 pub use session::*;
@@ -83,8 +85,32 @@ pub enum Method {
     WorkspaceMoveBlock(WorkspaceMoveBlockParams),
     #[serde(rename = "workspace.report_metadata")]
     WorkspaceReportMetadata(WorkspaceReportMetadataParams),
+    #[serde(rename = "workspace.resources.report")]
+    WorkspaceReportResources(WorkspaceReportResourcesParams),
     #[serde(rename = "workspace.close")]
     WorkspaceClose(WorkspaceTarget),
+    #[serde(rename = "repository.list")]
+    RepositoryList(EmptyParams),
+    #[serde(rename = "repository.get")]
+    RepositoryGet(RepositoryTarget),
+    #[serde(rename = "repository.focus")]
+    RepositoryFocus(RepositoryTarget),
+    #[serde(rename = "repository.rename")]
+    RepositoryRename(RepositoryRenameParams),
+    #[serde(rename = "repository.move")]
+    RepositoryMove(RepositoryMoveParams),
+    #[serde(rename = "repository.close")]
+    RepositoryClose(RepositoryTarget),
+    #[serde(rename = "checkout.open")]
+    CheckoutOpen(WorkspaceCreateParams),
+    #[serde(rename = "checkout.focus")]
+    CheckoutFocus(WorkspaceTarget),
+    #[serde(rename = "checkout.rename")]
+    CheckoutRename(WorkspaceRenameParams),
+    #[serde(rename = "checkout.move")]
+    CheckoutMove(CheckoutMoveParams),
+    #[serde(rename = "checkout.close")]
+    CheckoutClose(WorkspaceTarget),
     #[serde(rename = "worktree.list")]
     WorktreeList(WorktreeListParams),
     #[serde(rename = "worktree.create")]

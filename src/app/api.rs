@@ -11,6 +11,7 @@ mod layouts;
 mod pane_graphics;
 mod panes;
 pub(crate) mod plugins;
+mod repositories;
 mod responses;
 mod session;
 mod tabs;
@@ -93,6 +94,7 @@ impl App {
             .state
             .apply_workspace_git_statuses(&self.terminal_runtimes, results);
         if changed {
+            self.state.reconcile_repositories();
             self.render_dirty.store(true, Ordering::Release);
             self.render_notify.notify_one();
         }
@@ -861,8 +863,92 @@ impl App {
     }
 
     pub(super) fn emit_event(&mut self, event: crate::api::schema::EventEnvelope) {
+        let checkout_alias = match &event.data {
+            crate::api::schema::EventData::WorkspaceCreated { workspace }
+                if workspace.checkout.is_some() =>
+            {
+                Some(crate::api::schema::EventEnvelope {
+                    event: crate::api::schema::EventKind::CheckoutOpened,
+                    data: crate::api::schema::EventData::CheckoutOpened {
+                        checkout: workspace.clone(),
+                    },
+                })
+            }
+            crate::api::schema::EventData::WorkspaceRenamed {
+                workspace_id,
+                label,
+            } if self
+                .state
+                .workspaces
+                .iter()
+                .find(|workspace| &workspace.id == workspace_id)
+                .is_some_and(|workspace| workspace.checkout.is_some()) =>
+            {
+                Some(crate::api::schema::EventEnvelope {
+                    event: crate::api::schema::EventKind::CheckoutRenamed,
+                    data: crate::api::schema::EventData::CheckoutRenamed {
+                        workspace_id: workspace_id.clone(),
+                        label: label.clone(),
+                    },
+                })
+            }
+            crate::api::schema::EventData::WorkspaceMoved {
+                workspace_id,
+                insert_index,
+                ..
+            } if self
+                .state
+                .workspaces
+                .iter()
+                .find(|workspace| &workspace.id == workspace_id)
+                .is_some_and(|workspace| workspace.checkout.is_some()) =>
+            {
+                Some(crate::api::schema::EventEnvelope {
+                    event: crate::api::schema::EventKind::CheckoutMoved,
+                    data: crate::api::schema::EventData::CheckoutMoved {
+                        workspace_id: workspace_id.clone(),
+                        insert_index: *insert_index,
+                    },
+                })
+            }
+            crate::api::schema::EventData::WorkspaceClosed {
+                workspace_id,
+                workspace,
+            } if workspace
+                .as_ref()
+                .is_some_and(|workspace| workspace.checkout.is_some()) =>
+            {
+                Some(crate::api::schema::EventEnvelope {
+                    event: crate::api::schema::EventKind::CheckoutClosed,
+                    data: crate::api::schema::EventData::CheckoutClosed {
+                        workspace_id: workspace_id.clone(),
+                        checkout: workspace.clone(),
+                    },
+                })
+            }
+            crate::api::schema::EventData::WorkspaceFocused { workspace_id }
+                if self
+                    .state
+                    .workspaces
+                    .iter()
+                    .find(|workspace| &workspace.id == workspace_id)
+                    .is_some_and(|workspace| workspace.checkout.is_some()) =>
+            {
+                Some(crate::api::schema::EventEnvelope {
+                    event: crate::api::schema::EventKind::CheckoutFocused,
+                    data: crate::api::schema::EventData::CheckoutFocused {
+                        workspace_id: workspace_id.clone(),
+                    },
+                })
+            }
+            _ => None,
+        };
         self.run_plugin_event_hooks(&event);
         self.event_hub.push(event);
+        if let Some(checkout_alias) = checkout_alias {
+            self.run_plugin_event_hooks(&checkout_alias);
+            self.event_hub.push(checkout_alias);
+        }
     }
 
     pub(crate) fn emit_pane_updated(&mut self, ws_idx: usize, pane_id: crate::layout::PaneId) {
@@ -880,6 +966,15 @@ impl App {
         self.event_hub.push(crate::api::schema::EventEnvelope {
             event: crate::api::schema::EventKind::WorkspaceMetadataUpdated,
             data: crate::api::schema::EventData::WorkspaceMetadataUpdated {
+                workspace: self.workspace_info(ws_idx),
+            },
+        });
+    }
+
+    pub(crate) fn emit_workspace_resources_updated(&mut self, ws_idx: usize) {
+        self.event_hub.push(crate::api::schema::EventEnvelope {
+            event: crate::api::schema::EventKind::WorkspaceResourcesUpdated,
+            data: crate::api::schema::EventData::WorkspaceResourcesUpdated {
                 workspace: self.workspace_info(ws_idx),
             },
         });
@@ -1076,8 +1171,35 @@ impl App {
             Method::WorkspaceReportMetadata(params) => {
                 return self.handle_workspace_report_metadata(request.id, params);
             }
-            Method::WorkspaceClose(target) => {
+            Method::WorkspaceReportResources(params) => {
+                return self.handle_workspace_report_resources(request.id, params);
+            }
+            Method::WorkspaceClose(target) | Method::CheckoutClose(target) => {
                 return self.handle_workspace_close(request.id, target)
+            }
+            Method::CheckoutOpen(params) => {
+                return self.handle_workspace_create(request.id, params)
+            }
+            Method::CheckoutFocus(target) => {
+                return self.handle_workspace_focus(request.id, target)
+            }
+            Method::CheckoutRename(params) => {
+                return self.handle_workspace_rename(request.id, params)
+            }
+            Method::CheckoutMove(params) => return self.handle_checkout_move(request.id, params),
+            Method::RepositoryList(_) => return self.handle_repository_list(request.id),
+            Method::RepositoryGet(target) => return self.handle_repository_get(request.id, target),
+            Method::RepositoryFocus(target) => {
+                return self.handle_repository_focus(request.id, target)
+            }
+            Method::RepositoryRename(params) => {
+                return self.handle_repository_rename(request.id, params)
+            }
+            Method::RepositoryMove(params) => {
+                return self.handle_repository_move(request.id, params)
+            }
+            Method::RepositoryClose(target) => {
+                return self.handle_repository_close(request.id, target)
             }
             Method::WorktreeList(params) => return self.handle_worktree_list(request.id, params),
             Method::WorktreeCreate(params) => {

@@ -253,6 +253,14 @@ shell 插件可以从各个环境变量读取常用 id,或解析上下文 JSON �
 命令见 [CLI 参考](/zh-cn/docs/cli-reference/),原始请求结构见
 [socket API](/zh-cn/docs/socket-api/)。
 
+### 工作区资源
+
+插件可通过 `workspace.resources.report` 报告瞬态资源。`workspace_resource` 上下文仅提供给资源所有者插件，过期资源选择会被拒绝。
+
+### 操作选项
+
+`choices_command` 可为匹配的上下文菜单异步提供选项。
+
 ## 窗格
 
 清单中窗格的 `placement` 默认为 `overlay`,它在活动窗格上方打开一个

@@ -124,6 +124,12 @@ impl ActiveSubscription {
                 event_kind: crate::api::schema::EventKind::WorkspaceMetadataUpdated,
                 last_sequence: 0,
             })),
+            Subscription::WorkspaceResourcesUpdated {} => {
+                Ok(Self::Event(ActiveEventSubscription {
+                    event_kind: crate::api::schema::EventKind::WorkspaceResourcesUpdated,
+                    last_sequence: 0,
+                }))
+            }
             Subscription::WorkspaceRenamed {} => Ok(Self::Event(ActiveEventSubscription {
                 event_kind: crate::api::schema::EventKind::WorkspaceRenamed,
                 last_sequence: 0,
@@ -142,6 +148,46 @@ impl ActiveSubscription {
             })),
             Subscription::WorkspaceFocused {} => Ok(Self::Event(ActiveEventSubscription {
                 event_kind: crate::api::schema::EventKind::WorkspaceFocused,
+                last_sequence: 0,
+            })),
+            Subscription::CheckoutOpened {} => Ok(Self::Event(ActiveEventSubscription {
+                event_kind: crate::api::schema::EventKind::CheckoutOpened,
+                last_sequence: 0,
+            })),
+            Subscription::CheckoutRenamed {} => Ok(Self::Event(ActiveEventSubscription {
+                event_kind: crate::api::schema::EventKind::CheckoutRenamed,
+                last_sequence: 0,
+            })),
+            Subscription::CheckoutMoved {} => Ok(Self::Event(ActiveEventSubscription {
+                event_kind: crate::api::schema::EventKind::CheckoutMoved,
+                last_sequence: 0,
+            })),
+            Subscription::CheckoutClosed {} => Ok(Self::Event(ActiveEventSubscription {
+                event_kind: crate::api::schema::EventKind::CheckoutClosed,
+                last_sequence: 0,
+            })),
+            Subscription::CheckoutFocused {} => Ok(Self::Event(ActiveEventSubscription {
+                event_kind: crate::api::schema::EventKind::CheckoutFocused,
+                last_sequence: 0,
+            })),
+            Subscription::RepositoryCreated {} => Ok(Self::Event(ActiveEventSubscription {
+                event_kind: crate::api::schema::EventKind::RepositoryCreated,
+                last_sequence: 0,
+            })),
+            Subscription::RepositoryRenamed {} => Ok(Self::Event(ActiveEventSubscription {
+                event_kind: crate::api::schema::EventKind::RepositoryRenamed,
+                last_sequence: 0,
+            })),
+            Subscription::RepositoryMoved {} => Ok(Self::Event(ActiveEventSubscription {
+                event_kind: crate::api::schema::EventKind::RepositoryMoved,
+                last_sequence: 0,
+            })),
+            Subscription::RepositoryClosed {} => Ok(Self::Event(ActiveEventSubscription {
+                event_kind: crate::api::schema::EventKind::RepositoryClosed,
+                last_sequence: 0,
+            })),
+            Subscription::RepositoryFocused {} => Ok(Self::Event(ActiveEventSubscription {
+                event_kind: crate::api::schema::EventKind::RepositoryFocused,
                 last_sequence: 0,
             })),
             Subscription::WorktreeCreated {} => Ok(Self::Event(ActiveEventSubscription {

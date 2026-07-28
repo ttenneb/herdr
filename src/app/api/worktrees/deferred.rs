@@ -53,6 +53,17 @@ impl App {
             return self.find_parent_workspace_by_key(&api.repo_key);
         };
         let workspace = &self.state.workspaces[ws_idx];
+        if let Some(space) =
+            workspace.resolved_git_space_from(&self.state.terminals, &self.terminal_runtimes)
+        {
+            return (!space.is_linked_worktree
+                && space.key == api.repo_key
+                && crate::worktree::canonical_or_original(&space.repo_root)
+                    == crate::worktree::canonical_or_original(&api.source_repo_root))
+            .then_some(ws_idx)
+            .or_else(|| self.find_parent_workspace_by_key(&api.repo_key));
+        }
+
         if let Some(expected) = api.source_existing_membership.as_ref() {
             if workspace.worktree_space() == Some(expected) {
                 return Some(ws_idx);
@@ -73,22 +84,7 @@ impl App {
             }
             return self.find_parent_workspace_by_key(&api.repo_key);
         }
-        let git_space = workspace.git_space().cloned().or_else(|| {
-            workspace
-                .resolved_identity_cwd_from(&self.state.terminals, &self.terminal_runtimes)
-                .as_deref()
-                .and_then(crate::workspace::git_space_metadata)
-        });
-        if git_space.is_some_and(|space| {
-            !space.is_linked_worktree
-                && space.key == api.repo_key
-                && crate::worktree::canonical_or_original(&space.repo_root)
-                    == crate::worktree::canonical_or_original(&api.source_repo_root)
-        }) {
-            Some(ws_idx)
-        } else {
-            self.find_parent_workspace_by_key(&api.repo_key)
-        }
+        self.find_parent_workspace_by_key(&api.repo_key)
     }
 
     fn start_api_worktree_create(
@@ -97,6 +93,7 @@ impl App {
         params: WorktreeCreateParams,
         respond_to: std::sync::mpsc::Sender<String>,
     ) {
+        let requested_base = params.base.clone();
         let branch = params
             .branch
             .unwrap_or_else(|| {
@@ -115,14 +112,67 @@ impl App {
             );
             return;
         }
-        let base = params.base.unwrap_or_else(|| "HEAD".into());
-        let source = match self.resolve_worktree_source(params.workspace_id, params.cwd) {
+        let workspace_id = match self
+            .worktree_workspace_source(params.repository_id.clone(), params.workspace_id)
+        {
+            Ok(workspace_id) => workspace_id,
+            Err(err) => {
+                Self::send_api_response(respond_to, encode_error(id, err.code, err.message));
+                return;
+            }
+        };
+        let source = match self.resolve_worktree_source(workspace_id, params.cwd) {
             Ok(source) => source,
             Err(err) => {
                 Self::send_api_response(respond_to, encode_error(id, err.code, err.message));
                 return;
             }
         };
+        let preferred_base = params.repository_id.as_deref().and_then(|repository_id| {
+            self.state
+                .repository(repository_id)
+                .and_then(|repository| repository.preferred_base.as_deref())
+        });
+        let branch_exists = crate::worktree::local_branch_exists(&source.source_repo_root, &branch)
+            .unwrap_or(false);
+        let base = if branch_exists {
+            // Git ignores the base when checking out an existing local branch.
+            params.base.unwrap_or_else(|| "HEAD".into())
+        } else if let Some(requested) = params.base {
+            let Some(resolved) =
+                crate::worktree::resolve_worktree_base(&source.source_repo_root, &requested)
+            else {
+                Self::send_api_response(
+                    respond_to,
+                    encode_error(
+                        id,
+                        "invalid_base",
+                        format!("base '{requested}' does not resolve to a commit"),
+                    ),
+                );
+                return;
+            };
+            resolved.reference
+        } else {
+            crate::worktree::resolve_repository_base(&source.source_repo_root, preferred_base)
+                .map(|base| base.reference)
+                .unwrap_or_else(|| "HEAD".into())
+        };
+        if !branch_exists {
+            if let (Some(repository_id), Some(requested_base)) =
+                (params.repository_id.as_deref(), requested_base)
+            {
+                if let Some(repository) = self
+                    .state
+                    .repositories
+                    .iter_mut()
+                    .find(|repository| repository.id == repository_id)
+                {
+                    repository.preferred_base = Some(requested_base);
+                    self.state.mark_session_dirty();
+                }
+            }
+        }
         let checkout_path = match params.path {
             Some(path) => match absolute_user_path(&path) {
                 Ok(path) => path,
@@ -217,7 +267,15 @@ impl App {
         params: WorktreeRemoveParams,
         respond_to: std::sync::mpsc::Sender<String>,
     ) {
-        let Some(ws_idx) = self.parse_workspace_id(&params.workspace_id) else {
+        // Removal is destructive: positional and legacy aliases can point at
+        // a different checkout after reordering. Require the immutable public
+        // workspace ID while retaining aliases for non-destructive APIs.
+        let Some(ws_idx) = self
+            .state
+            .workspaces
+            .iter()
+            .position(|workspace| workspace.id == params.workspace_id)
+        else {
             Self::send_api_response(
                 respond_to,
                 encode_error(
@@ -548,6 +606,9 @@ impl App {
                         .cloned()
                         .map(|space| self.worktree_info_for_membership(&space, None));
                 }
+                let repository_id = workspace_snapshot
+                    .as_ref()
+                    .and_then(|workspace| workspace.repository_id.clone());
                 self.close_removed_linked_worktree_workspace(ws_idx);
                 self.shutdown_detached_terminal_runtimes();
                 self.emit_event(EventEnvelope {
@@ -557,6 +618,14 @@ impl App {
                         workspace: workspace_snapshot.clone(),
                     },
                 });
+                if let Some(repository_id) =
+                    repository_id.filter(|id| self.state.repository(id).is_none())
+                {
+                    self.emit_event(EventEnvelope {
+                        event: EventKind::RepositoryClosed,
+                        data: EventData::RepositoryClosed { repository_id },
+                    });
+                }
             } else if let Some(snapshot) = workspace_snapshot.as_ref() {
                 workspace_id = snapshot.workspace_id.clone();
             }

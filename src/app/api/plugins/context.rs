@@ -9,9 +9,12 @@ impl App {
     ) -> PluginInvocationContext {
         let mut context = self.current_plugin_context(correlation_id);
         if let Some(provided) = provided {
+            context.workspace_resource = provided.workspace_resource.or(context.workspace_resource);
             context.workspace_id = provided.workspace_id.or(context.workspace_id);
             context.workspace_label = provided.workspace_label.or(context.workspace_label);
             context.workspace_cwd = provided.workspace_cwd.or(context.workspace_cwd);
+            context.repository_id = provided.repository_id.or(context.repository_id);
+            context.checkout = provided.checkout.or(context.checkout);
             context.worktree = provided.worktree.or(context.worktree);
             context.tab_id = provided.tab_id.or(context.tab_id);
             context.tab_label = provided.tab_label.or(context.tab_label);
@@ -45,6 +48,10 @@ impl App {
             EventData::WorkspaceCreated { workspace }
             | EventData::WorkspaceUpdated { workspace }
             | EventData::WorkspaceMetadataUpdated { workspace }
+            | EventData::WorkspaceResourcesUpdated { workspace }
+            | EventData::CheckoutOpened {
+                checkout: workspace,
+            }
             | EventData::WorktreeCreated { workspace, .. }
             | EventData::WorktreeOpened { workspace, .. } => {
                 self.plugin_context_for_workspace_info(workspace, correlation_id)
@@ -71,13 +78,48 @@ impl App {
                 .unwrap_or_else(|| empty_plugin_context(correlation_id)),
             EventData::WorkspaceRenamed { workspace_id, .. }
             | EventData::WorkspaceMoved { workspace_id, .. }
-            | EventData::WorkspaceFocused { workspace_id } => self
+            | EventData::WorkspaceFocused { workspace_id }
+            | EventData::CheckoutRenamed { workspace_id, .. }
+            | EventData::CheckoutMoved { workspace_id, .. }
+            | EventData::CheckoutFocused { workspace_id } => self
                 .plugin_context_for_workspace_id(workspace_id, correlation_id)
                 .unwrap_or_else(|| {
                     let mut context = empty_plugin_context(correlation_id);
                     context.workspace_id = Some(workspace_id.clone());
                     context
                 }),
+            EventData::CheckoutClosed {
+                workspace_id,
+                checkout,
+            } => checkout
+                .as_ref()
+                .map(|workspace| self.plugin_context_for_workspace_info(workspace, correlation_id))
+                .unwrap_or_else(|| {
+                    self.plugin_context_for_workspace_id(workspace_id, correlation_id)
+                        .unwrap_or_else(|| {
+                            let mut context = empty_plugin_context(correlation_id);
+                            context.workspace_id = Some(workspace_id.clone());
+                            context
+                        })
+                }),
+            EventData::RepositoryCreated { repository } => repository
+                .last_focused_workspace_id
+                .as_deref()
+                .and_then(|workspace_id| {
+                    self.plugin_context_for_workspace_id(workspace_id, correlation_id)
+                })
+                .unwrap_or_else(|| empty_plugin_context(correlation_id)),
+            EventData::RepositoryRenamed { repository_id, .. }
+            | EventData::RepositoryMoved { repository_id, .. }
+            | EventData::RepositoryClosed { repository_id }
+            | EventData::RepositoryFocused { repository_id } => self
+                .state
+                .repository(repository_id)
+                .and_then(|repository| repository.last_focused_workspace_id.as_deref())
+                .and_then(|workspace_id| {
+                    self.plugin_context_for_workspace_id(workspace_id, correlation_id)
+                })
+                .unwrap_or_else(|| empty_plugin_context(correlation_id)),
             EventData::WorktreeRemoved {
                 workspace_id,
                 workspace,
@@ -368,9 +410,12 @@ impl App {
             .and_then(|pane| self.parse_pane_id(&pane.pane_id))
             .and_then(|(_, pane_id)| self.selected_text_for_pane(pane_id));
         PluginInvocationContext {
+            workspace_resource: None,
             workspace_id: Some(workspace.workspace_id),
             workspace_label: Some(workspace.label),
             workspace_cwd,
+            repository_id: workspace.repository_id,
+            checkout: workspace.checkout,
             worktree: workspace.worktree,
             tab_id,
             tab_label,
@@ -415,9 +460,12 @@ impl App {
 
 fn empty_plugin_context(correlation_id: &str) -> PluginInvocationContext {
     PluginInvocationContext {
+        workspace_resource: None,
         workspace_id: None,
         workspace_label: None,
         workspace_cwd: None,
+        repository_id: None,
+        checkout: None,
         worktree: None,
         tab_id: None,
         tab_label: None,

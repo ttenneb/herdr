@@ -28,46 +28,31 @@ impl App {
             return Err("Workspace not found.".into());
         };
         let existing_membership = ws.worktree_space().cloned();
-        if existing_membership
-            .as_ref()
-            .is_some_and(|membership| membership.is_linked_worktree)
-        {
-            return Err(
-                "New and open worktree actions start from the repo parent workspace.".into(),
-            );
-        }
 
-        let git_space = ws.git_space().cloned().or_else(|| {
-            ws.resolved_identity_cwd_from(&self.state.terminals, &self.terminal_runtimes)
-                .as_deref()
-                .and_then(crate::workspace::git_space_metadata)
-        });
-        if git_space
-            .as_ref()
-            .is_some_and(|metadata| metadata.is_linked_worktree)
-        {
-            return Err(
-                "New and open worktree actions start from the repo parent workspace.".into(),
-            );
-        }
-
-        let space = existing_membership
-            .as_ref()
-            .map_or(git_space, |membership| {
-                Some(crate::workspace::GitSpaceMetadata {
-                    key: membership.key.clone(),
-                    checkout_key: membership.checkout_path.display().to_string(),
-                    label: membership.label.clone(),
-                    repo_root: membership.repo_root.clone(),
-                    is_linked_worktree: membership.is_linked_worktree,
-                })
+        let live_space = ws.resolved_git_space_from(&self.state.terminals, &self.terminal_runtimes);
+        let space = live_space
+            .clone()
+            .or_else(|| {
+                existing_membership
+                    .as_ref()
+                    .map(|membership| crate::workspace::GitSpaceMetadata {
+                        key: membership.key.clone(),
+                        checkout_key: membership.checkout_path.display().to_string(),
+                        label: membership.label.clone(),
+                        repo_root: membership.repo_root.clone(),
+                        is_linked_worktree: membership.is_linked_worktree,
+                    })
             })
             .ok_or_else(|| {
                 "Herdr worktree actions require a workspace inside a Git work tree.".to_string()
             })?;
-        let source_checkout_path = existing_membership
-            .as_ref()
-            .map(|membership| membership.checkout_path.clone())
+        let source_checkout_path = live_space
+            .map(|space| space.repo_root)
+            .or_else(|| {
+                existing_membership
+                    .as_ref()
+                    .map(|membership| membership.checkout_path.clone())
+            })
             .unwrap_or_else(|| space.repo_root.clone());
         let source_workspace_id = self.state.workspaces[ws_idx].id.clone();
         Ok((
@@ -79,6 +64,18 @@ impl App {
     }
 
     pub(crate) fn open_new_linked_worktree_dialog(&mut self, ws_idx: usize) {
+        self.open_new_worktree_dialog(ws_idx, None);
+    }
+
+    pub(crate) fn open_new_repository_worktree_dialog(
+        &mut self,
+        repository_id: &str,
+        ws_idx: usize,
+    ) {
+        self.open_new_worktree_dialog(ws_idx, Some(repository_id));
+    }
+
+    fn open_new_worktree_dialog(&mut self, ws_idx: usize, repository_scope: Option<&str>) {
         let (existing_membership, space, source_checkout_path, source_workspace_id) =
             match self.worktree_source_metadata(ws_idx) {
                 Ok(metadata) => metadata,
@@ -99,6 +96,19 @@ impl App {
             &repo_name,
             &branch,
         );
+        let preferred_base = repository_scope
+            .and_then(|id| self.state.repository(id))
+            .and_then(|repository| repository.preferred_base.as_deref());
+        let base = repository_scope
+            .and_then(|_| {
+                crate::worktree::resolve_repository_base(&space.repo_root, preferred_base)
+            })
+            .or_else(|| crate::worktree::resolve_checkout_head(&source_checkout_path))
+            .or_else(|| crate::worktree::resolve_repository_base(&space.repo_root, None))
+            .unwrap_or_else(|| crate::worktree::WorktreeBase {
+                reference: "HEAD".into(),
+                commit: "unresolved".into(),
+            });
 
         tracing::info!(
             ws_idx,
@@ -116,8 +126,13 @@ impl App {
             source_existing_membership: existing_membership,
             source_repo_root: space.repo_root,
             repo_key: space.key,
+            repository_id: repository_scope.map(str::to_owned),
             repo_name,
             branch,
+            base_ref: base.reference,
+            base_commit: base.commit,
+            editing_base: false,
+            branch_exists: false,
             checkout_path,
             error: None,
             creating: false,
@@ -182,14 +197,8 @@ impl App {
                             == entry_checkout_path;
                     }
 
-                    let git_space = ws.git_space().cloned().or_else(|| {
-                        ws.resolved_identity_cwd_from(
-                            &self.state.terminals,
-                            &self.terminal_runtimes,
-                        )
-                        .as_deref()
-                        .and_then(crate::workspace::git_space_metadata)
-                    });
+                    let git_space =
+                        ws.resolved_git_space_from(&self.state.terminals, &self.terminal_runtimes);
                     if git_space
                         .as_ref()
                         .is_some_and(|metadata| metadata.checkout_key == entry_checkout_key)
@@ -247,6 +256,16 @@ impl App {
                 }
                 self.close_worktree_create_dialog();
             }
+            KeyCode::Tab => self.toggle_worktree_base_editing(),
+            KeyCode::Enter
+                if self
+                    .state
+                    .worktree_create
+                    .as_ref()
+                    .is_some_and(|create| create.editing_base) =>
+            {
+                self.finish_worktree_base_editing();
+            }
             KeyCode::Enter => self.submit_worktree_create_via_api(),
             KeyCode::Backspace => {
                 if self.state.name_input_replace_on_type {
@@ -255,7 +274,7 @@ impl App {
                 } else {
                     self.state.name_input.pop();
                 }
-                self.sync_worktree_branch_from_input();
+                self.sync_worktree_create_input();
             }
             KeyCode::Char(c) => {
                 self.insert_worktree_create_text(&c.to_string());
@@ -270,7 +289,67 @@ impl App {
             self.state.name_input_replace_on_type = false;
         }
         self.state.name_input.push_str(text);
-        self.sync_worktree_branch_from_input();
+        self.sync_worktree_create_input();
+    }
+
+    pub(crate) fn begin_worktree_base_editing(&mut self) {
+        let Some(create) = &mut self.state.worktree_create else {
+            return;
+        };
+        if create.creating || create.branch_exists {
+            return;
+        }
+        create.editing_base = true;
+        self.state.name_input = create.base_ref.clone();
+        self.state.name_input_replace_on_type = false;
+        create.error = None;
+    }
+
+    fn toggle_worktree_base_editing(&mut self) {
+        if self
+            .state
+            .worktree_create
+            .as_ref()
+            .is_some_and(|create| create.editing_base)
+        {
+            self.finish_worktree_base_editing();
+        } else {
+            self.begin_worktree_base_editing();
+        }
+    }
+
+    fn finish_worktree_base_editing(&mut self) {
+        let Some(create) = &mut self.state.worktree_create else {
+            return;
+        };
+        let reference = self.state.name_input.trim();
+        let Some(base) =
+            crate::worktree::resolve_worktree_base(&create.source_repo_root, reference)
+        else {
+            create.error = Some(format!("base '{reference}' does not resolve to a commit"));
+            return;
+        };
+        create.base_ref = base.reference;
+        create.base_commit = base.commit;
+        create.editing_base = false;
+        self.state.name_input = create.branch.clone();
+        self.state.name_input_replace_on_type = false;
+        create.error = None;
+    }
+
+    fn sync_worktree_create_input(&mut self) {
+        if self
+            .state
+            .worktree_create
+            .as_ref()
+            .is_some_and(|create| create.editing_base)
+        {
+            if let Some(create) = &mut self.state.worktree_create {
+                create.error = None;
+            }
+        } else {
+            self.sync_worktree_branch_from_input();
+        }
     }
 
     pub(crate) fn handle_worktree_open_key(&mut self, key: KeyEvent) {
@@ -498,6 +577,9 @@ impl App {
             &create.repo_name,
             &create.branch,
         );
+        create.branch_exists =
+            crate::worktree::local_branch_exists(&create.source_repo_root, create.branch.trim())
+                .unwrap_or(false);
         create.error = None;
     }
 
@@ -539,6 +621,7 @@ impl App {
         let path = create.checkout_path.clone();
         let source_checkout_path = create.source_checkout_path.clone();
         let branch = create.branch.clone();
+        let base = create.base_ref.clone();
         let event_tx = self.event_tx.clone();
         std::thread::spawn(move || {
             let result = if let Some(parent_dir) = parent_dir {
@@ -551,7 +634,7 @@ impl App {
                     &source_checkout_path,
                     &path,
                     &branch,
-                    "HEAD",
+                    &base,
                 )
             });
             let _ = event_tx.blocking_send(AppEvent::WorktreeAddFinished(Box::new(
@@ -565,6 +648,22 @@ impl App {
     }
 
     pub(crate) fn submit_worktree_create_via_api(&mut self) {
+        if self
+            .state
+            .worktree_create
+            .as_ref()
+            .is_some_and(|create| create.editing_base)
+        {
+            self.finish_worktree_base_editing();
+            if self
+                .state
+                .worktree_create
+                .as_ref()
+                .is_some_and(|create| create.editing_base)
+            {
+                return;
+            }
+        }
         self.sync_worktree_branch_from_input();
         let Some(create) = &mut self.state.worktree_create else {
             return;
@@ -587,17 +686,18 @@ impl App {
         );
         create.creating = true;
         create.error = None;
-        let workspace_id = create.source_workspace_id.clone();
+        let (repository_id, workspace_id) = create.api_target();
         let checkout_path = create.checkout_path.display().to_string();
-
+        let base = create.base_ref.clone();
         let immediate_response = self.runtime_worktree_create_deferred(
             "tui.worktree.create",
             crate::api::schema::WorktreeCreateParams {
-                workspace_id: Some(workspace_id),
+                repository_id,
+                workspace_id,
                 cwd: None,
                 branch: Some(branch),
                 path: Some(checkout_path),
-                base: Some("HEAD".into()),
+                base: Some(base),
                 focus: true,
                 label: None,
             },
@@ -723,6 +823,7 @@ impl App {
         let response = self.runtime_worktree_open(
             "tui.worktree.open",
             crate::api::schema::WorktreeOpenParams {
+                repository_id: None,
                 workspace_id: Some(source_workspace_id),
                 cwd: None,
                 path: Some(entry.path.display().to_string()),
@@ -916,6 +1017,9 @@ impl App {
                             space.is_linked_worktree && space.checkout_path == result.path
                         });
                     if still_same_linked_worktree {
+                        let repository_id = workspace_snapshot
+                            .as_ref()
+                            .and_then(|workspace| workspace.repository_id.clone());
                         self.close_removed_linked_worktree_workspace(ws_idx);
                         self.shutdown_detached_terminal_runtimes();
                         self.emit_event(crate::api::schema::EventEnvelope {
@@ -925,6 +1029,16 @@ impl App {
                                 workspace: workspace_snapshot.clone(),
                             },
                         });
+                        if let Some(repository_id) =
+                            repository_id.filter(|id| self.state.repository(id).is_none())
+                        {
+                            self.emit_event(crate::api::schema::EventEnvelope {
+                                event: crate::api::schema::EventKind::RepositoryClosed,
+                                data: crate::api::schema::EventData::RepositoryClosed {
+                                    repository_id,
+                                },
+                            });
+                        }
                     }
                 } else if let Some(snapshot) = workspace_snapshot.as_ref() {
                     workspace_id = snapshot.workspace_id.clone();
@@ -1146,8 +1260,13 @@ mod tests {
             source_existing_membership: None,
             source_repo_root: "/repo/herdr".into(),
             repo_key: "repo-key".into(),
+            repository_id: None,
             repo_name: "herdr".into(),
             branch: "generated-branch".into(),
+            base_ref: "HEAD".into(),
+            base_commit: "00000000".into(),
+            editing_base: false,
+            branch_exists: false,
             checkout_path: "/repo/herdr-generated-branch".into(),
             error: None,
             creating: false,
@@ -1492,9 +1611,10 @@ mod tests {
     }
 
     #[test]
-    fn worktree_create_and_open_dialogs_reject_linked_child_source() {
+    fn worktree_create_dialog_accepts_linked_checkout_source() {
         let mut app = app_for_worktree_tests();
         app.state.workspaces = vec![crate::workspace::Workspace::test_new("issue")];
+        app.state.workspaces[0].identity_cwd = "/definitely/not/live/linked-worktree".into();
         app.state.mode = Mode::Navigate;
         app.state.workspaces[0].worktree_space = Some(crate::workspace::WorktreeSpaceMembership {
             key: "repo-key".into(),
@@ -1506,20 +1626,19 @@ mod tests {
 
         app.open_new_linked_worktree_dialog(0);
 
-        assert_eq!(app.state.mode, Mode::Navigate);
-        assert!(app.state.worktree_create.is_none());
+        assert_eq!(app.state.mode, Mode::NewLinkedWorktree);
+        let create = app
+            .state
+            .worktree_create
+            .as_ref()
+            .expect("linked source should be accepted");
         assert_eq!(
-            app.state.config_diagnostic.as_deref(),
-            Some("New and open worktree actions start from the repo parent workspace.")
+            create.source_checkout_path,
+            std::path::PathBuf::from("/repo/herdr-issue")
         );
-
-        app.state.config_diagnostic = None;
-        app.open_existing_worktree_dialog(0);
-
-        assert!(app.state.worktree_open.is_none());
         assert_eq!(
-            app.state.config_diagnostic.as_deref(),
-            Some("New and open worktree actions start from the repo parent workspace.")
+            create.source_repo_root,
+            std::path::PathBuf::from("/repo/herdr")
         );
     }
 
@@ -1534,8 +1653,13 @@ mod tests {
             source_existing_membership: None,
             source_repo_root: std::path::PathBuf::from("/repo/herdr"),
             repo_key: "repo-key".into(),
+            repository_id: None,
             repo_name: "herdr".into(),
             branch: "old".into(),
+            base_ref: "HEAD".into(),
+            base_commit: "00000000".into(),
+            editing_base: false,
+            branch_exists: false,
             checkout_path: std::path::PathBuf::from("/old"),
             error: Some("old error".into()),
             creating: false,
@@ -1552,17 +1676,139 @@ mod tests {
         assert_eq!(create.error, None);
     }
 
+    #[tokio::test]
+    async fn repository_row_tui_create_uses_repository_id_only_and_persists_edited_base() {
+        let repo = create_committed_repo("app-repository-row-base");
+        let worktree_root = unique_temp_path("app-repository-row-base-root");
+        let mut app = app_for_worktree_tests();
+        let mut workspace = crate::workspace::Workspace::test_new("main");
+        workspace.identity_cwd = repo.clone();
+        workspace.cached_identity_cwd = repo.clone();
+        workspace.cached_git_space = crate::workspace::git_space_metadata(&repo);
+        app.state.workspaces = vec![workspace];
+        app.state.ensure_test_terminals();
+        app.state.active = Some(0);
+        app.state.selected = 0;
+        app.state.worktree_directory = worktree_root.clone();
+        app.state.reconcile_repositories();
+        let repository_id = app.state.repositories[0].id.clone();
+
+        app.open_new_repository_worktree_dialog(&repository_id, 0);
+        assert_eq!(
+            app.state
+                .worktree_create
+                .as_ref()
+                .unwrap()
+                .repository_id
+                .as_deref(),
+            Some(repository_id.as_str())
+        );
+        app.begin_worktree_base_editing();
+        app.state.name_input = "HEAD~0".into();
+        app.finish_worktree_base_editing();
+        let create = app.state.worktree_create.as_ref().unwrap();
+        let checkout_path = create.checkout_path.clone();
+        assert_eq!(
+            create.api_target(),
+            (Some(repository_id.clone()), None),
+            "repository-row TUI requests must omit the conflicting workspace_id"
+        );
+
+        app.submit_worktree_create_via_api();
+        let create = app.state.worktree_create.as_ref().unwrap();
+        assert!(
+            create.creating,
+            "repository_id and workspace_id must not conflict"
+        );
+        assert_eq!(create.error, None);
+        assert_eq!(
+            app.state
+                .repository(&repository_id)
+                .unwrap()
+                .preferred_base
+                .as_deref(),
+            Some("HEAD~0")
+        );
+
+        let event = wait_for_worktree_event(&mut app);
+        app.handle_internal_event(event);
+        for (_, runtime) in app.terminal_runtimes.drain() {
+            runtime.shutdown();
+        }
+        let remove = crate::worktree::build_worktree_remove_command(&repo, &checkout_path, true);
+        crate::worktree::run_worktree_command(&remove).unwrap();
+        let _ = std::fs::remove_dir_all(worktree_root);
+        let _ = std::fs::remove_dir_all(repo);
+    }
+
+    #[test]
+    fn worktree_base_editor_requires_exact_commit_and_restores_branch_focus() {
+        let repo = create_committed_repo("app-worktree-base-editor");
+        let mut app = app_for_worktree_tests();
+        app.state.workspaces = vec![crate::workspace::Workspace::test_new("source")];
+        app.state.workspaces[0].identity_cwd = repo.clone();
+        app.open_new_linked_worktree_dialog(0);
+
+        app.begin_worktree_base_editing();
+        assert!(app.state.worktree_create.as_ref().unwrap().editing_base);
+        app.state.name_input = "missing/base".into();
+        app.finish_worktree_base_editing();
+        let create = app.state.worktree_create.as_ref().unwrap();
+        assert!(create.editing_base);
+        assert!(create
+            .error
+            .as_deref()
+            .unwrap()
+            .contains("does not resolve"));
+
+        app.state.name_input = "HEAD".into();
+        app.finish_worktree_base_editing();
+        let create = app.state.worktree_create.as_ref().unwrap();
+        assert!(!create.editing_base);
+        assert_eq!(create.base_ref, "HEAD");
+        assert_ne!(create.base_commit, "unresolved");
+        assert_eq!(app.state.name_input, create.branch);
+        let _ = std::fs::remove_dir_all(repo);
+    }
+
+    #[test]
+    fn existing_branch_disables_base_editor_because_git_ignores_base() {
+        let mut app = app_for_worktree_tests();
+        app.state.worktree_create = Some(WorktreeCreateState {
+            source_workspace_id: "w1".into(),
+            source_checkout_path: "/repo".into(),
+            source_existing_membership: None,
+            source_repo_root: "/repo".into(),
+            repo_key: "repo".into(),
+            repository_id: None,
+            repo_name: "repo".into(),
+            branch: "existing".into(),
+            base_ref: "HEAD".into(),
+            base_commit: "deadbeef".into(),
+            editing_base: false,
+            branch_exists: true,
+            checkout_path: "/tmp/existing".into(),
+            error: None,
+            creating: false,
+        });
+        app.state.name_input = "existing".into();
+        app.begin_worktree_base_editing();
+        assert!(!app.state.worktree_create.as_ref().unwrap().editing_base);
+        assert_eq!(app.state.name_input, "existing");
+    }
+
     #[test]
     fn worktree_create_enter_submits_through_api_path() {
         let mut app = app_for_worktree_tests();
         app.state.worktree_directory = std::path::PathBuf::from("/w");
         app.state.workspaces = vec![crate::workspace::Workspace::test_new("source")];
         let source_workspace_id = app.state.workspaces[0].id.clone();
+        let source_repo = std::env::current_dir().unwrap();
         let source_membership = crate::workspace::WorktreeSpaceMembership {
             key: "repo-key".into(),
             label: "herdr".into(),
-            repo_root: "/repo/herdr".into(),
-            checkout_path: "/repo/herdr".into(),
+            repo_root: source_repo.clone(),
+            checkout_path: source_repo.clone(),
             is_linked_worktree: false,
         };
         let branch = "issue/195";
@@ -1575,12 +1821,17 @@ mod tests {
         app.state.name_input = branch.into();
         app.state.worktree_create = Some(WorktreeCreateState {
             source_workspace_id,
-            source_checkout_path: "/repo/herdr".into(),
+            source_checkout_path: source_repo.clone(),
             source_existing_membership: Some(source_membership),
-            source_repo_root: "/repo/herdr".into(),
+            source_repo_root: source_repo,
             repo_key: "repo-key".into(),
+            repository_id: None,
             repo_name: "herdr".into(),
             branch: branch.into(),
+            base_ref: "HEAD".into(),
+            base_commit: "00000000".into(),
+            editing_base: false,
+            branch_exists: false,
             checkout_path,
             error: None,
             creating: false,
@@ -1616,6 +1867,7 @@ mod tests {
         let event_hub = crate::api::EventHub::default();
         let mut app = app_for_worktree_tests_with_event_hub(event_hub.clone());
         app.state.workspaces = vec![crate::workspace::Workspace::test_new("source")];
+        app.state.workspaces[0].identity_cwd = repo.clone();
         let source_workspace_id = app.state.workspaces[0].id.clone();
         let source_membership = crate::workspace::WorktreeSpaceMembership {
             key: "repo-key".into(),
@@ -1651,7 +1903,9 @@ mod tests {
         assert_eq!(
             event_kinds(&event_hub),
             vec![
+                crate::api::schema::EventKind::WorkspaceUpdated,
                 crate::api::schema::EventKind::WorkspaceCreated,
+                crate::api::schema::EventKind::CheckoutOpened,
                 crate::api::schema::EventKind::TabCreated,
                 crate::api::schema::EventKind::PaneCreated,
                 crate::api::schema::EventKind::LayoutUpdated,
@@ -1730,8 +1984,13 @@ mod tests {
             source_existing_membership: Some(source_membership),
             source_repo_root: repo.clone(),
             repo_key: "repo-key".into(),
+            repository_id: None,
             repo_name: "herdr".into(),
             branch: branch.into(),
+            base_ref: "HEAD".into(),
+            base_commit: "00000000".into(),
+            editing_base: false,
+            branch_exists: false,
             checkout_path: checkout.clone(),
             error: None,
             creating: true,
@@ -1776,7 +2035,9 @@ mod tests {
         assert_eq!(
             event_kinds(&event_hub),
             vec![
+                crate::api::schema::EventKind::RepositoryCreated,
                 crate::api::schema::EventKind::WorkspaceCreated,
+                crate::api::schema::EventKind::CheckoutOpened,
                 crate::api::schema::EventKind::TabCreated,
                 crate::api::schema::EventKind::PaneCreated,
                 crate::api::schema::EventKind::LayoutUpdated,
@@ -1855,8 +2116,13 @@ mod tests {
             source_existing_membership: None,
             source_repo_root: "/repo/herdr".into(),
             repo_key: "repo-key".into(),
+            repository_id: None,
             repo_name: "herdr".into(),
             branch: "worktree/create-race".into(),
+            base_ref: "HEAD".into(),
+            base_commit: "00000000".into(),
+            editing_base: false,
+            branch_exists: false,
             checkout_path: checkout.clone(),
             error: None,
             creating: true,
@@ -1903,8 +2169,13 @@ mod tests {
             source_existing_membership: None,
             source_repo_root: repo.clone(),
             repo_key: "repo-key".into(),
+            repository_id: None,
             repo_name: "herdr".into(),
             branch: branch.into(),
+            base_ref: "HEAD".into(),
+            base_commit: "00000000".into(),
+            editing_base: false,
+            branch_exists: false,
             checkout_path: checkout.clone(),
             error: None,
             creating: false,
@@ -1950,8 +2221,13 @@ mod tests {
             source_existing_membership: None,
             source_repo_root: repo.clone(),
             repo_key: "repo-key".into(),
+            repository_id: None,
             repo_name: "herdr".into(),
             branch: branch.into(),
+            base_ref: "HEAD".into(),
+            base_commit: "00000000".into(),
+            editing_base: false,
+            branch_exists: false,
             checkout_path: checkout.clone(),
             error: None,
             creating: false,
@@ -2075,8 +2351,13 @@ mod tests {
             source_existing_membership: None,
             source_repo_root: repo.clone(),
             repo_key: "repo-key".into(),
+            repository_id: None,
             repo_name: "herdr".into(),
             branch: branch.into(),
+            base_ref: "HEAD".into(),
+            base_commit: "00000000".into(),
+            editing_base: false,
+            branch_exists: false,
             checkout_path: checkout.clone(),
             error: None,
             creating: false,

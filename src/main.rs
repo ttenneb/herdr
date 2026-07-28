@@ -89,6 +89,7 @@ mod raw_input;
 mod release_notes;
 mod remote;
 mod render_prof;
+mod repository;
 mod selection;
 mod server;
 mod session;
@@ -100,6 +101,7 @@ mod terminal_theme;
 mod ui;
 mod update;
 mod workspace;
+mod workspace_resources;
 mod worktree;
 
 fn init_logging() {

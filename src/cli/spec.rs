@@ -33,6 +33,8 @@ pub(super) fn command() -> Command {
         .subcommand(channel_command())
         .subcommand(server_command())
         .subcommand(api_command())
+        .subcommand(repository_command())
+        .subcommand(checkout_command())
         .subcommand(workspace_command())
         .subcommand(worktree_command())
         .subcommand(tab_command())
@@ -190,6 +192,67 @@ fn api_command() -> Command {
         )
 }
 
+fn repository_command() -> Command {
+    Command::new("repository")
+        .about("Manage first-class Git repository Spaces")
+        .subcommand(
+            Command::new("list")
+                .about("List repositories")
+                .arg(flag("json")),
+        )
+        .subcommand(id_command("get", "repository_id", "Show a repository").arg(flag("json")))
+        .subcommand(id_command(
+            "focus",
+            "repository_id",
+            "Focus a repository's MRU Checkout",
+        ))
+        .subcommand(
+            Command::new("rename")
+                .about("Rename a repository display label")
+                .arg(required("repository_id", "REPOSITORY_ID"))
+                .arg(required("label", "LABEL").num_args(1..)),
+        )
+        .subcommand(
+            Command::new("move")
+                .about("Move a repository in top-level Space order")
+                .arg(required("repository_id", "REPOSITORY_ID"))
+                .arg(required("insert_index", "INSERT_INDEX")),
+        )
+        .subcommand(id_command(
+            "close",
+            "repository_id",
+            "Close every Checkout in a repository",
+        ))
+}
+
+fn checkout_command() -> Command {
+    Command::new("checkout")
+        .about("Manage repository Checkouts")
+        .subcommand(
+            Command::new("open")
+                .about("Open a directory as a Checkout or standalone Space")
+                .arg(option("cwd", "PATH"))
+                .arg(option("label", "TEXT"))
+                .arg(repeatable_option("env", "KEY=VALUE"))
+                .arg(flag("focus"))
+                .arg(flag("no-focus")),
+        )
+        .subcommand(id_command("focus", "workspace_id", "Focus a Checkout"))
+        .subcommand(
+            Command::new("rename")
+                .about("Rename a Checkout")
+                .arg(required("workspace_id", "WORKSPACE_ID"))
+                .arg(required("label", "LABEL").num_args(1..)),
+        )
+        .subcommand(
+            Command::new("move")
+                .about("Move a Checkout within its Repository")
+                .arg(required("workspace_id", "WORKSPACE_ID"))
+                .arg(required("insert_index", "INSERT_INDEX")),
+        )
+        .subcommand(id_command("close", "workspace_id", "Close one Checkout"))
+}
+
 fn workspace_command() -> Command {
     Command::new("workspace")
         .about("Manage workspaces over the socket API")
@@ -229,7 +292,8 @@ fn worktree_command() -> Command {
         .about("Manage Git worktree-backed workspaces")
         .subcommand(
             Command::new("list")
-                .about("List worktree workspaces")
+                .about("List repository worktree checkouts")
+                .arg(option("repository", "ID"))
                 .arg(option("workspace", "ID"))
                 .arg(path_option("cwd", "PATH"))
                 .arg(json_flag()),
@@ -237,6 +301,7 @@ fn worktree_command() -> Command {
         .subcommand(
             Command::new("create")
                 .about("Create and open a Git worktree")
+                .arg(option("repository", "ID"))
                 .arg(option("workspace", "ID"))
                 .arg(path_option("cwd", "PATH"))
                 .arg(option("branch", "NAME"))
@@ -250,6 +315,7 @@ fn worktree_command() -> Command {
         .subcommand(
             Command::new("open")
                 .about("Open an existing Git worktree")
+                .arg(option("repository", "ID"))
                 .arg(option("workspace", "ID"))
                 .arg(path_option("cwd", "PATH"))
                 .arg(path_option("path", "PATH"))

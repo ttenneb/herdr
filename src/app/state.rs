@@ -617,11 +617,35 @@ impl Palette {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SpaceRowTarget {
+    /// Immutable resource projection identity; workspace indices are intentionally not used.
+    WorkspaceResource {
+        workspace_id: String,
+        plugin_id: String,
+        resource_id: String,
+    },
+    Repository(String),
+    Workspace(usize),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WorkspaceCardArea {
-    pub ws_idx: usize,
+    pub target: SpaceRowTarget,
     pub rect: Rect,
+    /// Projection depth is retained for rendering; `indented` is only layout.
+    pub depth: u8,
     pub indented: bool,
+}
+
+impl WorkspaceCardArea {
+    #[cfg(test)]
+    pub(crate) fn workspace_index(&self) -> Option<usize> {
+        match self.target {
+            SpaceRowTarget::Workspace(idx) => Some(idx),
+            SpaceRowTarget::Repository(_) | SpaceRowTarget::WorkspaceResource { .. } => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -631,11 +655,28 @@ pub struct WorktreeCreateState {
     pub source_existing_membership: Option<crate::workspace::WorktreeSpaceMembership>,
     pub source_repo_root: std::path::PathBuf,
     pub repo_key: String,
+    /// Exact first-class Repository ID for repository-row creation.
+    /// Legacy checkout-scoped creation leaves this unset.
+    pub repository_id: Option<String>,
     pub repo_name: String,
     pub branch: String,
+    /// Exact source ref and resolved commit shown before Git mutation.
+    pub base_ref: String,
+    pub base_commit: String,
+    pub editing_base: bool,
+    pub branch_exists: bool,
     pub checkout_path: std::path::PathBuf,
     pub error: Option<String>,
     pub creating: bool,
+}
+
+impl WorktreeCreateState {
+    pub(crate) fn api_target(&self) -> (Option<String>, Option<String>) {
+        match &self.repository_id {
+            Some(repository_id) => (Some(repository_id.clone()), None),
+            None => (None, Some(self.source_workspace_id.clone())),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -853,8 +894,18 @@ impl Mode {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum NavigatorTarget {
+    /// Legacy internal target retained for compatibility; Navigator projects checkout roots.
+    #[allow(dead_code)] // Existing action plumbing accepts this internal repository target.
+    Repository {
+        repository_id: String,
+    },
     Workspace {
         ws_idx: usize,
+    },
+    WorkspaceResource {
+        workspace_id: String,
+        plugin_id: String,
+        resource_id: String,
     },
     Tab {
         ws_idx: usize,
@@ -897,7 +948,9 @@ pub(crate) enum NavigatorDisplayLine {
 pub(crate) fn navigator_display_lines(rows: &[NavigatorRow]) -> Vec<NavigatorDisplayLine> {
     let mut lines = Vec::with_capacity(rows.len().saturating_mul(2));
     for (idx, row) in rows.iter().enumerate() {
-        if row.is_workspace && !lines.is_empty() {
+        // Linked checkouts are depth-one children of their primary root, so
+        // only depth-zero workspaces begin a new visual group.
+        if row.is_workspace && row.depth == 0 && !lines.is_empty() {
             lines.push(NavigatorDisplayLine::Spacer);
         }
         lines.push(NavigatorDisplayLine::Row(idx));
@@ -1148,6 +1201,7 @@ pub struct SettingsState {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[expect(dead_code, reason = "socket compatibility operation")]
 pub(crate) enum WorkspaceDropTarget {
     Before(usize),
     End,
@@ -1155,8 +1209,8 @@ pub(crate) enum WorkspaceDropTarget {
 
 pub(crate) enum DragTarget {
     WorkspaceReorder {
-        source_ws_idx: usize,
-        drop_target: Option<WorkspaceDropTarget>,
+        source: SpaceRowTarget,
+        insert_idx: Option<usize>,
     },
     TabReorder {
         ws_idx: usize,
@@ -1198,7 +1252,7 @@ pub(crate) struct DragState {
 }
 
 pub(crate) struct WorkspacePressState {
-    pub ws_idx: usize,
+    pub target: SpaceRowTarget,
     pub start_col: u16,
     pub start_row: u16,
 }
@@ -1215,10 +1269,23 @@ pub enum ContextMenuKind {
     Workspace {
         ws_idx: usize,
     },
+    // Constructed by the resource-row context-menu path while that projection is introduced.
+    #[allow(dead_code)]
+    WorkspaceResource {
+        ws_idx: usize,
+        plugin_id: String,
+        resource_id: String,
+    },
     GitWorkspace {
         ws_idx: usize,
         is_linked_worktree: bool,
+        /// Depth-zero Checkout that proxies repository management.
+        is_repository_root: bool,
         has_worktree_children: bool,
+        collapsed: bool,
+    },
+    Repository {
+        repository_id: String,
         collapsed: bool,
     },
     Tab {
@@ -1254,6 +1321,11 @@ pub enum ContextMenuEntry {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum ContextMenuTarget {
+    WorkspaceResource {
+        workspace_id: String,
+        plugin_id: String,
+        resource_id: String,
+    },
     Workspace(String),
     Tab(String),
     Pane(String),
@@ -1307,7 +1379,51 @@ impl ContextMenuState {
 
     pub fn native_items(&self) -> &'static [&'static str] {
         match self.kind {
+            ContextMenuKind::WorkspaceResource { .. } => &[],
             ContextMenuKind::Workspace { .. } => &["Rename", "Close"],
+            ContextMenuKind::Repository {
+                collapsed: true, ..
+            } => &[
+                "Rename repository",
+                "Close repository...",
+                "New worktree",
+                "Open worktree...",
+                "Expand",
+            ],
+            ContextMenuKind::Repository {
+                collapsed: false, ..
+            } => &[
+                "Rename repository",
+                "Close repository...",
+                "New worktree",
+                "Open worktree...",
+                "Collapse",
+            ],
+            ContextMenuKind::GitWorkspace {
+                is_repository_root: true,
+                collapsed: true,
+                ..
+            } => &[
+                "Rename checkout",
+                "Close checkout",
+                "Rename repository",
+                "Close repository...",
+                "New worktree",
+                "Open worktree...",
+                "Expand",
+            ],
+            ContextMenuKind::GitWorkspace {
+                is_repository_root: true,
+                ..
+            } => &[
+                "Rename checkout",
+                "Close checkout",
+                "Rename repository",
+                "Close repository...",
+                "New worktree",
+                "Open worktree...",
+                "Collapse",
+            ],
             ContextMenuKind::GitWorkspace {
                 is_linked_worktree: false,
                 has_worktree_children: false,
@@ -1323,8 +1439,8 @@ impl ContextMenuState {
                 collapsed: true,
                 ..
             } => &[
-                "Rename",
-                "Close group",
+                "Rename repository",
+                "Close repository...",
                 "New worktree",
                 "Open worktree...",
                 "Expand",
@@ -1335,8 +1451,8 @@ impl ContextMenuState {
                 collapsed: false,
                 ..
             } => &[
-                "Rename",
-                "Close group",
+                "Rename repository",
+                "Close repository...",
                 "New worktree",
                 "Open worktree...",
                 "Collapse",
@@ -1648,9 +1764,15 @@ pub struct AppState {
     pub workspaces: Vec<Workspace>,
     /// Session-wide delegation provenance, independent of pane placement.
     pub delegations: crate::delegation::Delegations,
+    /// Server-owned repositories and the shared top-level Spaces ordering.
+    pub repositories: Vec<crate::repository::Repository>,
+    pub space_order: Vec<crate::repository::SpaceRef>,
     pub active: Option<usize>,
     pub(crate) previous_pane_focus: Option<PaneFocusTarget>,
     pub selected: usize,
+    /// TUI-only row selection when Navigate is on a Repository container row.
+    pub selected_repository_id: Option<String>,
+    pub selected_workspace_resource: Option<(String, String, String)>,
     pub mode: Mode,
     pub should_quit: bool,
     /// In monolithic --no-session mode, detach exits the app because there is no server to detach from.
@@ -1661,6 +1783,7 @@ pub struct AppState {
     pub request_new_workspace: bool,
     pub request_new_tab: bool,
     pub request_new_linked_worktree: Option<usize>,
+    pub request_new_repository_worktree: Option<(String, usize)>,
     pub request_open_existing_worktree: Option<usize>,
     pub request_new_workspace_cwd: Option<std::path::PathBuf>,
     pub request_remove_linked_worktree: Option<usize>,
@@ -1677,11 +1800,15 @@ pub struct AppState {
     pub creating_new_tab: bool,
     pub requested_new_tab_name: Option<String>,
     pub pending_workspace_create_cwd: Option<std::path::PathBuf>,
+    pub rename_repository_target: Option<String>,
+    pub confirm_repository_close_target: Option<String>,
     pub rename_pane_target: Option<PaneId>,
     pub worktree_create: Option<WorktreeCreateState>,
     pub worktree_open: Option<WorktreeOpenState>,
     pub worktree_remove: Option<WorktreeRemoveState>,
     pub worktree_directory: std::path::PathBuf,
+    /// Client-local repository expansion state. The legacy name remains internal
+    /// while UI consumers migrate; it is deliberately excluded from snapshots.
     pub collapsed_space_keys: std::collections::HashSet<String>,
     pub request_complete_onboarding: bool,
     pub name_input: String,
@@ -1848,6 +1975,103 @@ pub struct AppState {
 }
 
 impl AppState {
+    /// Reconcile all checkout membership from canonical Git common-directory identity.
+    /// Call only at lifecycle boundaries (open, close, restore), never from pane cwd updates.
+    pub(crate) fn reconcile_repositories(&mut self) {
+        let active_id = self
+            .active
+            .and_then(|idx| self.workspaces.get(idx))
+            .map(|workspace| workspace.id.clone());
+        crate::repository::reconcile(
+            &mut self.workspaces,
+            &mut self.repositories,
+            &mut self.space_order,
+            active_id.as_deref(),
+        );
+        let valid_ids = self
+            .repositories
+            .iter()
+            .map(|repository| repository.id.as_str())
+            .collect::<std::collections::HashSet<_>>();
+        self.collapsed_space_keys
+            .retain(|id| valid_ids.contains(id.as_str()));
+        if self
+            .selected_repository_id
+            .as_ref()
+            .is_some_and(|id| !valid_ids.contains(id.as_str()))
+        {
+            self.selected_repository_id = None;
+        }
+    }
+
+    /// Clear a resource selection when its transient owner or resource no
+    /// longer exists. Resource mutations are runtime-only, but selection is
+    /// shared UI state and must never point at a stale projection.
+    pub(crate) fn reconcile_selected_workspace_resource(&mut self) -> bool {
+        let Some((workspace_id, plugin_id, resource_id)) =
+            self.selected_workspace_resource.as_ref()
+        else {
+            return false;
+        };
+        let exists = self
+            .workspaces
+            .iter()
+            .find(|workspace| workspace.id == *workspace_id)
+            .is_some_and(|workspace| workspace.resources.find(plugin_id, resource_id).is_some());
+        if exists {
+            false
+        } else {
+            self.selected_workspace_resource = None;
+            true
+        }
+    }
+
+    pub(crate) fn repository(&self, id: &str) -> Option<&crate::repository::Repository> {
+        self.repositories
+            .iter()
+            .find(|repository| repository.id == id)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn close_repository(&mut self, repository_id: &str) -> bool {
+        let Some(workspace_ids) = self
+            .repository(repository_id)
+            .map(|repository| repository.checkout_workspace_ids.clone())
+        else {
+            return false;
+        };
+        for workspace_id in workspace_ids.into_iter().rev() {
+            if let Some(idx) = self
+                .workspaces
+                .iter()
+                .position(|workspace| workspace.id == workspace_id)
+            {
+                self.selected = idx;
+                self.close_selected_workspace();
+            }
+        }
+        true
+    }
+
+    pub(crate) fn focus_repository(&mut self, repository_id: &str) -> bool {
+        let target = self.repository(repository_id).and_then(|repository| {
+            repository
+                .last_focused_workspace_id
+                .as_ref()
+                .or_else(|| repository.checkout_workspace_ids.first())
+                .cloned()
+        });
+        let Some(idx) = target.and_then(|id| {
+            self.workspaces
+                .iter()
+                .position(|workspace| workspace.id == id)
+        }) else {
+            return false;
+        };
+        self.switch_workspace(idx);
+        true
+    }
+
     pub(crate) fn mark_session_dirty(&mut self) {
         self.session_dirty = true;
     }
@@ -2057,9 +2281,13 @@ impl AppState {
             public_pane_id_aliases: std::collections::HashMap::new(),
             workspaces: Vec::new(),
             delegations: crate::delegation::Delegations::new(),
+            repositories: Vec::new(),
+            space_order: Vec::new(),
             active: None,
             previous_pane_focus: None,
             selected: 0,
+            selected_repository_id: None,
+            selected_workspace_resource: None,
             mode: Mode::Navigate,
             should_quit: false,
             detach_exits: false,
@@ -2067,6 +2295,7 @@ impl AppState {
             request_new_workspace: false,
             request_new_tab: false,
             request_new_linked_worktree: None,
+            request_new_repository_worktree: None,
             request_open_existing_worktree: None,
             request_new_workspace_cwd: None,
             request_remove_linked_worktree: None,
@@ -2079,6 +2308,8 @@ impl AppState {
             creating_new_tab: false,
             requested_new_tab_name: None,
             pending_workspace_create_cwd: None,
+            rename_repository_target: None,
+            confirm_repository_close_target: None,
             rename_pane_target: None,
             worktree_create: None,
             worktree_open: None,
@@ -2330,6 +2561,14 @@ impl AppState {
                 self.context_menu.is_none(),
                 "empty app state must not keep context menu"
             );
+            assert!(
+                self.repositories.is_empty(),
+                "empty app state must not keep repositories"
+            );
+            assert!(
+                self.space_order.is_empty(),
+                "empty app state must not keep Space order"
+            );
             return;
         }
 
@@ -2388,6 +2627,78 @@ impl AppState {
                         "pane {:?} is attached to missing terminal {}",
                         pane_id,
                         pane.attached_terminal_id
+                    );
+                }
+            }
+        }
+
+        if !self.repositories.is_empty() || !self.space_order.is_empty() {
+            let repository_ids = self
+                .repositories
+                .iter()
+                .map(|repository| repository.id.as_str())
+                .collect::<std::collections::HashSet<_>>();
+            assert_eq!(
+                repository_ids.len(),
+                self.repositories.len(),
+                "duplicate repository id"
+            );
+            let mut checkout_roots = std::collections::HashSet::new();
+            for repository in &self.repositories {
+                assert!(
+                    !repository.checkout_workspace_ids.is_empty(),
+                    "repository {} is empty",
+                    repository.id
+                );
+                for workspace_id in &repository.checkout_workspace_ids {
+                    let workspace = self
+                        .workspaces
+                        .iter()
+                        .find(|workspace| &workspace.id == workspace_id)
+                        .unwrap_or_else(|| {
+                            panic!(
+                                "repository {} references missing workspace {}",
+                                repository.id, workspace_id
+                            )
+                        });
+                    let checkout = workspace
+                        .checkout
+                        .as_ref()
+                        .expect("repository member must have checkout provenance");
+                    assert_eq!(checkout.repository_id, repository.id);
+                    assert!(
+                        checkout_roots.insert(checkout.checkout_path.clone()),
+                        "duplicate checkout root {}",
+                        checkout.checkout_path.display()
+                    );
+                }
+                assert!(
+                    repository
+                        .last_focused_workspace_id
+                        .as_ref()
+                        .is_none_or(|id| repository.checkout_workspace_ids.contains(id)),
+                    "repository MRU must be a member"
+                );
+                assert_eq!(
+                    self.space_order
+                        .iter()
+                        .filter(|item| **item
+                            == crate::repository::SpaceRef::Repository(repository.id.clone()))
+                        .count(),
+                    1
+                );
+            }
+            for workspace in &self.workspaces {
+                if workspace.checkout.is_none() {
+                    assert_eq!(
+                        self.space_order
+                            .iter()
+                            .filter(|item| **item
+                                == crate::repository::SpaceRef::StandaloneWorkspace(
+                                    workspace.id.clone()
+                                ))
+                            .count(),
+                        1
                     );
                 }
             }
@@ -2491,13 +2802,34 @@ impl AppState {
         }
         if let Some(drag) = &self.drag {
             match &drag.target {
-                DragTarget::WorkspaceReorder {
-                    source_ws_idx,
-                    drop_target,
-                } => {
-                    assert_workspace_index(*source_ws_idx, "workspace drag source");
-                    if let Some(WorkspaceDropTarget::Before(ws_idx)) = drop_target {
-                        assert_workspace_index(*ws_idx, "workspace drag target");
+                DragTarget::WorkspaceReorder { source, insert_idx } => {
+                    match source {
+                        SpaceRowTarget::Workspace(source_ws_idx) => {
+                            assert_workspace_index(*source_ws_idx, "workspace drag source")
+                        }
+                        SpaceRowTarget::WorkspaceResource {
+                            workspace_id,
+                            plugin_id,
+                            resource_id,
+                        } => assert!(
+                            self.workspaces
+                                .iter()
+                                .any(|workspace| workspace.id == *workspace_id
+                                    && workspace.resources.find(plugin_id, resource_id).is_some()),
+                            "workspace resource press must exist"
+                        ),
+                        SpaceRowTarget::Repository(repository_id) => assert!(
+                            self.repository(repository_id).is_some(),
+                            "repository drag source must exist"
+                        ),
+                    };
+                    if let Some(insert_idx) = insert_idx {
+                        assert!(
+                            *insert_idx <= self.workspaces.len(),
+                            "workspace drag insert index {} out of bounds for {} workspaces",
+                            insert_idx,
+                            self.workspaces.len()
+                        );
                     }
                 }
                 DragTarget::TabReorder {
@@ -2522,17 +2854,69 @@ impl AppState {
                 _ => {}
             }
         }
+        if let Some(repository_id) = &self.selected_repository_id {
+            let repository = self
+                .repository(repository_id)
+                .expect("selected repository must exist");
+            assert!(
+                self.workspaces.get(self.selected).is_some_and(|workspace| {
+                    repository.checkout_workspace_ids.contains(&workspace.id)
+                }),
+                "repository row selection must retain a member checkout fallback"
+            );
+        }
         if let Some(press) = &self.workspace_press {
-            assert_workspace_index(press.ws_idx, "workspace press");
+            match &press.target {
+                SpaceRowTarget::Workspace(ws_idx) => {
+                    assert_workspace_index(*ws_idx, "workspace press")
+                }
+                SpaceRowTarget::WorkspaceResource {
+                    workspace_id,
+                    plugin_id,
+                    resource_id,
+                } => assert!(
+                    self.workspaces
+                        .iter()
+                        .any(|workspace| workspace.id == *workspace_id
+                            && workspace.resources.find(plugin_id, resource_id).is_some()),
+                    "workspace resource press must exist"
+                ),
+                SpaceRowTarget::Repository(repository_id) => assert!(
+                    self.repository(repository_id).is_some(),
+                    "repository press must exist"
+                ),
+            }
         }
         if let Some(press) = &self.tab_press {
             assert_tab_index(press.ws_idx, press.tab_idx, "tab press");
         }
         if let Some(menu) = &self.context_menu {
             match menu.kind {
+                ContextMenuKind::WorkspaceResource {
+                    ws_idx,
+                    ref plugin_id,
+                    ref resource_id,
+                } => {
+                    assert_workspace_index(ws_idx, "context menu workspace resource");
+                    assert!(
+                        self.workspaces[ws_idx]
+                            .resources
+                            .find(plugin_id, resource_id)
+                            .is_some(),
+                        "context menu resource must exist"
+                    );
+                }
                 ContextMenuKind::Workspace { ws_idx }
                 | ContextMenuKind::GitWorkspace { ws_idx, .. } => {
                     assert_workspace_index(ws_idx, "context menu workspace")
+                }
+                ContextMenuKind::Repository {
+                    ref repository_id, ..
+                } => {
+                    assert!(
+                        self.repository(repository_id).is_some(),
+                        "context menu repository must exist"
+                    );
                 }
                 ContextMenuKind::Tab { ws_idx, tab_idx } => {
                     assert_tab_index(ws_idx, tab_idx, "context menu tab")
@@ -2633,36 +3017,10 @@ mod tests {
         state.assert_invariants_for_test();
     }
 
-    #[test]
-    #[should_panic(expected = "appears in more than one tab or workspace")]
-    fn app_invariant_rejects_session_wide_duplicate_collection_ids() {
-        let mut state = AppState::test_new();
-        let collection = crate::layout::CollectionId::alloc().expect("collection id");
-        let mut workspaces = [
-            crate::workspace::Workspace::test_new("first"),
-            crate::workspace::Workspace::test_new("second"),
-        ];
-        for workspace in &mut workspaces {
-            let root = workspace.tabs[0].root_pane.expect("root pane");
-            assert!(workspace.tabs[0].layout.insert_collection_near(
-                crate::layout::LayoutLeaf::Pane(root),
-                collection,
-                ratatui::layout::Direction::Horizontal,
-                0.5,
-            ));
-        }
-        state.workspaces = workspaces.into();
-        state.active = Some(0);
-        state.selected = 0;
-        state.ensure_test_terminals();
-
-        state.assert_invariants_for_test();
-    }
-
-    fn navigator_row_for_display(is_workspace: bool) -> NavigatorRow {
+    fn navigator_row_for_display_at(depth: u8, is_workspace: bool) -> NavigatorRow {
         NavigatorRow {
             target: NavigatorTarget::Workspace { ws_idx: 0 },
-            depth: if is_workspace { 0 } else { 1 },
+            depth,
             label: String::new(),
             meta: String::new(),
             status: crate::detect::AgentState::Idle,
@@ -2674,6 +3032,10 @@ mod tests {
             search_text: String::new(),
             matched: true,
         }
+    }
+
+    fn navigator_row_for_display(is_workspace: bool) -> NavigatorRow {
+        navigator_row_for_display_at(if is_workspace { 0 } else { 1 }, is_workspace)
     }
 
     #[test]
@@ -2707,6 +3069,31 @@ mod tests {
             vec![NavigatorDisplayLine::Row(0), NavigatorDisplayLine::Row(1)]
         );
         assert!(navigator_display_lines(&[]).is_empty());
+    }
+
+    #[test]
+    fn navigator_display_lines_keep_linked_checkouts_in_primary_tree() {
+        // primary -> resource, linked checkout -> resource, linked checkout -> resource
+        let rows = vec![
+            navigator_row_for_display_at(0, true),
+            navigator_row_for_display_at(2, false),
+            navigator_row_for_display_at(1, true),
+            navigator_row_for_display_at(2, false),
+            navigator_row_for_display_at(1, true),
+            navigator_row_for_display_at(2, false),
+        ];
+
+        assert_eq!(
+            navigator_display_lines(&rows),
+            vec![
+                NavigatorDisplayLine::Row(0),
+                NavigatorDisplayLine::Row(1),
+                NavigatorDisplayLine::Row(2),
+                NavigatorDisplayLine::Row(3),
+                NavigatorDisplayLine::Row(4),
+                NavigatorDisplayLine::Row(5),
+            ]
+        );
     }
 
     #[test]
@@ -2795,12 +3182,13 @@ mod tests {
                 ContextMenuKind::GitWorkspace {
                     ws_idx: 0,
                     is_linked_worktree: false,
+                    is_repository_root: false,
                     has_worktree_children: true,
                     collapsed: true,
                 },
                 &[
-                    "Rename",
-                    "Close group",
+                    "Rename repository",
+                    "Close repository...",
                     "New worktree",
                     "Open worktree...",
                     "Expand",
@@ -2902,6 +3290,7 @@ mod tests {
             kind: ContextMenuKind::GitWorkspace {
                 ws_idx: 0,
                 is_linked_worktree: true,
+                is_repository_root: false,
                 has_worktree_children: false,
                 collapsed: false,
             },
@@ -2919,11 +3308,42 @@ mod tests {
     }
 
     #[test]
+    fn root_checkout_context_menu_combines_checkout_and_repository_actions() {
+        let menu = ContextMenuState {
+            kind: ContextMenuKind::GitWorkspace {
+                ws_idx: 0,
+                is_linked_worktree: false,
+                is_repository_root: true,
+                has_worktree_children: true,
+                collapsed: false,
+            },
+            x: 0,
+            y: 0,
+            list: MenuListState::new(0),
+            scroll_offset: 0,
+            plugin: None,
+        };
+        assert_eq!(
+            menu.items(),
+            &[
+                "Rename checkout",
+                "Close checkout",
+                "Rename repository",
+                "Close repository...",
+                "New worktree",
+                "Open worktree...",
+                "Collapse",
+            ]
+        );
+    }
+
+    #[test]
     fn git_workspace_context_menu_keeps_remove_for_managed_worktrees_only() {
         let menu = ContextMenuState {
             kind: ContextMenuKind::GitWorkspace {
                 ws_idx: 0,
                 is_linked_worktree: false,
+                is_repository_root: false,
                 has_worktree_children: false,
                 collapsed: false,
             },
@@ -2946,6 +3366,7 @@ mod tests {
             kind: ContextMenuKind::GitWorkspace {
                 ws_idx: 0,
                 is_linked_worktree: false,
+                is_repository_root: false,
                 has_worktree_children: true,
                 collapsed: false,
             },
@@ -2959,8 +3380,8 @@ mod tests {
         assert_eq!(
             menu.items(),
             &[
-                "Rename",
-                "Close group",
+                "Rename repository",
+                "Close repository...",
                 "New worktree",
                 "Open worktree...",
                 "Collapse"

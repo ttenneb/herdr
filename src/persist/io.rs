@@ -201,6 +201,8 @@ mod tests {
     fn empty_snapshot() -> SessionSnapshot {
         SessionSnapshot {
             version: SNAPSHOT_VERSION,
+            repositories: Vec::new(),
+            space_order: Vec::new(),
             workspaces: vec![],
             active: None,
             selected: 0,

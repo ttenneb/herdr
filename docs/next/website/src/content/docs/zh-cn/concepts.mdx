@@ -7,9 +7,11 @@ Herdr 是一个终端工作区管理器。它让真实的终端进程持续运�
 
 ## 工作区
 
-工作区是最顶层的项目容器。为每个仓库、任务或调查使用一个工作区。
+**Space** 是会话中可由用户排序的项目条目。Git 目录以 Repository → Checkout 两级结构打开,非 Git 目录则保持为独立 Space。
 
-工作区拥有标签页和窗格。它在侧边栏中的状态由内部的智能体汇总而来,让你一眼看出哪个项目需要关注。
+**Repository** 由规范化的 Git common directory 标识。链接 worktree 会自动与主 Checkout 分组,独立 clone 和嵌套仓库仍彼此分开。主 Checkout 是层级中可见且可点击的根节点，并使用 Repository 名称（包括自定义重命名）；链接 Checkout 显示在其下方并使用分支标签。根节点仍显示主 checkout 的分支、upstream 和状态详情。
+
+**Checkout** 是拥有标签页和窗格的终端工作区。主 Checkout 是 Repository 的根节点，链接和 detached Checkout 是其子项。关闭 Checkout 不会删除目录或分支。现有 `workspace.*` API 继续作为兼容接口。
 
 ## 标签页
 

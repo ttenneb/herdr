@@ -48,6 +48,15 @@ impl App {
             focused_workspace_id,
             focused_tab_id,
             focused_pane_id,
+            repositories: self
+                .state
+                .space_order
+                .iter()
+                .filter_map(|space| match space {
+                    crate::repository::SpaceRef::Repository(id) => self.repository_info(id),
+                    crate::repository::SpaceRef::StandaloneWorkspace(_) => None,
+                })
+                .collect(),
             workspaces,
             tabs,
             panes: self.collect_panes_for_workspace(None).unwrap_or_default(),

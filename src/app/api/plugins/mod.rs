@@ -35,9 +35,53 @@ impl App {
             .into_iter()
             .map(|plugin| (plugin.plugin_id.clone(), plugin))
             .collect();
+        self.clear_ineligible_workspace_resource_sources();
     }
 
-    fn refresh_installed_plugins(&mut self) -> std::io::Result<()> {
+    /// Registry reload happens in paths that already borrow plugin state, so
+    /// ownership eligibility is evaluated directly from the replacement map.
+    /// TTL only governs normal expiration: a vanished or ineligible owner must
+    /// lose every source immediately.
+    fn clear_ineligible_workspace_resource_sources(&mut self) {
+        // Snapshot eligibility before mutably borrowing workspaces. In
+        // particular, do not call the refresh-capable reporting guard here.
+        let eligible_owners = self
+            .state
+            .installed_plugins
+            .values()
+            .filter(|plugin| {
+                plugin.enabled
+                    && plugin_manifest_available(plugin)
+                    && ensure_platform_supported(&plugin.platforms, "workspace resource reporter")
+                        .is_ok()
+            })
+            .map(|plugin| plugin.plugin_id.as_str())
+            .collect::<std::collections::HashSet<_>>();
+        let changed = self
+            .state
+            .workspaces
+            .iter_mut()
+            .enumerate()
+            .filter_map(|(ws_idx, workspace)| {
+                let mut workspace_changed = false;
+                for plugin_id in workspace.resources.source_ids() {
+                    if !eligible_owners.contains(plugin_id.as_str()) {
+                        workspace_changed |= workspace.resources.clear_source(&plugin_id);
+                    }
+                }
+                workspace_changed.then_some(ws_idx)
+            })
+            .collect::<Vec<_>>();
+        if !changed.is_empty() {
+            self.state.reconcile_selected_workspace_resource();
+        }
+        for ws_idx in changed {
+            self.emit_workspace_resources_updated(ws_idx);
+        }
+        self.sync_agent_metadata_deadline();
+    }
+
+    pub(super) fn refresh_installed_plugins(&mut self) -> std::io::Result<()> {
         if self.no_session {
             return Ok(());
         }
@@ -107,6 +151,21 @@ impl App {
         encode_success(id, ResponseResult::PluginLinked { plugin })
     }
 
+    pub(super) fn plugin_can_own_workspace_resources(&mut self, plugin_id: &str) -> bool {
+        if self.refresh_installed_plugins().is_err() {
+            return false;
+        }
+        self.state
+            .installed_plugins
+            .get(plugin_id)
+            .is_some_and(|plugin| {
+                plugin.enabled
+                    && plugin_manifest_available(plugin)
+                    && ensure_platform_supported(&plugin.platforms, "workspace resource reporter")
+                        .is_ok()
+            })
+    }
+
     pub(super) fn handle_plugin_list(&mut self, id: String, params: PluginListParams) -> String {
         let plugin_id = match normalize_optional_plugin_id(&id, params.plugin_id) {
             Ok(plugin_id) => plugin_id,
@@ -146,6 +205,7 @@ impl App {
                 }
             };
         if removed {
+            self.clear_workspace_resource_source(&plugin_id);
             // Drop plugin_panes records for this plugin (panes keep running).
             self.state
                 .plugin_panes
@@ -221,6 +281,42 @@ impl App {
             return encode_error(id, code, message);
         }
         let context = self.merge_plugin_context(params.context, &id);
+        if action.contexts == vec![crate::api::schema::PluginActionContext::WorkspaceResource]
+            && context.workspace_resource.is_none()
+        {
+            return encode_error(
+                id,
+                "workspace_resource_required",
+                "workspace resource context is required",
+            );
+        }
+        if let Some(resource) = context.workspace_resource.as_ref() {
+            let valid = action
+                .contexts
+                .contains(&crate::api::schema::PluginActionContext::WorkspaceResource)
+                && resource.plugin_id == plugin.plugin_id
+                && context.workspace_id.as_deref() == Some(&resource.workspace_id)
+                && self.state.workspaces.iter().any(|workspace| {
+                    workspace.id == resource.workspace_id
+                        && workspace
+                            .resources
+                            .find(&resource.plugin_id, &resource.resource_id)
+                            == Some(&crate::workspace_resources::WorkspaceResource {
+                                plugin_id: resource.plugin_id.clone(),
+                                resource_id: resource.resource_id.clone(),
+                                label: resource.label.clone(),
+                                detail: resource.detail.clone(),
+                                data: resource.data.clone(),
+                            })
+                });
+            if !valid {
+                return encode_error(
+                    id,
+                    "stale_workspace_resource",
+                    "workspace resource is no longer valid",
+                );
+            }
+        }
         let log = match self.start_plugin_command(
             &plugin,
             Some(action.action_id.clone()),
@@ -260,6 +356,10 @@ impl App {
             Some(menu) => menu.kind.clone(),
             None => return,
         };
+        // A Repository is an aggregate native target, never an implicit Checkout.
+        if matches!(kind, ContextMenuKind::Repository { .. }) {
+            return;
+        }
         let generation = self.state.next_context_menu_generation;
         let Some(next_generation) = generation.checked_add(1) else {
             tracing::warn!("context-menu generation space exhausted");
@@ -268,6 +368,37 @@ impl App {
         self.state.next_context_menu_generation = next_generation;
         let correlation_id = format!("context-menu-{generation}");
         let (mut context, target, required_context) = match kind {
+            ContextMenuKind::WorkspaceResource {
+                ws_idx,
+                plugin_id,
+                resource_id,
+            } => {
+                let Some(workspace) = self.state.workspaces.get(ws_idx) else {
+                    return;
+                };
+                let Some(resource) = workspace.resources.find(&plugin_id, &resource_id) else {
+                    return;
+                };
+                let workspace_id = self.public_workspace_id(ws_idx);
+                let mut context = self.plugin_context_for_workspace(ws_idx, &correlation_id);
+                context.workspace_resource = Some(crate::api::schema::WorkspaceResourceInfo {
+                    workspace_id: workspace_id.clone(),
+                    plugin_id: plugin_id.clone(),
+                    resource_id: resource_id.clone(),
+                    label: resource.label.clone(),
+                    detail: resource.detail.clone(),
+                    data: resource.data.clone(),
+                });
+                (
+                    context,
+                    ContextMenuTarget::WorkspaceResource {
+                        workspace_id,
+                        plugin_id,
+                        resource_id,
+                    },
+                    crate::api::schema::PluginActionContext::WorkspaceResource,
+                )
+            }
             ContextMenuKind::Workspace { ws_idx }
             | ContextMenuKind::GitWorkspace { ws_idx, .. } => {
                 let Some(workspace_id) = self
@@ -284,6 +415,7 @@ impl App {
                     crate::api::schema::PluginActionContext::Workspace,
                 )
             }
+            ContextMenuKind::Repository { .. } => return,
             ContextMenuKind::Tab { ws_idx, tab_idx } => {
                 let Some(tab_id) = self.public_tab_id(ws_idx, tab_idx) else {
                     return;
@@ -322,12 +454,19 @@ impl App {
             },
             |()| true,
         );
+        let resource_owner = context
+            .workspace_resource
+            .as_ref()
+            .map(|resource| resource.plugin_id.as_str());
         let mut providers = self
             .state
             .installed_plugins
             .values()
             .filter(|plugin| {
-                plugins_available && plugin.enabled && plugin_manifest_available(plugin)
+                plugins_available
+                    && plugin.enabled
+                    && plugin_manifest_available(plugin)
+                    && resource_owner.is_none_or(|owner| plugin.plugin_id == owner)
             })
             .flat_map(|plugin| {
                 plugin.actions.iter().filter_map(|action| {
@@ -414,11 +553,15 @@ impl App {
             .and_then(|menu| menu.plugin.as_ref())
             .filter(|plugin| plugin.context == *context)
             .filter(|plugin| context_menu_target_exists(self, &plugin.target))
+            .filter(|plugin| workspace_resource_context_is_current(self, &plugin.context))
             .ok_or((
                 "plugin_action_choices_stale",
                 "context-menu target changed before choices provider start".to_string(),
             ))?;
         let required_context = match menu_plugin.target {
+            crate::app::state::ContextMenuTarget::WorkspaceResource { .. } => {
+                crate::api::schema::PluginActionContext::WorkspaceResource
+            }
             crate::app::state::ContextMenuTarget::Workspace(_) => {
                 crate::api::schema::PluginActionContext::Workspace
             }
@@ -650,7 +793,9 @@ impl App {
         }
         let plugin_id = snapshot.plugin.plugin_id.clone();
         let action_id = snapshot.action.id.clone();
-        if !context_menu_target_exists(self, &plugin_state.target) {
+        if !context_menu_target_exists(self, &plugin_state.target)
+            || !workspace_resource_context_is_current(self, &plugin_state.context)
+        {
             tracing::warn!(
                 plugin_id,
                 action_id,
@@ -686,6 +831,9 @@ impl App {
             return;
         };
         let expected_context = match plugin_state.target {
+            crate::app::state::ContextMenuTarget::WorkspaceResource { .. } => {
+                crate::api::schema::PluginActionContext::WorkspaceResource
+            }
             crate::app::state::ContextMenuTarget::Workspace(_) => {
                 crate::api::schema::PluginActionContext::Workspace
             }
@@ -1125,6 +1273,30 @@ impl App {
         None
     }
 
+    /// Resource reports are runtime-only. Removing their source must neither
+    /// dirty nor persist the session, but subscribers need the current view.
+    fn clear_workspace_resource_source(&mut self, plugin_id: &str) {
+        let changed = self
+            .state
+            .workspaces
+            .iter_mut()
+            .enumerate()
+            .filter_map(|(ws_idx, workspace)| {
+                workspace
+                    .resources
+                    .clear_source(plugin_id)
+                    .then_some(ws_idx)
+            })
+            .collect::<Vec<_>>();
+        if !changed.is_empty() {
+            self.state.reconcile_selected_workspace_resource();
+        }
+        for ws_idx in changed {
+            self.emit_workspace_resources_updated(ws_idx);
+        }
+        self.sync_agent_metadata_deadline();
+    }
+
     fn set_plugin_enabled(&mut self, id: String, plugin_id: String, enabled: bool) -> String {
         let Some(plugin_id) = normalize_plugin_id(&plugin_id) else {
             return invalid_plugin_id(id);
@@ -1149,6 +1321,7 @@ impl App {
             return encode_error(id, "plugin_not_found", "plugin not found");
         };
         if !enabled {
+            self.clear_workspace_resource_source(&plugin_id);
             self.clear_agent_view_for_source(&format!("plugin:{plugin_id}"));
         }
         if enabled {
@@ -1161,6 +1334,19 @@ impl App {
 
 fn context_menu_target_exists(app: &App, target: &crate::app::state::ContextMenuTarget) -> bool {
     match target {
+        crate::app::state::ContextMenuTarget::WorkspaceResource {
+            workspace_id,
+            plugin_id,
+            resource_id,
+        } => app
+            .state
+            .workspaces
+            .iter()
+            .enumerate()
+            .find(|(index, _)| app.public_workspace_id(*index) == *workspace_id)
+            .is_some_and(|(_, workspace)| {
+                workspace.resources.find(plugin_id, resource_id).is_some()
+            }),
         crate::app::state::ContextMenuTarget::Workspace(id) => app
             .state
             .workspaces
@@ -1170,6 +1356,29 @@ fn context_menu_target_exists(app: &App, target: &crate::app::state::ContextMenu
         crate::app::state::ContextMenuTarget::Tab(id) => app.parse_tab_id(id).is_some(),
         crate::app::state::ContextMenuTarget::Pane(id) => app.parse_pane_id(id).is_some(),
     }
+}
+
+fn workspace_resource_context_is_current(
+    app: &App,
+    context: &crate::api::schema::PluginInvocationContext,
+) -> bool {
+    let Some(resource) = context.workspace_resource.as_ref() else {
+        return true;
+    };
+    app.state
+        .workspaces
+        .iter()
+        .find(|workspace| workspace.id == resource.workspace_id)
+        .and_then(|workspace| {
+            workspace
+                .resources
+                .find(&resource.plugin_id, &resource.resource_id)
+        })
+        .is_some_and(|current| {
+            current.label == resource.label
+                && current.detail == resource.detail
+                && current.data == resource.data
+        })
 }
 
 fn leave_context_menu_after_plugin_choice(state: &mut crate::app::AppState) {
@@ -1204,7 +1413,7 @@ fn normalize_optional_plugin_id(
     }
 }
 
-fn plugin_manifest_available(plugin: &InstalledPluginInfo) -> bool {
+pub(super) fn plugin_manifest_available(plugin: &InstalledPluginInfo) -> bool {
     !plugin.warnings.iter().any(|warning| {
         warning.starts_with(crate::persist::plugin_registry::MANIFEST_UNAVAILABLE_WARNING_PREFIX)
     })
@@ -1292,6 +1501,48 @@ mod tests {
             },
             action,
         }
+    }
+
+    fn resource_plugin(plugin_id: &str) -> InstalledPluginInfo {
+        context_menu_snapshot(plugin_id).plugin
+    }
+
+    fn report_resource_to_workspace(
+        app: &mut App,
+        ws_idx: usize,
+        plugin_id: &str,
+        ttl: Option<std::time::Duration>,
+    ) {
+        while app.state.workspaces.len() <= ws_idx {
+            let name = format!("resources-{}", app.state.workspaces.len());
+            app.state
+                .workspaces
+                .push(crate::workspace::Workspace::test_new(&name));
+        }
+        app.state.workspaces[ws_idx]
+            .resources
+            .report(
+                plugin_id.into(),
+                vec![crate::workspace_resources::WorkspaceResource {
+                    plugin_id: plugin_id.into(),
+                    resource_id: "resource".into(),
+                    label: "Resource".into(),
+                    detail: None,
+                    data: None,
+                }],
+                None,
+                ttl,
+                std::time::Instant::now(),
+            )
+            .expect("resource report");
+    }
+
+    fn report_resource(app: &mut App, plugin_id: &str, ttl: Option<std::time::Duration>) {
+        report_resource_to_workspace(app, 0, plugin_id, ttl);
+    }
+
+    fn report_non_expiring_resource(app: &mut App, plugin_id: &str) {
+        report_resource(app, plugin_id, None);
     }
 
     fn response_result(response: &str) -> ResponseResult {
@@ -2018,6 +2269,157 @@ choices_command = ["provider"]
         menu.move_next();
         assert_eq!(menu.list.highlighted, 1);
         assert!(!menu.entry_enabled(2));
+    }
+
+    #[test]
+    fn registry_refresh_clears_non_expiring_resources_for_disappeared_plugin() {
+        let mut app = test_app();
+        let plugin = resource_plugin("example.resource");
+        app.state
+            .installed_plugins
+            .insert(plugin.plugin_id.clone(), plugin);
+        report_non_expiring_resource(&mut app, "example.resource");
+        app.state.session_dirty = false;
+
+        app.replace_installed_plugins(vec![]);
+
+        assert!(app.state.workspaces[0]
+            .resources
+            .resources()
+            .next()
+            .is_none());
+        assert!(!app.state.session_dirty);
+        assert!(app.event_hub.events_after(0).iter().any(|(_, event)| {
+            event.event == crate::api::schema::EventKind::WorkspaceResourcesUpdated
+        }));
+    }
+
+    #[test]
+    fn registry_refresh_clears_every_ineligible_source_and_updates_each_workspace_once() {
+        let mut app = test_app();
+        // The first workspace has two invalid owners with mixed expiration;
+        // the second proves updates remain one-per-changed-workspace.
+        report_resource_to_workspace(&mut app, 0, "example.non-expiring", None);
+        report_resource_to_workspace(
+            &mut app,
+            0,
+            "example.long-ttl",
+            Some(std::time::Duration::from_secs(24 * 60 * 60)),
+        );
+        report_resource_to_workspace(
+            &mut app,
+            1,
+            "example.second-workspace",
+            Some(std::time::Duration::from_secs(60)),
+        );
+
+        app.replace_installed_plugins(vec![]);
+
+        assert!(app.state.workspaces.iter().all(|workspace| workspace
+            .resources
+            .resources()
+            .next()
+            .is_none()));
+        assert_eq!(
+            app.event_hub
+                .events_after(0)
+                .iter()
+                .filter(|(_, event)| {
+                    event.event == crate::api::schema::EventKind::WorkspaceResourcesUpdated
+                })
+                .count(),
+            2
+        );
+    }
+
+    #[test]
+    fn registry_refresh_clears_long_ttl_resources_for_disabled_plugin() {
+        let mut app = test_app();
+        let root = unique_temp_path("disabled-resource-owner");
+        write_manifest(&root);
+        let mut plugin = load_plugin_manifest(&root.display().to_string(), false).unwrap();
+        plugin.enabled = false;
+        report_resource(
+            &mut app,
+            &plugin.plugin_id,
+            Some(std::time::Duration::from_secs(24 * 60 * 60)),
+        );
+        app.state.session_dirty = false;
+
+        app.replace_installed_plugins(vec![plugin]);
+
+        assert!(app.state.workspaces[0]
+            .resources
+            .resources()
+            .next()
+            .is_none());
+        assert!(!app.state.session_dirty);
+        assert!(app.event_hub.events_after(0).iter().any(|(_, event)| {
+            event.event == crate::api::schema::EventKind::WorkspaceResourcesUpdated
+        }));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn registry_refresh_clears_long_ttl_resources_for_incompatible_plugin() {
+        let mut app = test_app();
+        let root = unique_temp_path("incompatible-resource-owner");
+        write_manifest_content(
+            &root,
+            r#"
+id = "example.incompatible-resource-owner"
+name = "Incompatible resource owner"
+version = "0.1.0"
+min_herdr_version = "0.7.0"
+platforms = ["windows"]
+"#,
+        );
+        let plugin = load_plugin_manifest(&root.display().to_string(), true).unwrap();
+        report_resource(
+            &mut app,
+            &plugin.plugin_id,
+            Some(std::time::Duration::from_secs(24 * 60 * 60)),
+        );
+        app.state.session_dirty = false;
+
+        app.replace_installed_plugins(vec![plugin]);
+
+        assert!(app.state.workspaces[0]
+            .resources
+            .resources()
+            .next()
+            .is_none());
+        assert!(!app.state.session_dirty);
+        assert!(app.event_hub.events_after(0).iter().any(|(_, event)| {
+            event.event == crate::api::schema::EventKind::WorkspaceResourcesUpdated
+        }));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn registry_refresh_clears_long_ttl_resources_when_manifest_is_unavailable() {
+        let mut app = test_app();
+        let plugin = resource_plugin("example.resource");
+        report_resource(
+            &mut app,
+            &plugin.plugin_id,
+            Some(std::time::Duration::from_secs(24 * 60 * 60)),
+        );
+        app.state.session_dirty = false;
+
+        // reload_manifests marks this intentionally absent manifest unavailable.
+        app.replace_installed_plugins(vec![plugin]);
+
+        assert!(app.state.workspaces[0]
+            .resources
+            .resources()
+            .next()
+            .is_none());
+        assert!(!app.state.session_dirty);
+        assert!(app.event_hub.events_after(0).iter().any(|(_, event)| {
+            event.event == crate::api::schema::EventKind::WorkspaceResourcesUpdated
+        }));
     }
 
     #[test]
@@ -3285,6 +3687,9 @@ command = ["sh", "-c", "printf %s ${{HERDR_PANE_ID-unset}} > '{}'; sleep 1"]
                 plugin_id: Some("example.worktree-bootstrap".into()),
                 action_id: "bootstrap".into(),
                 context: Some(PluginInvocationContext {
+                    workspace_resource: None,
+                    repository_id: None,
+                    checkout: None,
                     workspace_id: Some("1".into()),
                     workspace_label: None,
                     workspace_cwd: None,
@@ -3393,6 +3798,90 @@ command = ["sh", "-c", "printf %s ${{HERDR_PANE_ID-unset}} > '{}'; sleep 1"]
         });
         let value: serde_json::Value = serde_json::from_str(&pane).unwrap();
         assert_eq!(value["error"]["code"], "plugin_manifest_unavailable");
+    }
+
+    #[test]
+    fn direct_resource_action_invoke_rejects_deleted_manifest_after_refresh() {
+        let _guard = crate::config::test_config_env_lock().lock().unwrap();
+        let previous_config_home = std::env::var_os("XDG_CONFIG_HOME");
+        let base = unique_temp_path("plugin-deleted-resource-action");
+        std::env::set_var("XDG_CONFIG_HOME", &base);
+        let root = base.join("plugin");
+        write_manifest_content(
+            &root,
+            r#"
+id = "example.deleted-resource-action"
+name = "Deleted resource action"
+version = "0.1.0"
+min_herdr_version = "0.7.0"
+platforms = ["linux", "macos", "windows"]
+
+[[actions]]
+id = "run"
+title = "Run"
+contexts = ["workspace_resource"]
+command = ["does-not-run"]
+"#,
+        );
+        let plugin = load_plugin_manifest(&root.display().to_string(), true).unwrap();
+        crate::persist::plugin_registry::update(|plugins| {
+            plugins.retain(|entry| entry.plugin_id != plugin.plugin_id);
+            plugins.push(plugin.clone());
+        })
+        .unwrap();
+
+        let mut app = test_app();
+        app.no_session = false;
+        app.state.workspaces = vec![crate::workspace::Workspace::test_new("resources")];
+        let workspace_id = app.public_workspace_id(0);
+        report_resource(
+            &mut app,
+            &plugin.plugin_id,
+            Some(std::time::Duration::from_secs(24 * 60 * 60)),
+        );
+        let resource = app.state.workspaces[0]
+            .resources
+            .find(&plugin.plugin_id, "resource")
+            .unwrap()
+            .clone();
+        // Simulate the cached plugin state that existed before the next refresh.
+        app.state
+            .installed_plugins
+            .insert(plugin.plugin_id.clone(), plugin.clone());
+        app.state.session_dirty = false;
+        std::fs::remove_dir_all(&root).unwrap();
+
+        let mut context = app.current_plugin_context("test");
+        context.workspace_resource = Some(crate::api::schema::WorkspaceResourceInfo {
+            workspace_id,
+            plugin_id: plugin.plugin_id.clone(),
+            resource_id: resource.resource_id,
+            label: resource.label,
+            detail: resource.detail,
+            data: resource.data,
+        });
+        let invoke = app.handle_api_request(Request {
+            id: "invoke-deleted".into(),
+            method: Method::PluginActionInvoke(PluginActionInvokeParams {
+                plugin_id: Some(plugin.plugin_id.clone()),
+                action_id: "run".into(),
+                context: Some(context),
+            }),
+        });
+        let value: serde_json::Value = serde_json::from_str(&invoke).unwrap();
+        assert_eq!(value["error"]["code"], "plugin_manifest_unavailable");
+        assert!(app.state.workspaces[0]
+            .resources
+            .find(&plugin.plugin_id, "resource")
+            .is_none());
+        assert!(app.state.plugin_command_logs.is_empty());
+        assert!(!app.state.session_dirty);
+
+        let _ = std::fs::remove_dir_all(&base);
+        match previous_config_home {
+            Some(previous) => std::env::set_var("XDG_CONFIG_HOME", previous),
+            None => std::env::remove_var("XDG_CONFIG_HOME"),
+        }
     }
 
     #[test]

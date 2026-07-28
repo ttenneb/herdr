@@ -152,9 +152,14 @@ impl App {
                             .state
                             .navigator_rows_from(&self.terminal_runtimes)
                             .get(idx)
-                            .map(|row| (row.target.clone(), row.is_workspace));
-                        if let Some((NavigatorTarget::Workspace { .. }, true)) = target {
-                            if self.state.navigator_row_caret_at(mouse.column) {
+                            .map(|row| (row.target.clone(), row.is_workspace, row.depth));
+                        if let Some((
+                            NavigatorTarget::Workspace { .. } | NavigatorTarget::Repository { .. },
+                            true,
+                            depth,
+                        )) = target
+                        {
+                            if self.state.navigator_row_caret_at(mouse.column, depth) {
                                 self.state.toggle_selected_navigator_workspace_from(
                                     &self.terminal_runtimes,
                                 );
@@ -348,9 +353,15 @@ impl AppState {
         }
     }
 
-    pub(crate) fn navigator_row_caret_at(&self, col: u16) -> bool {
-        let body = self.navigator_body_rect();
-        col <= body.x.saturating_add(3)
+    pub(crate) fn navigator_row_caret_at(&self, col: u16, depth: u8) -> bool {
+        // The gutter is three cells; every tree depth adds a three-cell
+        // connector before the workspace's caret.
+        let caret_col = self
+            .navigator_body_rect()
+            .x
+            .saturating_add(3)
+            .saturating_add(u16::from(depth).saturating_mul(3));
+        col == caret_col
     }
 
     pub(super) fn onboarding_modal_inner(&self, popup_w: u16, popup_h: u16) -> Option<Rect> {

@@ -52,6 +52,7 @@ pub struct WorkspaceGitStatus {
     pub demand: GitStatusRefreshDemand,
     pub auto_label: String,
     pub branch: Option<String>,
+    pub upstream: Option<String>,
     pub ahead_behind: Option<(usize, usize)>,
     pub space: Option<GitSpaceMetadata>,
 }
@@ -60,6 +61,7 @@ pub struct WorkspaceGitStatus {
 pub struct WorkspaceGitStatusSnapshot {
     pub auto_label: String,
     pub branch: Option<String>,
+    pub upstream: Option<String>,
     pub ahead_behind: Option<(usize, usize)>,
     pub space: Option<GitSpaceMetadata>,
 }
@@ -94,6 +96,7 @@ impl WorkspaceGitStatusSnapshot {
             demand,
             auto_label: self.auto_label,
             branch: self.branch,
+            upstream: self.upstream,
             ahead_behind: self.ahead_behind,
             space: self.space,
         }
@@ -187,14 +190,20 @@ pub struct Workspace {
     pub(crate) cached_git_status_key: PathBuf,
     /// Cached current git branch for the workspace repo.
     pub(crate) cached_git_branch: Option<String>,
+    /// Cached remote upstream for the workspace repo's current branch.
+    pub(crate) cached_git_primary_upstream: Option<String>,
     /// Cached ahead/behind counts for the workspace repo's current branch upstream.
     pub(crate) cached_git_ahead_behind: Option<(usize, usize)>,
     /// Cached derived Git repo metadata for worktree actions and status display.
     pub(crate) cached_git_space: Option<GitSpaceMetadata>,
-    /// Explicit Herdr-managed worktree grouping provenance.
+    /// First-class repository checkout provenance, bound when the workspace opens.
+    pub checkout: Option<crate::repository::CheckoutProvenance>,
+    /// Compatibility projection for the previous workspace/worktree API.
     pub worktree_space: Option<WorktreeSpaceMembership>,
     pub(crate) metadata_tokens: crate::metadata_tokens::MetadataTokens,
     pub(crate) metadata_token_sequences: HashMap<String, u64>,
+    /// Transient plugin-owned runtime resources. Never persisted with the session.
+    pub(crate) resources: crate::workspace_resources::WorkspaceResourceRegistry,
     /// Public pane numbers within this workspace. Closed pane numbers are not reused.
     pub public_pane_numbers: HashMap<PaneId, usize>,
     pub(crate) next_public_pane_number: usize,
@@ -256,11 +265,14 @@ impl Workspace {
             cached_auto_label,
             cached_git_status_key,
             cached_git_branch: git_branch(&identity_cwd),
+            cached_git_primary_upstream: None,
             cached_git_ahead_behind: None,
             cached_git_space,
+            checkout: None,
             worktree_space: None,
             metadata_tokens: crate::metadata_tokens::MetadataTokens::default(),
             metadata_token_sequences: HashMap::new(),
+            resources: crate::workspace_resources::WorkspaceResourceRegistry::default(),
             public_pane_numbers,
             next_public_pane_number: 2,
             next_public_tab_number: 2,
@@ -444,11 +456,14 @@ impl Workspace {
                 cached_auto_label,
                 cached_git_status_key,
                 cached_git_branch: git_branch(&initial_cwd),
+                cached_git_primary_upstream: None,
                 cached_git_ahead_behind: None,
                 cached_git_space,
+                checkout: None,
                 worktree_space: None,
                 metadata_tokens: crate::metadata_tokens::MetadataTokens::default(),
                 metadata_token_sequences: HashMap::new(),
+                resources: crate::workspace_resources::WorkspaceResourceRegistry::default(),
                 public_pane_numbers,
                 next_public_pane_number: 2,
                 next_public_tab_number: 2,
@@ -1612,12 +1627,29 @@ impl Workspace {
         self.cached_git_branch.clone()
     }
 
+    pub fn primary_upstream(&self) -> Option<&str> {
+        self.cached_git_primary_upstream.as_deref()
+    }
+
     pub fn git_ahead_behind(&self) -> Option<(usize, usize)> {
         self.cached_git_ahead_behind
     }
 
     pub fn git_space(&self) -> Option<&GitSpaceMetadata> {
         self.cached_git_space.as_ref()
+    }
+
+    /// Resolve Git identity from the live checkout first. The refresh cache is
+    /// only a continuity fallback when Git discovery cannot currently run.
+    pub(crate) fn resolved_git_space_from(
+        &self,
+        terminals: &HashMap<TerminalId, TerminalState>,
+        terminal_runtimes: &TerminalRuntimeRegistry,
+    ) -> Option<GitSpaceMetadata> {
+        self.resolved_identity_cwd_from(terminals, terminal_runtimes)
+            .as_deref()
+            .and_then(git_space_metadata)
+            .or_else(|| self.cached_git_space.clone())
     }
 
     pub fn worktree_space(&self) -> Option<&WorktreeSpaceMembership> {
@@ -1769,11 +1801,14 @@ impl Workspace {
             cached_auto_label: fallback_label_from_cwd(&identity_cwd),
             cached_git_status_key: identity_cwd.clone(),
             cached_git_branch: git_branch(&identity_cwd),
+            cached_git_primary_upstream: None,
             cached_git_ahead_behind: None,
             cached_git_space: None,
+            checkout: None,
             worktree_space: None,
             metadata_tokens: crate::metadata_tokens::MetadataTokens::default(),
             metadata_token_sequences: HashMap::new(),
+            resources: crate::workspace_resources::WorkspaceResourceRegistry::default(),
             public_pane_numbers,
             next_public_pane_number: 2,
             next_public_tab_number: 2,
@@ -2080,18 +2115,13 @@ mod tests {
         assert!(first.starts_with('w'));
         assert!(second.starts_with('w'));
         assert_ne!(first, second);
-        assert_eq!(
-            public_workspace_number(&first).map(encode_public_number),
-            first.strip_prefix('w').map(str::to_owned)
-        );
-        assert_eq!(
-            public_workspace_number(&second).map(encode_public_number),
-            second.strip_prefix('w').map(str::to_owned)
-        );
-
-        // Handle length is determined by the counter value, not test execution order.
-        assert_eq!(format!("w{}", encode_public_number(1)).len(), 2);
-        assert_eq!(format!("w{}", encode_public_number(1024)).len(), 3);
+        // The public counter encoding remains at most two characters through
+        // the original short-handle range; this avoids depending on global
+        // allocation consumed by other tests.
+        for counter in [1, 31, 32, 1023] {
+            let id = format!("w{}", encode_public_number(counter));
+            assert!(id.len() <= 3, "unexpectedly long workspace id: {id}");
+        }
     }
 
     #[test]

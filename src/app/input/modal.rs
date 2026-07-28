@@ -373,6 +373,7 @@ pub(super) fn open_rename_workspace(
     ws_idx: usize,
 ) {
     state.pending_workspace_create_cwd = None;
+    state.rename_repository_target = None;
     state.selected = ws_idx;
     state.rename_pane_target = None;
     state.name_input =
@@ -381,11 +382,41 @@ pub(super) fn open_rename_workspace(
     state.mode = Mode::RenameWorkspace;
 }
 
+fn repository_workspace_index(state: &AppState, repository_id: &str) -> Option<usize> {
+    state
+        .repository(repository_id)
+        .and_then(|repository| {
+            repository
+                .last_focused_workspace_id
+                .as_ref()
+                .or_else(|| repository.checkout_workspace_ids.first())
+        })
+        .and_then(|workspace_id| {
+            state
+                .workspaces
+                .iter()
+                .position(|workspace| &workspace.id == workspace_id)
+        })
+}
+
+pub(super) fn open_rename_repository(state: &mut AppState, repository_id: String) {
+    let Some(repository) = state.repository(&repository_id) else {
+        return;
+    };
+    state.name_input = repository.display_label().to_string();
+    state.name_input_replace_on_type = false;
+    state.pending_workspace_create_cwd = None;
+    state.rename_repository_target = Some(repository_id);
+    state.rename_pane_target = None;
+    state.mode = Mode::RenameWorkspace;
+}
+
 pub(crate) fn open_new_workspace_dialog(state: &mut AppState, cwd: std::path::PathBuf) {
     let suggested_name = crate::workspace::derive_label_from_cwd(&cwd);
     state.creating_new_tab = false;
     state.requested_new_tab_name = None;
     state.pending_workspace_create_cwd = Some(cwd);
+    state.rename_repository_target = None;
     state.rename_pane_target = None;
     state.name_input = suggested_name;
     state.name_input_replace_on_type = true;
@@ -738,7 +769,11 @@ pub(super) fn open_confirm_close(state: &mut AppState) {
 
 #[cfg(test)]
 pub(super) fn confirm_close_accept(state: &mut AppState) {
-    state.close_selected_workspace();
+    if let Some(repository_id) = state.confirm_repository_close_target.take() {
+        state.close_repository(&repository_id);
+    } else {
+        state.close_selected_workspace();
+    }
     if state.workspaces.is_empty() {
         state.mode = Mode::Navigate;
     } else {
@@ -747,6 +782,7 @@ pub(super) fn confirm_close_accept(state: &mut AppState) {
 }
 
 pub(super) fn confirm_close_cancel(state: &mut AppState) {
+    state.confirm_repository_close_target = None;
     state.mode = Mode::Navigate;
 }
 
@@ -768,8 +804,59 @@ pub(super) fn apply_context_menu_action(
 ) {
     let item = menu.items().get(idx).copied();
     match (menu.kind, item) {
-        (ContextMenuKind::GitWorkspace { ws_idx, .. }, Some("New worktree")) => {
-            state.request_new_linked_worktree = Some(ws_idx);
+        (ContextMenuKind::Repository { repository_id, .. }, Some("New worktree")) => {
+            if let Some(ws_idx) = repository_workspace_index(state, &repository_id) {
+                state.request_new_repository_worktree = Some((repository_id, ws_idx));
+            }
+            leave_modal(state);
+        }
+        (ContextMenuKind::Repository { repository_id, .. }, Some("Open worktree...")) => {
+            state.request_open_existing_worktree =
+                repository_workspace_index(state, &repository_id);
+            leave_modal(state);
+        }
+        (
+            ContextMenuKind::Repository {
+                repository_id,
+                collapsed,
+            },
+            Some("Collapse" | "Expand"),
+        ) => {
+            if collapsed {
+                state.collapsed_space_keys.remove(&repository_id);
+            } else {
+                state.collapsed_space_keys.insert(repository_id);
+            }
+            leave_modal(state);
+        }
+        (ContextMenuKind::Repository { repository_id, .. }, Some("Rename repository")) => {
+            open_rename_repository(state, repository_id);
+        }
+        (ContextMenuKind::Repository { repository_id, .. }, Some("Close repository...")) => {
+            if let Some(ws_idx) = repository_workspace_index(state, &repository_id) {
+                state.selected = ws_idx;
+            }
+            state.confirm_repository_close_target = Some(repository_id);
+            open_confirm_close(state);
+        }
+        (
+            ContextMenuKind::GitWorkspace {
+                ws_idx,
+                has_worktree_children,
+                ..
+            },
+            Some("New worktree"),
+        ) => {
+            if has_worktree_children {
+                state.request_new_repository_worktree = state
+                    .workspaces
+                    .get(ws_idx)
+                    .and_then(|workspace| workspace.checkout.as_ref())
+                    .map(|checkout| (checkout.repository_id.clone(), ws_idx));
+            }
+            if state.request_new_repository_worktree.is_none() {
+                state.request_new_linked_worktree = Some(ws_idx);
+            }
             leave_modal(state);
         }
         (ContextMenuKind::GitWorkspace { ws_idx, .. }, Some("Delete worktree checkout...")) => {
@@ -786,30 +873,49 @@ pub(super) fn apply_context_menu_action(
             },
             Some("Collapse" | "Expand"),
         ) => {
-            if let Some(key) = state
-                .workspaces
-                .get(ws_idx)
-                .and_then(|ws| ws.worktree_space())
-                .map(|space| space.key.clone())
-            {
+            if let Some(key) = state.workspaces.get(ws_idx).and_then(|workspace| {
+                workspace
+                    .checkout
+                    .as_ref()
+                    .map(|checkout| checkout.repository_id.clone())
+                    .or_else(|| workspace.worktree_space().map(|space| space.key.clone()))
+            }) {
                 if collapsed {
                     state.collapsed_space_keys.remove(&key);
                 } else {
                     state.collapsed_space_keys.insert(key);
                 }
-                state.mark_session_dirty();
             }
             leave_modal(state);
         }
+        (ContextMenuKind::GitWorkspace { ws_idx, .. }, Some("Rename repository")) => {
+            if let Some(repository_id) = state
+                .workspaces
+                .get(ws_idx)
+                .and_then(|workspace| workspace.checkout.as_ref())
+                .map(|checkout| checkout.repository_id.clone())
+            {
+                open_rename_repository(state, repository_id);
+            }
+        }
+        (ContextMenuKind::GitWorkspace { ws_idx, .. }, Some("Close repository...")) => {
+            state.selected = ws_idx;
+            state.confirm_repository_close_target = state
+                .workspaces
+                .get(ws_idx)
+                .and_then(|workspace| workspace.checkout.as_ref())
+                .map(|checkout| checkout.repository_id.clone());
+            open_confirm_close(state);
+        }
         (
             ContextMenuKind::Workspace { ws_idx } | ContextMenuKind::GitWorkspace { ws_idx, .. },
-            Some("Rename"),
+            Some("Rename" | "Rename checkout"),
         ) => {
             open_rename_workspace(state, terminal_runtimes, ws_idx);
         }
         (
             ContextMenuKind::Workspace { ws_idx } | ContextMenuKind::GitWorkspace { ws_idx, .. },
-            Some("Close" | "Close group"),
+            Some("Close" | "Close group" | "Close checkout"),
         ) => {
             state.selected = ws_idx;
             if state.confirm_close {
@@ -1021,7 +1127,19 @@ impl App {
 
         match self.state.mode {
             Mode::RenameWorkspace => {
-                if let Some(cwd) = self.state.pending_workspace_create_cwd.take() {
+                if let Some(repository_id) = self.state.rename_repository_target.take() {
+                    if !new_name.is_empty() {
+                        self.dispatch_runtime_mutation(
+                            "tui.repository.rename",
+                            crate::api::schema::Method::RepositoryRename(
+                                crate::api::schema::RepositoryRenameParams {
+                                    repository_id,
+                                    label: new_name,
+                                },
+                            ),
+                        );
+                    }
+                } else if let Some(cwd) = self.state.pending_workspace_create_cwd.take() {
                     let suggested_name = crate::workspace::derive_label_from_cwd(&cwd);
                     let label = workspace_create_label(&new_name, &suggested_name);
                     self.runtime_workspace_create(
@@ -1124,9 +1242,18 @@ impl App {
         if self.confirm_pending_collection_group_close() {
             return;
         }
-        let ws_idx = self.state.selected;
-        if ws_idx < self.state.workspaces.len() {
-            self.close_workspace_idx_via_api(ws_idx);
+        if let Some(repository_id) = self.state.confirm_repository_close_target.take() {
+            self.dispatch_runtime_mutation(
+                "tui.repository.close",
+                crate::api::schema::Method::RepositoryClose(crate::api::schema::RepositoryTarget {
+                    repository_id,
+                }),
+            );
+        } else {
+            let ws_idx = self.state.selected;
+            if ws_idx < self.state.workspaces.len() {
+                self.close_workspace_idx_via_api(ws_idx);
+            }
         }
         self.state.mode = if self.state.active.is_some() {
             Mode::Terminal
@@ -1220,6 +1347,21 @@ impl App {
     }
 
     fn re_resolve_context_menu_kind(&self, menu: &ContextMenuState) -> Option<ContextMenuKind> {
+        // Repository menus intentionally have no plugin state: they are aggregate
+        // native targets and must never be projected onto a Checkout.
+        if let ContextMenuKind::Repository {
+            repository_id,
+            collapsed,
+        } = &menu.kind
+        {
+            return self
+                .state
+                .repository(repository_id)
+                .map(|_| ContextMenuKind::Repository {
+                    repository_id: repository_id.clone(),
+                    collapsed: *collapsed,
+                });
+        }
         let target = &menu.plugin.as_ref()?.target;
         match (&menu.kind, target) {
             (
@@ -1229,21 +1371,80 @@ impl App {
                 .parse_workspace_id(id)
                 .map(|ws_idx| ContextMenuKind::Workspace { ws_idx }),
             (
-                ContextMenuKind::GitWorkspace {
-                    is_linked_worktree,
-                    has_worktree_children,
+                ContextMenuKind::Repository {
+                    repository_id,
                     collapsed,
-                    ..
                 },
-                crate::app::state::ContextMenuTarget::Workspace(id),
+                crate::app::state::ContextMenuTarget::Workspace(_),
             ) => self
-                .parse_workspace_id(id)
-                .map(|ws_idx| ContextMenuKind::GitWorkspace {
-                    ws_idx,
-                    is_linked_worktree: *is_linked_worktree,
-                    has_worktree_children: *has_worktree_children,
+                .state
+                .repository(repository_id)
+                .map(|_| ContextMenuKind::Repository {
+                    repository_id: repository_id.clone(),
                     collapsed: *collapsed,
                 }),
+            (
+                ContextMenuKind::GitWorkspace { .. },
+                crate::app::state::ContextMenuTarget::Workspace(id),
+            ) => self.parse_workspace_id(id).map(|ws_idx| {
+                let workspace = &self.state.workspaces[ws_idx];
+                let is_linked_worktree = workspace.checkout.as_ref().is_some_and(|checkout| {
+                    checkout.kind == crate::repository::CheckoutKind::Linked
+                }) || workspace
+                    .worktree_space()
+                    .is_some_and(|space| space.is_linked_worktree);
+                // Revalidate against canonical membership rather than a stale
+                // rendered row: CheckoutMove may have changed the root.
+                let is_repository_root = workspace.checkout.as_ref().is_some_and(|checkout| {
+                    self.state
+                        .repository(&checkout.repository_id)
+                        .and_then(|repository| {
+                            repository
+                                .checkout_workspace_ids
+                                .iter()
+                                .find(|workspace_id| {
+                                    self.state.workspaces.iter().any(|member| {
+                                        &member.id == *workspace_id
+                                            && member.checkout.as_ref().is_some_and(
+                                                |member_checkout| {
+                                                    member_checkout.kind
+                                                        == crate::repository::CheckoutKind::Primary
+                                                },
+                                            )
+                                    })
+                                })
+                                .or_else(|| {
+                                    repository
+                                        .checkout_workspace_ids
+                                        .iter()
+                                        .find(|workspace_id| {
+                                            self.state
+                                                .workspaces
+                                                .iter()
+                                                .any(|member| &member.id == *workspace_id)
+                                        })
+                                })
+                        })
+                        .is_some_and(|workspace_id| workspace_id == &workspace.id)
+                });
+                let group_state = crate::ui::workspace_parent_group_state(&self.state, ws_idx)
+                    .filter(|_| workspace.checkout.is_none());
+                let collapsed = group_state
+                    .as_ref()
+                    .is_some_and(|(_, collapsed)| *collapsed)
+                    || workspace.checkout.as_ref().is_some_and(|checkout| {
+                        self.state
+                            .collapsed_space_keys
+                            .contains(&checkout.repository_id)
+                    });
+                ContextMenuKind::GitWorkspace {
+                    ws_idx,
+                    is_linked_worktree,
+                    is_repository_root,
+                    has_worktree_children: group_state.is_some() || is_repository_root,
+                    collapsed,
+                }
+            }),
             (ContextMenuKind::Tab { .. }, crate::app::state::ContextMenuTarget::Tab(id)) => self
                 .parse_tab_id(id)
                 .map(|(ws_idx, tab_idx)| ContextMenuKind::Tab { ws_idx, tab_idx }),
@@ -1322,8 +1523,60 @@ impl App {
         }
         menu.kind = kind;
         match (menu.kind, item) {
-            (ContextMenuKind::GitWorkspace { ws_idx, .. }, Some("New worktree")) => {
-                self.state.request_new_linked_worktree = Some(ws_idx);
+            (ContextMenuKind::Repository { repository_id, .. }, Some("New worktree")) => {
+                if let Some(ws_idx) = repository_workspace_index(&self.state, &repository_id) {
+                    self.state.request_new_repository_worktree = Some((repository_id, ws_idx));
+                }
+                leave_modal(&mut self.state);
+            }
+            (ContextMenuKind::Repository { repository_id, .. }, Some("Open worktree...")) => {
+                self.state.request_open_existing_worktree =
+                    repository_workspace_index(&self.state, &repository_id);
+                leave_modal(&mut self.state);
+            }
+            (
+                ContextMenuKind::Repository {
+                    repository_id,
+                    collapsed,
+                },
+                Some("Collapse" | "Expand"),
+            ) => {
+                if collapsed {
+                    self.state.collapsed_space_keys.remove(&repository_id);
+                } else {
+                    self.state.collapsed_space_keys.insert(repository_id);
+                }
+                leave_modal(&mut self.state);
+            }
+            (ContextMenuKind::Repository { repository_id, .. }, Some("Rename repository")) => {
+                open_rename_repository(&mut self.state, repository_id);
+            }
+            (ContextMenuKind::Repository { repository_id, .. }, Some("Close repository...")) => {
+                if let Some(ws_idx) = repository_workspace_index(&self.state, &repository_id) {
+                    self.state.selected = ws_idx;
+                }
+                self.state.confirm_repository_close_target = Some(repository_id);
+                open_confirm_close(&mut self.state);
+            }
+            (
+                ContextMenuKind::GitWorkspace {
+                    ws_idx,
+                    has_worktree_children,
+                    ..
+                },
+                Some("New worktree"),
+            ) => {
+                if has_worktree_children {
+                    self.state.request_new_repository_worktree = self
+                        .state
+                        .workspaces
+                        .get(ws_idx)
+                        .and_then(|workspace| workspace.checkout.as_ref())
+                        .map(|checkout| (checkout.repository_id.clone(), ws_idx));
+                }
+                if self.state.request_new_repository_worktree.is_none() {
+                    self.state.request_new_linked_worktree = Some(ws_idx);
+                }
                 leave_modal(&mut self.state);
             }
             (ContextMenuKind::GitWorkspace { ws_idx, .. }, Some("Delete worktree checkout...")) => {
@@ -1340,31 +1593,51 @@ impl App {
                 },
                 Some("Collapse" | "Expand"),
             ) => {
-                if let Some(key) = self
-                    .state
-                    .workspaces
-                    .get(ws_idx)
-                    .and_then(|ws| ws.worktree_space())
-                    .map(|space| space.key.clone())
-                {
+                if let Some(key) = self.state.workspaces.get(ws_idx).and_then(|workspace| {
+                    workspace
+                        .checkout
+                        .as_ref()
+                        .map(|checkout| checkout.repository_id.clone())
+                        .or_else(|| workspace.worktree_space().map(|space| space.key.clone()))
+                }) {
                     if collapsed {
                         self.state.collapsed_space_keys.remove(&key);
                     } else {
                         self.state.collapsed_space_keys.insert(key);
                     }
-                    self.state.mark_session_dirty();
                 }
                 leave_modal(&mut self.state);
+            }
+            (ContextMenuKind::GitWorkspace { ws_idx, .. }, Some("Rename repository")) => {
+                if let Some(repository_id) = self
+                    .state
+                    .workspaces
+                    .get(ws_idx)
+                    .and_then(|workspace| workspace.checkout.as_ref())
+                    .map(|checkout| checkout.repository_id.clone())
+                {
+                    open_rename_repository(&mut self.state, repository_id);
+                }
+            }
+            (ContextMenuKind::GitWorkspace { ws_idx, .. }, Some("Close repository...")) => {
+                self.state.selected = ws_idx;
+                self.state.confirm_repository_close_target = self
+                    .state
+                    .workspaces
+                    .get(ws_idx)
+                    .and_then(|workspace| workspace.checkout.as_ref())
+                    .map(|checkout| checkout.repository_id.clone());
+                open_confirm_close(&mut self.state);
             }
             (
                 ContextMenuKind::Workspace { ws_idx }
                 | ContextMenuKind::GitWorkspace { ws_idx, .. },
-                Some("Rename"),
+                Some("Rename" | "Rename checkout"),
             ) => open_rename_workspace(&mut self.state, &self.terminal_runtimes, ws_idx),
             (
                 ContextMenuKind::Workspace { ws_idx }
                 | ContextMenuKind::GitWorkspace { ws_idx, .. },
-                Some("Close" | "Close group"),
+                Some("Close" | "Close group" | "Close checkout"),
             ) => {
                 self.state.selected = ws_idx;
                 if self.state.confirm_close {
@@ -1542,6 +1815,7 @@ fn cancel_rename_modal(state: &mut AppState) {
     state.creating_new_tab = false;
     state.requested_new_tab_name = None;
     state.pending_workspace_create_cwd = None;
+    state.rename_repository_target = None;
     state.rename_pane_target = None;
     state.name_input.clear();
     state.name_input_replace_on_type = false;
@@ -2361,6 +2635,7 @@ mod tests {
             kind: ContextMenuKind::GitWorkspace {
                 ws_idx: 0,
                 is_linked_worktree: false,
+                is_repository_root: false,
                 has_worktree_children: true,
                 collapsed: false,
             },
@@ -2379,8 +2654,8 @@ mod tests {
 
         confirm_close_accept(&mut state);
 
-        assert!(state.workspaces.is_empty());
-        assert_eq!(state.mode, Mode::Navigate);
+        assert_eq!(state.workspaces.len(), 1);
+        assert_eq!(state.workspaces[0].display_name(), "issue");
     }
 
     #[test]
@@ -2429,12 +2704,12 @@ mod tests {
         apply_context_menu_action(&mut state, &mut terminal_runtimes, menu, idx);
 
         assert_eq!(state.selected, 0);
-        assert_eq!(state.mode, Mode::ConfirmClose);
-        assert_eq!(state.workspaces.len(), 2);
+        assert_eq!(state.mode, Mode::Terminal);
+        assert_eq!(state.workspaces.len(), 1);
     }
 
     #[test]
-    fn api_context_menu_close_tab_last_parent_group_workspace_keeps_confirmation_mode() {
+    fn api_context_menu_close_tab_last_primary_checkout_closes_only_checkout() {
         let mut app = app_with_test_workspaces(&["main", "issue"]);
         mark_worktree_space_member(&mut app.state, 0, "repo-key");
         mark_worktree_space_member(&mut app.state, 1, "repo-key");
@@ -2464,8 +2739,8 @@ mod tests {
         app.apply_context_menu_action_via_api(menu, idx);
 
         assert_eq!(app.state.selected, 0);
-        assert_eq!(app.state.mode, Mode::ConfirmClose);
-        assert_eq!(app.state.workspaces.len(), 2);
+        assert_eq!(app.state.mode, Mode::Terminal);
+        assert_eq!(app.state.workspaces.len(), 1);
     }
 
     #[test]
@@ -2505,8 +2780,8 @@ mod tests {
         app.handle_context_menu_key_via_api(KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()));
 
         assert_eq!(app.state.selected, 0);
-        assert_eq!(app.state.mode, Mode::ConfirmClose);
-        assert_eq!(app.state.workspaces.len(), 2);
+        assert_eq!(app.state.mode, Mode::Terminal);
+        assert_eq!(app.state.workspaces.len(), 1);
         assert!(app.state.context_menu.is_none());
     }
 }

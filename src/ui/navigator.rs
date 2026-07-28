@@ -276,17 +276,18 @@ fn render_row(
     }
 }
 
-/// Tree prefix for a navigator row: expand caret for workspaces, connected
-/// branch glyphs for children (`├──`, `└──` for the last sibling, with `│`
-/// continuation lines under ancestors that have more siblings below).
+/// Tree prefix for a navigator row: expand carets stay attached to their
+/// workspace's connector, while descendants use (`├──`, `└──`) with `│`
+/// continuation lines under ancestors that have more siblings below.
 fn tree_prefix(rows: &[NavigatorRow], idx: usize) -> String {
     let row = &rows[idx];
-    if row.is_workspace {
-        return if row.expanded { "▾" } else { "▸" }.to_string();
-    }
+    let caret = row
+        .is_workspace
+        .then_some(if row.expanded { "▾" } else { "▸" });
     if row.depth == 0 {
-        return "  ".to_string();
+        return caret.unwrap_or("  ").to_string();
     }
+
     let mut prefix = String::new();
     for level in 1..row.depth {
         prefix.push_str(if has_following_sibling_at_depth(rows, idx, level) {
@@ -300,6 +301,9 @@ fn tree_prefix(rows: &[NavigatorRow], idx: usize) -> String {
     } else {
         "└──"
     });
+    if let Some(caret) = caret {
+        prefix.push_str(caret);
+    }
     prefix
 }
 
@@ -380,6 +384,21 @@ fn selected_detail(app: &AppState, terminal_runtimes: &TerminalRuntimeRegistry) 
         return String::new();
     };
     match row.target {
+        NavigatorTarget::WorkspaceResource {
+            ref workspace_id,
+            ref plugin_id,
+            ref resource_id,
+        } => app
+            .workspaces
+            .iter()
+            .find(|workspace| &workspace.id == workspace_id)
+            .and_then(|workspace| workspace.resources.find(plugin_id, resource_id))
+            .and_then(|resource| resource.detail.clone())
+            .unwrap_or_default(),
+        NavigatorTarget::Repository { ref repository_id } => app
+            .repository(repository_id)
+            .map(|repository| format!("{} · {}", repository.git_common_dir.display(), row.meta))
+            .unwrap_or_default(),
         NavigatorTarget::Workspace { ws_idx } => workspace_detail(app, terminal_runtimes, ws_idx),
         NavigatorTarget::Tab { ws_idx, tab_idx } => {
             tab_detail(app, terminal_runtimes, ws_idx, tab_idx)
@@ -635,6 +654,27 @@ mod tests {
     fn spine_stops_after_last_ancestor_sibling() {
         let rows = multi_tab_rows();
         assert_eq!(tree_prefix(&rows, 5), "   └──");
+    }
+
+    #[test]
+    fn checkout_tree_prefixes_preserve_primary_linked_and_resource_depths() {
+        // primary -> resource, linked checkout -> resource, linked checkout -> resource
+        let rows = vec![
+            row(0, true),
+            row(2, false),
+            row(1, true),
+            row(2, false),
+            row(1, true),
+            row(2, false),
+        ];
+
+        assert_eq!(
+            rows.iter()
+                .enumerate()
+                .map(|(idx, _)| tree_prefix(&rows, idx))
+                .collect::<Vec<_>>(),
+            vec!["▾", "│  └──", "├──▾", "│  └──", "└──▾", "   └──"]
+        );
     }
 
     #[test]

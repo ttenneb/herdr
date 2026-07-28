@@ -15,6 +15,7 @@ use super::{
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct GitStatusRefreshDemand {
     pub branch: bool,
+    pub upstream: bool,
     pub ahead_behind: bool,
 }
 
@@ -22,11 +23,12 @@ impl GitStatusRefreshDemand {
     #[cfg(test)]
     pub const ALL: Self = Self {
         branch: true,
+        upstream: true,
         ahead_behind: true,
     };
 
     pub fn is_empty(self) -> bool {
-        !self.branch && !self.ahead_behind
+        !self.branch && !self.upstream && !self.ahead_behind
     }
 }
 
@@ -99,6 +101,7 @@ pub fn git_status_snapshot_for_cwd_with_demand(
         let snapshot = WorkspaceGitStatusSnapshot {
             auto_label: fallback_label_from_cwd(cwd),
             branch: None,
+            upstream: None,
             ahead_behind: None,
             space: None,
         };
@@ -115,19 +118,28 @@ pub fn git_status_snapshot_for_cwd_with_demand(
     let auto_label = space.label.clone();
 
     if !demand.ahead_behind {
+        let fingerprint = demand
+            .branch
+            .then(|| git_status_fingerprint_from_info(&info))
+            .flatten();
         let branch = demand
             .branch
             .then(|| {
-                read_head_identity(&info).and_then(|head| match head {
-                    GitHeadIdentity::Branch { short_name, .. } => Some(short_name),
-                    GitHeadIdentity::Detached { .. } => None,
-                })
+                fingerprint
+                    .as_ref()
+                    .and_then(GitStatusFingerprint::branch_name)
             })
+            .flatten()
+            .map(str::to_string);
+        let upstream = demand
+            .upstream
+            .then(|| primary_remote_upstream_name(&info))
             .flatten();
         return (
             WorkspaceGitStatusSnapshot {
                 auto_label,
                 branch,
+                upstream,
                 ahead_behind: None,
                 space: Some(space),
             },
@@ -140,6 +152,7 @@ pub fn git_status_snapshot_for_cwd_with_demand(
             WorkspaceGitStatusSnapshot {
                 auto_label,
                 branch: None,
+                upstream: None,
                 ahead_behind: None,
                 space: Some(space),
             },
@@ -147,11 +160,16 @@ pub fn git_status_snapshot_for_cwd_with_demand(
         );
     };
     let branch = fingerprint.branch_name().map(str::to_string);
+    let upstream = demand
+        .upstream
+        .then(|| primary_remote_upstream_name(&info))
+        .flatten();
 
     if let Some(cached) = cached.filter(|entry| entry.fingerprint.as_ref() == Some(&fingerprint)) {
         let snapshot = WorkspaceGitStatusSnapshot {
             auto_label,
             branch,
+            upstream,
             ahead_behind: cached.snapshot.ahead_behind,
             space: Some(space),
         };
@@ -172,6 +190,7 @@ pub fn git_status_snapshot_for_cwd_with_demand(
     let snapshot = WorkspaceGitStatusSnapshot {
         auto_label,
         branch,
+        upstream,
         ahead_behind,
         space: Some(space),
     };
@@ -206,6 +225,31 @@ fn git_status_fingerprint_from_info(info: &GitWorktreeInfo) -> Option<GitStatusF
     })
 }
 
+fn primary_remote_upstream_name(info: &GitWorktreeInfo) -> Option<String> {
+    if info.is_bare {
+        return None;
+    }
+    let primary = if info.is_linked_worktree {
+        let repo_root = (info.git_common_dir.file_name()? == ".git")
+            .then(|| info.git_common_dir.parent().map(Path::to_path_buf))
+            .flatten()?;
+        GitWorktreeInfo {
+            repo_root,
+            git_dir: info.git_common_dir.clone(),
+            git_common_dir: info.git_common_dir.clone(),
+            is_bare: false,
+            is_linked_worktree: false,
+        }
+    } else {
+        info.clone()
+    };
+    let branch = match read_head_identity(&primary)? {
+        GitHeadIdentity::Branch { short_name, .. } => short_name,
+        GitHeadIdentity::Detached { .. } => return None,
+    };
+    read_upstream_identity(&primary, &branch)?.remote_name()
+}
+
 impl GitStatusFingerprint {
     fn branch_name(&self) -> Option<&str> {
         match &self.head {
@@ -225,6 +269,16 @@ impl GitStatusFingerprint {
         self.upstream
             .as_ref()
             .and_then(|upstream| upstream.oid.as_deref())
+    }
+}
+
+impl GitUpstreamIdentity {
+    fn remote_name(&self) -> Option<String> {
+        if self.remote == "." {
+            return None;
+        }
+        let branch = self.merge_ref.strip_prefix("refs/heads/")?;
+        Some(format!("{}/{}", self.remote, branch))
     }
 }
 
@@ -398,6 +452,7 @@ mod tests {
         let (snapshot, update) = git_status_snapshot_for_cwd(&root, Some(&cache_entry));
 
         assert_eq!(snapshot.branch.as_deref(), Some("main"));
+        assert_eq!(snapshot.upstream.as_deref(), Some("origin/main"));
         assert!(update.is_some_and(|entry| entry.fingerprint.is_some()));
         std::fs::remove_dir_all(root).unwrap();
     }
@@ -412,14 +467,96 @@ mod tests {
             None,
             GitStatusRefreshDemand {
                 branch: true,
+                upstream: false,
                 ahead_behind: false,
             },
         );
 
         assert_eq!(snapshot.branch.as_deref(), Some("main"));
+        assert_eq!(snapshot.upstream, None);
         assert_eq!(snapshot.ahead_behind, None);
         assert_eq!(update, None);
 
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn upstream_only_refresh_reports_remote_tracking_branch() {
+        let root = temp_test_dir("upstream-only");
+        write_fake_tracked_repo(&root);
+
+        let (snapshot, update) = git_status_snapshot_for_cwd_with_demand(
+            &root,
+            None,
+            GitStatusRefreshDemand {
+                branch: false,
+                upstream: true,
+                ahead_behind: false,
+            },
+        );
+
+        assert_eq!(snapshot.branch, None);
+        assert_eq!(snapshot.upstream.as_deref(), Some("origin/main"));
+        assert_eq!(snapshot.ahead_behind, None);
+        assert_eq!(update, None);
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn linked_checkout_refresh_reports_primary_checkout_upstream() {
+        let base = temp_test_dir("linked-primary-upstream");
+        let primary = base.join("repo");
+        let linked = base.join("linked");
+        run_git(&base, &["init", "-b", "main", primary.to_str().unwrap()]);
+        run_git(&primary, &["config", "user.email", "herdr@example.invalid"]);
+        run_git(&primary, &["config", "user.name", "Herdr Test"]);
+        run_git(&primary, &["commit", "--allow-empty", "-m", "initial"]);
+        run_git(&primary, &["config", "branch.main.remote", "origin"]);
+        run_git(
+            &primary,
+            &["config", "branch.main.merge", "refs/heads/main"],
+        );
+        run_git(
+            &primary,
+            &["worktree", "add", "-b", "feature", linked.to_str().unwrap()],
+        );
+
+        let (snapshot, _) = git_status_snapshot_for_cwd_with_demand(
+            &linked,
+            None,
+            GitStatusRefreshDemand {
+                branch: false,
+                upstream: true,
+                ahead_behind: false,
+            },
+        );
+
+        assert_eq!(snapshot.upstream.as_deref(), Some("origin/main"));
+        std::fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn upstream_refresh_hides_local_tracking_branch() {
+        let root = temp_test_dir("local-upstream");
+        write_fake_tracked_repo(&root);
+        std::fs::write(
+            root.join(".git/config"),
+            "[branch \"main\"]\n\tremote = .\n\tmerge = refs/heads/other\n",
+        )
+        .unwrap();
+
+        let (snapshot, _) = git_status_snapshot_for_cwd_with_demand(
+            &root,
+            None,
+            GitStatusRefreshDemand {
+                branch: false,
+                upstream: true,
+                ahead_behind: false,
+            },
+        );
+
+        assert_eq!(snapshot.upstream, None);
         std::fs::remove_dir_all(root).unwrap();
     }
 
@@ -434,6 +571,7 @@ mod tests {
             snapshot: WorkspaceGitStatusSnapshot {
                 auto_label: "repo".into(),
                 branch: Some("main".into()),
+                upstream: Some("origin/main".into()),
                 ahead_behind: Some((2, 1)),
                 space: git_space_metadata(&root),
             },
@@ -459,6 +597,7 @@ mod tests {
             snapshot: WorkspaceGitStatusSnapshot {
                 auto_label: "repo".into(),
                 branch: Some("main".into()),
+                upstream: Some("origin/main".into()),
                 ahead_behind: Some((4, 0)),
                 space: git_space_metadata(&root),
             },
@@ -494,6 +633,7 @@ mod tests {
             snapshot: WorkspaceGitStatusSnapshot {
                 auto_label: "repo".into(),
                 branch: Some("main".into()),
+                upstream: Some("origin/main".into()),
                 ahead_behind: Some((0, 3)),
                 space: git_space_metadata(&root),
             },

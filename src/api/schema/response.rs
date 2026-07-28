@@ -17,6 +17,7 @@ use super::plugins::{
     InstalledPluginInfo, PluginActionInfo, PluginCommandLogInfo, PluginInvocationContext,
     PluginPaneInfo,
 };
+use super::repositories::RepositoryInfo;
 use super::server::ServerCapabilities;
 use super::session::SessionSnapshot;
 use super::tabs::TabInfo;
@@ -63,6 +64,12 @@ pub enum ResponseResult {
     },
     WorkspaceList {
         workspaces: Vec<WorkspaceInfo>,
+    },
+    RepositoryInfo {
+        repository: RepositoryInfo,
+    },
+    RepositoryList {
+        repositories: Vec<RepositoryInfo>,
     },
     WorktreeList {
         source: WorktreeSourceInfo,

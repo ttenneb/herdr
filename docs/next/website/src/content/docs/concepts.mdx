@@ -7,9 +7,15 @@ Herdr is a terminal workspace manager. It keeps real terminal processes running 
 
 ## Workspace
 
-A workspace is the top-level project container. Use one workspace per repo, task, or investigation.
+A **Space** is one entry in the session’s ordered project list. Git directories open as a two-level Repository → Checkout Space; non-Git directories remain standalone Spaces.
 
-A workspace owns tabs and panes. Its sidebar state rolls up from the agents inside it, so you can see which project needs attention.
+A **Repository** is identified by its canonical Git common directory. Linked worktrees group automatically with their primary checkout, while separate clones and nested repositories remain separate. Its primary Checkout is the visible, clickable root of the hierarchy and uses the Repository name (including a custom rename); linked Checkouts appear beneath it with their branch labels. The root still shows the primary checkout’s branch, upstream, and status details.
+
+A **Checkout** is the terminal workspace that owns tabs and panes. The primary Checkout is the Repository’s root; linked and detached Checkouts are its children. Closing a Checkout only closes Herdr runtime state. It never removes its directory or branch; use the explicit worktree removal action to remove a linked checkout.
+
+The New worktree dialog resolves its displayed Base to an exact commit. Select `[change]` (or press `tab`) to edit the ref. A successfully used Base becomes the Repository preference. When the branch already exists, Git checks out that branch directly, the Base is explicitly marked ignored, and the preference is unchanged.
+
+Existing `workspace.*` automation remains compatible and addresses Checkouts or standalone Spaces. New integrations should prefer `repository.*` and `checkout.*`.
 
 ## Tab
 

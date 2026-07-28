@@ -2578,7 +2578,7 @@ mod tests {
     }
 
     #[test]
-    fn empty_final_collection_uses_group_workspace_close_path() {
+    fn empty_final_collection_closes_only_its_workspace() {
         let (_tx, rx) = tokio::sync::mpsc::unbounded_channel();
         let mut app = App::new(
             &Config::default(),
@@ -2623,6 +2623,7 @@ mod tests {
         app.state.workspaces[0].worktree_space = Some(membership(false));
         let mut linked = Workspace::test_new("linked");
         linked.worktree_space = Some(membership(true));
+        let linked_workspace_id = linked.id.clone();
         app.state.workspaces.push(linked);
         app.state.ensure_test_terminals();
         app.state.confirm_close = false;
@@ -2639,14 +2640,15 @@ mod tests {
         );
 
         assert_eq!(closed["result"]["type"], "ok");
-        assert!(app.state.workspaces.is_empty());
+        assert_eq!(app.state.workspaces.len(), 1);
+        assert_eq!(app.state.workspaces[0].id, linked_workspace_id);
         let events = app.event_hub.events_after(sequence);
         assert_eq!(
             events
                 .iter()
                 .filter(|(_, event)| event.event == EventKind::WorkspaceClosed)
                 .count(),
-            2
+            1
         );
         assert!(events
             .iter()
@@ -2705,7 +2707,7 @@ mod tests {
     }
 
     #[test]
-    fn final_collection_close_uses_group_workspace_close_and_emits_all_events() {
+    fn final_collection_close_closes_only_its_workspace_and_emits_all_events() {
         let (mut app, root, second, third) = app_with_panes();
         let collection_id = create_collection(&mut app, root);
         for pane in [root, second, third] {
@@ -2720,6 +2722,7 @@ mod tests {
             assert!(added.get("error").is_none(), "{added}");
         }
         app.state.workspaces.push(Workspace::test_new("linked"));
+        let linked_workspace_id = app.state.workspaces[1].id.clone();
         let membership = |linked| crate::workspace::WorktreeSpaceMembership {
             key: "repo-key".into(),
             label: "repo".into(),
@@ -2748,14 +2751,15 @@ mod tests {
         );
 
         assert_eq!(closed["result"]["type"], "ok");
-        assert!(app.state.workspaces.is_empty());
+        assert_eq!(app.state.workspaces.len(), 1);
+        assert_eq!(app.state.workspaces[0].id, linked_workspace_id);
         let events = app.event_hub.events_after(sequence);
         assert_eq!(
             events
                 .iter()
                 .filter(|(_, event)| event.event == EventKind::WorkspaceClosed)
                 .count(),
-            2
+            1
         );
         assert!(events
             .iter()
@@ -2765,7 +2769,7 @@ mod tests {
                 .iter()
                 .filter(|(_, event)| event.event == EventKind::PaneClosed)
                 .count(),
-            4
+            3
         );
     }
 

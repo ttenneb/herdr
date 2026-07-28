@@ -454,6 +454,9 @@ fn plugin_action_invoke(args: &[String]) -> std::io::Result<i32> {
         action_id: action_id.clone(),
         plugin_id,
         context: Some(PluginInvocationContext {
+            workspace_resource: None,
+            repository_id: None,
+            checkout: None,
             workspace_id: None,
             workspace_label: None,
             workspace_cwd: None,
@@ -1300,6 +1303,7 @@ fn choice_provider_contexts(contexts: &[PluginActionContext]) -> String {
         .iter()
         .filter_map(|context| match context {
             PluginActionContext::Workspace => Some("workspace"),
+            PluginActionContext::WorkspaceResource => Some("workspace_resource"),
             PluginActionContext::Tab => Some("tab"),
             PluginActionContext::Pane => Some("pane"),
             PluginActionContext::Global | PluginActionContext::Selection => None,
