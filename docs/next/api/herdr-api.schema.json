@@ -79,6 +79,36 @@
           ],
           "type": "string"
         },
+        "CheckoutInfo": {
+          "properties": {
+            "checkout_path": {
+              "type": "string"
+            },
+            "kind": {
+              "$ref": "#/schemas/event/$defs/CheckoutKind"
+            },
+            "repository_id": {
+              "type": "string"
+            },
+            "workspace_id": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "workspace_id",
+            "repository_id",
+            "checkout_path",
+            "kind"
+          ],
+          "type": "object"
+        },
+        "CheckoutKind": {
+          "enum": [
+            "primary",
+            "linked"
+          ],
+          "type": "string"
+        },
         "CollectionInfo": {
           "properties": {
             "collection_id": {
@@ -291,6 +321,22 @@
             {
               "properties": {
                 "type": {
+                  "const": "workspace_resources_updated",
+                  "type": "string"
+                },
+                "workspace": {
+                  "$ref": "#/schemas/event/$defs/WorkspaceInfo"
+                }
+              },
+              "required": [
+                "type",
+                "workspace"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "type": {
                   "const": "workspace_closed",
                   "type": "string"
                 },
@@ -408,6 +454,196 @@
               "required": [
                 "type",
                 "workspace_id"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "checkout": {
+                  "$ref": "#/schemas/event/$defs/WorkspaceInfo"
+                },
+                "type": {
+                  "const": "checkout_opened",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type",
+                "checkout"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "label": {
+                  "type": "string"
+                },
+                "type": {
+                  "const": "checkout_renamed",
+                  "type": "string"
+                },
+                "workspace_id": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type",
+                "workspace_id",
+                "label"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "insert_index": {
+                  "format": "uint",
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                "type": {
+                  "const": "checkout_moved",
+                  "type": "string"
+                },
+                "workspace_id": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type",
+                "workspace_id",
+                "insert_index"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "checkout": {
+                  "anyOf": [
+                    {
+                      "$ref": "#/schemas/event/$defs/WorkspaceInfo"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
+                },
+                "type": {
+                  "const": "checkout_closed",
+                  "type": "string"
+                },
+                "workspace_id": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type",
+                "workspace_id"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "type": {
+                  "const": "checkout_focused",
+                  "type": "string"
+                },
+                "workspace_id": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type",
+                "workspace_id"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "repository": {
+                  "$ref": "#/schemas/event/$defs/RepositoryInfo"
+                },
+                "type": {
+                  "const": "repository_created",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type",
+                "repository"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "label": {
+                  "type": "string"
+                },
+                "repository_id": {
+                  "type": "string"
+                },
+                "type": {
+                  "const": "repository_renamed",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type",
+                "repository_id",
+                "label"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "insert_index": {
+                  "format": "uint",
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                "repository_id": {
+                  "type": "string"
+                },
+                "type": {
+                  "const": "repository_moved",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type",
+                "repository_id",
+                "insert_index"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "repository_id": {
+                  "type": "string"
+                },
+                "type": {
+                  "const": "repository_closed",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type",
+                "repository_id"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "repository_id": {
+                  "type": "string"
+                },
+                "type": {
+                  "const": "repository_focused",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type",
+                "repository_id"
               ],
               "type": "object"
             },
@@ -1180,11 +1416,22 @@
             "workspace_created",
             "workspace_updated",
             "workspace_metadata_updated",
+            "workspace_resources_updated",
             "workspace_closed",
             "workspace_renamed",
             "workspace_moved",
             "workspace_reordered",
             "workspace_focused",
+            "checkout_opened",
+            "checkout_renamed",
+            "checkout_moved",
+            "checkout_closed",
+            "checkout_focused",
+            "repository_created",
+            "repository_renamed",
+            "repository_moved",
+            "repository_closed",
+            "repository_focused",
             "worktree_created",
             "worktree_opened",
             "worktree_removed",
@@ -1601,6 +1848,64 @@
           ],
           "type": "object"
         },
+        "RepositoryInfo": {
+          "properties": {
+            "active_agent_count": {
+              "format": "uint",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "agent_status": {
+              "$ref": "#/schemas/event/$defs/AgentStatus"
+            },
+            "checkout_workspace_ids": {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            "focused": {
+              "type": "boolean"
+            },
+            "git_common_dir": {
+              "type": "string"
+            },
+            "label": {
+              "type": "string"
+            },
+            "last_focused_workspace_id": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "pane_count": {
+              "format": "uint",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "preferred_base": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "repository_id": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "repository_id",
+            "label",
+            "git_common_dir",
+            "checkout_workspace_ids",
+            "focused",
+            "pane_count",
+            "active_agent_count",
+            "agent_status"
+          ],
+          "type": "object"
+        },
         "SplitDirection": {
           "enum": [
             "right",
@@ -1655,6 +1960,16 @@
             "agent_status": {
               "$ref": "#/schemas/event/$defs/AgentStatus"
             },
+            "checkout": {
+              "anyOf": [
+                {
+                  "$ref": "#/schemas/event/$defs/CheckoutInfo"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
             "focused": {
               "type": "boolean"
             },
@@ -1670,6 +1985,18 @@
               "format": "uint",
               "minimum": 0,
               "type": "integer"
+            },
+            "repository_id": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "resources": {
+              "items": {
+                "$ref": "#/schemas/event/$defs/WorkspaceResourceInfo"
+              },
+              "type": "array"
             },
             "tab_count": {
               "format": "uint",
@@ -1709,6 +2036,36 @@
             "tab_count",
             "active_tab_id",
             "agent_status"
+          ],
+          "type": "object"
+        },
+        "WorkspaceResourceInfo": {
+          "properties": {
+            "data": true,
+            "detail": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "label": {
+              "type": "string"
+            },
+            "plugin_id": {
+              "type": "string"
+            },
+            "resource_id": {
+              "type": "string"
+            },
+            "workspace_id": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "workspace_id",
+            "plugin_id",
+            "resource_id",
+            "label"
           ],
           "type": "object"
         },
@@ -2265,6 +2622,54 @@
           },
           "required": [
             "target"
+          ],
+          "type": "object"
+        },
+        "CheckoutInfo": {
+          "properties": {
+            "checkout_path": {
+              "type": "string"
+            },
+            "kind": {
+              "$ref": "#/schemas/request/$defs/CheckoutKind"
+            },
+            "repository_id": {
+              "type": "string"
+            },
+            "workspace_id": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "workspace_id",
+            "repository_id",
+            "checkout_path",
+            "kind"
+          ],
+          "type": "object"
+        },
+        "CheckoutKind": {
+          "enum": [
+            "primary",
+            "linked"
+          ],
+          "type": "string"
+        },
+        "CheckoutMoveParams": {
+          "properties": {
+            "insert_index": {
+              "description": "Insertion coordinate in the repository's complete\n`checkout_workspace_ids` order (the pinned primary is index zero).\nValues targeting zero are clamped after the primary.",
+              "format": "uint",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "workspace_id": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "workspace_id",
+            "insert_index"
           ],
           "type": "object"
         },
@@ -4186,6 +4591,16 @@
         },
         "PluginInvocationContext": {
           "properties": {
+            "checkout": {
+              "anyOf": [
+                {
+                  "$ref": "#/schemas/request/$defs/CheckoutInfo"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
             "clicked_url": {
               "type": [
                 "string",
@@ -4238,6 +4653,12 @@
                 "null"
               ]
             },
+            "repository_id": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
             "selected_text": {
               "type": [
                 "string",
@@ -4272,6 +4693,16 @@
               "type": [
                 "string",
                 "null"
+              ]
+            },
+            "workspace_resource": {
+              "anyOf": [
+                {
+                  "$ref": "#/schemas/request/$defs/WorkspaceResourceInfo"
+                },
+                {
+                  "type": "null"
+                }
               ]
             },
             "worktree": {
@@ -4570,6 +5001,49 @@
           ],
           "type": "string"
         },
+        "RepositoryMoveParams": {
+          "properties": {
+            "insert_index": {
+              "format": "uint",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "repository_id": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "repository_id",
+            "insert_index"
+          ],
+          "type": "object"
+        },
+        "RepositoryRenameParams": {
+          "properties": {
+            "label": {
+              "type": "string"
+            },
+            "repository_id": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "repository_id",
+            "label"
+          ],
+          "type": "object"
+        },
+        "RepositoryTarget": {
+          "properties": {
+            "repository_id": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "repository_id"
+          ],
+          "type": "object"
+        },
         "ServerLiveHandoffParams": {
           "properties": {
             "expected_protocol": {
@@ -4643,6 +5117,18 @@
             {
               "properties": {
                 "type": {
+                  "const": "workspace.resources_updated",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "type": {
                   "const": "workspace.renamed",
                   "type": "string"
                 }
@@ -4692,6 +5178,126 @@
               "properties": {
                 "type": {
                   "const": "workspace.focused",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "type": {
+                  "const": "checkout.opened",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "type": {
+                  "const": "checkout.renamed",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "type": {
+                  "const": "checkout.moved",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "type": {
+                  "const": "checkout.closed",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "type": {
+                  "const": "checkout.focused",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "type": {
+                  "const": "repository.created",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "type": {
+                  "const": "repository.renamed",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "type": {
+                  "const": "repository.moved",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "type": {
+                  "const": "repository.closed",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "type": {
+                  "const": "repository.focused",
                   "type": "string"
                 }
               },
@@ -5373,6 +5979,97 @@
           ],
           "type": "object"
         },
+        "WorkspaceReportResourcesParams": {
+          "properties": {
+            "plugin_id": {
+              "type": "string"
+            },
+            "resources": {
+              "items": {
+                "$ref": "#/schemas/request/$defs/WorkspaceResourceInput"
+              },
+              "type": "array"
+            },
+            "seq": {
+              "format": "uint64",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "ttl_ms": {
+              "format": "uint64",
+              "maximum": 86400000,
+              "minimum": 1,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "workspace_id": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "workspace_id",
+            "plugin_id",
+            "resources"
+          ],
+          "type": "object"
+        },
+        "WorkspaceResourceInfo": {
+          "properties": {
+            "data": true,
+            "detail": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "label": {
+              "type": "string"
+            },
+            "plugin_id": {
+              "type": "string"
+            },
+            "resource_id": {
+              "type": "string"
+            },
+            "workspace_id": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "workspace_id",
+            "plugin_id",
+            "resource_id",
+            "label"
+          ],
+          "type": "object"
+        },
+        "WorkspaceResourceInput": {
+          "properties": {
+            "data": true,
+            "detail": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "label": {
+              "type": "string"
+            },
+            "resource_id": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "resource_id",
+            "label"
+          ],
+          "type": "object"
+        },
         "WorkspaceTarget": {
           "properties": {
             "workspace_id": {
@@ -5447,6 +6144,12 @@
                 "null"
               ]
             },
+            "repository_id": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
             "workspace_id": {
               "type": [
                 "string",
@@ -5459,6 +6162,12 @@
         "WorktreeListParams": {
           "properties": {
             "cwd": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "repository_id": {
               "type": [
                 "string",
                 "null"
@@ -5498,6 +6207,12 @@
               ]
             },
             "path": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "repository_id": {
               "type": [
                 "string",
                 "null"
@@ -5821,7 +6536,199 @@
         {
           "properties": {
             "method": {
+              "const": "workspace.resources.report",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/schemas/request/$defs/WorkspaceReportResourcesParams"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "method": {
               "const": "workspace.close",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/schemas/request/$defs/WorkspaceTarget"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "method": {
+              "const": "repository.list",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/schemas/request/$defs/EmptyParams"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "method": {
+              "const": "repository.get",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/schemas/request/$defs/RepositoryTarget"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "method": {
+              "const": "repository.focus",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/schemas/request/$defs/RepositoryTarget"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "method": {
+              "const": "repository.rename",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/schemas/request/$defs/RepositoryRenameParams"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "method": {
+              "const": "repository.move",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/schemas/request/$defs/RepositoryMoveParams"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "method": {
+              "const": "repository.close",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/schemas/request/$defs/RepositoryTarget"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "method": {
+              "const": "checkout.open",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/schemas/request/$defs/WorkspaceCreateParams"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "method": {
+              "const": "checkout.focus",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/schemas/request/$defs/WorkspaceTarget"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "method": {
+              "const": "checkout.rename",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/schemas/request/$defs/WorkspaceRenameParams"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "method": {
+              "const": "checkout.move",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/schemas/request/$defs/CheckoutMoveParams"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "method": {
+              "const": "checkout.close",
               "type": "string"
             },
             "params": {
@@ -7728,6 +8635,36 @@
           ],
           "type": "string"
         },
+        "CheckoutInfo": {
+          "properties": {
+            "checkout_path": {
+              "type": "string"
+            },
+            "kind": {
+              "$ref": "#/schemas/success_response/$defs/CheckoutKind"
+            },
+            "repository_id": {
+              "type": "string"
+            },
+            "workspace_id": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "workspace_id",
+            "repository_id",
+            "checkout_path",
+            "kind"
+          ],
+          "type": "object"
+        },
+        "CheckoutKind": {
+          "enum": [
+            "primary",
+            "linked"
+          ],
+          "type": "string"
+        },
         "ClientWindowTitleReason": {
           "enum": [
             "set",
@@ -8022,6 +8959,22 @@
             {
               "properties": {
                 "type": {
+                  "const": "workspace_resources_updated",
+                  "type": "string"
+                },
+                "workspace": {
+                  "$ref": "#/schemas/success_response/$defs/WorkspaceInfo"
+                }
+              },
+              "required": [
+                "type",
+                "workspace"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "type": {
                   "const": "workspace_closed",
                   "type": "string"
                 },
@@ -8139,6 +9092,196 @@
               "required": [
                 "type",
                 "workspace_id"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "checkout": {
+                  "$ref": "#/schemas/success_response/$defs/WorkspaceInfo"
+                },
+                "type": {
+                  "const": "checkout_opened",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type",
+                "checkout"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "label": {
+                  "type": "string"
+                },
+                "type": {
+                  "const": "checkout_renamed",
+                  "type": "string"
+                },
+                "workspace_id": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type",
+                "workspace_id",
+                "label"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "insert_index": {
+                  "format": "uint",
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                "type": {
+                  "const": "checkout_moved",
+                  "type": "string"
+                },
+                "workspace_id": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type",
+                "workspace_id",
+                "insert_index"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "checkout": {
+                  "anyOf": [
+                    {
+                      "$ref": "#/schemas/success_response/$defs/WorkspaceInfo"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
+                },
+                "type": {
+                  "const": "checkout_closed",
+                  "type": "string"
+                },
+                "workspace_id": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type",
+                "workspace_id"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "type": {
+                  "const": "checkout_focused",
+                  "type": "string"
+                },
+                "workspace_id": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type",
+                "workspace_id"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "repository": {
+                  "$ref": "#/schemas/success_response/$defs/RepositoryInfo"
+                },
+                "type": {
+                  "const": "repository_created",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type",
+                "repository"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "label": {
+                  "type": "string"
+                },
+                "repository_id": {
+                  "type": "string"
+                },
+                "type": {
+                  "const": "repository_renamed",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type",
+                "repository_id",
+                "label"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "insert_index": {
+                  "format": "uint",
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                "repository_id": {
+                  "type": "string"
+                },
+                "type": {
+                  "const": "repository_moved",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type",
+                "repository_id",
+                "insert_index"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "repository_id": {
+                  "type": "string"
+                },
+                "type": {
+                  "const": "repository_closed",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type",
+                "repository_id"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "repository_id": {
+                  "type": "string"
+                },
+                "type": {
+                  "const": "repository_focused",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type",
+                "repository_id"
               ],
               "type": "object"
             },
@@ -8926,11 +10069,22 @@
             "workspace_created",
             "workspace_updated",
             "workspace_metadata_updated",
+            "workspace_resources_updated",
             "workspace_closed",
             "workspace_renamed",
             "workspace_moved",
             "workspace_reordered",
             "workspace_focused",
+            "checkout_opened",
+            "checkout_renamed",
+            "checkout_moved",
+            "checkout_closed",
+            "checkout_focused",
+            "repository_created",
+            "repository_renamed",
+            "repository_moved",
+            "repository_closed",
+            "repository_focused",
             "worktree_created",
             "worktree_opened",
             "worktree_removed",
@@ -10094,6 +11248,7 @@
           "enum": [
             "global",
             "workspace",
+            "workspace_resource",
             "tab",
             "pane",
             "selection"
@@ -10243,6 +11398,16 @@
         },
         "PluginInvocationContext": {
           "properties": {
+            "checkout": {
+              "anyOf": [
+                {
+                  "$ref": "#/schemas/success_response/$defs/CheckoutInfo"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
             "clicked_url": {
               "type": [
                 "string",
@@ -10295,6 +11460,12 @@
                 "null"
               ]
             },
+            "repository_id": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
             "selected_text": {
               "type": [
                 "string",
@@ -10329,6 +11500,16 @@
               "type": [
                 "string",
                 "null"
+              ]
+            },
+            "workspace_resource": {
+              "anyOf": [
+                {
+                  "$ref": "#/schemas/success_response/$defs/WorkspaceResourceInfo"
+                },
+                {
+                  "type": "null"
+                }
               ]
             },
             "worktree": {
@@ -10690,6 +11871,64 @@
           ],
           "type": "string"
         },
+        "RepositoryInfo": {
+          "properties": {
+            "active_agent_count": {
+              "format": "uint",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "agent_status": {
+              "$ref": "#/schemas/success_response/$defs/AgentStatus"
+            },
+            "checkout_workspace_ids": {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            "focused": {
+              "type": "boolean"
+            },
+            "git_common_dir": {
+              "type": "string"
+            },
+            "label": {
+              "type": "string"
+            },
+            "last_focused_workspace_id": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "pane_count": {
+              "format": "uint",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "preferred_base": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "repository_id": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "repository_id",
+            "label",
+            "git_common_dir",
+            "checkout_workspace_ids",
+            "focused",
+            "pane_count",
+            "active_agent_count",
+            "agent_status"
+          ],
+          "type": "object"
+        },
         "ResponseResult": {
           "oneOf": [
             {
@@ -10797,6 +12036,41 @@
               "required": [
                 "type",
                 "workspaces"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "repository": {
+                  "$ref": "#/schemas/success_response/$defs/RepositoryInfo"
+                },
+                "type": {
+                  "const": "repository_info",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type",
+                "repository"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "repositories": {
+                  "items": {
+                    "$ref": "#/schemas/success_response/$defs/RepositoryInfo"
+                  },
+                  "type": "array"
+                },
+                "type": {
+                  "const": "repository_list",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type",
+                "repositories"
               ],
               "type": "object"
             },
@@ -11950,6 +13224,12 @@
               "minimum": 0,
               "type": "integer"
             },
+            "repositories": {
+              "items": {
+                "$ref": "#/schemas/success_response/$defs/RepositoryInfo"
+              },
+              "type": "array"
+            },
             "tabs": {
               "items": {
                 "$ref": "#/schemas/success_response/$defs/TabInfo"
@@ -11969,6 +13249,7 @@
           "required": [
             "version",
             "protocol",
+            "repositories",
             "workspaces",
             "tabs",
             "panes",
@@ -12031,6 +13312,16 @@
             "agent_status": {
               "$ref": "#/schemas/success_response/$defs/AgentStatus"
             },
+            "checkout": {
+              "anyOf": [
+                {
+                  "$ref": "#/schemas/success_response/$defs/CheckoutInfo"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
             "focused": {
               "type": "boolean"
             },
@@ -12046,6 +13337,18 @@
               "format": "uint",
               "minimum": 0,
               "type": "integer"
+            },
+            "repository_id": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "resources": {
+              "items": {
+                "$ref": "#/schemas/success_response/$defs/WorkspaceResourceInfo"
+              },
+              "type": "array"
             },
             "tab_count": {
               "format": "uint",
@@ -12085,6 +13388,36 @@
             "tab_count",
             "active_tab_id",
             "agent_status"
+          ],
+          "type": "object"
+        },
+        "WorkspaceResourceInfo": {
+          "properties": {
+            "data": true,
+            "detail": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "label": {
+              "type": "string"
+            },
+            "plugin_id": {
+              "type": "string"
+            },
+            "resource_id": {
+              "type": "string"
+            },
+            "workspace_id": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "workspace_id",
+            "plugin_id",
+            "resource_id",
+            "label"
           ],
           "type": "object"
         },
@@ -12168,6 +13501,12 @@
             },
             "repo_root": {
               "type": "string"
+            },
+            "repository_id": {
+              "type": [
+                "string",
+                "null"
+              ]
             },
             "source_checkout_path": {
               "type": "string"

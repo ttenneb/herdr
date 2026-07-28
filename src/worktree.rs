@@ -264,6 +264,69 @@ pub(crate) fn build_worktree_add_existing_branch_command(
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct WorktreeBase {
+    pub reference: String,
+    pub commit: String,
+}
+
+pub(crate) fn resolve_worktree_base(repo_root: &Path, reference: &str) -> Option<WorktreeBase> {
+    let output = crate::noninteractive_process::command("git")
+        .arg("-C")
+        .arg(repo_root)
+        .args(["rev-parse", "--verify"])
+        .arg(format!("{reference}^{{commit}}"))
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let commit = String::from_utf8(output.stdout).ok()?.trim().to_string();
+    (!commit.is_empty()).then(|| WorktreeBase {
+        reference: reference.to_string(),
+        commit,
+    })
+}
+
+/// Resolve a repository-level worktree base using the product fallback chain.
+pub(crate) fn resolve_repository_base(
+    repo_root: &Path,
+    preferred: Option<&str>,
+) -> Option<WorktreeBase> {
+    if let Some(base) = preferred.and_then(|reference| resolve_worktree_base(repo_root, reference))
+    {
+        return Some(base);
+    }
+    let remote_head = crate::noninteractive_process::command("git")
+        .arg("-C")
+        .arg(repo_root)
+        .args([
+            "symbolic-ref",
+            "--quiet",
+            "--short",
+            "refs/remotes/origin/HEAD",
+        ])
+        .output()
+        .ok()
+        .filter(|output| output.status.success())
+        .and_then(|output| String::from_utf8(output.stdout).ok())
+        .map(|reference| reference.trim().to_string())
+        .filter(|reference| !reference.is_empty());
+    remote_head
+        .as_deref()
+        .and_then(|reference| resolve_worktree_base(repo_root, reference))
+        .or_else(|| resolve_worktree_base(repo_root, "main"))
+        .or_else(|| resolve_worktree_base(repo_root, "master"))
+        .or_else(|| resolve_worktree_base(repo_root, "HEAD"))
+}
+
+pub(crate) fn resolve_checkout_head(repo_root: &Path) -> Option<WorktreeBase> {
+    resolve_worktree_base(repo_root, "HEAD").map(|mut base| {
+        base.reference = crate::workspace::git_branch(repo_root).unwrap_or_else(|| "HEAD".into());
+        base
+    })
+}
+
 pub(crate) fn local_branch_exists(repo_root: &Path, branch: &str) -> Result<bool, String> {
     let output = crate::noninteractive_process::command("git")
         .arg("-C")
@@ -812,6 +875,38 @@ prunable stale
                 "HEAD"
             ]
         );
+    }
+
+    #[test]
+    fn repository_base_prefers_valid_preference_then_remote_head() {
+        let repo = create_committed_repo("base-resolution");
+        run_git(&repo, &["branch", "preferred"]);
+        run_git(&repo, &["update-ref", "refs/remotes/origin/main", "HEAD"]);
+        run_git(
+            &repo,
+            &[
+                "symbolic-ref",
+                "refs/remotes/origin/HEAD",
+                "refs/remotes/origin/main",
+            ],
+        );
+
+        let preferred = resolve_repository_base(&repo, Some("preferred")).unwrap();
+        assert_eq!(preferred.reference, "preferred");
+        let remote = resolve_repository_base(&repo, Some("missing")).unwrap();
+        assert_eq!(remote.reference, "origin/main");
+        assert_eq!(remote.commit.len(), 40);
+
+        std::fs::remove_dir_all(repo).unwrap();
+    }
+
+    #[test]
+    fn checkout_base_resolves_exact_head_commit() {
+        let repo = create_committed_repo("checkout-base");
+        let base = resolve_checkout_head(&repo).unwrap();
+        assert!(matches!(base.reference.as_str(), "main" | "master"));
+        assert_eq!(base.commit.len(), 40);
+        std::fs::remove_dir_all(repo).unwrap();
     }
 
     #[test]

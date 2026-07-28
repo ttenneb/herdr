@@ -367,6 +367,11 @@ impl AppState {
         self.navigator.scroll = 0;
         self.navigator.expanded_workspaces.clear();
 
+        for repository in &self.repositories {
+            self.navigator
+                .expanded_workspaces
+                .insert(repository.id.clone());
+        }
         for ws in &self.workspaces {
             self.navigator.expanded_workspaces.insert(ws.id.clone());
         }
@@ -376,6 +381,15 @@ impl AppState {
             .current_navigator_row_index_from(terminal_runtimes)
             .unwrap_or(0);
         self.ensure_navigator_selection_visible_from(terminal_runtimes);
+    }
+
+    pub(crate) fn repository_display_label_for_root_workspace(
+        &self,
+        ws_idx: usize,
+    ) -> Option<&str> {
+        let checkout = self.workspaces.get(ws_idx)?.checkout.as_ref()?;
+        self.repository(&checkout.repository_id)
+            .map(crate::repository::Repository::display_label)
     }
 
     #[cfg(test)]
@@ -391,8 +405,101 @@ impl AppState {
         let query = self.navigator.query.trim().to_lowercase();
         let query_kind = navigator_query_kind(&query, self.navigator.state_filter);
         let mut rows = Vec::new();
-        for (ws_idx, ws) in self.workspaces.iter().enumerate() {
-            let workspace_label = ws.display_name_from(&self.terminals, terminal_runtimes);
+        let workspace_order = if self.space_order.is_empty() {
+            (0..self.workspaces.len()).collect::<Vec<_>>()
+        } else {
+            self.space_order
+                .iter()
+                .flat_map(|space| match space {
+                    crate::repository::SpaceRef::Repository(id) => self
+                        .repository(id)
+                        .map(|repository| {
+                            repository
+                                .checkout_workspace_ids
+                                .iter()
+                                .filter_map(|workspace_id| {
+                                    self.workspaces
+                                        .iter()
+                                        .position(|workspace| &workspace.id == workspace_id)
+                                })
+                                .collect::<Vec<_>>()
+                        })
+                        .unwrap_or_default(),
+                    crate::repository::SpaceRef::StandaloneWorkspace(id) => self
+                        .workspaces
+                        .iter()
+                        .position(|workspace| &workspace.id == id)
+                        .into_iter()
+                        .collect(),
+                })
+                .collect()
+        };
+        for ws_idx in workspace_order {
+            let Some(ws) = self.workspaces.get(ws_idx) else {
+                continue;
+            };
+            let mut expansion_id = ws.id.clone();
+            let workspace_depth = if let Some(repository_id) = ws
+                .checkout
+                .as_ref()
+                .map(|checkout| checkout.repository_id.as_str())
+            {
+                expansion_id = repository_id.to_string();
+                let Some(repository) = self.repository(repository_id) else {
+                    continue;
+                };
+                // A live primary is the root; canonical order only supplies
+                // the presentation fallback when the primary is unavailable.
+                let root_id = repository
+                    .checkout_workspace_ids
+                    .iter()
+                    .find(|workspace_id| {
+                        self.workspaces.iter().any(|workspace| {
+                            &workspace.id == *workspace_id
+                                && workspace.checkout.as_ref().is_some_and(|checkout| {
+                                    checkout.kind == crate::repository::CheckoutKind::Primary
+                                })
+                        })
+                    })
+                    .or_else(|| {
+                        repository
+                            .checkout_workspace_ids
+                            .iter()
+                            .find(|workspace_id| {
+                                self.workspaces
+                                    .iter()
+                                    .any(|workspace| &workspace.id == *workspace_id)
+                            })
+                    });
+                let is_root = root_id.is_some_and(|workspace_id| workspace_id == &ws.id);
+                let repository_expanded = !matches!(query_kind, NavigatorQueryKind::Empty)
+                    || self.navigator.expanded_workspaces.contains(repository_id);
+                if !is_root && !repository_expanded {
+                    continue;
+                }
+                u8::from(!is_root)
+            } else {
+                0
+            };
+            let workspace_label = (workspace_depth == 0)
+                .then(|| self.repository_display_label_for_root_workspace(ws_idx))
+                .flatten()
+                .map(str::to_owned)
+                .or_else(|| {
+                    (workspace_depth > 0).then(|| {
+                        ws.branch()
+                            .map(|branch| {
+                                branch
+                                    .strip_prefix("worktree/")
+                                    .unwrap_or(&branch)
+                                    .to_string()
+                            })
+                            .unwrap_or_else(|| {
+                                ws.display_name_from(&self.terminals, terminal_runtimes)
+                            })
+                    })
+                })
+                .unwrap_or_else(|| ws.display_name_from(&self.terminals, terminal_runtimes));
             let activity = workspace_activity_summary(ws, &self.terminals);
             let workspace_search_text = format!("{workspace_label} {activity}").to_lowercase();
             let workspace_matches = match query_kind {
@@ -404,19 +511,28 @@ impl AppState {
                 NavigatorQueryKind::Text => navigator_matches(&query, &workspace_search_text),
             };
 
-            let child_rows =
+            let mut child_rows =
                 self.navigator_child_rows(ws_idx, query_kind, &query, workspace_matches);
+            if workspace_depth > 0 {
+                for row in &mut child_rows {
+                    // Resources stay at their fixed checkout-tree depth; only terminal
+                    // descendants follow the linked checkout one level deeper.
+                    if !matches!(&row.target, NavigatorTarget::WorkspaceResource { .. }) {
+                        row.depth = row.depth.saturating_add(1);
+                    }
+                }
+            }
             if !workspace_matches && child_rows.is_empty() {
                 continue;
             }
 
             let expanded = !matches!(query_kind, NavigatorQueryKind::Empty)
-                || self.navigator.expanded_workspaces.contains(&ws.id);
+                || self.navigator.expanded_workspaces.contains(&expansion_id);
             let (state, seen) = ws.aggregate_state(&self.terminals);
             let pane_count = ws.tabs.iter().map(|tab| tab.panes.len()).sum::<usize>();
             rows.push(NavigatorRow {
                 target: NavigatorTarget::Workspace { ws_idx },
-                depth: 0,
+                depth: workspace_depth,
                 label: format!("{workspace_label} ({pane_count})"),
                 meta: activity,
                 status: state,
@@ -446,7 +562,62 @@ impl AppState {
             return Vec::new();
         };
         let multi_tab = ws.tabs.len() > 1;
-        let mut rows = Vec::new();
+        let resource_rows = ws
+            .resources
+            .resources()
+            .map(|resource| {
+                let status = crate::detect::AgentState::Unknown;
+                let seen = true;
+                let search_text = format!(
+                    "{} {} {} {}",
+                    resource.label,
+                    resource.detail.as_deref().unwrap_or(""),
+                    resource.plugin_id,
+                    resource.resource_id,
+                )
+                .to_lowercase();
+                let matched = match query_kind {
+                    NavigatorQueryKind::Empty => true,
+                    NavigatorQueryKind::State(filter) => {
+                        navigator_state_filter_matches(filter, status, seen)
+                    }
+                    NavigatorQueryKind::Text => navigator_matches(query, &search_text),
+                };
+                NavigatorRow {
+                    target: NavigatorTarget::WorkspaceResource {
+                        workspace_id: ws.id.clone(),
+                        plugin_id: resource.plugin_id.clone(),
+                        resource_id: resource.resource_id.clone(),
+                    },
+                    depth: 2,
+                    label: resource.label.clone(),
+                    meta: resource.detail.clone().unwrap_or_default(),
+                    status,
+                    seen,
+                    is_current: false,
+                    is_workspace: false,
+                    is_tab: false,
+                    expanded: false,
+                    search_text,
+                    matched,
+                }
+            })
+            .collect::<Vec<_>>();
+        let mut rows = match query_kind {
+            NavigatorQueryKind::Empty => resource_rows,
+            NavigatorQueryKind::State(_) => resource_rows
+                .into_iter()
+                .filter(|row| row.matched)
+                .collect(),
+            // Like pane rows, a matching workspace retains its resource rows as
+            // dimmed context; otherwise a resource must match for its workspace
+            // to be included.
+            NavigatorQueryKind::Text if workspace_matches => resource_rows,
+            NavigatorQueryKind::Text => resource_rows
+                .into_iter()
+                .filter(|row| row.matched)
+                .collect(),
+        };
         for tab_idx in 0..ws.tabs.len() {
             let mut tab_row = multi_tab.then(|| self.navigator_tab_row(ws_idx, tab_idx));
             let tab_matches = tab_row.as_ref().is_some_and(|row| match query_kind {
@@ -758,11 +929,19 @@ impl AppState {
         else {
             return;
         };
-        let NavigatorTarget::Workspace { ws_idx } = row.target else {
-            return;
-        };
-        let Some(workspace_id) = self.workspaces.get(ws_idx).map(|ws| ws.id.clone()) else {
-            return;
+        let workspace_id = match row.target {
+            NavigatorTarget::Repository { repository_id } => repository_id,
+            NavigatorTarget::Workspace { ws_idx } => {
+                let Some(workspace) = self.workspaces.get(ws_idx) else {
+                    return;
+                };
+                workspace
+                    .checkout
+                    .as_ref()
+                    .map(|checkout| checkout.repository_id.clone())
+                    .unwrap_or_else(|| workspace.id.clone())
+            }
+            _ => return,
         };
         if self.navigator.expanded_workspaces.contains(&workspace_id) {
             self.navigator.expanded_workspaces.remove(&workspace_id);
@@ -794,6 +973,30 @@ impl AppState {
 
     pub(crate) fn focus_navigator_target(&mut self, target: NavigatorTarget) -> bool {
         match target {
+            NavigatorTarget::WorkspaceResource {
+                workspace_id,
+                plugin_id,
+                resource_id,
+            } => {
+                let Some(ws_idx) = self
+                    .workspaces
+                    .iter()
+                    .position(|workspace| workspace.id == workspace_id)
+                else {
+                    return false;
+                };
+                self.selected_workspace_resource = Some((workspace_id, plugin_id, resource_id));
+                self.switch_workspace(ws_idx);
+                self.mode = Mode::Terminal;
+                true
+            }
+            NavigatorTarget::Repository { repository_id } => {
+                if !self.focus_repository(&repository_id) {
+                    return false;
+                }
+                self.mode = Mode::Terminal;
+                true
+            }
             NavigatorTarget::Workspace { ws_idx } => {
                 if ws_idx >= self.workspaces.len() {
                     return false;
@@ -1004,6 +1207,11 @@ impl AppState {
                     .iter()
                     .filter_map(|workspace| workspace.metadata_tokens.next_expiry()),
             )
+            .chain(
+                self.workspaces
+                    .iter()
+                    .filter_map(|workspace| workspace.resources.next_expiry()),
+            )
             .min()
     }
 
@@ -1102,6 +1310,14 @@ impl AppState {
         (changed_panes, changed_workspaces)
     }
 
+    pub(crate) fn expire_workspace_resources(&mut self, now: std::time::Instant) -> Vec<usize> {
+        self.workspaces
+            .iter_mut()
+            .enumerate()
+            .filter_map(|(ws_idx, workspace)| workspace.resources.expire(now).then_some(ws_idx))
+            .collect()
+    }
+
     pub(crate) fn pane_is_in_active_tab(&self, ws_idx: usize, pane_id: PaneId) -> bool {
         let Some(active_ws_idx) = self.active else {
             return false;
@@ -1156,6 +1372,7 @@ impl AppState {
             let previous_focus = self.current_pane_focus_target();
             self.active = Some(idx);
             self.selected = idx;
+            self.selected_repository_id = None;
             let workspace_id = self.workspaces[idx].id.clone();
             crate::logging::workspace_focused(&workspace_id);
             self.mark_session_dirty();
@@ -1170,6 +1387,19 @@ impl AppState {
             self.tab_scroll_follow_active = true;
             self.refresh_tab_bar_view();
             self.record_pane_focus_after_navigation(previous_focus);
+            if let Some(repository_id) = self.workspaces[idx]
+                .checkout
+                .as_ref()
+                .map(|checkout| checkout.repository_id.clone())
+            {
+                if let Some(repository) = self
+                    .repositories
+                    .iter_mut()
+                    .find(|repository| repository.id == repository_id)
+                {
+                    repository.last_focused_workspace_id = Some(workspace_id);
+                }
+            }
             self.sync_selection_after_focus_navigation();
         }
     }
@@ -1190,6 +1420,7 @@ impl AppState {
         let workspace_changed = self.active != Some(ws_idx);
         self.active = Some(ws_idx);
         self.selected = ws_idx;
+        self.selected_repository_id = None;
         let workspace_id = self.workspaces[ws_idx].id.clone();
         if workspace_changed {
             crate::logging::workspace_focused(&workspace_id);
@@ -1205,6 +1436,19 @@ impl AppState {
         self.tab_scroll_follow_active = true;
         self.refresh_tab_bar_view();
         self.record_pane_focus_after_navigation(previous_focus);
+        if let Some(repository_id) = self.workspaces[ws_idx]
+            .checkout
+            .as_ref()
+            .map(|checkout| checkout.repository_id.clone())
+        {
+            if let Some(repository) = self
+                .repositories
+                .iter_mut()
+                .find(|repository| repository.id == repository_id)
+            {
+                repository.last_focused_workspace_id = Some(workspace_id);
+            }
+        }
         self.sync_selection_after_focus_navigation();
         true
     }
@@ -1225,10 +1469,7 @@ impl AppState {
 
         let entries = crate::ui::workspace_list_entries(self);
         let Some(target_entry_idx) = entries.iter().position(|entry| {
-            matches!(
-                entry,
-                crate::ui::WorkspaceListEntry::Workspace { ws_idx, .. } if *ws_idx == idx
-            )
+            matches!(entry, crate::ui::WorkspaceListEntry::Workspace { ws_idx, .. } if *ws_idx == idx)
         }) else {
             return;
         };
@@ -1239,7 +1480,10 @@ impl AppState {
             self.workspace_scroll,
         );
         let mut cards = crate::ui::compute_workspace_card_areas(self, self.view.sidebar_rect);
-        if cards.iter().any(|card| card.ws_idx == idx) {
+        if cards
+            .iter()
+            .any(|card| card.target == crate::app::state::SpaceRowTarget::Workspace(idx))
+        {
             return;
         }
 
@@ -1248,7 +1492,10 @@ impl AppState {
             return;
         }
 
-        while !cards.iter().any(|card| card.ws_idx == idx) {
+        while !cards
+            .iter()
+            .any(|card| card.target == crate::app::state::SpaceRowTarget::Workspace(idx))
+        {
             let previous_scroll = self.workspace_scroll;
             self.workspace_scroll = self.workspace_scroll.saturating_add(1);
             if self.workspace_scroll == previous_scroll {
@@ -1333,9 +1580,19 @@ impl AppState {
         changed
     }
 
-    pub(crate) fn visible_workspace_order(&self) -> Vec<usize> {
+    pub(crate) fn visible_space_order(&self) -> Vec<crate::app::state::SpaceRowTarget> {
         // Mobile always shows the worktree tree expanded, so its visible order
         // must ignore collapse state to match what the switcher renders.
+        if self.view.layout != ViewLayout::Mobile && self.sidebar_collapsed {
+            let order = crate::ui::top_level_space_targets(self);
+            return if order.is_empty() {
+                (0..self.workspaces.len())
+                    .map(crate::app::state::SpaceRowTarget::Workspace)
+                    .collect()
+            } else {
+                order
+            };
+        }
         let entries = if self.view.layout == ViewLayout::Mobile {
             crate::ui::workspace_list_entries_expanded(self)
         } else {
@@ -1344,35 +1601,116 @@ impl AppState {
         let order = entries
             .into_iter()
             .map(|entry| match entry {
-                crate::ui::WorkspaceListEntry::Workspace { ws_idx, .. } => ws_idx,
+                crate::ui::WorkspaceListEntry::Repository { repository_id } => {
+                    crate::app::state::SpaceRowTarget::Repository(repository_id)
+                }
+                crate::ui::WorkspaceListEntry::Workspace { ws_idx, .. } => {
+                    crate::app::state::SpaceRowTarget::Workspace(ws_idx)
+                }
+                crate::ui::WorkspaceListEntry::Resource {
+                    workspace_id,
+                    plugin_id,
+                    resource_id,
+                    ..
+                } => crate::app::state::SpaceRowTarget::WorkspaceResource {
+                    workspace_id,
+                    plugin_id,
+                    resource_id,
+                },
             })
             .collect::<Vec<_>>();
         if order.is_empty() {
-            (0..self.workspaces.len()).collect()
+            (0..self.workspaces.len())
+                .map(crate::app::state::SpaceRowTarget::Workspace)
+                .collect()
         } else {
             order
         }
     }
 
-    pub(crate) fn workspace_at_visible_position(&self, position: usize) -> Option<usize> {
-        self.visible_workspace_order().get(position).copied()
+    pub(crate) fn space_at_visible_position(
+        &self,
+        position: usize,
+    ) -> Option<crate::app::state::SpaceRowTarget> {
+        self.visible_space_order().get(position).cloned()
+    }
+
+    pub(crate) fn selected_space_row(&self) -> crate::app::state::SpaceRowTarget {
+        if let Some((workspace_id, plugin_id, resource_id)) = &self.selected_workspace_resource {
+            return crate::app::state::SpaceRowTarget::WorkspaceResource {
+                workspace_id: workspace_id.clone(),
+                plugin_id: plugin_id.clone(),
+                resource_id: resource_id.clone(),
+            };
+        }
+        self.selected_repository_id
+            .as_ref()
+            .map(|id| crate::app::state::SpaceRowTarget::Repository(id.clone()))
+            .unwrap_or(crate::app::state::SpaceRowTarget::Workspace(self.selected))
+    }
+
+    pub(crate) fn select_space_row(&mut self, target: crate::app::state::SpaceRowTarget) {
+        match target {
+            crate::app::state::SpaceRowTarget::WorkspaceResource {
+                workspace_id,
+                plugin_id,
+                resource_id,
+            } => {
+                if let Some(idx) = self
+                    .workspaces
+                    .iter()
+                    .position(|workspace| workspace.id == workspace_id)
+                {
+                    self.selected = idx;
+                    self.selected_repository_id = None;
+                    self.selected_workspace_resource = Some((workspace_id, plugin_id, resource_id));
+                    self.ensure_workspace_visible(idx);
+                }
+            }
+            crate::app::state::SpaceRowTarget::Repository(id) => {
+                if let Some(idx) = self
+                    .repository(&id)
+                    .and_then(|repository| {
+                        repository
+                            .last_focused_workspace_id
+                            .as_ref()
+                            .or_else(|| repository.checkout_workspace_ids.first())
+                    })
+                    .and_then(|workspace_id| {
+                        self.workspaces
+                            .iter()
+                            .position(|workspace| &workspace.id == workspace_id)
+                    })
+                {
+                    self.selected = idx;
+                }
+                self.selected_repository_id = Some(id);
+                self.selected_workspace_resource = None;
+            }
+            crate::app::state::SpaceRowTarget::Workspace(idx) => {
+                self.selected_repository_id = None;
+                self.selected_workspace_resource = None;
+                self.selected = idx;
+                self.ensure_workspace_visible(idx);
+            }
+        }
     }
 
     pub(crate) fn move_selected_workspace_by_visible_delta(&mut self, delta: isize) {
         if self.workspaces.is_empty() {
             return;
         }
-        let order = self.visible_workspace_order();
+        let order = self.visible_space_order();
+        let current = self.selected_space_row();
         let current_pos = order
             .iter()
-            .position(|idx| *idx == self.selected)
+            .position(|target| target == &current)
             .unwrap_or(0);
         let target_pos = current_pos
             .saturating_add_signed(delta)
             .min(order.len().saturating_sub(1));
-        if let Some(ws_idx) = order.get(target_pos).copied() {
-            self.selected = ws_idx;
-            self.ensure_workspace_visible(ws_idx);
+        if let Some(target) = order.get(target_pos).cloned() {
+            self.select_space_row(target);
         }
     }
 
@@ -1382,7 +1720,15 @@ impl AppState {
             return;
         }
         let current = self.active.unwrap_or(self.selected);
-        let order = self.visible_workspace_order();
+        let order = self
+            .visible_space_order()
+            .into_iter()
+            .filter_map(|target| match target {
+                crate::app::state::SpaceRowTarget::Workspace(idx) => Some(idx),
+                crate::app::state::SpaceRowTarget::Repository(_)
+                | crate::app::state::SpaceRowTarget::WorkspaceResource { .. } => None,
+            })
+            .collect::<Vec<_>>();
         let current_pos = order.iter().position(|idx| *idx == current).unwrap_or(0);
         let next = order[(current_pos + 1) % order.len()];
         self.switch_workspace(next);
@@ -1394,7 +1740,15 @@ impl AppState {
             return;
         }
         let current = self.active.unwrap_or(self.selected);
-        let order = self.visible_workspace_order();
+        let order = self
+            .visible_space_order()
+            .into_iter()
+            .filter_map(|target| match target {
+                crate::app::state::SpaceRowTarget::Workspace(idx) => Some(idx),
+                crate::app::state::SpaceRowTarget::Repository(_)
+                | crate::app::state::SpaceRowTarget::WorkspaceResource { .. } => None,
+            })
+            .collect::<Vec<_>>();
         let current_pos = order.iter().position(|idx| *idx == current).unwrap_or(0);
         let prev = if current_pos == 0 {
             order[order.len() - 1]
@@ -1426,8 +1780,32 @@ impl AppState {
             .get(self.selected)
             .map(|workspace| workspace.id.clone());
 
+        let moved_repository_id = self.workspaces[source_idx]
+            .checkout
+            .as_ref()
+            .map(|checkout| checkout.repository_id.clone());
         let workspace = self.workspaces.remove(source_idx);
         self.workspaces.insert(target_idx, workspace);
+
+        if moved_repository_id.is_none() {
+            self.space_order.sort_by_key(|space| match space {
+                crate::repository::SpaceRef::StandaloneWorkspace(id) => self
+                    .workspaces
+                    .iter()
+                    .position(|workspace| &workspace.id == id)
+                    .unwrap_or(usize::MAX),
+                crate::repository::SpaceRef::Repository(id) => self
+                    .workspaces
+                    .iter()
+                    .position(|workspace| {
+                        workspace
+                            .checkout
+                            .as_ref()
+                            .is_some_and(|checkout| &checkout.repository_id == id)
+                    })
+                    .unwrap_or(usize::MAX),
+            });
+        }
 
         self.active = active_id.and_then(|id| self.workspaces.iter().position(|ws| ws.id == id));
         self.selected = selected_id
@@ -1496,6 +1874,48 @@ impl AppState {
                 .copied()
                 .unwrap_or(usize::MAX)
         });
+
+        // workspace.move_block predates Spaces. Keep its compatibility vector
+        // order, but project the same order into the canonical hierarchy used
+        // by rendering and persistence: top-level spaces and linked checkout
+        // membership each follow the moved identities.
+        self.space_order.sort_by_key(|space| match space {
+            crate::repository::SpaceRef::StandaloneWorkspace(id) => {
+                desired_positions.get(id).copied().unwrap_or(usize::MAX)
+            }
+            crate::repository::SpaceRef::Repository(repository_id) => self
+                .repositories
+                .iter()
+                .find(|repository| &repository.id == repository_id)
+                // The pinned primary is the top-level drag proxy. Linked
+                // children reorder only checkout membership, never their
+                // repository's top-level position.
+                .and_then(|repository| repository.checkout_workspace_ids.first())
+                .and_then(|id| desired_positions.get(id))
+                .copied()
+                .unwrap_or(usize::MAX),
+        });
+        for repository in &mut self.repositories {
+            repository
+                .checkout_workspace_ids
+                .sort_by_key(|workspace_id| {
+                    let is_primary = self
+                        .workspaces
+                        .iter()
+                        .find(|workspace| &workspace.id == workspace_id)
+                        .and_then(|workspace| workspace.checkout.as_ref())
+                        .is_some_and(|checkout| {
+                            checkout.kind == crate::repository::CheckoutKind::Primary
+                        });
+                    (
+                        usize::from(!is_primary),
+                        desired_positions
+                            .get(workspace_id)
+                            .copied()
+                            .unwrap_or(usize::MAX),
+                    )
+                });
+        }
         self.active = active_id.and_then(|id| self.workspaces.iter().position(|ws| ws.id == id));
         self.selected = selected_id
             .and_then(|id| self.workspaces.iter().position(|ws| ws.id == id))
@@ -1733,24 +2153,43 @@ impl AppState {
         self.selection = None;
         self.selection_autoscroll = None;
         self.mark_session_dirty();
-        let close_indices = self
-            .workspaces
-            .get(self.selected)
-            .and_then(|ws| ws.worktree_space())
-            .filter(|space| !space.is_linked_worktree)
-            .map(|space| {
-                self.workspaces
-                    .iter()
-                    .enumerate()
-                    .filter_map(|(idx, ws)| {
-                        ws.worktree_space()
-                            .is_some_and(|member| member.key == space.key)
-                            .then_some(idx)
+        // Workspace close is the compatibility alias for closing one Checkout
+        // (or one standalone Space). Repository close is an explicit operation.
+        let preferred_sibling_id = self.workspaces.get(self.selected).and_then(|workspace| {
+            workspace
+                .checkout
+                .as_ref()
+                .and_then(|checkout| {
+                    self.repository(&checkout.repository_id)
+                        .and_then(|repository| {
+                            repository
+                                .checkout_workspace_ids
+                                .iter()
+                                .find(|id| **id != workspace.id)
+                                .cloned()
+                        })
+                })
+                .or_else(|| {
+                    workspace.worktree_space().and_then(|space| {
+                        self.workspaces
+                            .iter()
+                            .find(|candidate| {
+                                candidate.id != workspace.id
+                                    && candidate.worktree_space().is_some_and(|candidate_space| {
+                                        candidate_space.key == space.key
+                                    })
+                            })
+                            .map(|candidate| candidate.id.clone())
                     })
-                    .collect::<Vec<_>>()
-            })
-            .filter(|indices| indices.len() >= 2)
-            .unwrap_or_else(|| vec![self.selected]);
+                })
+        });
+        // A workspace close is the Repository/Checkout compatibility alias for
+        // one checkout. Group destruction remains an explicit lifecycle path.
+        let close_indices = vec![self.selected];
+        let active_workspace_id = self
+            .active
+            .and_then(|idx| self.workspaces.get(idx))
+            .map(|workspace| workspace.id.clone());
 
         let mut terminal_ids = Vec::new();
         let mut pane_ids = Vec::new();
@@ -1761,15 +2200,16 @@ impl AppState {
                 crate::logging::workspace_closed(&workspace_id);
             }
         }
-        let active_workspace_id = self
-            .active
-            .and_then(|idx| self.workspaces.get(idx))
-            .map(|ws| ws.id.clone());
         let destruction = self.finalize_pane_destruction(pane_ids);
         for idx in close_indices.iter().rev() {
             self.workspaces.remove(*idx);
         }
         self.remove_unattached_terminal_ids(terminal_ids);
+        // Synthetic/non-Git workspaces may legitimately share a cwd in tests
+        // and headless embeddings; only reconcile an established hierarchy.
+        if !self.repositories.is_empty() {
+            self.reconcile_repositories();
+        }
         if self.workspaces.is_empty() {
             self.active = None;
             self.selected = 0;
@@ -1777,16 +2217,21 @@ impl AppState {
             self.tab_scroll = 0;
             self.tab_scroll_follow_active = true;
         } else {
-            // Keep focus on the previously focused workspace
-            if let Some(id) = active_workspace_id {
-                if let Some(idx) = self.workspaces.iter().position(|ws| ws.id == id) {
-                    self.selected = idx;
-                }
-            }
-            if self.selected >= self.workspaces.len() {
-                self.selected = self.workspaces.len() - 1;
-            }
-            self.active = Some(self.selected);
+            let active_index = active_workspace_id.as_ref().and_then(|id| {
+                self.workspaces
+                    .iter()
+                    .position(|workspace| &workspace.id == id)
+            });
+            self.selected = active_index
+                .or_else(|| {
+                    preferred_sibling_id.and_then(|id| {
+                        self.workspaces
+                            .iter()
+                            .position(|workspace| workspace.id == id)
+                    })
+                })
+                .unwrap_or_else(|| self.selected.min(self.workspaces.len() - 1));
+            self.active = active_index.or(Some(self.selected));
             self.workspace_scroll = self
                 .workspace_scroll
                 .min(self.workspaces.len().saturating_sub(1));
@@ -2041,21 +2486,8 @@ impl AppState {
         self.apply_pane_zoom(ws_idx, pane_id, PaneZoomCommand::Toggle);
     }
 
-    pub(crate) fn workspace_close_would_close_worktree_group(&self, ws_idx: usize) -> bool {
-        self.workspaces
-            .get(ws_idx)
-            .and_then(|ws| ws.worktree_space())
-            .filter(|space| !space.is_linked_worktree)
-            .is_some_and(|space| {
-                self.workspaces
-                    .iter()
-                    .filter(|ws| {
-                        ws.worktree_space()
-                            .is_some_and(|member| member.key == space.key)
-                    })
-                    .count()
-                    >= 2
-            })
+    pub(crate) fn workspace_close_would_close_worktree_group(&self, _ws_idx: usize) -> bool {
+        false
     }
 
     pub(crate) fn confirm_implicit_worktree_group_close(&mut self, ws_idx: usize) -> bool {
@@ -2783,6 +3215,10 @@ impl AppState {
                 ws.cached_git_branch = result.branch;
                 changed = true;
             }
+            if result.demand.upstream && ws.cached_git_primary_upstream != result.upstream {
+                ws.cached_git_primary_upstream = result.upstream;
+                changed = true;
+            }
             if result.demand.ahead_behind && ws.cached_git_ahead_behind != result.ahead_behind {
                 ws.cached_git_ahead_behind = result.ahead_behind;
                 changed = true;
@@ -3478,6 +3914,33 @@ mod tests {
         state
     }
 
+    fn add_test_resource(
+        state: &mut AppState,
+        ws_idx: usize,
+        plugin_id: &str,
+        resource_id: &str,
+        label: &str,
+        detail: Option<&str>,
+    ) {
+        state.workspaces[ws_idx]
+            .resources
+            .report(
+                plugin_id.into(),
+                vec![crate::workspace_resources::normalize_resource(
+                    plugin_id,
+                    resource_id.into(),
+                    label.into(),
+                    detail.map(str::to_owned),
+                    None,
+                )
+                .unwrap()],
+                None,
+                None,
+                std::time::Instant::now(),
+            )
+            .unwrap();
+    }
+
     fn insert_test_pane_graphics_layer(state: &mut AppState, pane_id: PaneId) {
         state.pane_graphics_layers.insert(
             pane_id,
@@ -3723,6 +4186,79 @@ mod tests {
             None
         );
         assert_eq!(selected_url("open file:///tmp/report", "file"), None);
+    }
+
+    #[test]
+    fn navigator_projects_primary_checkout_as_root() {
+        let mut state = app_with_workspaces(&["main"]);
+        state.workspaces[0].cached_git_space = Some(crate::workspace::GitSpaceMetadata {
+            key: "/repo/app/.git".into(),
+            checkout_key: "/repo/app".into(),
+            label: "app".into(),
+            repo_root: "/repo/app".into(),
+            is_linked_worktree: false,
+        });
+        state.reconcile_repositories();
+        state.open_navigator();
+        let rows = state.navigator_rows();
+        assert!(matches!(
+            rows[0].target,
+            NavigatorTarget::Workspace { ws_idx: 0 }
+        ));
+        assert_eq!(rows[0].depth, 0);
+    }
+
+    #[test]
+    fn navigator_uses_renamed_repository_for_primary_root_and_branch_for_linked_checkout() {
+        let mut state = app_with_workspaces(&["main", "feature-directory"]);
+        for (index, linked) in [(0, false), (1, true)] {
+            state.workspaces[index].identity_cwd = if linked {
+                "/definitely/not/live/feature".into()
+            } else {
+                "/definitely/not/live/app".into()
+            };
+            state.workspaces[index].cached_git_space = Some(crate::workspace::GitSpaceMetadata {
+                key: "/repo/app/.git".into(),
+                checkout_key: if linked { "/repo/feature" } else { "/repo/app" }.into(),
+                label: "app".into(),
+                repo_root: if linked { "/repo/feature" } else { "/repo/app" }.into(),
+                is_linked_worktree: linked,
+            });
+        }
+        state.workspaces[1].cached_git_branch = Some("feature/navigator-label".into());
+        for workspace in &state.workspaces {
+            let terminal_id = workspace.tabs[0].panes
+                [&workspace.tabs[0].root_pane.expect("root pane")]
+                .attached_terminal_id
+                .clone();
+            state.terminals.get_mut(&terminal_id).unwrap().cwd = workspace.identity_cwd.clone();
+        }
+        state.reconcile_repositories();
+        state.repositories[0].custom_name = Some("Product".into());
+        state.open_navigator();
+
+        let rows = state.navigator_rows();
+        let primary = rows
+            .iter()
+            .find(|row| matches!(row.target, NavigatorTarget::Workspace { ws_idx: 0 }))
+            .unwrap();
+        let linked = rows
+            .iter()
+            .find(|row| matches!(row.target, NavigatorTarget::Workspace { ws_idx: 1 }))
+            .unwrap();
+        assert_eq!(primary.label, "Product (1)");
+        assert_eq!(linked.label, "feature/navigator-label (1)");
+        assert_eq!(linked.depth, 1);
+
+        // Repository expansion owns the entire checkout tree; depth-one
+        // checkouts must not keep a misleading expanded caret after collapse.
+        let repository_id = state.repositories[0].id.clone();
+        state.navigator.expanded_workspaces.remove(&repository_id);
+        let collapsed_rows = state.navigator_rows();
+        assert!(!collapsed_rows[0].expanded);
+        assert!(!collapsed_rows
+            .iter()
+            .any(|row| matches!(row.target, NavigatorTarget::Workspace { ws_idx: 1 })));
     }
 
     #[test]
@@ -3996,6 +4532,119 @@ mod tests {
     }
 
     #[test]
+    fn navigator_search_filters_workspace_resources_and_keeps_matching_parents() {
+        let mut state = app_with_workspaces(&["one", "two"]);
+        add_test_resource(
+            &mut state,
+            0,
+            "plugin-alpha",
+            "resource-alpha",
+            "Deploy dashboard",
+            Some("release notes"),
+        );
+        add_test_resource(
+            &mut state,
+            1,
+            "plugin-beta",
+            "resource-beta",
+            "Unrelated resource",
+            Some("unrelated detail"),
+        );
+        state.open_navigator();
+
+        for query in ["deploy", "release notes", "plugin-alpha", "resource-alpha"] {
+            state.navigator.query = query.into();
+            let rows = state.navigator_rows();
+            assert!(rows
+                .iter()
+                .any(|row| matches!(&row.target, NavigatorTarget::Workspace { ws_idx: 0 })));
+            assert!(rows.iter().any(|row| matches!(
+                &row.target,
+                NavigatorTarget::WorkspaceResource {
+                    workspace_id: _,
+                    plugin_id,
+                    resource_id,
+                } if plugin_id == "plugin-alpha" && resource_id == "resource-alpha"
+            )));
+            assert!(!rows
+                .iter()
+                .any(|row| matches!(&row.target, NavigatorTarget::Workspace { ws_idx: 1 })));
+            assert!(!rows.iter().any(|row| matches!(
+                &row.target,
+                NavigatorTarget::WorkspaceResource {
+                    plugin_id,
+                    resource_id,
+                    ..
+                } if plugin_id == "plugin-beta" && resource_id == "resource-beta"
+            )));
+        }
+
+        state.navigator.query = "no such resource".into();
+        assert!(state.navigator_rows().is_empty());
+
+        state.navigator.query.clear();
+        let rows = state.navigator_rows();
+        assert!(rows.iter().any(|row| matches!(
+            &row.target,
+            NavigatorTarget::WorkspaceResource {
+                plugin_id,
+                resource_id,
+                ..
+            } if plugin_id == "plugin-alpha" && resource_id == "resource-alpha"
+        )));
+        assert!(rows.iter().any(|row| matches!(
+            &row.target,
+            NavigatorTarget::WorkspaceResource {
+                plugin_id,
+                resource_id,
+                ..
+            } if plugin_id == "plugin-beta" && resource_id == "resource-beta"
+        )));
+    }
+
+    #[test]
+    fn navigator_state_filters_exclude_workspace_resources() {
+        let mut state = app_with_workspaces(&["one", "two"]);
+        add_test_resource(
+            &mut state,
+            0,
+            "plugin-alpha",
+            "resource-alpha",
+            "Deploy dashboard",
+            None,
+        );
+        let pane = state.workspaces[0].tabs[0].root_pane.expect("root pane");
+        let terminal_id = state.workspaces[0].terminal_id(pane).cloned().unwrap();
+        state
+            .terminals
+            .get_mut(&terminal_id)
+            .unwrap()
+            .set_detected_state(Some(Agent::Codex), AgentState::Working);
+        state.open_navigator();
+        for filter in [
+            NavigatorStateFilter::Blocked,
+            NavigatorStateFilter::Working,
+            NavigatorStateFilter::Idle,
+            NavigatorStateFilter::Done,
+        ] {
+            state.navigator.state_filter = Some(filter);
+            assert!(!state
+                .navigator_rows()
+                .iter()
+                .any(|row| matches!(&row.target, NavigatorTarget::WorkspaceResource { .. })));
+        }
+
+        state.navigator.state_filter = Some(NavigatorStateFilter::Working);
+        let rows = state.navigator_rows();
+        assert!(rows
+            .iter()
+            .any(|row| matches!(&row.target, NavigatorTarget::Workspace { ws_idx: 0 })));
+        assert!(!rows
+            .iter()
+            .any(|row| matches!(&row.target, NavigatorTarget::Workspace { ws_idx: 1 })));
+    }
+
+    #[test]
     fn navigator_search_filters_panes_but_keeps_workspace_context() {
         let mut state = app_with_workspaces(&["one"]);
         let root = state.workspaces[0].tabs[0]
@@ -4117,6 +4766,7 @@ mod tests {
                 demand: crate::workspace::GitStatusRefreshDemand::ALL,
                 auto_label: "one".into(),
                 branch: Some("main".into()),
+                upstream: Some("origin/main".into()),
                 ahead_behind: Some((2, 1)),
                 space: None,
             }],
@@ -4124,6 +4774,7 @@ mod tests {
 
         assert!(changed);
         assert_eq!(state.workspaces[0].branch().as_deref(), Some("main"));
+        assert_eq!(state.workspaces[0].primary_upstream(), Some("origin/main"));
         assert_eq!(state.workspaces[0].git_ahead_behind(), Some((2, 1)));
         assert_eq!(state.workspaces[1].id, second_id);
         assert_eq!(state.workspaces[1].git_ahead_behind(), None);
@@ -4146,6 +4797,7 @@ mod tests {
                 demand: crate::workspace::GitStatusRefreshDemand::ALL,
                 auto_label: "stale".into(),
                 branch: Some("main".into()),
+                upstream: None,
                 ahead_behind: Some((0, 1)),
                 space: None,
             }],
@@ -4173,10 +4825,12 @@ mod tests {
                 status_cache_key: cwd,
                 demand: crate::workspace::GitStatusRefreshDemand {
                     branch: false,
+                    upstream: false,
                     ahead_behind: true,
                 },
                 auto_label: "one".into(),
                 branch: Some("new".into()),
+                upstream: None,
                 ahead_behind: None,
                 space: None,
             }],
@@ -4204,6 +4858,7 @@ mod tests {
                 demand: crate::workspace::GitStatusRefreshDemand::ALL,
                 auto_label: "one".into(),
                 branch: None,
+                upstream: None,
                 ahead_behind: None,
                 space: None,
             }],
@@ -4232,6 +4887,7 @@ mod tests {
                 demand: crate::workspace::GitStatusRefreshDemand::ALL,
                 auto_label: "other".into(),
                 branch: Some("scratch".into()),
+                upstream: None,
                 ahead_behind: None,
                 space: Some(crate::workspace::GitSpaceMetadata {
                     key: "other-repo-key".into(),
@@ -4597,7 +5253,7 @@ mod tests {
             .view
             .workspace_card_areas
             .iter()
-            .any(|card| card.ws_idx == 7));
+            .any(|card| card.workspace_index() == Some(7)));
     }
 
     #[test]
@@ -4684,6 +5340,73 @@ mod tests {
     }
 
     #[test]
+    fn move_workspace_block_projects_order_into_spaces_and_checkout_membership() {
+        let mut state = app_with_workspaces(&["primary", "linked-one", "linked-two", "notes"]);
+        let ids = state
+            .workspaces
+            .iter()
+            .map(|workspace| workspace.id.clone())
+            .collect::<Vec<_>>();
+        let repository_id = "repo".to_string();
+        for (index, kind) in [
+            crate::repository::CheckoutKind::Primary,
+            crate::repository::CheckoutKind::Linked,
+            crate::repository::CheckoutKind::Linked,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            state.workspaces[index].checkout = Some(crate::repository::CheckoutProvenance {
+                repository_id: repository_id.clone(),
+                checkout_path: format!("/checkouts/{index}").into(),
+                kind,
+            });
+        }
+        state.repositories = vec![crate::repository::Repository {
+            id: repository_id.clone(),
+            git_common_dir: "/repo/.git".into(),
+            label: "repo".into(),
+            custom_name: None,
+            preferred_base: None,
+            checkout_workspace_ids: ids[..3].to_vec(),
+            last_focused_workspace_id: Some(ids[0].clone()),
+        }];
+        state.space_order = vec![
+            crate::repository::SpaceRef::Repository(repository_id.clone()),
+            crate::repository::SpaceRef::StandaloneWorkspace(ids[3].clone()),
+        ];
+
+        assert!(state.move_workspace_block(&[ids[2].clone(), ids[1].clone()], Some(&ids[0]),));
+        assert_eq!(
+            state.repositories[0].checkout_workspace_ids,
+            vec![ids[0].clone(), ids[2].clone(), ids[1].clone()]
+        );
+        assert_eq!(state.workspaces[0].id, ids[2]);
+        assert_eq!(state.workspaces[1].id, ids[1]);
+
+        assert!(state.move_workspace_block(&[ids[0].clone()], None));
+        assert_eq!(
+            state.space_order,
+            vec![
+                crate::repository::SpaceRef::StandaloneWorkspace(ids[3].clone()),
+                crate::repository::SpaceRef::Repository(repository_id),
+            ]
+        );
+    }
+
+    #[test]
+    fn resource_selection_is_cleared_when_its_transient_resource_disappears() {
+        let mut state = app_with_workspaces(&["one"]);
+        add_test_resource(&mut state, 0, "owner", "resource", "Resource", None);
+        let workspace_id = state.workspaces[0].id.clone();
+        state.selected_workspace_resource = Some((workspace_id, "owner".into(), "resource".into()));
+        assert!(!state.reconcile_selected_workspace_resource());
+        state.workspaces[0].resources.clear_source("owner");
+        assert!(state.reconcile_selected_workspace_resource());
+        assert_eq!(state.selected_workspace_resource, None);
+    }
+
+    #[test]
     fn move_workspace_block_rejects_invalid_and_noop_orders() {
         let mut state = app_with_workspaces(&["a", "b", "c"]);
         let ids = state
@@ -4722,7 +5445,7 @@ mod tests {
     }
 
     #[test]
-    fn close_parent_worktree_workspace_closes_group() {
+    fn close_primary_checkout_keeps_repository_sibling_open() {
         let mut state = app_with_workspaces(&["main", "issue", "notes"]);
         state.workspaces[0].worktree_space = Some(crate::workspace::WorktreeSpaceMembership {
             key: "repo-key".into(),
@@ -4743,8 +5466,9 @@ mod tests {
 
         state.close_selected_workspace();
 
-        assert_eq!(state.workspaces.len(), 1);
-        assert_eq!(state.workspaces[0].display_name(), "notes");
+        assert_eq!(state.workspaces.len(), 2);
+        assert_eq!(state.workspaces[0].display_name(), "issue");
+        assert_eq!(state.workspaces[1].display_name(), "notes");
         assert_eq!(state.active, Some(0));
         assert_eq!(state.selected, 0);
     }
@@ -4803,7 +5527,7 @@ mod tests {
         state.workspace_scroll =
             crate::ui::normalized_workspace_scroll(&state, state.view.sidebar_rect, usize::MAX / 2);
         let cards = crate::ui::compute_workspace_card_areas(&state, state.view.sidebar_rect);
-        assert!(cards.iter().all(|card| card.ws_idx != 1));
+        assert!(cards.iter().all(|card| card.workspace_index() != Some(1)));
 
         let pane_id = *state.workspaces[0].panes.keys().next().unwrap();
         state.handle_pane_died(pane_id);
@@ -4813,7 +5537,7 @@ mod tests {
         assert_eq!(state.selected, 0);
         assert_eq!(state.active, Some(0));
         let cards = crate::ui::compute_workspace_card_areas(&state, state.view.sidebar_rect);
-        assert!(cards.iter().any(|card| card.ws_idx == 0));
+        assert!(cards.iter().any(|card| card.workspace_index() == Some(0)));
         state.assert_invariants_for_test();
     }
 
@@ -6130,7 +6854,7 @@ mod tests {
     }
 
     #[test]
-    fn close_pane_last_pane_in_parent_worktree_group_prompts() {
+    fn close_pane_last_pane_in_primary_checkout_closes_only_that_checkout() {
         let mut state = app_with_workspaces(&["parent", "child"]);
         mark_parent_worktree(&mut state, 0);
         mark_linked_worktree(&mut state, 1);
@@ -6139,10 +6863,10 @@ mod tests {
 
         let deferred = state.close_pane();
 
-        assert!(deferred);
-        assert_eq!(state.mode, Mode::ConfirmClose);
+        assert!(!deferred);
         assert_eq!(state.selected, 0);
-        assert_eq!(state.workspaces.len(), 2);
+        assert_eq!(state.workspaces.len(), 1);
+        assert_eq!(state.workspaces[0].display_name(), "child");
     }
 
     #[test]
@@ -6160,7 +6884,7 @@ mod tests {
     }
 
     #[test]
-    fn close_tab_last_tab_in_parent_worktree_group_prompts() {
+    fn close_tab_last_tab_in_primary_checkout_closes_only_that_checkout() {
         let mut state = app_with_workspaces(&["parent", "child"]);
         mark_parent_worktree(&mut state, 0);
         mark_linked_worktree(&mut state, 1);
@@ -6169,10 +6893,10 @@ mod tests {
 
         let deferred = state.close_tab();
 
-        assert!(deferred);
-        assert_eq!(state.mode, Mode::ConfirmClose);
+        assert!(!deferred);
         assert_eq!(state.selected, 0);
-        assert_eq!(state.workspaces.len(), 2);
+        assert_eq!(state.workspaces.len(), 1);
+        assert_eq!(state.workspaces[0].display_name(), "child");
     }
 
     #[test]
@@ -6201,7 +6925,8 @@ mod tests {
         let deferred = state.close_pane();
 
         assert!(!deferred);
-        assert_eq!(state.workspaces.len(), 1);
-        assert_eq!(state.workspaces[0].display_name(), "notes");
+        assert_eq!(state.workspaces.len(), 2);
+        assert_eq!(state.workspaces[0].display_name(), "child");
+        assert_eq!(state.workspaces[1].display_name(), "notes");
     }
 }

@@ -428,6 +428,8 @@ impl App {
         let mut restored_terminal_runtimes = crate::terminal::TerminalRuntimeRegistry::new();
         let (
             workspaces,
+            restored_repositories,
+            restored_space_order,
             active,
             selected,
             sidebar_width,
@@ -436,6 +438,8 @@ impl App {
             collapsed_space_keys,
         ) = if no_session {
             (
+                Vec::new(),
+                Vec::new(),
                 Vec::new(),
                 None,
                 0,
@@ -472,6 +476,8 @@ impl App {
                 crate::logging::session_restored(0, "empty");
                 (
                     Vec::new(),
+                    snap.repositories.clone(),
+                    snap.space_order.clone(),
                     None,
                     0,
                     snap.sidebar_width.unwrap_or(config.ui.sidebar_width),
@@ -485,10 +491,31 @@ impl App {
                 )
             } else {
                 crate::logging::session_restored(ws.len(), "ok");
-                let active = snap.active.filter(|&i| i < ws.len());
-                let selected = snap.selected.min(ws.len().saturating_sub(1));
+                // Checkouts can be unavailable during restore, so persisted indices
+                // must be remapped through immutable workspace IDs.
+                let restored_index = |snapshot_index: usize| {
+                    snap.workspaces
+                        .get(snapshot_index)
+                        .and_then(|workspace| workspace.id.as_ref())
+                        .and_then(|workspace_id| {
+                            ws.iter()
+                                .position(|workspace| &workspace.id == workspace_id)
+                        })
+                        // Legacy snapshots did not persist workspace IDs and cannot
+                        // have selectively skipped repository checkouts.
+                        .or_else(|| {
+                            snap.workspaces
+                                .get(snapshot_index)
+                                .is_some_and(|workspace| workspace.id.is_none())
+                                .then_some(snapshot_index)
+                        })
+                };
+                let active = snap.active.and_then(restored_index);
+                let selected = restored_index(snap.selected).unwrap_or(0);
                 (
                     ws,
+                    snap.repositories.clone(),
+                    snap.space_order.clone(),
                     active,
                     selected,
                     snap.sidebar_width.unwrap_or(config.ui.sidebar_width),
@@ -503,6 +530,8 @@ impl App {
             }
         } else {
             (
+                Vec::new(),
+                Vec::new(),
                 Vec::new(),
                 None,
                 0,
@@ -575,9 +604,13 @@ impl App {
             public_pane_id_aliases: std::collections::HashMap::new(),
             workspaces,
             delegations: restored_delegations,
+            repositories: restored_repositories,
+            space_order: restored_space_order,
             active,
             previous_pane_focus: None,
             selected,
+            selected_repository_id: None,
+            selected_workspace_resource: None,
             mode,
             should_quit: false,
             detach_exits: no_session,
@@ -585,6 +618,7 @@ impl App {
             request_new_workspace: false,
             request_new_tab: false,
             request_new_linked_worktree: None,
+            request_new_repository_worktree: None,
             request_open_existing_worktree: None,
             request_new_workspace_cwd: None,
             request_remove_linked_worktree: None,
@@ -597,6 +631,8 @@ impl App {
             creating_new_tab: false,
             requested_new_tab_name: None,
             pending_workspace_create_cwd: None,
+            rename_repository_target: None,
+            confirm_repository_close_target: None,
             rename_pane_target: None,
             worktree_create: None,
             worktree_open: None,
@@ -747,6 +783,7 @@ impl App {
         };
 
         state.terminals = restored_terminals;
+        state.reconcile_repositories();
 
         for ws_idx in 0..state.workspaces.len() {
             let cwd = state.workspaces[ws_idx]
@@ -886,12 +923,27 @@ impl App {
         app.state.collection_archive_times = archive_times;
         app.state.terminals = terminals;
         app.terminal_runtimes = runtimes.into();
-        app.state.active = snapshot
-            .active
-            .filter(|&idx| idx < app.state.workspaces.len());
-        app.state.selected = snapshot
-            .selected
-            .min(app.state.workspaces.len().saturating_sub(1));
+        let restored_index = |snapshot_index: usize| {
+            snapshot
+                .workspaces
+                .get(snapshot_index)
+                .and_then(|workspace| workspace.id.as_ref())
+                .and_then(|workspace_id| {
+                    app.state
+                        .workspaces
+                        .iter()
+                        .position(|workspace| &workspace.id == workspace_id)
+                })
+                .or_else(|| {
+                    snapshot
+                        .workspaces
+                        .get(snapshot_index)
+                        .is_some_and(|workspace| workspace.id.is_none())
+                        .then_some(snapshot_index)
+                })
+        };
+        app.state.active = snapshot.active.and_then(restored_index);
+        app.state.selected = restored_index(snapshot.selected).unwrap_or(0);
         if let Some(width) = snapshot.sidebar_width {
             app.state.sidebar_width = width;
             app.state.sidebar_width_source = state::SidebarWidthSource::Persisted;
@@ -899,7 +951,10 @@ impl App {
         if let Some(split) = snapshot.sidebar_section_split {
             app.state.sidebar_section_split = split;
         }
-        app.state.collapsed_space_keys = snapshot.collapsed_space_keys.clone();
+        app.state.collapsed_space_keys.clear();
+        app.state.repositories = snapshot.repositories.clone();
+        app.state.space_order = snapshot.space_order.clone();
+        app.state.reconcile_repositories();
         app.state.mode = if app.state.active.is_some() {
             state::Mode::Terminal
         } else {
@@ -1045,6 +1100,11 @@ impl App {
 
             if let Some(ws_idx) = self.state.request_new_linked_worktree.take() {
                 self.open_new_linked_worktree_dialog(ws_idx);
+                needs_render = true;
+            }
+            if let Some((repository_id, ws_idx)) = self.state.request_new_repository_worktree.take()
+            {
+                self.open_new_repository_worktree_dialog(&repository_id, ws_idx);
                 needs_render = true;
             }
 
@@ -2248,6 +2308,7 @@ mod tests {
                 demand: crate::workspace::GitStatusRefreshDemand::ALL,
                 auto_label: "one".into(),
                 branch: Some("render-dirty-test".into()),
+                upstream: None,
                 ahead_behind: Some((1, 0)),
                 space: None,
             }],
@@ -4665,7 +4726,7 @@ mod tests {
     }
 
     #[test]
-    fn pane_close_request_requires_confirmation_before_closing_parent_worktree_group() {
+    fn pane_close_request_closes_only_primary_checkout_runtime() {
         let mut app = test_app();
         let mut parent = Workspace::test_new("api-pane-close-parent");
         parent.worktree_space = Some(crate::workspace::WorktreeSpaceMembership {
@@ -4701,10 +4762,13 @@ mod tests {
         });
         let response: serde_json::Value = serde_json::from_str(&response).unwrap();
 
-        assert_eq!(response["error"]["code"], "confirmation_required");
-        assert_eq!(app.state.mode, Mode::ConfirmClose);
+        assert_eq!(response["result"]["type"], "ok");
         assert_eq!(app.state.selected, 0);
-        assert_eq!(app.state.workspaces.len(), 2);
+        assert_eq!(app.state.workspaces.len(), 1);
+        assert_eq!(
+            app.state.workspaces[0].display_name(),
+            "api-pane-close-child"
+        );
     }
 
     #[test]
@@ -5773,8 +5837,13 @@ last_pane = "prefix+tab"
             source_existing_membership: None,
             source_repo_root: "/repo/herdr".into(),
             repo_key: "repo-key".into(),
+            repository_id: None,
             repo_name: "herdr".into(),
             branch: "generated-branch".into(),
+            base_ref: "HEAD".into(),
+            base_commit: "00000000".into(),
+            editing_base: false,
+            branch_exists: false,
             checkout_path: "/repo/herdr-generated-branch".into(),
             error: None,
             creating: false,

@@ -357,6 +357,7 @@ pub enum PluginPlatform {
 pub enum PluginActionContext {
     Global,
     Workspace,
+    WorkspaceResource,
     Tab,
     Pane,
     Selection,
@@ -365,11 +366,17 @@ pub enum PluginActionContext {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct PluginInvocationContext {
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace_resource: Option<super::workspaces::WorkspaceResourceInfo>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workspace_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workspace_label: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workspace_cwd: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repository_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub checkout: Option<super::repositories::CheckoutInfo>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub worktree: Option<WorkspaceWorktreeInfo>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

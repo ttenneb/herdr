@@ -661,3 +661,71 @@ fn tab_management_commands_work() {
 
     cleanup_spawned_herdr(herdr, base);
 }
+
+#[test]
+fn repository_queries_print_human_and_json_output_and_report_unknown_ids() {
+    let base = unique_test_dir();
+    let config_home = base.join("config");
+    let runtime_dir = base.join("runtime");
+    let socket_path = runtime_dir.join("herdr.sock");
+    let repo = base.join("query-repo");
+    fs::create_dir_all(&repo).unwrap();
+    let git = std::process::Command::new("git")
+        .args(["-C", repo.to_str().unwrap(), "init", "--quiet"])
+        .status()
+        .unwrap();
+    assert!(git.success());
+
+    let herdr = spawn_herdr(&config_home, &runtime_dir, &socket_path);
+    wait_for_socket(&socket_path, Duration::from_secs(5));
+    let created = run_cli(
+        &socket_path,
+        &["workspace", "create", "--cwd", repo.to_str().unwrap()],
+    );
+    assert!(
+        created.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&created.stderr)
+    );
+
+    let listed = run_cli(&socket_path, &["repository", "list"]);
+    assert!(listed.status.success());
+    let list_text = String::from_utf8_lossy(&listed.stdout);
+    assert!(list_text.contains("query-repo"), "{list_text}");
+    assert!(list_text.contains("checkout"), "{list_text}");
+
+    let listed_json = run_cli(&socket_path, &["repository", "list", "--json"]);
+    assert!(listed_json.status.success());
+    let listed_json: serde_json::Value = serde_json::from_slice(&listed_json.stdout).unwrap();
+    let repository_id = listed_json["result"]["repositories"][0]["repository_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let fetched = run_cli(&socket_path, &["repository", "get", &repository_id]);
+    assert!(fetched.status.success());
+    let get_text = String::from_utf8_lossy(&fetched.stdout);
+    assert!(
+        get_text.contains(&format!("id: {repository_id}")),
+        "{get_text}"
+    );
+    assert!(get_text.contains("git common dir:"), "{get_text}");
+
+    let fetched_json = run_cli(
+        &socket_path,
+        &["repository", "get", &repository_id, "--json"],
+    );
+    assert!(fetched_json.status.success());
+    let fetched_json: serde_json::Value = serde_json::from_slice(&fetched_json.stdout).unwrap();
+    assert_eq!(
+        fetched_json["result"]["repository"]["repository_id"],
+        repository_id
+    );
+
+    let missing = run_cli(&socket_path, &["repository", "get", "r-missing"]);
+    assert_eq!(missing.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&missing.stderr).contains("repository_not_found"));
+    assert!(missing.stdout.is_empty());
+
+    cleanup_spawned_herdr(herdr, base);
+}

@@ -216,7 +216,9 @@ impl App {
                 }
             }
             NavigateAction::RenameWorkspace => {
-                if let Some(ws_idx) = workspace_action_target(&self.state, context) {
+                if let Some(repository_id) = self.state.selected_repository_id.clone() {
+                    super::modal::open_rename_repository(&mut self.state, repository_id);
+                } else if let Some(ws_idx) = workspace_action_target(&self.state, context) {
                     super::modal::open_rename_workspace(
                         &mut self.state,
                         &self.terminal_runtimes,
@@ -225,7 +227,10 @@ impl App {
                 }
             }
             NavigateAction::CloseWorkspace => {
-                if let Some(ws_idx) = workspace_action_target(&self.state, context) {
+                if let Some(repository_id) = self.state.selected_repository_id.clone() {
+                    self.state.confirm_repository_close_target = Some(repository_id);
+                    super::modal::open_confirm_close(&mut self.state);
+                } else if let Some(ws_idx) = workspace_action_target(&self.state, context) {
                     self.state.selected = ws_idx;
                     if self.state.confirm_close {
                         super::modal::open_confirm_close(&mut self.state);
@@ -236,8 +241,43 @@ impl App {
                 }
             }
             NavigateAction::SwitchWorkspace(idx) => {
-                if let Some(ws_idx) = self.state.workspace_at_visible_position(idx) {
-                    self.focus_workspace_idx_via_api(ws_idx);
+                if let Some(target) = self.state.space_at_visible_position(idx) {
+                    match target {
+                        crate::app::state::SpaceRowTarget::Repository(repository_id) => {
+                            self.dispatch_runtime_mutation(
+                                "tui.repository.focus",
+                                crate::api::schema::Method::RepositoryFocus(
+                                    crate::api::schema::RepositoryTarget { repository_id },
+                                ),
+                            );
+                        }
+                        crate::app::state::SpaceRowTarget::Workspace(ws_idx) => {
+                            self.focus_workspace_idx_via_api(ws_idx)
+                        }
+                        crate::app::state::SpaceRowTarget::WorkspaceResource {
+                            workspace_id,
+                            plugin_id,
+                            resource_id,
+                        } => {
+                            // Enter activates the selected resource like mouse/mobile/Navigator.
+                            let Some(ws_idx) = self
+                                .state
+                                .workspaces
+                                .iter()
+                                .position(|workspace| workspace.id == workspace_id)
+                            else {
+                                return;
+                            };
+                            self.state.select_space_row(
+                                crate::app::state::SpaceRowTarget::WorkspaceResource {
+                                    workspace_id,
+                                    plugin_id,
+                                    resource_id,
+                                },
+                            );
+                            self.focus_workspace_idx_via_api(ws_idx);
+                        }
+                    }
                     leave_navigate_mode(&mut self.state);
                 }
             }
@@ -441,6 +481,7 @@ impl App {
         );
     }
 
+    #[expect(dead_code, reason = "socket compatibility operation")]
     pub(crate) fn move_workspace_block_via_api(
         &mut self,
         params: crate::api::schema::WorkspaceMoveBlockParams,
@@ -699,7 +740,16 @@ impl App {
     }
 
     fn relative_visible_workspace(&self, delta: isize) -> Option<usize> {
-        let order = self.state.visible_workspace_order();
+        let order = self
+            .state
+            .visible_space_order()
+            .into_iter()
+            .filter_map(|target| match target {
+                crate::app::state::SpaceRowTarget::Workspace(idx) => Some(idx),
+                crate::app::state::SpaceRowTarget::Repository(_)
+                | crate::app::state::SpaceRowTarget::WorkspaceResource { .. } => None,
+            })
+            .collect::<Vec<_>>();
         if order.is_empty() {
             return None;
         }
@@ -1169,8 +1219,16 @@ fn unmodified_digit_for_key(key: TerminalKey) -> Option<char> {
 pub(super) fn handle_navigate_reserved_key(state: &mut AppState, key: TerminalKey) -> bool {
     if let Some(c) = unmodified_digit_for_key(key) {
         let idx = (c as usize) - ('1' as usize);
-        if let Some(ws_idx) = state.workspace_at_visible_position(idx) {
-            state.switch_workspace(ws_idx);
+        if let Some(target) = state.space_at_visible_position(idx) {
+            match target {
+                crate::app::state::SpaceRowTarget::Repository(id) => {
+                    state.focus_repository(&id);
+                }
+                crate::app::state::SpaceRowTarget::Workspace(ws_idx) => {
+                    state.switch_workspace(ws_idx);
+                }
+                crate::app::state::SpaceRowTarget::WorkspaceResource { .. } => return true,
+            }
             leave_navigate_mode(state);
         }
         return true;
@@ -1180,8 +1238,27 @@ pub(super) fn handle_navigate_reserved_key(state: &mut AppState, key: TerminalKe
     if modifiers.is_empty() {
         match code {
             KeyCode::Enter => {
-                if !state.workspaces.is_empty() {
+                if let Some(repository_id) = state.selected_repository_id.clone() {
+                    state.focus_repository(&repository_id);
+                    leave_navigate_mode(state);
+                } else if !state.workspaces.is_empty() {
                     state.switch_workspace(state.selected);
+                    leave_navigate_mode(state);
+                }
+                return true;
+            }
+            KeyCode::Char(c @ '1'..='9') => {
+                let idx = (c as usize) - ('1' as usize);
+                if let Some(target) = state.space_at_visible_position(idx) {
+                    match target {
+                        crate::app::state::SpaceRowTarget::Repository(id) => {
+                            state.focus_repository(&id);
+                        }
+                        crate::app::state::SpaceRowTarget::Workspace(ws_idx) => {
+                            state.switch_workspace(ws_idx)
+                        }
+                        crate::app::state::SpaceRowTarget::WorkspaceResource { .. } => return true,
+                    }
                     leave_navigate_mode(state);
                 }
                 return true;
@@ -1252,11 +1329,20 @@ fn navigate_reserved_action_for_key(state: &AppState, key: TerminalKey) -> Optio
             KeyCode::Enter => {
                 return (!state.workspaces.is_empty()).then_some(NavigateAction::SwitchWorkspace(
                     state
-                        .visible_workspace_order()
+                        .visible_space_order()
                         .iter()
-                        .position(|idx| *idx == state.selected)
-                        .unwrap_or(state.selected),
+                        .position(|target| target == &state.selected_space_row())
+                        .unwrap_or(0),
                 ));
+            }
+            KeyCode::Char(c @ '1'..='9') => {
+                let position = (c as usize) - ('1' as usize);
+                // Numeric space shortcuts intentionally skip resource rows.
+                return (!matches!(
+                    state.space_at_visible_position(position),
+                    Some(crate::app::state::SpaceRowTarget::WorkspaceResource { .. })
+                ))
+                .then_some(NavigateAction::SwitchWorkspace(position));
             }
             KeyCode::Tab => return Some(NavigateAction::CyclePaneNext),
             KeyCode::BackTab => return Some(NavigateAction::CyclePanePrevious),
@@ -1624,8 +1710,16 @@ pub(super) fn execute_navigate_action_in_context(
             }
         }
         NavigateAction::SwitchWorkspace(idx) => {
-            if let Some(ws_idx) = state.workspace_at_visible_position(idx) {
-                state.switch_workspace(ws_idx);
+            if let Some(target) = state.space_at_visible_position(idx) {
+                match target {
+                    crate::app::state::SpaceRowTarget::Repository(id) => {
+                        state.focus_repository(&id);
+                    }
+                    crate::app::state::SpaceRowTarget::Workspace(ws_idx) => {
+                        state.switch_workspace(ws_idx)
+                    }
+                    crate::app::state::SpaceRowTarget::WorkspaceResource { .. } => return,
+                }
                 leave_navigate_mode(state);
             }
         }
@@ -3139,8 +3233,8 @@ navigate_pane_down = "ctrl+j"
         execute_navigate_action(&mut state, NavigateAction::ClosePane);
 
         assert_eq!(state.selected, 0);
-        assert_eq!(state.mode, Mode::ConfirmClose);
-        assert_eq!(state.workspaces.len(), 2);
+        assert_eq!(state.mode, Mode::Terminal);
+        assert_eq!(state.workspaces.len(), 1);
     }
 
     #[test]
@@ -3155,8 +3249,8 @@ navigate_pane_down = "ctrl+j"
         app.execute_tui_navigate_action(NavigateAction::CloseTab, ActionContext::Navigate);
 
         assert_eq!(app.state.selected, 0);
-        assert_eq!(app.state.mode, Mode::ConfirmClose);
-        assert_eq!(app.state.workspaces.len(), 2);
+        assert_eq!(app.state.mode, Mode::Terminal);
+        assert_eq!(app.state.workspaces.len(), 1);
     }
 
     #[test]
@@ -3171,8 +3265,8 @@ navigate_pane_down = "ctrl+j"
         app.execute_tui_navigate_action(NavigateAction::ClosePane, ActionContext::Navigate);
 
         assert_eq!(app.state.selected, 0);
-        assert_eq!(app.state.mode, Mode::ConfirmClose);
-        assert_eq!(app.state.workspaces.len(), 2);
+        assert_eq!(app.state.mode, Mode::Terminal);
+        assert_eq!(app.state.workspaces.len(), 1);
     }
 
     #[cfg(unix)]

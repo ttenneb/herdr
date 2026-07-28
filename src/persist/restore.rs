@@ -279,6 +279,16 @@ fn restore_with_imports_and_failures(
     let mut pane_id_map = HashMap::new();
     let mut failed_imports = 0;
     for (idx, ws_snap) in snapshot.workspaces.iter().enumerate() {
+        let is_repository_checkout = ws_snap.id.as_ref().is_some_and(|workspace_id| {
+            snapshot
+                .repositories
+                .iter()
+                .any(|repository| repository.checkout_workspace_ids.contains(workspace_id))
+        });
+        if is_repository_checkout && !ws_snap.identity_cwd.exists() {
+            warn!(cwd = %ws_snap.identity_cwd.display(), "repository checkout is unavailable during restore; dropping checkout");
+            continue;
+        }
         let runtime_context = RestoreRuntimeContext {
             scrollback_limit_bytes,
             shell_config,
@@ -479,11 +489,14 @@ fn restore_workspace(
             cached_auto_label,
             cached_git_status_key,
             cached_git_branch: crate::workspace::git_branch(&snap.identity_cwd),
+            cached_git_primary_upstream: None,
             cached_git_ahead_behind: None,
             cached_git_space,
+            checkout: snap.checkout.clone(),
             worktree_space,
             metadata_tokens: crate::metadata_tokens::MetadataTokens::default(),
             metadata_token_sequences: HashMap::new(),
+            resources: crate::workspace_resources::WorkspaceResourceRegistry::default(),
             public_pane_numbers,
             next_public_pane_number,
             next_public_tab_number,
@@ -1256,10 +1269,13 @@ mod tests {
     ) -> SessionSnapshot {
         SessionSnapshot {
             version: super::super::snapshot::SNAPSHOT_VERSION,
+            repositories: Vec::new(),
+            space_order: Vec::new(),
             workspaces: vec![WorkspaceSnapshot {
                 id: Some("restore-test".into()),
                 custom_name: None,
                 identity_cwd: std::env::current_dir().unwrap(),
+                checkout: None,
                 worktree_space: None,
                 public_pane_numbers: HashMap::new(),
                 next_public_pane_number: 0,
@@ -1353,6 +1369,7 @@ mod tests {
             id: Some(id.into()),
             custom_name: None,
             identity_cwd: cwd.clone(),
+            checkout: None,
             worktree_space: None,
             public_pane_numbers: HashMap::new(),
             next_public_pane_number: 1,
@@ -1363,6 +1380,8 @@ mod tests {
         };
         let snapshot = SessionSnapshot {
             version: super::super::snapshot::SNAPSHOT_VERSION,
+            repositories: Vec::new(),
+            space_order: Vec::new(),
             workspaces: vec![
                 workspace(
                     "duplicate-tabs",
@@ -1687,10 +1706,13 @@ mod tests {
         let cwd = std::env::current_dir().unwrap();
         let snapshot = SessionSnapshot {
             version: super::super::snapshot::SNAPSHOT_VERSION,
+            repositories: Vec::new(),
+            space_order: Vec::new(),
             workspaces: vec![WorkspaceSnapshot {
                 id: Some("workspace".into()),
                 custom_name: None,
                 identity_cwd: cwd.clone(),
+                checkout: None,
                 worktree_space: None,
                 public_pane_numbers: HashMap::new(),
                 next_public_pane_number: 0,
@@ -1773,10 +1795,13 @@ mod tests {
         let cwd = std::env::current_dir().unwrap();
         let snapshot = SessionSnapshot {
             version: super::super::snapshot::SNAPSHOT_VERSION,
+            repositories: Vec::new(),
+            space_order: Vec::new(),
             workspaces: vec![WorkspaceSnapshot {
                 id: Some("w1".into()),
                 custom_name: None,
                 identity_cwd: cwd.clone(),
+                checkout: None,
                 worktree_space: None,
                 public_pane_numbers: HashMap::from([(10, 1), (20, 3)]),
                 next_public_pane_number: 4,
@@ -2112,10 +2137,13 @@ mod tests {
         };
         let snapshot = SessionSnapshot {
             version: super::super::snapshot::SNAPSHOT_VERSION,
+            repositories: Vec::new(),
+            space_order: Vec::new(),
             workspaces: vec![WorkspaceSnapshot {
                 id: Some("w1".into()),
                 custom_name: None,
                 identity_cwd: cwd.clone(),
+                checkout: None,
                 worktree_space: None,
                 public_pane_numbers: HashMap::from([(10, 1), (11, 2), (12, 3), (13, 4)]),
                 next_public_pane_number: 5,
@@ -2214,6 +2242,7 @@ mod tests {
             id: Some("w1".into()),
             custom_name: None,
             identity_cwd: cwd,
+            checkout: None,
             worktree_space: None,
             public_pane_numbers: HashMap::new(),
             next_public_pane_number: 0,
@@ -2252,10 +2281,13 @@ mod tests {
         let cwd = std::env::current_dir().unwrap();
         let snapshot = SessionSnapshot {
             version: super::super::snapshot::SNAPSHOT_VERSION,
+            repositories: Vec::new(),
+            space_order: Vec::new(),
             workspaces: vec![WorkspaceSnapshot {
                 id: Some("workspace".into()),
                 custom_name: None,
                 identity_cwd: cwd.clone(),
+                checkout: None,
                 worktree_space: None,
                 public_pane_numbers: HashMap::new(),
                 next_public_pane_number: 0,
@@ -2473,10 +2505,13 @@ mod tests {
         };
         let snapshot = SessionSnapshot {
             version: super::super::snapshot::SNAPSHOT_VERSION,
+            repositories: Vec::new(),
+            space_order: Vec::new(),
             workspaces: vec![WorkspaceSnapshot {
                 id: Some("workspace".into()),
                 custom_name: None,
                 identity_cwd: cwd,
+                checkout: None,
                 worktree_space: None,
                 public_pane_numbers: HashMap::new(),
                 next_public_pane_number: 0,

@@ -30,7 +30,7 @@ This is the strongest persistence path because the original processes never stop
 
 ## Snapshot restore
 
-If the Herdr server stops and starts again, the original pane processes are gone. Herdr restores the saved session shape: workspaces, tabs, panes, cwd, layout, and focus.
+If the Herdr server stops and starts again, the original pane processes are gone. Herdr restores the saved session shape: the ordered main-worktree-root/standalone Space list, Checkout membership, workspaces, tabs, panes, cwd, layout, and focus. Existing workspace, tab, pane, and terminal identities are preserved across the repository-state migration. Missing checkout directories drop only that Checkout; an empty Repository is removed.
 
 Snapshot restore does not preserve running shells, servers, tests, or arbitrary processes. Panes that cannot use a stronger restore path come back as new shells in their saved directories.
 

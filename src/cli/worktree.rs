@@ -25,12 +25,21 @@ pub(super) fn run_worktree_command(args: &[String]) -> std::io::Result<i32> {
 }
 
 fn worktree_list(args: &[String]) -> std::io::Result<i32> {
+    let mut repository_id = None;
     let mut workspace_id = None;
     let mut cwd = None;
 
     let mut index = 0;
     while index < args.len() {
         match args[index].as_str() {
+            "--repository" => {
+                let Some(value) = args.get(index + 1) else {
+                    eprintln!("missing value for --repository");
+                    return Ok(2);
+                };
+                repository_id = Some(value.clone());
+                index += 2;
+            }
             "--workspace" => {
                 let Some(value) = args.get(index + 1) else {
                     eprintln!("missing value for --workspace");
@@ -54,15 +63,26 @@ fn worktree_list(args: &[String]) -> std::io::Result<i32> {
             }
         }
     }
-    if workspace_id.is_some() && cwd.is_some() {
-        eprintln!("usage: herdr worktree list [--workspace ID | --cwd PATH] [--json]");
+    if usize::from(repository_id.is_some())
+        + usize::from(workspace_id.is_some())
+        + usize::from(cwd.is_some())
+        > 1
+    {
+        eprintln!(
+            "usage: herdr worktree list [--repository ID | --workspace ID | --cwd PATH] [--json]"
+        );
         return Ok(2);
     }
 
-    super::runtime::worktree_list(WorktreeListParams { workspace_id, cwd })
+    super::runtime::worktree_list(WorktreeListParams {
+        repository_id,
+        workspace_id,
+        cwd,
+    })
 }
 
 fn worktree_create(args: &[String]) -> std::io::Result<i32> {
+    let mut repository_id = None;
     let mut workspace_id = None;
     let mut cwd = None;
     let mut branch = None;
@@ -74,6 +94,14 @@ fn worktree_create(args: &[String]) -> std::io::Result<i32> {
     let mut index = 0;
     while index < args.len() {
         match args[index].as_str() {
+            "--repository" => {
+                let Some(value) = args.get(index + 1) else {
+                    eprintln!("missing value for --repository");
+                    return Ok(2);
+                };
+                repository_id = Some(value.clone());
+                index += 2;
+            }
             "--workspace" => {
                 let Some(value) = args.get(index + 1) else {
                     eprintln!("missing value for --workspace");
@@ -137,14 +165,19 @@ fn worktree_create(args: &[String]) -> std::io::Result<i32> {
             }
         }
     }
-    if workspace_id.is_some() && cwd.is_some() {
+    if usize::from(repository_id.is_some())
+        + usize::from(workspace_id.is_some())
+        + usize::from(cwd.is_some())
+        > 1
+    {
         eprintln!(
-            "usage: herdr worktree create [--workspace ID | --cwd PATH] [--branch NAME] [--base REF] [--path PATH] [--label TEXT] [--focus] [--no-focus] [--json]"
+            "usage: herdr worktree create [--repository ID | --workspace ID | --cwd PATH] [--branch NAME] [--base REF] [--path PATH] [--label TEXT] [--focus] [--no-focus] [--json]"
         );
         return Ok(2);
     }
 
     super::runtime::worktree_create(WorktreeCreateParams {
+        repository_id,
         workspace_id,
         cwd,
         branch,
@@ -156,6 +189,7 @@ fn worktree_create(args: &[String]) -> std::io::Result<i32> {
 }
 
 fn worktree_open(args: &[String]) -> std::io::Result<i32> {
+    let mut repository_id = None;
     let mut workspace_id = None;
     let mut cwd = None;
     let mut path = None;
@@ -166,6 +200,14 @@ fn worktree_open(args: &[String]) -> std::io::Result<i32> {
     let mut index = 0;
     while index < args.len() {
         match args[index].as_str() {
+            "--repository" => {
+                let Some(value) = args.get(index + 1) else {
+                    eprintln!("missing value for --repository");
+                    return Ok(2);
+                };
+                repository_id = Some(value.clone());
+                index += 2;
+            }
             "--workspace" => {
                 let Some(value) = args.get(index + 1) else {
                     eprintln!("missing value for --workspace");
@@ -221,20 +263,25 @@ fn worktree_open(args: &[String]) -> std::io::Result<i32> {
             }
         }
     }
-    if workspace_id.is_some() && cwd.is_some() {
+    if usize::from(repository_id.is_some())
+        + usize::from(workspace_id.is_some())
+        + usize::from(cwd.is_some())
+        > 1
+    {
         eprintln!(
-            "usage: herdr worktree open [--workspace ID | --cwd PATH] (--path PATH | --branch NAME) [--label TEXT] [--focus] [--no-focus] [--json]"
+            "usage: herdr worktree open [--repository ID | --workspace ID | --cwd PATH] (--path PATH | --branch NAME) [--label TEXT] [--focus] [--no-focus] [--json]"
         );
         return Ok(2);
     }
     if path.is_some() == branch.is_some() {
         eprintln!(
-            "usage: herdr worktree open [--workspace ID | --cwd PATH] (--path PATH | --branch NAME) [--label TEXT] [--focus] [--no-focus] [--json]"
+            "usage: herdr worktree open [--repository ID | --workspace ID | --cwd PATH] (--path PATH | --branch NAME) [--label TEXT] [--focus] [--no-focus] [--json]"
         );
         return Ok(2);
     }
 
     super::runtime::worktree_open(WorktreeOpenParams {
+        repository_id,
         workspace_id,
         cwd,
         path,
@@ -284,12 +331,12 @@ fn worktree_remove(args: &[String]) -> std::io::Result<i32> {
 
 fn print_worktree_help() {
     eprintln!("herdr worktree commands:");
-    eprintln!("  herdr worktree list [--workspace ID | --cwd PATH] [--json]");
+    eprintln!("  herdr worktree list [--repository ID | --workspace ID | --cwd PATH] [--json]");
     eprintln!(
-        "  herdr worktree create [--workspace ID | --cwd PATH] [--branch NAME] [--base REF] [--path PATH] [--label TEXT] [--focus] [--no-focus] [--json]"
+        "  herdr worktree create [--repository ID | --workspace ID | --cwd PATH] [--branch NAME] [--base REF] [--path PATH] [--label TEXT] [--focus] [--no-focus] [--json]"
     );
     eprintln!(
-        "  herdr worktree open [--workspace ID | --cwd PATH] (--path PATH | --branch NAME) [--label TEXT] [--focus] [--no-focus] [--json]"
+        "  herdr worktree open [--repository ID | --workspace ID | --cwd PATH] (--path PATH | --branch NAME) [--label TEXT] [--focus] [--no-focus] [--json]"
     );
     eprintln!("  herdr worktree remove --workspace ID [--force] [--json]");
 }

@@ -418,6 +418,43 @@ impl App {
                     MouseAction::FocusWorkspace { ws_idx } => {
                         self.focus_workspace_idx_via_api(ws_idx)
                     }
+                    MouseAction::FocusWorkspaceResource {
+                        ws_idx,
+                        plugin_id,
+                        resource_id,
+                        column,
+                        row,
+                    } => {
+                        // Focus through the runtime API before opening this local menu so
+                        // subscribers receive the standard workspace.focused event.
+                        self.focus_workspace_idx_via_api(ws_idx);
+                        if let Some(workspace) = self.state.workspaces.get(ws_idx) {
+                            self.state.selected_workspace_resource = Some((
+                                workspace.id.clone(),
+                                plugin_id.clone(),
+                                resource_id.clone(),
+                            ));
+                            self.state.context_menu =
+                                Some(crate::app::state::ContextMenuState::new(
+                                    crate::app::state::ContextMenuKind::WorkspaceResource {
+                                        ws_idx,
+                                        plugin_id,
+                                        resource_id,
+                                    },
+                                    column,
+                                    row,
+                                ));
+                            self.state.mode = crate::app::state::Mode::ContextMenu;
+                        }
+                    }
+                    MouseAction::FocusRepository { repository_id } => {
+                        self.dispatch_runtime_mutation(
+                            "tui.repository.focus",
+                            crate::api::schema::Method::RepositoryFocus(
+                                crate::api::schema::RepositoryTarget { repository_id },
+                            ),
+                        );
+                    }
                     MouseAction::FocusTab { tab_idx } => self.focus_tab_idx_via_api(tab_idx),
                     MouseAction::FocusPane { ws_idx, pane_id } => {
                         self.focus_pane_internal_via_api(ws_idx, pane_id)
@@ -427,8 +464,33 @@ impl App {
                         source_ws_idx,
                         insert_idx,
                     } => self.move_workspace_via_api(source_ws_idx, insert_idx),
-                    MouseAction::MoveWorkspaceBlock { params } => {
-                        self.move_workspace_block_via_api(params)
+                    MouseAction::MoveRepository {
+                        repository_id,
+                        insert_idx,
+                    } => {
+                        self.dispatch_runtime_mutation(
+                            "tui.repository.move",
+                            crate::api::schema::Method::RepositoryMove(
+                                crate::api::schema::RepositoryMoveParams {
+                                    repository_id,
+                                    insert_index: insert_idx,
+                                },
+                            ),
+                        );
+                    }
+                    MouseAction::MoveCheckout {
+                        workspace_id,
+                        insert_idx,
+                    } => {
+                        self.dispatch_runtime_mutation(
+                            "tui.checkout.move",
+                            crate::api::schema::Method::CheckoutMove(
+                                crate::api::schema::CheckoutMoveParams {
+                                    workspace_id,
+                                    insert_index: insert_idx,
+                                },
+                            ),
+                        );
                     }
                     MouseAction::MoveTab {
                         ws_idx,
@@ -933,6 +995,8 @@ fn capture_snapshot(state: &AppState) -> crate::persist::SessionSnapshot {
     let terminal_runtimes = crate::terminal::TerminalRuntimeRegistry::new();
     crate::persist::capture(
         &state.workspaces,
+        &state.repositories,
+        &state.space_order,
         &state.delegations,
         &state.collection_archive_times,
         &state.terminals,
@@ -993,6 +1057,69 @@ mod tests {
         )
     }
 
+    #[test]
+    fn mobile_resource_tap_focuses_through_api_and_opens_resource_menu() {
+        let mut app = test_app();
+        let mut owner = crate::workspace::Workspace::test_new("owner");
+        owner.id = "owner-id".into();
+        owner
+            .resources
+            .report(
+                "example".into(),
+                vec![crate::workspace_resources::WorkspaceResource {
+                    plugin_id: "example".into(),
+                    resource_id: "resource".into(),
+                    label: "Resource".into(),
+                    detail: None,
+                    data: None,
+                }],
+                None,
+                None,
+                std::time::Instant::now(),
+            )
+            .expect("resource report");
+        app.state.workspaces = vec![crate::workspace::Workspace::test_new("other"), owner];
+        app.state.active = Some(0);
+        app.state.selected = 0;
+        app.state.mode = Mode::Navigate;
+        app.state.view.layout = crate::app::state::ViewLayout::Mobile;
+        app.state.view.mobile_header_rect = ratatui::layout::Rect::new(0, 0, 40, 2);
+        app.state.view.terminal_area = ratatui::layout::Rect::new(0, 2, 40, 18);
+
+        // no agent rows: title/new/workspace rows occupy doc rows 0..3;
+        // the owner's resource starts at doc row 6.
+        assert!(matches!(
+            crate::ui::mobile_switcher_target_at(&app.state, 2, 9),
+            Some(crate::ui::MobileSwitcherTarget::WorkspaceResource { .. })
+        ));
+        app.handle_mouse(crossterm::event::MouseEvent {
+            kind: crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left),
+            column: 2,
+            row: 9,
+            modifiers: crossterm::event::KeyModifiers::NONE,
+        });
+        app.sync_focus_events();
+
+        assert_eq!(app.state.active, Some(1));
+        assert!(matches!(
+            app.state.context_menu.as_ref().map(|menu| &menu.kind),
+            Some(crate::app::state::ContextMenuKind::WorkspaceResource {
+                ws_idx: 1,
+                plugin_id,
+                resource_id,
+            }) if plugin_id == "example" && resource_id == "resource"
+        ));
+        assert!(app
+            .event_hub
+            .events_after(0)
+            .iter()
+            .any(|(_, event)| matches!(
+                event.data,
+                crate::api::schema::EventData::WorkspaceFocused { ref workspace_id }
+                    if workspace_id == "owner-id"
+            )));
+    }
+
     #[tokio::test]
     async fn paste_routes_to_rename_modal_input() {
         let mut app = test_app();
@@ -1036,8 +1163,13 @@ mod tests {
             source_existing_membership: None,
             source_repo_root: "/repo/herdr".into(),
             repo_key: "repo-key".into(),
+            repository_id: None,
             repo_name: "herdr".into(),
             branch: "generated-branch".into(),
+            base_ref: "HEAD".into(),
+            base_commit: "00000000".into(),
+            editing_base: false,
+            branch_exists: false,
             checkout_path: "/repo/herdr-generated-branch".into(),
             error: None,
             creating: false,

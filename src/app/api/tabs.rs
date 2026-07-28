@@ -268,8 +268,6 @@ impl App {
                     "closing this tab would close a worktree group",
                 );
             }
-            // The parent may own linked worktree workspaces.  Use the canonical
-            // group close path so every member emits the complete lifecycle.
             self.close_workspace_group_with_lifecycle(ws_idx);
             return encode_success(id, ResponseResult::Ok {});
         }

@@ -1169,6 +1169,8 @@ impl HeadlessServer {
 
         let snapshot = crate::persist::capture(
             &self.app.state.workspaces,
+            &self.app.state.repositories,
+            &self.app.state.space_order,
             &self.app.state.delegations,
             &self.app.state.collection_archive_times,
             &self.app.state.terminals,
@@ -5047,11 +5049,28 @@ mod tests {
     async fn headless_deferred_workspace_create_uses_runtime_events() {
         let event_hub = api::EventHub::default();
         let mut server = test_headless_server_with_event_hub(event_hub.clone());
+        let cwd = std::env::temp_dir().join(format!(
+            "herdr-headless-deferred-workspace-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        fs::create_dir_all(&cwd).expect("create test repository directory");
+        let status = std::process::Command::new("git")
+            .args(["init", "--quiet"])
+            .current_dir(&cwd)
+            .status()
+            .expect("initialize test repository");
+        assert!(status.success(), "git init failed");
 
-        server.app.state.request_new_workspace = true;
+        // Do not derive this from the test process cwd: that differs between a
+        // checkout and a clean CI directory, which changes Git discovery.
+        server.app.state.request_new_workspace_cwd = Some(cwd.clone());
 
         assert!(server.handle_deferred_requests_headless());
-        assert!(!server.app.state.request_new_workspace);
+        assert_eq!(server.app.state.request_new_workspace_cwd, None);
         assert_eq!(
             event_hub
                 .events_after(0)
@@ -5059,13 +5078,16 @@ mod tests {
                 .map(|(_, event)| event.event)
                 .collect::<Vec<_>>(),
             vec![
+                api::schema::EventKind::RepositoryCreated,
                 api::schema::EventKind::WorkspaceCreated,
+                api::schema::EventKind::CheckoutOpened,
                 api::schema::EventKind::TabCreated,
                 api::schema::EventKind::PaneCreated,
                 api::schema::EventKind::LayoutUpdated,
             ]
         );
         shutdown_test_runtimes(&mut server);
+        let _ = fs::remove_dir_all(cwd);
     }
 
     #[tokio::test]
@@ -6043,6 +6065,7 @@ next_tab = ""
                 demand: crate::workspace::GitStatusRefreshDemand::ALL,
                 auto_label: "cached".into(),
                 branch: None,
+                upstream: None,
                 ahead_behind: None,
                 space: None,
             }],
@@ -6069,6 +6092,7 @@ next_tab = ""
                 demand: crate::workspace::GitStatusRefreshDemand::ALL,
                 auto_label: "one".into(),
                 branch: Some("changed".into()),
+                upstream: None,
                 ahead_behind: None,
                 space: None,
             }],

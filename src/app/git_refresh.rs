@@ -100,7 +100,10 @@ impl App {
     }
 
     fn git_refresh_demand(&self) -> GitStatusRefreshDemand {
-        let mut demand = GitStatusRefreshDemand::default();
+        let mut demand = GitStatusRefreshDemand {
+            upstream: !self.state.repositories.is_empty(),
+            ..GitStatusRefreshDemand::default()
+        };
         for token in self.state.sidebar_spaces.rows.iter().flatten() {
             match token.parts().0 {
                 crate::config::SpaceSidebarToken::Branch => demand.branch = true,
@@ -343,6 +346,7 @@ mod tests {
                 crate::config::SpaceSidebarToken::Branch,
                 GitStatusRefreshDemand {
                     branch: true,
+                    upstream: false,
                     ahead_behind: false,
                 },
             ),
@@ -350,6 +354,7 @@ mod tests {
                 crate::config::SpaceSidebarToken::GitStatus,
                 GitStatusRefreshDemand {
                     branch: false,
+                    upstream: false,
                     ahead_behind: true,
                 },
             ),
@@ -368,6 +373,33 @@ mod tests {
                 "token: {token:?}"
             );
         }
+    }
+
+    #[test]
+    fn repository_rows_demand_primary_upstream_refresh() {
+        let mut config = crate::config::Config::default();
+        config.ui.sidebar.spaces.rows = vec![vec![crate::config::SpaceSidebarToken::Workspace]];
+        let mut app = test_app(&config);
+        let mut workspace = Workspace::test_new("repo");
+        workspace.cached_git_space = Some(crate::workspace::GitSpaceMetadata {
+            key: "/repo/.git".into(),
+            checkout_key: "/repo".into(),
+            label: "repo".into(),
+            repo_root: "/repo".into(),
+            is_linked_worktree: false,
+        });
+        app.state.workspaces.push(workspace);
+        app.state.reconcile_repositories();
+
+        assert_eq!(
+            app.git_refresh_demand(),
+            GitStatusRefreshDemand {
+                branch: false,
+                upstream: true,
+                ahead_behind: false,
+            }
+        );
+        assert!(app.git_refresh_deadline().is_some());
     }
 
     #[test]

@@ -30,6 +30,16 @@ pub(super) enum MouseAction {
     FocusWorkspace {
         ws_idx: usize,
     },
+    FocusWorkspaceResource {
+        ws_idx: usize,
+        plugin_id: String,
+        resource_id: String,
+        column: u16,
+        row: u16,
+    },
+    FocusRepository {
+        repository_id: String,
+    },
     FocusTab {
         tab_idx: usize,
     },
@@ -42,8 +52,13 @@ pub(super) enum MouseAction {
         source_ws_idx: usize,
         insert_idx: usize,
     },
-    MoveWorkspaceBlock {
-        params: crate::api::schema::WorkspaceMoveBlockParams,
+    MoveRepository {
+        repository_id: String,
+        insert_idx: usize,
+    },
+    MoveCheckout {
+        workspace_id: String,
+        insert_idx: usize,
     },
     MoveTab {
         ws_idx: usize,
@@ -322,6 +337,22 @@ impl AppState {
                     if let Some(inner) =
                         crate::ui::new_linked_worktree_inner_rect(self.screen_rect())
                     {
+                        let change = crate::ui::new_linked_worktree_base_change_rect(inner);
+                        if mouse.column >= change.x
+                            && mouse.column < change.x + change.width
+                            && mouse.row >= change.y
+                            && mouse.row < change.y + change.height
+                        {
+                            if let Some(create) = &mut self.worktree_create {
+                                if !create.creating && !create.branch_exists {
+                                    create.editing_base = true;
+                                    self.name_input = create.base_ref.clone();
+                                    self.name_input_replace_on_type = false;
+                                    create.error = None;
+                                }
+                            }
+                            return None;
+                        }
                         let (create, cancel) = crate::ui::new_linked_worktree_button_rects(inner);
                         match modal_action_from_buttons(
                             mouse.column,
@@ -588,9 +619,29 @@ impl AppState {
                     }
 
                     if self.sidebar_collapsed {
-                        if let Some(idx) = self.collapsed_workspace_at_row(mouse.row) {
+                        if let Some(target) = self.collapsed_space_target_at_row(mouse.row) {
                             self.mode = Mode::Terminal;
-                            return Some(MouseAction::FocusWorkspace { ws_idx: idx });
+                            return Some(match target {
+                                crate::app::state::SpaceRowTarget::Repository(repository_id) => {
+                                    MouseAction::FocusRepository { repository_id }
+                                }
+                                crate::app::state::SpaceRowTarget::Workspace(ws_idx) => {
+                                    self.select_space_row(
+                                        crate::app::state::SpaceRowTarget::Workspace(ws_idx),
+                                    );
+                                    MouseAction::FocusWorkspace { ws_idx }
+                                }
+                                crate::app::state::SpaceRowTarget::WorkspaceResource {
+                                    workspace_id,
+                                    ..
+                                } => {
+                                    let ws_idx = self
+                                        .workspaces
+                                        .iter()
+                                        .position(|workspace| workspace.id == workspace_id)?;
+                                    MouseAction::FocusWorkspace { ws_idx }
+                                }
+                            });
                         }
 
                         if let Some((ws_idx, _tab_idx, pane_id)) =
@@ -636,22 +687,29 @@ impl AppState {
                         let chevron = crate::ui::workspace_group_chevron_rect(card);
                         mouse.row == chevron.y && mouse.column == chevron.x && chevron.width > 0
                     }) {
-                        if let Some((key, collapsed)) =
-                            crate::ui::workspace_parent_group_state(self, card.ws_idx)
-                        {
-                            if collapsed {
+                        let key = match &card.target {
+                            crate::app::state::SpaceRowTarget::Repository(key) => Some(key.clone()),
+                            crate::app::state::SpaceRowTarget::Workspace(ws_idx)
+                                if !card.indented =>
+                            {
+                                crate::ui::workspace_parent_group_state(self, *ws_idx)
+                                    .map(|(key, _)| key)
+                            }
+                            _ => None,
+                        };
+                        if let Some(key) = key {
+                            if self.collapsed_space_keys.contains(&key) {
                                 self.collapsed_space_keys.remove(&key);
                             } else {
                                 self.collapsed_space_keys.insert(key);
                             }
-                            self.mark_session_dirty();
                             return None;
                         }
                     }
 
-                    if let Some(idx) = self.workspace_at_row(mouse.row) {
+                    if let Some(target) = self.space_target_at_row(mouse.row) {
                         self.workspace_press = Some(WorkspacePressState {
-                            ws_idx: idx,
+                            target,
                             start_col: mouse.column,
                             start_row: mouse.row,
                         });
@@ -742,21 +800,55 @@ impl AppState {
                     }
                 }
 
-                let workspace_drop_target = self.workspace_drop_target_at_row(mouse.row);
+                let workspace_drop_index =
+                    self.workspace_press
+                        .as_ref()
+                        .and_then(|press| match press.target {
+                            crate::app::state::SpaceRowTarget::Repository(_) => {
+                                self.top_space_drop_index_at_row(mouse.row)
+                            }
+                            crate::app::state::SpaceRowTarget::Workspace(ws_idx)
+                                if self.is_repository_root_checkout_row(ws_idx) =>
+                            {
+                                self.top_space_drop_index_at_row(mouse.row)
+                            }
+                            crate::app::state::SpaceRowTarget::Workspace(ws_idx)
+                                if self
+                                    .workspaces
+                                    .get(ws_idx)
+                                    .is_some_and(|workspace| workspace.checkout.is_some()) =>
+                            {
+                                // The sidebar only renders linked children. checkout.move
+                                // retains its public full-membership insert coordinate, where
+                                // the pinned primary occupies index zero.
+                                self.checkout_drop_index_at_row(ws_idx, mouse.row)
+                                    .map(|linked_index| linked_index + 1)
+                            }
+                            crate::app::state::SpaceRowTarget::Workspace(_) => {
+                                self.workspace_drop_index_at_row(mouse.row)
+                            }
+                            crate::app::state::SpaceRowTarget::WorkspaceResource { .. } => None,
+                        });
                 let tab_drop_index = self.tab_drop_index_at(mouse.column, mouse.row);
                 if self.drag.is_none() {
                     if let Some(press) = &self.workspace_press {
                         let delta_col = mouse.column.abs_diff(press.start_col);
                         let delta_row = mouse.row.abs_diff(press.start_row);
-                        let can_reorder = self.workspaces.get(press.ws_idx).is_some_and(|ws| {
-                            ws.worktree_space()
-                                .is_none_or(|space| !space.is_linked_worktree)
-                        });
+                        let can_reorder = match &press.target {
+                            crate::app::state::SpaceRowTarget::Repository(_) => true,
+                            crate::app::state::SpaceRowTarget::Workspace(idx) => {
+                                self.workspaces.get(*idx).is_some_and(|workspace| {
+                                    workspace.checkout.is_some()
+                                        || workspace.worktree_space().is_none()
+                                })
+                            }
+                            crate::app::state::SpaceRowTarget::WorkspaceResource { .. } => false,
+                        };
                         if can_reorder && delta_col.max(delta_row) >= WORKSPACE_DRAG_THRESHOLD {
                             self.drag = Some(DragState {
                                 target: DragTarget::WorkspaceReorder {
-                                    source_ws_idx: press.ws_idx,
-                                    drop_target: workspace_drop_target,
+                                    source: press.target.clone(),
+                                    insert_idx: workspace_drop_index,
                                 },
                             });
                         }
@@ -776,10 +868,10 @@ impl AppState {
                 }
 
                 if let Some(DragState {
-                    target: DragTarget::WorkspaceReorder { drop_target, .. },
+                    target: DragTarget::WorkspaceReorder { insert_idx, .. },
                 }) = &mut self.drag
                 {
-                    *drop_target = workspace_drop_target;
+                    *insert_idx = workspace_drop_index;
                 } else if let Some(DragState {
                     target:
                         DragTarget::TabReorder {
@@ -907,35 +999,56 @@ impl AppState {
                     Some(DragState {
                         target:
                             DragTarget::WorkspaceReorder {
-                                source_ws_idx,
-                                drop_target: Some(drop_target),
+                                source,
+                                insert_idx: Some(insert_idx),
                             },
-                    }) => {
-                        if let Some(params) =
-                            self.workspace_move_block_params(source_ws_idx, drop_target)
+                    }) => match source {
+                        crate::app::state::SpaceRowTarget::Repository(repository_id) => {
+                            return Some(MouseAction::MoveRepository {
+                                repository_id,
+                                insert_idx,
+                            })
+                        }
+                        crate::app::state::SpaceRowTarget::Workspace(source_ws_idx)
+                            if self.is_repository_root_checkout_row(source_ws_idx) =>
                         {
+                            if let Some(repository_id) = self
+                                .workspaces
+                                .get(source_ws_idx)
+                                .and_then(|workspace| workspace.checkout.as_ref())
+                                .map(|checkout| checkout.repository_id.clone())
+                            {
+                                return Some(MouseAction::MoveRepository {
+                                    repository_id,
+                                    insert_idx,
+                                });
+                            }
+                        }
+                        crate::app::state::SpaceRowTarget::Workspace(source_ws_idx)
                             if self
                                 .workspaces
                                 .get(source_ws_idx)
-                                .is_some_and(|workspace| workspace.worktree_space().is_some())
+                                .is_some_and(|workspace| workspace.checkout.is_some()) =>
+                        {
+                            if let Some(workspace_id) = self
+                                .workspaces
+                                .get(source_ws_idx)
+                                .map(|workspace| workspace.id.clone())
                             {
-                                return Some(MouseAction::MoveWorkspaceBlock { params });
+                                return Some(MouseAction::MoveCheckout {
+                                    workspace_id,
+                                    insert_idx,
+                                });
                             }
-                            let insert_idx = params
-                                .before_workspace_id
-                                .as_ref()
-                                .and_then(|id| {
-                                    self.workspaces
-                                        .iter()
-                                        .position(|workspace| workspace.id == *id)
-                                })
-                                .unwrap_or(self.workspaces.len());
+                        }
+                        crate::app::state::SpaceRowTarget::Workspace(source_ws_idx) => {
                             return Some(MouseAction::MoveWorkspace {
                                 source_ws_idx,
                                 insert_idx,
-                            });
+                            })
                         }
-                    }
+                        crate::app::state::SpaceRowTarget::WorkspaceResource { .. } => {}
+                    },
                     Some(DragState {
                         target:
                             DragTarget::TabReorder {
@@ -957,8 +1070,34 @@ impl AppState {
                     None => {
                         if let Some(press) = workspace_press {
                             self.mode = Mode::Terminal;
-                            return Some(MouseAction::FocusWorkspace {
-                                ws_idx: press.ws_idx,
+                            return Some(match press.target {
+                                crate::app::state::SpaceRowTarget::Repository(repository_id) => {
+                                    MouseAction::FocusRepository { repository_id }
+                                }
+                                crate::app::state::SpaceRowTarget::Workspace(ws_idx) => {
+                                    self.select_space_row(
+                                        crate::app::state::SpaceRowTarget::Workspace(ws_idx),
+                                    );
+                                    MouseAction::FocusWorkspace { ws_idx }
+                                }
+                                crate::app::state::SpaceRowTarget::WorkspaceResource {
+                                    workspace_id,
+                                    plugin_id,
+                                    resource_id,
+                                } => {
+                                    let ws_idx = self
+                                        .workspaces
+                                        .iter()
+                                        .position(|workspace| workspace.id == workspace_id)?;
+                                    self.select_space_row(
+                                        crate::app::state::SpaceRowTarget::WorkspaceResource {
+                                            workspace_id,
+                                            plugin_id,
+                                            resource_id,
+                                        },
+                                    );
+                                    MouseAction::FocusWorkspace { ws_idx }
+                                }
                             });
                         }
                         if let Some(press) = tab_press {
@@ -1109,13 +1248,77 @@ impl AppState {
                 {
                     return None;
                 }
-                if let Some(idx) = self.workspace_at_row(mouse.row) {
-                    self.selected = idx;
+                if let Some(target) = self.space_target_at_row(mouse.row) {
+                    let idx = match target {
+                        crate::app::state::SpaceRowTarget::Repository(repository_id) => {
+                            self.selected_repository_id = Some(repository_id.clone());
+                            let idx = self
+                                .repository(&repository_id)
+                                .and_then(|repository| {
+                                    repository
+                                        .last_focused_workspace_id
+                                        .as_ref()
+                                        .or_else(|| repository.checkout_workspace_ids.first())
+                                })
+                                .and_then(|workspace_id| {
+                                    self.workspaces
+                                        .iter()
+                                        .position(|workspace| &workspace.id == workspace_id)
+                                })?;
+                            self.selected = idx;
+                            let collapsed = self.collapsed_space_keys.contains(&repository_id);
+                            self.context_menu = Some(ContextMenuState::new(
+                                ContextMenuKind::Repository {
+                                    repository_id,
+                                    collapsed,
+                                },
+                                mouse.column,
+                                mouse.row,
+                            ));
+                            self.mode = Mode::ContextMenu;
+                            return None;
+                        }
+                        crate::app::state::SpaceRowTarget::Workspace(idx) => {
+                            self.selected_repository_id = None;
+                            self.selected_workspace_resource = None;
+                            self.selected = idx;
+                            idx
+                        }
+                        crate::app::state::SpaceRowTarget::WorkspaceResource {
+                            workspace_id,
+                            plugin_id,
+                            resource_id,
+                        } => {
+                            let idx = self
+                                .workspaces
+                                .iter()
+                                .position(|workspace| workspace.id == workspace_id)?;
+                            self.switch_workspace(idx);
+                            self.selected_repository_id = None;
+                            self.selected_workspace_resource =
+                                Some((workspace_id, plugin_id.clone(), resource_id.clone()));
+                            self.context_menu = Some(ContextMenuState::new(
+                                ContextMenuKind::WorkspaceResource {
+                                    ws_idx: idx,
+                                    plugin_id,
+                                    resource_id,
+                                },
+                                mouse.column,
+                                mouse.row,
+                            ));
+                            self.mode = Mode::ContextMenu;
+                            return None;
+                        }
+                    };
                     let kind = self
                         .workspaces
                         .get(idx)
                         .and_then(|ws| {
-                            let group_state = crate::ui::workspace_parent_group_state(self, idx);
+                            let group_state = crate::ui::workspace_parent_group_state(self, idx)
+                                .filter(|_| ws.checkout.is_none());
+                            // The visible depth-zero Checkout proxies repository-native
+                            // management while remaining a Checkout plugin context.
+                            let is_repository_root = self.is_repository_root_checkout_row(idx);
                             let git_space = ws.git_space().cloned().or_else(|| {
                                 ws.resolved_identity_cwd_from(&self.terminals, terminal_runtimes)
                                     .as_deref()
@@ -1136,10 +1339,14 @@ impl AppState {
                             show_git_menu.then_some(ContextMenuKind::GitWorkspace {
                                 ws_idx: idx,
                                 is_linked_worktree,
-                                has_worktree_children: group_state.is_some(),
+                                is_repository_root,
+                                has_worktree_children: group_state.is_some() || is_repository_root,
                                 collapsed: group_state
                                     .as_ref()
-                                    .is_some_and(|(_, collapsed)| *collapsed),
+                                    .is_some_and(|(_, collapsed)| *collapsed)
+                                    || ws.checkout.as_ref().is_some_and(|checkout| {
+                                        self.collapsed_space_keys.contains(&checkout.repository_id)
+                                    }),
                             })
                         })
                         .unwrap_or(ContextMenuKind::Workspace { ws_idx: idx });
@@ -1244,9 +1451,34 @@ impl AppState {
             Some(crate::ui::MobileSwitcherTarget::NewWorkspace) => {
                 return MobileMouseResult::Action(MouseAction::NewWorkspace);
             }
+            Some(crate::ui::MobileSwitcherTarget::Repository(repository_id)) => {
+                self.mode = Mode::Terminal;
+                return MobileMouseResult::Action(MouseAction::FocusRepository { repository_id });
+            }
             Some(crate::ui::MobileSwitcherTarget::Workspace(ws_idx)) => {
+                self.select_space_row(crate::app::state::SpaceRowTarget::Workspace(ws_idx));
                 self.mode = Mode::Terminal;
                 return MobileMouseResult::Action(MouseAction::FocusWorkspace { ws_idx });
+            }
+            Some(crate::ui::MobileSwitcherTarget::WorkspaceResource {
+                workspace_id,
+                plugin_id,
+                resource_id,
+            }) => {
+                let Some(ws_idx) = self
+                    .workspaces
+                    .iter()
+                    .position(|workspace| workspace.id == workspace_id)
+                else {
+                    return MobileMouseResult::Ignored;
+                };
+                return MobileMouseResult::Action(MouseAction::FocusWorkspaceResource {
+                    ws_idx,
+                    plugin_id,
+                    resource_id,
+                    column: mouse.column,
+                    row: mouse.row,
+                });
             }
             Some(crate::ui::MobileSwitcherTarget::NewTab) => {
                 if self.prompt_new_tab_name {
@@ -2024,6 +2256,101 @@ mod tests {
             checkout_path: format!("/repo/worktree-{ws_idx}").into(),
             is_linked_worktree: ws_idx != 0,
         });
+    }
+
+    #[test]
+    fn clicking_workspace_resource_selects_and_focuses_parent_checkout() {
+        let mut app = app_for_mouse_test();
+        let mut first = Workspace::test_new("first");
+        first.id = "checkout-a".into();
+        let mut second = Workspace::test_new("second");
+        second.id = "checkout-b".into();
+        second
+            .resources
+            .report(
+                "example".into(),
+                vec![crate::workspace_resources::WorkspaceResource {
+                    plugin_id: "example".into(),
+                    resource_id: "jail-1".into(),
+                    label: "Jail 1".into(),
+                    detail: None,
+                    data: None,
+                }],
+                None,
+                None,
+                std::time::Instant::now(),
+            )
+            .expect("resource report");
+        app.state.workspaces = vec![first, second];
+        app.state.active = Some(0);
+        app.state.selected = 0;
+        app.state.view.sidebar_rect = Rect::new(0, 0, 30, 20);
+        app.state.view.workspace_card_areas = vec![crate::app::state::WorkspaceCardArea {
+            target: crate::app::state::SpaceRowTarget::WorkspaceResource {
+                workspace_id: "checkout-b".into(),
+                plugin_id: "example".into(),
+                resource_id: "jail-1".into(),
+            },
+            rect: Rect::new(0, 4, 30, 1),
+            depth: 2,
+            indented: true,
+        }];
+
+        let (state, runtimes) = (&mut app.state, &mut app.terminal_runtimes);
+        assert!(state
+            .handle_mouse(
+                runtimes,
+                mouse(MouseEventKind::Down(MouseButton::Left), 2, 4)
+            )
+            .is_none());
+        let action =
+            state.handle_mouse(runtimes, mouse(MouseEventKind::Up(MouseButton::Left), 2, 4));
+
+        assert!(matches!(
+            action,
+            Some(MouseAction::FocusWorkspace { ws_idx: 1 })
+        ));
+        assert_eq!(state.selected, 1);
+        assert_eq!(
+            state.selected_workspace_resource,
+            Some(("checkout-b".into(), "example".into(), "jail-1".into()))
+        );
+    }
+
+    #[test]
+    fn clicking_checkout_after_resource_clears_resource_selection() {
+        let mut app = app_for_mouse_test();
+        let mut first = Workspace::test_new("first");
+        first.id = "checkout-a".into();
+        let mut second = Workspace::test_new("second");
+        second.id = "checkout-b".into();
+        app.state.workspaces = vec![first, second];
+        app.state.selected_workspace_resource =
+            Some(("checkout-b".into(), "example".into(), "jail-1".into()));
+        app.state.view.sidebar_rect = Rect::new(0, 0, 30, 20);
+        app.state.view.workspace_card_areas = vec![crate::app::state::WorkspaceCardArea {
+            target: crate::app::state::SpaceRowTarget::Workspace(1),
+            rect: Rect::new(0, 4, 30, 1),
+            depth: 1,
+            indented: true,
+        }];
+
+        let (state, runtimes) = (&mut app.state, &mut app.terminal_runtimes);
+        assert!(state
+            .handle_mouse(
+                runtimes,
+                mouse(MouseEventKind::Down(MouseButton::Left), 2, 4)
+            )
+            .is_none());
+        let action =
+            state.handle_mouse(runtimes, mouse(MouseEventKind::Up(MouseButton::Left), 2, 4));
+
+        assert!(matches!(
+            action,
+            Some(MouseAction::FocusWorkspace { ws_idx: 1 })
+        ));
+        assert_eq!(state.selected, 1);
+        assert_eq!(state.selected_workspace_resource, None);
     }
 
     #[tokio::test]
@@ -3877,8 +4204,8 @@ mod tests {
         ));
 
         assert_eq!(app.state.selected, 0);
-        assert_eq!(app.state.mode, Mode::ConfirmClose);
-        assert_eq!(app.state.workspaces.len(), 2);
+        assert_eq!(app.state.mode, Mode::Terminal);
+        assert_eq!(app.state.workspaces.len(), 1);
         assert!(app.state.context_menu.is_none());
     }
 

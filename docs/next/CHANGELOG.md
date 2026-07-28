@@ -3,13 +3,16 @@
 ## Unreleased
 
 ### Added
+- Added first-class Repository and Checkout Spaces, including grouped hierarchy, Repository lifecycle/API commands, and compatibility-preserving workspace projections.
 - Added pane collections: one nested, scrollable list leaf can hold multiple real terminal panes with inline previews, active/archive sections, collection and delegation CLI/socket APIs, and explicit promote-or-cascade close behavior.
 - Added session-wide delegation provenance with stable parent, purpose, sibling order, root, descendants, tombstones, persistence, and restore semantics.
 - Added advisory `ui.collections.archive_age_days`, `archive_count`, and `concurrency` thresholds that never automatically archive, stop, or close panes.
-- Plugin actions can now declare bounded asynchronous `choices_command` providers for workspace, tab, pane, and collection-member context menus.
+- Added transient plugin-owned Workspace Resources with bounded atomic reports, TTL expiry, snapshot/event exposure, resource child rows, and owner-only `workspace_resource` context-menu actions.
+- Plugin actions can now declare bounded asynchronous `choices_command` providers for workspace, tab, pane, collection-member, and Workspace Resource context menus.
 
 ### Changed
 - Grouped panes now count as seen only after a foreground human enters that child terminal; collection selection, API focus, reads, and passive observation do not acknowledge attention.
+- Repository rows are aggregate native targets: their menus do not expose Checkout or plugin actions, while Checkout menus retain workspace plugin choices.
 - Relicensed Herdr from AGPL-3.0-or-later to Apache-2.0.
 
 ### Fixed

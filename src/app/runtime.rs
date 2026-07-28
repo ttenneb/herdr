@@ -390,6 +390,14 @@ impl App {
         for ws_idx in workspaces {
             self.emit_workspace_token_updated(ws_idx);
         }
+        // Resources are transient runtime facts; expiry must not dirty or persist the session.
+        let expired_resources = self.state.expire_workspace_resources(now);
+        if !expired_resources.is_empty() {
+            self.state.reconcile_selected_workspace_resource();
+        }
+        for ws_idx in expired_resources {
+            self.emit_workspace_resources_updated(ws_idx);
+        }
         self.sync_agent_metadata_deadline();
     }
 

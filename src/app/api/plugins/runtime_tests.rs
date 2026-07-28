@@ -3,6 +3,9 @@ use crate::api::schema::PluginInvocationContext;
 
 fn context() -> PluginInvocationContext {
     PluginInvocationContext {
+        workspace_resource: None,
+        repository_id: None,
+        checkout: None,
         workspace_id: Some("workspace-exact".into()),
         workspace_label: None,
         workspace_cwd: None,

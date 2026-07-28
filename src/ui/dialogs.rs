@@ -15,6 +15,8 @@ use crate::app::{state::WorktreeOpenState, AppState, Mode};
 use crate::terminal::TerminalRuntimeRegistry;
 
 const NEW_LINKED_WORKTREE_POPUP_WIDTH: u16 = 68;
+const NEW_LINKED_WORKTREE_POPUP_HEIGHT: u16 = 15;
+
 const COLLECTION_CLOSE_POPUP_WIDTH: u16 = 76;
 const COLLECTION_CLOSE_POPUP_HEIGHT: u16 = 12;
 
@@ -143,7 +145,6 @@ pub(super) fn render_collection_close_overlay(app: &AppState, frame: &mut Frame,
             .add_modifier(Modifier::BOLD),
     );
 }
-const NEW_LINKED_WORKTREE_POPUP_HEIGHT: u16 = 12;
 
 pub(crate) fn rename_button_rects(inner: Rect) -> (Rect, Rect, Rect) {
     let rects = action_button_row_rects(
@@ -172,8 +173,19 @@ pub(super) fn render_rename_overlay(app: &AppState, frame: &mut Frame, area: Rec
     super::dim_background(frame, area);
 
     let title = match app.mode {
-        Mode::RenameWorkspace if app.pending_workspace_create_cwd.is_some() => "new workspace",
-        Mode::RenameWorkspace => "rename workspace",
+        Mode::RenameWorkspace if app.pending_workspace_create_cwd.is_some() => {
+            "new standalone space"
+        }
+        Mode::RenameWorkspace if app.rename_repository_target.is_some() => "rename repository",
+        Mode::RenameWorkspace
+            if app
+                .workspaces
+                .get(app.selected)
+                .is_some_and(|workspace| workspace.checkout.is_some()) =>
+        {
+            "rename checkout"
+        }
+        Mode::RenameWorkspace => "rename space",
         Mode::RenameTab if app.creating_new_tab => "new tab",
         Mode::RenameTab => "rename tab",
         Mode::RenamePane => "rename pane",
@@ -257,6 +269,16 @@ pub(crate) fn new_linked_worktree_inner_rect(area: Rect) -> Option<Rect> {
             popup.height.saturating_sub(2),
         )
     })
+}
+
+pub(crate) fn new_linked_worktree_base_change_rect(inner: Rect) -> Rect {
+    let width = 10.min(inner.width);
+    Rect::new(
+        inner.x + inner.width.saturating_sub(width),
+        inner.y.saturating_add(4),
+        width,
+        1,
+    )
 }
 
 pub(crate) fn new_linked_worktree_button_rects(inner: Rect) -> (Rect, Rect) {
@@ -372,7 +394,7 @@ pub(super) fn render_new_linked_worktree_overlay(app: &AppState, frame: &mut Fra
     ) else {
         return;
     };
-    if inner.height < 9 {
+    if inner.height < 12 {
         return;
     }
 
@@ -382,13 +404,20 @@ pub(super) fn render_new_linked_worktree_overlay(app: &AppState, frame: &mut Fra
         Constraint::Length(1),
         Constraint::Length(1),
         Constraint::Length(1),
+        Constraint::Length(1),
+        Constraint::Length(1),
         Constraint::Length(3),
         Constraint::Length(1),
         Constraint::Min(0),
     ])
-    .areas::<8>(inner);
+    .areas::<10>(inner);
 
-    render_modal_header(frame, rows[0], "new worktree", &app.palette);
+    render_modal_header(
+        frame,
+        rows[0],
+        &format!("new worktree in {}", create.repo_name),
+        &app.palette,
+    );
 
     frame.render_widget(
         Paragraph::new(" branch").style(Style::default().fg(app.palette.overlay0)),
@@ -397,7 +426,12 @@ pub(super) fn render_new_linked_worktree_overlay(app: &AppState, frame: &mut Fra
     let input_rect = Rect::new(rows[2].x, rows[2].y, rows[2].width, 1);
     frame.render_widget(Clear, input_rect);
     frame.render_widget(
-        Paragraph::new(format!(" {}█", app.name_input)).style(
+        Paragraph::new(if create.editing_base {
+            format!(" {}", create.branch)
+        } else {
+            format!(" {}█", app.name_input)
+        })
+        .style(
             Style::default()
                 .fg(app.palette.text)
                 .bg(app.palette.surface0),
@@ -405,27 +439,65 @@ pub(super) fn render_new_linked_worktree_overlay(app: &AppState, frame: &mut Fra
         input_rect,
     );
 
+    frame.render_widget(
+        Paragraph::new(" base").style(Style::default().fg(app.palette.overlay0)),
+        rows[3],
+    );
+    let short_commit = create.base_commit.chars().take(8).collect::<String>();
+    let base_detail = if create.branch_exists {
+        format!(" existing branch {} (base ignored)", create.branch)
+    } else if create.editing_base {
+        format!(" {}█", app.name_input)
+    } else {
+        format!(" {} @ {}", create.base_ref, short_commit)
+    };
+    frame.render_widget(
+        Paragraph::new(base_detail).style(
+            Style::default()
+                .fg(if create.branch_exists {
+                    app.palette.yellow
+                } else {
+                    app.palette.subtext0
+                })
+                .bg(if create.editing_base {
+                    app.palette.surface0
+                } else {
+                    app.palette.panel_bg
+                }),
+        ),
+        rows[4],
+    );
+    if !create.branch_exists && !create.editing_base {
+        let change = new_linked_worktree_base_change_rect(inner);
+        frame.render_widget(
+            Paragraph::new("[change]")
+                .alignment(ratatui::layout::Alignment::Right)
+                .style(Style::default().fg(app.palette.accent)),
+            change,
+        );
+    }
+
     let checkout = create.checkout_path.display().to_string();
     frame.render_widget(
         Paragraph::new(" checkout").style(Style::default().fg(app.palette.overlay0)),
-        rows[3],
+        rows[5],
     );
     frame.render_widget(
         Paragraph::new(format!(" {checkout}")).style(Style::default().fg(app.palette.subtext0)),
-        rows[4],
+        rows[6],
     );
 
     if create.creating {
         frame.render_widget(
             Paragraph::new(" creating…").style(Style::default().fg(app.palette.overlay0)),
-            rows[5],
+            rows[7],
         );
     } else if let Some(error) = &create.error {
         frame.render_widget(
             Paragraph::new(format!(" {error}"))
                 .style(Style::default().fg(app.palette.red))
                 .wrap(Wrap { trim: false }),
-            rows[5],
+            rows[7],
         );
     }
 
@@ -734,35 +806,33 @@ fn confirm_close_overlay_text(
         .get(app.selected)
         .map(|ws| ws.display_name_from(&app.terminals, terminal_runtimes))
         .unwrap_or_else(|| "?".to_string());
-    let selected_space = app
-        .workspaces
-        .get(app.selected)
-        .and_then(|ws| ws.worktree_space());
-    let group_member_indices = selected_space
-        .filter(|space| !space.is_linked_worktree)
-        .map(|space| {
-            app.workspaces
+    let group_member_indices = app
+        .confirm_repository_close_target
+        .as_deref()
+        .and_then(|repository_id| app.repository(repository_id))
+        .map(|repository| {
+            repository
+                .checkout_workspace_ids
                 .iter()
-                .enumerate()
-                .filter_map(|(idx, ws)| {
-                    ws.worktree_space()
-                        .is_some_and(|member| member.key == space.key)
-                        .then_some(idx)
+                .filter_map(|id| {
+                    app.workspaces
+                        .iter()
+                        .position(|workspace| &workspace.id == id)
                 })
                 .collect::<Vec<_>>()
         })
         .unwrap_or_default();
-    let closes_group = group_member_indices.len() > 1;
+    let closes_group = app.confirm_repository_close_target.is_some();
     let pane_count = if closes_group {
         group_member_indices
             .iter()
             .filter_map(|idx| app.workspaces.get(*idx))
-            .map(|ws| ws.layout.pane_count())
+            .map(|ws| ws.public_pane_numbers.len())
             .sum()
     } else {
         app.workspaces
             .get(app.selected)
-            .map(|ws| ws.layout.pane_count())
+            .map(|ws| ws.public_pane_numbers.len())
             .unwrap_or(0)
     };
 
@@ -771,23 +841,41 @@ fn confirm_close_overlay_text(
     } else {
         format!("{pane_count} panes")
     };
+    let active_agent_count = group_member_indices
+        .iter()
+        .filter_map(|idx| app.workspaces.get(*idx))
+        .flat_map(|workspace| workspace.tabs.iter())
+        .flat_map(|tab| tab.panes.values())
+        .filter(|pane| {
+            app.terminals
+                .get(&pane.attached_terminal_id)
+                .is_some_and(|terminal| terminal.effective_agent_label().is_some())
+        })
+        .count();
+    let agent_text = if active_agent_count == 1 {
+        ", 1 active agent".to_string()
+    } else if active_agent_count > 1 {
+        format!(", {active_agent_count} active agents")
+    } else {
+        String::new()
+    };
     let workspace_text = if closes_group {
         let count = group_member_indices.len();
         if count == 1 {
-            "1 workspace, ".to_string()
+            "1 checkout, ".to_string()
         } else {
-            format!("{count} workspaces, ")
+            format!("{count} checkouts, ")
         }
     } else {
         String::new()
     };
 
     let title = if closes_group {
-        "Close worktree group?"
+        "Close repository?"
     } else {
         "Close workspace?"
     };
-    let detail = format!("{ws_name} — {workspace_text}{pane_text}");
+    let detail = format!("{ws_name} — {workspace_text}{pane_text}{agent_text}");
     (title.to_string(), detail)
 }
 
@@ -1054,13 +1142,45 @@ mod tests {
             is_linked_worktree: true,
         });
         app.workspaces = vec![parent, child];
+        let ids = app
+            .workspaces
+            .iter()
+            .map(|workspace| workspace.id.clone())
+            .collect::<Vec<_>>();
+        for (idx, workspace) in app.workspaces.iter_mut().enumerate() {
+            workspace.checkout = Some(crate::repository::CheckoutProvenance {
+                repository_id: "rtest".into(),
+                checkout_path: workspace
+                    .worktree_space
+                    .as_ref()
+                    .unwrap()
+                    .checkout_path
+                    .clone(),
+                kind: if idx == 0 {
+                    crate::repository::CheckoutKind::Primary
+                } else {
+                    crate::repository::CheckoutKind::Linked
+                },
+            });
+        }
+        app.repositories = vec![crate::repository::Repository {
+            id: "rtest".into(),
+            git_common_dir: "/repo/herdr/.git".into(),
+            label: "herdr".into(),
+            custom_name: None,
+            preferred_base: None,
+            checkout_workspace_ids: ids.clone(),
+            last_focused_workspace_id: Some(ids[0].clone()),
+        }];
+        app.space_order = vec![crate::repository::SpaceRef::Repository("rtest".into())];
+        app.confirm_repository_close_target = Some("rtest".into());
         app.selected = 0;
 
         let terminal_runtimes = crate::terminal::TerminalRuntimeRegistry::new();
         let (title, detail) = confirm_close_overlay_text(&app, &terminal_runtimes);
 
-        assert_eq!(title, "Close worktree group?");
-        assert_eq!(detail, "main — 2 workspaces, 2 panes");
+        assert_eq!(title, "Close repository?");
+        assert_eq!(detail, "main — 2 checkouts, 2 panes");
     }
 
     #[test]
@@ -1073,8 +1193,13 @@ mod tests {
             source_existing_membership: None,
             source_repo_root: "/repo/herdr".into(),
             repo_key: "repo-key".into(),
+            repository_id: None,
             repo_name: "herdr".into(),
             branch: "foo".into(),
+            base_ref: "HEAD".into(),
+            base_commit: "00000000".into(),
+            editing_base: false,
+            branch_exists: false,
             checkout_path: "/repo/.worktrees/herdr/foo".into(),
             error: Some(
                 "Preparing worktree (new branch 'foo')\nfatal: a branch named 'foo' already exists"
@@ -1097,6 +1222,7 @@ mod tests {
             .collect::<String>();
 
         assert!(rendered.contains("fatal: a branch named 'foo' already exists"));
+        assert!(rendered.contains("[change]"));
     }
 
     #[test]
@@ -1104,10 +1230,13 @@ mod tests {
         let area = Rect::new(0, 0, 100, 30);
         let inner = super::new_linked_worktree_inner_rect(area).unwrap();
         let (create, cancel) = super::new_linked_worktree_button_rects(inner);
+        let change = super::new_linked_worktree_base_change_rect(inner);
 
         assert_eq!(inner.width, super::NEW_LINKED_WORKTREE_POPUP_WIDTH - 2);
         assert_eq!(inner.height, super::NEW_LINKED_WORKTREE_POPUP_HEIGHT - 2);
         assert_eq!(create.y, inner.y + inner.height - 1);
         assert_eq!(cancel.y, inner.y + inner.height - 1);
+        assert_eq!(change.y, inner.y + 4);
+        assert_eq!(change.x + change.width, inner.x + inner.width);
     }
 }

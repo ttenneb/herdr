@@ -271,8 +271,8 @@ but it does not validate, sync, or delete their contents. The plugin owns the
 file format and lifecycle.
 
 `HERDR_PLUGIN_CONTEXT_JSON` can include workspace, tab, focused pane, worktree,
-agent, selected text, clicked URL, and link handler fields when they are
-available for that invocation. Shell plugins can read the individual env vars
+agent, selected text, clicked URL, link handler, and `workspace_resource`
+fields when they are available for that invocation. Shell plugins can read the individual env vars
 for common ids, or parse the context JSON for the full shape.
 
 Use `HERDR_BIN_PATH` when a plugin needs to call Herdr portably from Node,
@@ -352,6 +352,29 @@ selected action contains the available fields from this exact snapshot:
 `context-menu-<generation>`; unavailable optional fields, including
 `clicked_url` and `link_handler_id`, are omitted. Focus, cwd, agent state, or
 selection changes while the menu is open do not alter this captured JSON.
+
+### Workspace resources
+
+Plugins can report transient runtime children beneath a Checkout or standalone
+Workspace with `workspace.resources.report` (or `herdr workspace
+report-resources`). A report replaces the reporting plugin's complete resource
+set for one Workspace atomically. The JSON array contains `resource_id`,
+`label`, optional `detail`, and optional `data`; resource IDs are opaque stable
+live identities. Herdr permits at most 32 resources from one plugin, 64 total
+resources and 32 reporting plugins per Workspace. IDs are capped at 120
+characters, visible text at 256 characters, and `data` at 8 KiB/16 nesting
+levels. `ttl_ms` expires a complete report set; resources are transient and are
+not persisted in session state.
+
+Actions may declare `contexts = ["workspace_resource"]`. A resource menu has
+no native actions and is offered only to the plugin that owns that resource;
+Repository menus never run plugin providers. The captured
+`PluginInvocationContext.workspace_resource` contains the owning
+`workspace_id`, `plugin_id`, `resource_id`, `label`, `detail`, and `data`.
+Herdr revalidates the Workspace, owner plugin, action context, and the complete
+captured resource value before starting a provider and before invoking a
+choice. If a replacement changed the same resource ID's label, detail, or data,
+the old menu is stale and must be reopened.
 
 Providers run off the UI event loop. Herdr shows one loading row until every
 eligible provider has settled, then publishes results deterministically in

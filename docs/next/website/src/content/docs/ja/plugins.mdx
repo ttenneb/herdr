@@ -285,6 +285,14 @@ Windows クライアントは名前付きパイプに接続します。`HERDR_BI
 [CLI リファレンス](/ja/docs/cli-reference/)、生のリクエスト形式は
 [ソケット API](/ja/docs/socket-api/)を参照してください。
 
+### ワークスペースリソース
+
+プラグインは `workspace.resources.report` で一時的なリソースを報告できます。`workspace_resource` コンテキストは所有プラグインだけに提供され、古いリソース選択は拒否されます。
+
+### アクション選択
+
+`choices_command` は対応するコンテキストメニューで非同期の選択肢を提供します。
+
 ## ペイン
 
 マニフェストのペイン `placement` のデフォルトは `overlay` で、アクティブなペインの

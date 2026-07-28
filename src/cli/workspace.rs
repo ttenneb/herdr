@@ -2,7 +2,45 @@ use std::collections::HashMap;
 
 use crate::api::schema::{
     Method, WorkspaceCreateParams, WorkspaceRenameParams, WorkspaceReportMetadataParams,
+    WorkspaceReportResourcesParams, WorkspaceResourceInput,
 };
+
+pub(super) fn run_checkout_command(args: &[String]) -> std::io::Result<i32> {
+    let Some(command) = args.first().map(String::as_str) else {
+        print_checkout_help();
+        return Ok(2);
+    };
+    let mapped = match command {
+        "open" => "create",
+        "move" if args.len() == 3 => {
+            let insert_index = match args[2].parse::<usize>() {
+                Ok(index) => index,
+                Err(_) => {
+                    eprintln!("insert_index must be a non-negative integer");
+                    return Ok(2);
+                }
+            };
+            return super::send_ok_request(Method::CheckoutMove(
+                crate::api::schema::CheckoutMoveParams {
+                    workspace_id: super::normalize_workspace_id(&args[1]),
+                    insert_index,
+                },
+            ));
+        }
+        "focus" | "rename" | "close" => command,
+        "help" | "--help" | "-h" => {
+            print_checkout_help();
+            return Ok(0);
+        }
+        _ => {
+            print_checkout_help();
+            return Ok(2);
+        }
+    };
+    let mut compatibility_args = vec![mapped.to_string()];
+    compatibility_args.extend_from_slice(&args[1..]);
+    run_workspace_command(&compatibility_args)
+}
 
 pub(super) fn run_workspace_command(args: &[String]) -> std::io::Result<i32> {
     let Some(subcommand) = args.first().map(|arg| arg.as_str()) else {
@@ -17,6 +55,7 @@ pub(super) fn run_workspace_command(args: &[String]) -> std::io::Result<i32> {
         "focus" => workspace_focus(&args[1..]),
         "rename" => workspace_rename(&args[1..]),
         "report-metadata" => workspace_report_metadata(&args[1..]),
+        "report-resources" => workspace_report_resources(&args[1..]),
         "close" => workspace_close(&args[1..]),
         "help" | "--help" | "-h" => {
             print_workspace_help();
@@ -224,6 +263,87 @@ fn workspace_report_metadata(args: &[String]) -> std::io::Result<i32> {
     ))
 }
 
+fn workspace_report_resources(args: &[String]) -> std::io::Result<i32> {
+    let Some(raw_workspace_id) = args.first() else {
+        eprintln!("usage: herdr workspace report-resources <workspace_id> --plugin ID --file <json-file|-> [--seq N] [--ttl-ms N]");
+        return Ok(2);
+    };
+    let workspace_id = super::normalize_workspace_id(raw_workspace_id);
+    let mut plugin_id = None;
+    let mut file = None;
+    let mut seq = None;
+    let mut ttl_ms = None;
+    let mut index = 1;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--plugin" => {
+                plugin_id = args.get(index + 1).cloned();
+                index += 2;
+            }
+            "--file" => {
+                file = args.get(index + 1).cloned();
+                index += 2;
+            }
+            "--seq" => {
+                let Some(value) = args.get(index + 1) else {
+                    eprintln!("missing value for --seq");
+                    return Ok(2);
+                };
+                seq = Some(super::parse_u64_flag("--seq", value)?);
+                index += 2;
+            }
+            "--ttl-ms" => {
+                let Some(value) = args.get(index + 1) else {
+                    eprintln!("missing value for --ttl-ms");
+                    return Ok(2);
+                };
+                ttl_ms = Some(super::parse_u64_flag("--ttl-ms", value)?);
+                index += 2;
+            }
+            other => {
+                eprintln!("unknown option: {other}");
+                return Ok(2);
+            }
+        }
+    }
+    let (Some(plugin_id), Some(file)) = (plugin_id, file) else {
+        eprintln!("--plugin and --file are required");
+        return Ok(2);
+    };
+    use std::io::Read as _;
+    const MAX_RESOURCE_REPORT_BYTES: usize = 512 * 1024;
+    let mut input = String::new();
+    if file == "-" {
+        std::io::stdin()
+            .take((MAX_RESOURCE_REPORT_BYTES + 1) as u64)
+            .read_to_string(&mut input)?;
+    } else {
+        std::fs::File::open(file)?
+            .take((MAX_RESOURCE_REPORT_BYTES + 1) as u64)
+            .read_to_string(&mut input)?;
+    }
+    if input.len() > MAX_RESOURCE_REPORT_BYTES {
+        eprintln!("resource report input exceeds 512 KiB");
+        return Ok(2);
+    }
+    let resources: Vec<WorkspaceResourceInput> = match serde_json::from_str(&input) {
+        Ok(resources) => resources,
+        Err(error) => {
+            eprintln!("invalid resource JSON: {error}");
+            return Ok(2);
+        }
+    };
+    super::send_ok_request(Method::WorkspaceReportResources(
+        WorkspaceReportResourcesParams {
+            workspace_id,
+            plugin_id,
+            resources,
+            seq,
+            ttl_ms,
+        },
+    ))
+}
+
 fn workspace_close(args: &[String]) -> std::io::Result<i32> {
     let Some(raw_workspace_id) = args.first() else {
         eprintln!("usage: herdr workspace close <workspace_id>");
@@ -237,6 +357,15 @@ fn workspace_close(args: &[String]) -> std::io::Result<i32> {
     super::runtime::workspace_close(super::normalize_workspace_id(raw_workspace_id))
 }
 
+fn print_checkout_help() {
+    eprintln!("herdr checkout commands:");
+    eprintln!("  herdr checkout open [--cwd PATH] [--label TEXT] [--env KEY=VALUE] [--focus] [--no-focus]");
+    eprintln!("  herdr checkout focus <workspace_id>");
+    eprintln!("  herdr checkout rename <workspace_id> <label>");
+    eprintln!("  herdr checkout move <workspace_id> <insert_index>");
+    eprintln!("  herdr checkout close <workspace_id>");
+}
+
 fn print_workspace_help() {
     eprintln!("herdr workspace commands:");
     eprintln!("  herdr workspace list");
@@ -245,5 +374,6 @@ fn print_workspace_help() {
     eprintln!("  herdr workspace focus <workspace_id>");
     eprintln!("  herdr workspace rename <workspace_id> <label>");
     eprintln!("  herdr workspace report-metadata <workspace_id> --source ID [--token NAME=VALUE] [--clear-token NAME] [--seq N] [--ttl-ms N]");
+    eprintln!("  herdr workspace report-resources <workspace_id> --plugin ID --file <json-file|-> [--seq N] [--ttl-ms N]");
     eprintln!("  herdr workspace close <workspace_id>");
 }

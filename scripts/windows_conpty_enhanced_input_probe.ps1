@@ -46,7 +46,11 @@ function Wait-PaneText {
 
 function New-ProbePane {
     param([string] $Mode)
-    $created = & $script:Exe workspace create --cwd $PWD.Path 2>&1
+    # Each probe needs its own standalone workspace. Opening the checkout cwd
+    # again intentionally reuses its existing checkout and root pane.
+    $probeDir = Join-Path $workDir "probe-$Mode"
+    New-Item -ItemType Directory -Force -Path $probeDir | Out-Null
+    $created = & $script:Exe workspace create --cwd $probeDir 2>&1
     if ($LASTEXITCODE -ne 0) {
         throw "workspace create failed with exit code $LASTEXITCODE`: $($created -join "`n")"
     }

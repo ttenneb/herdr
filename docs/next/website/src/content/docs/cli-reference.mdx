@@ -114,6 +114,24 @@ Use `default` as the session name when you need to stop the default session expl
 
 ## Workspaces
 
+Repositories and Checkouts are the preferred names for Git-backed Spaces:
+
+```bash
+herdr repository list [--json]
+herdr repository get <repository_id> [--json]
+herdr repository focus <repository_id>
+herdr repository rename <repository_id> <label>
+herdr repository move <repository_id> <insert_index>
+herdr repository close <repository_id>
+herdr checkout open [--cwd PATH] [--label TEXT] [--focus]
+herdr checkout focus <workspace_id>
+herdr checkout rename <workspace_id> <label>
+herdr checkout move <workspace_id> <insert_index>
+herdr checkout close <workspace_id>
+```
+
+`repository close` closes every child Checkout after explicit repository targeting; it never removes directories or branches. `checkout close` closes one Checkout. The legacy workspace commands remain available for scripts:
+
 ```bash
 herdr workspace list
 herdr workspace create [--cwd PATH] [--label TEXT] [--env KEY=VALUE] [--focus] [--no-focus]
@@ -121,6 +139,7 @@ herdr workspace get <workspace_id>
 herdr workspace focus <workspace_id>
 herdr workspace rename <workspace_id> <label>
 herdr workspace report-metadata <workspace_id> --source ID [--token NAME=VALUE] [--clear-token NAME] [--seq N] [--ttl-ms N]
+herdr workspace report-resources <workspace_id> --plugin ID --file <json-file|-> [--seq N] [--ttl-ms N]
 herdr workspace close <workspace_id>
 ```
 
@@ -130,18 +149,20 @@ Create a workspace without stealing focus:
 herdr workspace create --cwd ~/project --label api --no-focus
 ```
 
-A workspace is the top-level project or work context. Creating one also creates its first tab and root pane. The JSON response exposes their IDs as `.result.workspace.workspace_id`, `.result.tab.tab_id`, and `.result.root_pane.pane_id`.
+A workspace is the compatibility name for a Checkout or standalone Space. Opening a path inside an existing Git checkout reuses that Checkout, and Git checkouts sharing a canonical common directory group automatically. Creating one also creates its first tab and root pane. The JSON response exposes their IDs as `.result.workspace.workspace_id`, `.result.tab.tab_id`, and `.result.root_pane.pane_id`.
+
+`workspace report-resources` accepts a JSON array of plugin-owned `{resource_id,label,detail?,data?}` records. It atomically replaces that plugin's transient resource set for the Workspace; resources are bounded, may use TTL expiry, and are not saved in session state.
 
 ## Worktrees
 
 ```bash
-herdr worktree list [--workspace ID | --cwd PATH] [--json]
-herdr worktree create [--workspace ID | --cwd PATH] [--branch NAME] [--base REF] [--path PATH] [--label TEXT] [--focus] [--no-focus] [--json]
-herdr worktree open [--workspace ID | --cwd PATH] (--path PATH | --branch NAME) [--label TEXT] [--focus] [--no-focus] [--json]
+herdr worktree list [--repository ID | --workspace ID | --cwd PATH] [--json]
+herdr worktree create [--repository ID | --workspace ID | --cwd PATH] [--branch NAME] [--base REF] [--path PATH] [--label TEXT] [--focus] [--no-focus] [--json]
+herdr worktree open [--repository ID | --workspace ID | --cwd PATH] (--path PATH | --branch NAME) [--label TEXT] [--focus] [--no-focus] [--json]
 herdr worktree remove --workspace ID [--force] [--json]
 ```
 
-Worktrees are normal Herdr workspaces with Git checkout provenance. `worktree create` creates a Git worktree checkout, opens it as a workspace, and groups it with the parent repo workspace. If `--branch` names an existing local branch, Herdr checks it out; otherwise it creates the branch from `--base` or `HEAD`. Without `--path`, Herdr creates the checkout under `<worktrees.directory>/<repo>/<branch-slug>`.
+Worktrees open as peer Checkouts in a Repository. `worktree create` creates a linked checkout and opens it in the matching Repository. If `--branch` names an existing local branch, Herdr checks it out and ignores Base; otherwise it creates the branch from the visible `--base`. Repository-scoped creation defaults through the stored preferred base, `origin/HEAD`, `main`/`master`, then the most recently used Checkout’s `HEAD`. Without `--path`, Herdr creates the checkout under `<worktrees.directory>/<repo>/<branch-slug>`.
 
 `workspace close` closes Herdr state only. `worktree remove` is the explicit checkout deletion path; it runs `git worktree remove`, never deletes the branch, and requires `--force` when Git refuses a dirty checkout.
 

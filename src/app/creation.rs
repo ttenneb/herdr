@@ -265,6 +265,7 @@ impl App {
             .root_pane
             .ok_or_else(|| std::io::Error::other("new workspace has no root pane"))?;
         self.state.remove_alias_shadowed_by_new_pane(root_pane);
+        self.state.reconcile_repositories();
         let workspace_id = self.state.workspaces[idx].id.clone();
         let root_pane = root_pane.raw();
         crate::logging::workspace_created(&workspace_id, root_pane);
@@ -346,12 +347,32 @@ impl App {
 
     pub(crate) fn emit_workspace_open_events(&mut self, ws_idx: usize) {
         let workspace_info = self.workspace_info(ws_idx);
+        let created_repository =
+            workspace_info
+                .repository_id
+                .as_deref()
+                .and_then(|repository_id| {
+                    self.state
+                        .repository(repository_id)
+                        .filter(|repository| {
+                            repository.checkout_workspace_ids.len() == 1
+                                && repository.checkout_workspace_ids.first()
+                                    == Some(&workspace_info.workspace_id)
+                        })
+                        .and_then(|_| self.repository_info(repository_id))
+                });
         let Some(tab) = self.tab_info(ws_idx, 0) else {
             return;
         };
         let Some(root_pane) = self.root_pane_info(ws_idx, 0) else {
             return;
         };
+        if let Some(repository) = created_repository {
+            self.emit_event(EventEnvelope {
+                event: EventKind::RepositoryCreated,
+                data: EventData::RepositoryCreated { repository },
+            });
+        }
         self.emit_event(EventEnvelope {
             event: EventKind::WorkspaceCreated,
             data: EventData::WorkspaceCreated {
@@ -507,6 +528,31 @@ impl App {
             }),
             agent_status: pane_agent_status(agg_state, seen),
             tokens: ws.metadata_tokens.values(),
+            resources: ws
+                .resources
+                .resources()
+                .map(|resource| crate::api::schema::WorkspaceResourceInfo {
+                    workspace_id: ws.id.clone(),
+                    plugin_id: resource.plugin_id.clone(),
+                    resource_id: resource.resource_id.clone(),
+                    label: resource.label.clone(),
+                    detail: resource.detail.clone(),
+                    data: resource.data.clone(),
+                })
+                .collect(),
+            repository_id: ws
+                .checkout
+                .as_ref()
+                .map(|checkout| checkout.repository_id.clone()),
+            checkout: ws
+                .checkout
+                .as_ref()
+                .map(|checkout| crate::api::schema::CheckoutInfo {
+                    workspace_id: ws.id.clone(),
+                    repository_id: checkout.repository_id.clone(),
+                    checkout_path: checkout.checkout_path.display().to_string(),
+                    kind: checkout.kind,
+                }),
             worktree: ws
                 .worktree_space()
                 .map(|space| crate::api::schema::WorkspaceWorktreeInfo {
