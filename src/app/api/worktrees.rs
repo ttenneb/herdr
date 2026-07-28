@@ -695,7 +695,7 @@ fn worktree_source_from_space(
         source_checkout_path,
         source_repo_root: primary_checkout,
         repo_key: space.key,
-        repo_name: space.label,
+        repo_name: space.repo_name,
     }
 }
 
@@ -889,7 +889,7 @@ mod tests {
         app.state.workspaces[0].cached_git_space = Some(crate::workspace::GitSpaceMetadata {
             key: "/gone/old/.git".into(),
             checkout_key: repo.display().to_string(),
-            label: "old".into(),
+            repo_name: "old".into(),
             repo_root: repo.clone(),
             is_linked_worktree: false,
         });
@@ -921,7 +921,7 @@ mod tests {
         workspace.cached_git_space = Some(crate::workspace::GitSpaceMetadata {
             key: "/cached/app/.git".into(),
             checkout_key: missing.display().to_string(),
-            label: "cached-app".into(),
+            repo_name: "cached-app".into(),
             repo_root: missing.clone(),
             is_linked_worktree: false,
         });

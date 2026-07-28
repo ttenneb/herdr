@@ -90,7 +90,7 @@ pub(crate) fn reconcile(
                 Some(crate::workspace::GitSpaceMetadata {
                     key: repository.git_common_dir.display().to_string(),
                     checkout_key: checkout.checkout_path.display().to_string(),
-                    label: repository.label.clone(),
+                    repo_name: repository.label.clone(),
                     repo_root: checkout.checkout_path.clone(),
                     is_linked_worktree: checkout.kind == CheckoutKind::Linked,
                 })
@@ -101,7 +101,7 @@ pub(crate) fn reconcile(
                     .map(|membership| crate::workspace::GitSpaceMetadata {
                         key: membership.key.clone(),
                         checkout_key: membership.checkout_path.display().to_string(),
-                        label: membership.label.clone(),
+                        repo_name: membership.label.clone(),
                         repo_root: membership.checkout_path.clone(),
                         is_linked_worktree: membership.is_linked_worktree,
                     })
@@ -115,7 +115,7 @@ pub(crate) fn reconcile(
                 } else {
                     CheckoutKind::Primary
                 },
-                space.label,
+                space.repo_name,
             ));
         } else {
             workspace.checkout = None;
@@ -245,7 +245,7 @@ mod tests {
         workspace.cached_git_space = Some(GitSpaceMetadata {
             key: common.into(),
             checkout_key: root.into(),
-            label: common.rsplit('/').next().unwrap_or("repo").into(),
+            repo_name: common.rsplit('/').next().unwrap_or("repo").into(),
             repo_root: root.into(),
             is_linked_worktree: linked,
         });

@@ -289,7 +289,7 @@ fn migrate_repository_state(
             crate::workspace::git_space_metadata(&workspace.identity_cwd).map(|space| {
                 crate::workspace::WorktreeSpaceMembership {
                     key: space.key,
-                    label: space.label,
+                    label: space.repo_name,
                     repo_root: space.repo_root.clone(),
                     checkout_path: space.repo_root,
                     is_linked_worktree: space.is_linked_worktree,
@@ -1222,7 +1222,7 @@ mod tests {
         state.workspaces[0].cached_git_space = Some(crate::workspace::GitSpaceMetadata {
             key: "/repo/herdr/.git".into(),
             checkout_key: "/repo/herdr".into(),
-            label: "herdr".into(),
+            repo_name: "herdr".into(),
             repo_root: "/repo/herdr".into(),
             is_linked_worktree: false,
         });
