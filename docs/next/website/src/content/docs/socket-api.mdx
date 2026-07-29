@@ -767,9 +767,10 @@ Pane collections use `collection.list`, `collection.get`, `collection.create`,
 `collection.add`, `collection.move`, `collection.promote`, `collection.select`,
 `collection.reorder`, `collection.archive`, `collection.restore`,
 `collection.member_create`, and `collection.close`. A non-empty close requires
-`disposition: "cascade_close"` or `"promote_members"`; cascade close can return
-`confirmation_required` when it would close a worktree group. Collection
-responses include stable IDs, ordered members, archive/selection state,
+`disposition: "cascade_close"` or `"promote_members"`. Cascade close terminates
+every member PTY; promote members preserves every process in its own new
+standalone tab in the same workspace. `target_pane_id` must be omitted when
+promoting a collection. Collection responses include stable IDs, ordered members, archive/selection state,
 lifecycle counts, and advisory warnings. For delegated members,
 `collection.reorder.index` is the requested final canonical displayed index of
 the moved subtree root. The moving subtree is removed before that index is

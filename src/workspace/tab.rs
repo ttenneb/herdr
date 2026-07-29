@@ -489,39 +489,6 @@ impl Tab {
         Ok(())
     }
 
-    pub(crate) fn promote_all_collection_members_near(
-        &mut self,
-        collection_id: CollectionId,
-        target_pane_id: PaneId,
-        direction: Direction,
-        ratio: f32,
-    ) -> Result<Vec<PaneId>, CollectionMutationError> {
-        let members = self
-            .layout
-            .collection(collection_id)
-            .map(|collection| collection.members().to_vec())
-            .ok_or(CollectionMutationError::CollectionNotFound)?;
-        if self.layout.placement(target_pane_id) != Some(PanePlacement::Tiled) {
-            return Err(CollectionMutationError::TargetNotTiled);
-        }
-        let mut layout = self.layout.clone();
-        let mut insertion_target = target_pane_id;
-        for pane_id in &members {
-            if !layout.remove_collection_member(collection_id, *pane_id)
-                || !layout.insert_pane_near(insertion_target, *pane_id, direction, ratio)
-            {
-                return Err(CollectionMutationError::LayoutMutationFailed);
-            }
-            insertion_target = *pane_id;
-        }
-        if !layout.remove_collection(collection_id) || take_collection_mutation_failure_for_test() {
-            return Err(CollectionMutationError::LayoutMutationFailed);
-        }
-        self.layout = layout;
-        self.zoomed = false;
-        Ok(members)
-    }
-
     pub fn select_collection_member(
         &mut self,
         collection_id: CollectionId,

@@ -8,9 +8,7 @@ use ratatui::layout::Direction;
 use tokio::sync::{mpsc, Notify};
 
 use crate::events::AppEvent;
-#[cfg(test)]
-use crate::layout::PanePlacement;
-use crate::layout::{CollectionId, LayoutLeaf, PaneId, TileLayout};
+use crate::layout::{CollectionId, LayoutLeaf, PaneId, PanePlacement, TileLayout};
 use crate::pane::{PaneLaunchEnv, PaneState};
 use crate::terminal::{TerminalId, TerminalRuntime, TerminalRuntimeRegistry, TerminalState};
 
@@ -1180,13 +1178,10 @@ impl Workspace {
         })
     }
 
-    pub(crate) fn promote_all_collection_members(
+    pub(crate) fn promote_collection_members_to_tabs(
         &mut self,
         collection_id: CollectionId,
-        target_pane_id: Option<PaneId>,
-        direction: Direction,
-        ratio: f32,
-    ) -> Result<CollectionPromotionOutcome, CollectionMutationError> {
+    ) -> Result<CollectionTabsPromotionOutcome, CollectionMutationError> {
         let source_tab_idx = self
             .tabs
             .iter()
@@ -1196,43 +1191,18 @@ impl Workspace {
             .collection(collection_id)
             .map(|collection| collection.members().to_vec())
             .ok_or(CollectionMutationError::CollectionNotFound)?;
-
-        if let Some(target_pane_id) = target_pane_id {
-            if self.find_tab_index_for_pane(target_pane_id) != Some(source_tab_idx) {
-                return Err(CollectionMutationError::TargetNotTiled);
-            }
-            let promoted = self.tabs[source_tab_idx].promote_all_collection_members_near(
-                collection_id,
-                target_pane_id,
-                direction,
-                ratio,
-            )?;
-            return Ok(CollectionPromotionOutcome {
-                members: promoted,
-                target_tab_idx: source_tab_idx,
-                created_tab: false,
-                removed_tab_idx: None,
-            });
+        if members.is_empty() {
+            return Err(CollectionMutationError::CollectionNotEmpty);
         }
 
-        // A collection-only source has no legal split anchor. Deterministically
-        // reuse the first other tab with a tiled pane, or create a normal tab.
-        let reusable = self.tabs.iter().enumerate().find_map(|(idx, tab)| {
-            (idx != source_tab_idx)
-                .then(|| {
-                    tab.layout
-                        .tiled_pane_ids()
-                        .into_iter()
-                        .next()
-                        .map(|pane| (idx, pane))
-                })
-                .flatten()
-        });
         let pane_states = members
             .iter()
             .map(|pane_id| {
-                self.tabs[source_tab_idx]
-                    .panes
+                let tab = &self.tabs[source_tab_idx];
+                if tab.pane_placement(*pane_id) != Some(PanePlacement::Collection(collection_id)) {
+                    return Err(CollectionMutationError::PaneNotFound);
+                }
+                tab.panes
                     .get(pane_id)
                     .cloned()
                     .map(|state| (*pane_id, state))
@@ -1254,98 +1224,68 @@ impl Workspace {
             }
             Some(layout)
         };
+
+        let source_tab = &self.tabs[source_tab_idx];
+        let first_public_tab_number = self.next_public_tab_number;
+        let mut promoted_tabs = Vec::with_capacity(pane_states.len());
+        for (offset, (pane_id, pane_state)) in pane_states.iter().enumerate() {
+            promoted_tabs.push(Tab::from_existing_pane(
+                first_public_tab_number + offset,
+                None,
+                MovedPane {
+                    pane_id: *pane_id,
+                    pane_state: pane_state.clone(),
+                    archived: false,
+                },
+                source_tab.events.clone(),
+                source_tab.render_notify.clone(),
+                source_tab.render_dirty.clone(),
+            ));
+        }
         if crate::workspace::tab::take_collection_mutation_failure_for_test() {
             return Err(CollectionMutationError::LayoutMutationFailed);
         }
 
-        let (mut target_tab_idx, created_tab) =
-            if let Some((target_tab_idx, target_pane)) = reusable {
-                let mut layout = self.tabs[target_tab_idx].layout.clone();
-                let mut insertion_target = target_pane;
-                for pane_id in &members {
-                    if !layout.insert_pane_near(insertion_target, *pane_id, direction, ratio) {
-                        return Err(CollectionMutationError::LayoutMutationFailed);
-                    }
-                    insertion_target = *pane_id;
-                }
-                self.tabs[target_tab_idx].layout = layout;
-                for (pane_id, pane_state) in &pane_states {
-                    self.tabs[target_tab_idx]
-                        .panes
-                        .insert(*pane_id, pane_state.clone());
-                }
-                (target_tab_idx, false)
-            } else {
-                let Some((first_id, first_state)) = pane_states.first() else {
-                    return Err(CollectionMutationError::CollectionNotEmpty);
-                };
-                let moved = MovedPane {
-                    pane_id: *first_id,
-                    pane_state: first_state.clone(),
-                    archived: false,
-                };
-                let number = self.next_public_tab_number;
-                self.next_public_tab_number += 1;
-                let source_tab = &self.tabs[source_tab_idx];
-                let mut tab = Tab::from_existing_pane(
-                    number,
-                    None,
-                    moved,
-                    source_tab.events.clone(),
-                    source_tab.render_notify.clone(),
-                    source_tab.render_dirty.clone(),
-                );
-                let mut insertion_target = *first_id;
-                for (pane_id, pane_state) in pane_states.iter().skip(1) {
-                    tab.insert_existing_pane(
-                        insertion_target,
-                        MovedPane {
-                            pane_id: *pane_id,
-                            pane_state: pane_state.clone(),
-                            archived: false,
-                        },
-                        direction,
-                        ratio,
-                    )
-                    .map_err(|_| CollectionMutationError::LayoutMutationFailed)?;
-                    insertion_target = *pane_id;
-                }
-                self.tabs.push(tab);
-                (self.tabs.len() - 1, true)
-            };
-
-        let removed_tab_idx = if source_is_only_leaf {
+        let active_tab_number = self.tabs.get(self.active_tab).map(|tab| tab.number);
+        if source_is_only_leaf {
             self.tabs.remove(source_tab_idx);
-            self.adjust_active_tab_after_removal(source_tab_idx);
-            if source_tab_idx < target_tab_idx {
-                target_tab_idx -= 1;
-            }
-            Some(source_tab_idx)
         } else {
-            self.tabs[source_tab_idx].layout =
+            let source_tab = &mut self.tabs[source_tab_idx];
+            source_tab.layout =
                 source_layout.ok_or(CollectionMutationError::LayoutMutationFailed)?;
             for pane_id in &members {
-                self.tabs[source_tab_idx].panes.remove(pane_id);
+                source_tab.panes.remove(pane_id);
             }
-            if self.tabs[source_tab_idx]
+            if source_tab
                 .root_pane
                 .is_some_and(|root| members.contains(&root))
             {
-                self.tabs[source_tab_idx].root_pane = self.tabs[source_tab_idx]
-                    .layout
-                    .placed_pane_ids()
-                    .into_iter()
-                    .next();
+                source_tab.root_pane = source_tab.layout.placed_pane_ids().into_iter().next();
             }
-            self.tabs[source_tab_idx].zoomed = false;
-            None
-        };
+            source_tab.zoomed = false;
+        }
 
-        Ok(CollectionPromotionOutcome {
+        let insertion_idx = if source_is_only_leaf {
+            source_tab_idx
+        } else {
+            source_tab_idx + 1
+        };
+        let created_tab_indices =
+            (insertion_idx..insertion_idx + promoted_tabs.len()).collect::<Vec<_>>();
+        self.tabs
+            .splice(insertion_idx..insertion_idx, promoted_tabs);
+        self.next_public_tab_number += members.len();
+
+        self.active_tab = active_tab_number
+            .and_then(|number| self.tabs.iter().position(|tab| tab.number == number))
+            .unwrap_or(insertion_idx)
+            .min(self.tabs.len().saturating_sub(1));
+
+        Ok(CollectionTabsPromotionOutcome {
             members,
-            target_tab_idx,
-            created_tab,
-            removed_tab_idx,
+            created_tab_indices,
+            source_layout_tab_idx: (!source_is_only_leaf).then_some(source_tab_idx),
+            removed_tab_idx: source_is_only_leaf.then_some(source_tab_idx),
         })
     }
 
@@ -1739,10 +1679,10 @@ impl Workspace {
     }
 }
 
-pub(crate) struct CollectionPromotionOutcome {
+pub(crate) struct CollectionTabsPromotionOutcome {
     pub members: Vec<PaneId>,
-    pub target_tab_idx: usize,
-    pub created_tab: bool,
+    pub created_tab_indices: Vec<usize>,
+    pub source_layout_tab_idx: Option<usize>,
     pub removed_tab_idx: Option<usize>,
 }
 

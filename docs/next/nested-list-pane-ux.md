@@ -322,7 +322,7 @@ The running terminal and agent identity must survive the move.
 Removing a non-empty pane collection requires an explicit member disposition. CLI and socket API calls refuse an ambiguous close and require one of:
 
 - **cascade-close:** close the collection and every member PTY
-- **promote-members:** remove the collection and move surviving members into ordinary placement without restarting them
+- **promote-members:** remove the collection and move every surviving member into its own standalone tab in the same workspace without restarting it
 
 The TUI presents the same choices and shows at least:
 
@@ -420,7 +420,7 @@ The product semantics and core runtime boundaries are settled. Detailed implemen
 1. The concrete typed layout representation and migration from the current pane-only BSP leaf and focus invariants.
 2. The exact public ID format and API schema for pane collections and delegation records.
 3. How portable layout export distinguishes collection structure from member launch commands, and how apply targets existing versus new panes.
-4. The deterministic fallback layout used by `promote-members`, especially when a collection contains many panes.
+4. The deterministic member order and focus behavior used when `promote-members` creates one standalone tab per member.
 5. The event and command names required for atomic create, add, move, reorder, reparent, archive, promote, cascade-close, and remove operations.
 6. Geometry-claim revisioning, drag debounce, minimum preview dimensions, pixel-cell metadata, and recovery when the foreground client disconnects.
 7. Whether local expansion, scroll, preview-height, and maximize state is optionally persisted per client across detach.

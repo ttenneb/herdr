@@ -355,7 +355,11 @@ impl App {
             .as_ref()
             .and_then(|menu| menu.plugin.as_ref())
             .map(|plugin| plugin.generation);
-        if self.handle_collection_mouse_from(source_id, mouse) {
+        if !matches!(
+            self.state.mode,
+            crate::app::state::Mode::CollectionClose | crate::app::state::Mode::ContextMenu
+        ) && self.handle_collection_mouse_from(source_id, mouse)
+        {
             let current_context_menu_generation = self
                 .state
                 .context_menu

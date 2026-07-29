@@ -623,8 +623,7 @@ workspace 的 get/list 响应会公开生成的 `tokens` 映射,空间侧边栏�
 `collection.add`、`collection.move`、`collection.promote`、`collection.select`、
 `collection.reorder`、`collection.archive`、`collection.restore`、
 `collection.member_create` 和 `collection.close`。关闭非空集合时必须提供
-`disposition: "cascade_close"` 或 `"promote_members"`;若操作会关闭工作树组,可能返回
-`confirmation_required`。集合响应包含稳定 ID、有序成员、归档/选择状态、生命周期计数和提示。对于已委派成员,`collection.reorder.index` 是移动子树根节点所请求的最终规范显示索引。该索引在移除待移动子树后解释,且目标必须是同一委派父项、同一活动/归档分区中的同级子树边界;如需更改父项,请使用 `delegation.reparent`。未委派成员仍直接重排成员向量。
+`disposition: "cascade_close"` 或 `"promote_members"`。`cascade_close` 会终止所有成员 PTY;`promote_members` 会保留所有进程,并把每个成员移入同一工作区中的新独立标签页。提升集合时必须省略 `target_pane_id`。集合响应包含稳定 ID、有序成员、归档/选择状态、生命周期计数和提示。对于已委派成员,`collection.reorder.index` 是移动子树根节点所请求的最终规范显示索引。该索引在移除待移动子树后解释,且目标必须是同一委派父项、同一活动/归档分区中的同级子树边界;如需更改父项,请使用 `delegation.reparent`。未委派成员仍直接重排成员向量。
 
 委派元数据独立于布局。使用 `delegation.create`、`delegation.get`、
 `delegation.tree`、`delegation.root`、`delegation.descendants`、

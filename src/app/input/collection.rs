@@ -1547,6 +1547,57 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn collection_context_menu_and_close_dialog_own_left_clicks_over_collection_content() {
+        let (mut app, collection, child, _rx) = collection_scroll_app(b"", 12);
+        let layout = app.state.view.collection_layouts[0].clone();
+        let header = layout.active_header.expect("active header");
+
+        app.handle_mouse(mouse(
+            MouseEventKind::Down(MouseButton::Right),
+            header.x,
+            header.y,
+        ));
+        let menu = app.state.context_menu_rect().expect("context menu rect");
+        app.handle_mouse(mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            menu.x + 1,
+            menu.y + 1,
+        ));
+        assert_eq!(app.state.mode, Mode::CollectionClose);
+        assert_eq!(
+            app.state
+                .pending_collection_close
+                .as_ref()
+                .map(|pending| pending.collection_id),
+            Some(collection)
+        );
+
+        let popup = crate::ui::collection_close_popup_rect(app.state.view.terminal_area)
+            .expect("collection close popup");
+        let inner = Rect::new(
+            popup.x + 1,
+            popup.y + 1,
+            popup.width.saturating_sub(2),
+            popup.height.saturating_sub(2),
+        );
+        let (promote, _, _) = crate::ui::collection_close_button_rects(inner);
+        app.handle_mouse(mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            promote.x,
+            promote.y,
+        ));
+
+        assert!(app.state.workspaces[0].tabs[0]
+            .collection(collection)
+            .is_none());
+        let promoted_tab = app.state.workspaces[0]
+            .find_tab_index_for_pane(child)
+            .expect("standalone promoted tab");
+        assert_ne!(promoted_tab, 0);
+        assert_eq!(app.state.workspaces[0].tabs[promoted_tab].pane_count(), 1);
+    }
+
+    #[tokio::test]
     async fn maximized_preview_keeps_member_menu_but_its_outer_border_opens_collection_menu() {
         let (mut app, collection, child, _rx) = collection_scroll_app(b"", 0);
         app.state

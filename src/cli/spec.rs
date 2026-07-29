@@ -447,7 +447,6 @@ fn collection_command() -> Command {
                 .arg(required("collection_id", "COLLECTION_ID"))
                 .arg(flag("cascade-close"))
                 .arg(flag("promote-members"))
-                .arg(option("target-pane", "PANE_ID"))
                 .arg(flag("focus-promoted"))
                 .group(
                     ArgGroup::new("disposition")

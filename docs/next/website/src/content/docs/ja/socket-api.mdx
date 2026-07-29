@@ -627,8 +627,7 @@ workspace の get/list 応答は結果の `tokens` マップを公開し、ス�
 `collection.add`、`collection.move`、`collection.promote`、`collection.select`、
 `collection.reorder`、`collection.archive`、`collection.restore`、
 `collection.member_create`、`collection.close` を使います。空でないコレクションを閉じる場合は
-`disposition` に `cascade_close` または `promote_members` が必要です。ワークツリーグループを
-閉じる操作では `confirmation_required` が返ることがあります。レスポンスには安定 ID、順序付きメンバー、
+`disposition` に `cascade_close` または `promote_members` が必要です。`cascade_close` は全メンバーの PTY を終了し、`promote_members` は各プロセスを同じワークスペース内の新しい独立タブに移して保持します。プロモート時は `target_pane_id` を省略してください。レスポンスには安定 ID、順序付きメンバー、
 アーカイブ/選択状態、ライフサイクル集計、警告が含まれます。委譲されたメンバーでは `collection.reorder.index` は、移動するサブツリーのルートに要求する最終的な正規表示インデックスです。このインデックスは移動するサブツリーを除外した後に解釈され、移動先は同じ委譲親かつ同じアクティブ/アーカイブ区分にある兄弟サブツリーの境界でなければなりません。親を変更するには `delegation.reparent` を使います。委譲されていないメンバーは、従来どおりメンバーベクターを直接並べ替えます。
 
 委譲メタデータは配置とは独立しています。`delegation.create`、`delegation.get`、
