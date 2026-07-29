@@ -760,7 +760,8 @@ fn render_mobile_switcher_content(
             ws.aggregate_state(&app.terminals)
         };
         let child_checkout = *depth > 0;
-        let linked_checkout = child_checkout
+        let indented_checkout = child_checkout && ws.checkout.is_some();
+        let linked_checkout = indented_checkout
             && ws
                 .checkout
                 .as_ref()
@@ -775,10 +776,11 @@ fn render_mobile_switcher_content(
         let mut title_spans = vec![Span::styled("  ", Style::default().bg(bg))];
         // Worktrees of the same space render as branches off their parent, so a
         // child gets an L/T connector on its name row and a matching vertical
-        // continuation on its detail row. Its state marker stays aligned with
-        // the root Space's status column, while the branch icon stays by the tree.
+        // continuation on its detail row. Indented Checkouts keep their state
+        // marker aligned with the root Space's status column, while actual linked
+        // Checkouts keep the branch icon by the tree.
         let detail_prefix = if child_checkout {
-            if linked_checkout {
+            if indented_checkout {
                 title_spans.push(Span::styled(state_dot, state_dot_style.bg(bg)));
                 title_spans.push(Span::styled(" ", Style::default().bg(bg)));
             }
@@ -787,7 +789,7 @@ fn render_mobile_switcher_content(
                 if last_child { "└─ " } else { "├─ " },
                 Style::default().fg(p.overlay0).bg(bg),
             ));
-            match (linked_checkout, last_child) {
+            match (indented_checkout, last_child) {
                 (true, true) => "         ",
                 (true, false) => "    │    ",
                 (false, true) => "       ",
@@ -799,7 +801,7 @@ fn render_mobile_switcher_content(
 
         if linked_checkout {
             title_spans.push(Span::styled("", branch_icon_style.bg(bg)));
-        } else {
+        } else if !indented_checkout {
             title_spans.push(Span::styled(state_dot, state_dot_style.bg(bg)));
         }
         title_spans.push(Span::styled(" ", Style::default().bg(bg)));
@@ -821,7 +823,7 @@ fn render_mobile_switcher_content(
         } else {
             raw_label
         };
-        let name_budget = content.width.saturating_sub(if linked_checkout {
+        let name_budget = content.width.saturating_sub(if indented_checkout {
             10
         } else if child_checkout {
             8
