@@ -1822,14 +1822,9 @@ fn render_workspace_list(
         });
         // A Workspace can be a visually indented Checkout even when its
         // persisted provenance is Primary (for example, a second Workspace
-        // attached to the primary checkout). Its status still belongs in the
-        // root status column; only actual linked Checkouts receive the branch glyph.
+        // attached to the primary checkout). Its state and branch glyph follow
+        // that visual hierarchy, rather than the provenance kind.
         let indented_checkout = card.indented && ws.checkout.is_some();
-        let linked_checkout = indented_checkout
-            && ws
-                .checkout
-                .as_ref()
-                .is_some_and(|checkout| checkout.kind == crate::repository::CheckoutKind::Linked);
         let linked_status_marker_style = app
             .sidebar_spaces
             .rows
@@ -1873,7 +1868,7 @@ fn render_workspace_list(
                         if is_last_child { "└─ " } else { "├─ " },
                         Style::default().fg(p.overlay0),
                     ));
-                    if linked_checkout && !fixed_status_column {
+                    if indented_checkout && !fixed_status_column {
                         spans.push(Span::styled(" ", branch_style));
                         8
                     } else {
@@ -1905,11 +1900,7 @@ fn render_workspace_list(
                 .map(|_| {
                     if fixed_status_column && !replaced_fixed_status_icon {
                         replaced_fixed_status_icon = true;
-                        if linked_checkout {
-                            ("", branch_style)
-                        } else {
-                            ("", Style::default())
-                        }
+                        ("", branch_style)
                     } else {
                         state_icon
                     }
@@ -1937,8 +1928,8 @@ fn render_workspace_list(
         if let Some(style) =
             linked_status_marker_style.filter(|_| fixed_status_column && card.rect.width > 1)
         {
-            // Indented Checkouts share the fixed status column used by roots.
-            // Actual linked Checkouts retain their branch icon beside the tree connector.
+            // Indented Checkouts share the fixed status column used by roots
+            // and retain their branch icon beside the tree connector.
             let child_state_icon = state_dot(agg_state, agg_seen, p);
             frame.buffer_mut()[(card.rect.x + 1, row_y)]
                 .set_symbol(child_state_icon.0)
@@ -3173,7 +3164,7 @@ rows = [[{ token = "git_status", fg = "#123456" }]]
     }
 
     #[test]
-    fn indented_primary_checkout_uses_root_status_column_without_branch_icon() {
+    fn indented_primary_checkout_uses_root_status_column_and_branch_icon() {
         let mut app = crate::app::state::AppState::test_new();
         let mut ws = Workspace::test_new("duplicate primary");
         ws.checkout = Some(crate::repository::CheckoutProvenance {
@@ -3210,7 +3201,7 @@ rows = [[{ token = "git_status", fg = "#123456" }]]
             .map(|x| terminal.backend().buffer()[(x, 1)].symbol())
             .collect::<String>();
         assert_eq!(terminal.backend().buffer()[(1, 1)].symbol(), "·");
-        assert!(!row.contains(""), "rendered row: {row:?}");
+        assert!(row.contains(""), "rendered row: {row:?}");
     }
 
     fn workspace_with_worktree_space(
