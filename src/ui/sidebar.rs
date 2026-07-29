@@ -1322,6 +1322,7 @@ pub(super) fn render_sidebar(
 fn resolved_token_spans(
     resolved: &[ResolvedToken],
     state_icon: (&str, Style),
+    state_icon_overrides: &[(&str, Style)],
     state_text_style: Style,
     workspace_style: Style,
     secondary_style: Style,
@@ -1427,6 +1428,7 @@ fn resolved_token_spans(
         }
     }
     let mut spans = Vec::new();
+    let mut state_icon_index = 0;
     for (position, index) in visible_indices.iter().copied().enumerate() {
         let token = &resolved[index];
         if position > 0 {
@@ -1438,9 +1440,14 @@ fn resolved_token_spans(
         }
         match &token.kind {
             ResolvedTokenKind::StateIcon => {
+                let icon = state_icon_overrides
+                    .get(state_icon_index)
+                    .copied()
+                    .unwrap_or(state_icon);
+                state_icon_index += 1;
                 spans.push(Span::styled(
-                    state_icon.0.to_string(),
-                    apply_token_style(state_icon.1, token.style),
+                    icon.0.to_string(),
+                    apply_token_style(icon.1, token.style),
                 ));
             }
             ResolvedTokenKind::StateText(text) => {
@@ -1813,11 +1820,25 @@ fn render_workspace_list(
         } else {
             p.overlay0
         });
-        let state_icon = if card.indented && ws.checkout.is_some() {
-            ("", branch_style)
-        } else {
-            state_dot(display_state, display_seen, p)
-        };
+        let linked_checkout = card.indented
+            && ws
+                .checkout
+                .as_ref()
+                .is_some_and(|checkout| checkout.kind == crate::repository::CheckoutKind::Linked);
+        let linked_status_marker_style = app
+            .sidebar_spaces
+            .rows
+            .first()
+            .and_then(|row| row.first())
+            .and_then(|configured| {
+                let (token, style) = configured.parts();
+                matches!(token, crate::config::SpaceSidebarToken::StateIcon).then_some(style)
+            });
+        // The default fixed status column replaces its first state-icon token with
+        // the branch glyph. For configurable layouts, retain every state-icon token
+        // and render the branch glyph as tree chrome instead.
+        let fixed_status_column = linked_checkout && linked_status_marker_style.is_some();
+        let state_icon = state_dot(display_state, display_seen, p);
         let state_text_style = Style::default()
             .fg(state_label_color(display_state, display_seen, p))
             .add_modifier(Modifier::DIM);
@@ -1834,6 +1855,7 @@ fn render_workspace_list(
             },
         );
 
+        let mut replaced_fixed_status_icon = false;
         for (row_index, resolved) in rows.iter().enumerate() {
             if row_index as u16 >= row_height || row_y + row_index as u16 >= list_bottom {
                 break;
@@ -1846,7 +1868,12 @@ fn render_workspace_list(
                         if is_last_child { "└─ " } else { "├─ " },
                         Style::default().fg(p.overlay0),
                     ));
-                    6
+                    if linked_checkout && !fixed_status_column {
+                        spans.push(Span::styled(" ", branch_style));
+                        8
+                    } else {
+                        6
+                    }
                 } else if is_last_child {
                     spans.push(Span::raw("     "));
                     8
@@ -1867,9 +1894,22 @@ fn render_workspace_list(
             } else {
                 0
             };
+            let state_icon_overrides = resolved
+                .iter()
+                .filter(|token| matches!(token.kind, ResolvedTokenKind::StateIcon))
+                .map(|_| {
+                    if fixed_status_column && !replaced_fixed_status_icon {
+                        replaced_fixed_status_icon = true;
+                        ("", branch_style)
+                    } else {
+                        state_icon
+                    }
+                })
+                .collect::<Vec<_>>();
             spans.extend(resolved_token_spans(
                 resolved,
                 state_icon,
+                &state_icon_overrides,
                 state_text_style,
                 name_style,
                 branch_style,
@@ -1883,6 +1923,17 @@ fn render_workspace_list(
                 Paragraph::new(Line::from(spans)),
                 Rect::new(card.rect.x, row_y + row_index as u16, card.rect.width, 1),
             );
+        }
+
+        if let Some(style) =
+            linked_status_marker_style.filter(|_| fixed_status_column && card.rect.width > 1)
+        {
+            // Linked Checkouts retain their branch icon beside the tree connector,
+            // but their state marker shares the fixed status column used by roots.
+            let child_state_icon = state_dot(agg_state, agg_seen, p);
+            frame.buffer_mut()[(card.rect.x + 1, row_y)]
+                .set_symbol(child_state_icon.0)
+                .set_style(apply_token_style(child_state_icon.1, style));
         }
 
         if let Some((_, collapsed)) = parent_group {
@@ -2045,6 +2096,7 @@ fn render_agent_detail(
             spans.extend(resolved_token_spans(
                 resolved,
                 state_icon,
+                &[],
                 status_style,
                 name_style,
                 agent_style,
@@ -2320,6 +2372,7 @@ rows = [[{ token = "git_status", fg = "#123456" }]]
                 style: config.ui.sidebar.spaces.rows[0][0].parts().1,
             }],
             ("", Style::default()),
+            &[],
             Style::default(),
             Style::default(),
             Style::default(),
@@ -2431,6 +2484,7 @@ rows = [[{ token = "git_status", fg = "#123456" }]]
                 "修复🙂标题很长".into(),
             ))],
             ("", Style::default()),
+            &[],
             Style::default(),
             Style::default(),
             Style::default(),
@@ -3065,7 +3119,7 @@ rows = [[{ token = "git_status", fg = "#123456" }]]
     }
 
     #[test]
-    fn linked_checkout_uses_git_branch_icon_instead_of_state_dot() {
+    fn linked_checkout_keeps_branch_icon_and_uses_root_status_column() {
         let mut app = crate::app::state::AppState::test_new();
         let mut ws = Workspace::test_new("feature");
         ws.checkout = Some(crate::repository::CheckoutProvenance {
@@ -3102,7 +3156,11 @@ rows = [[{ token = "git_status", fg = "#123456" }]]
             .map(|x| terminal.backend().buffer()[(x, 1)].symbol())
             .collect::<String>();
         assert!(row.contains(""), "rendered row: {row:?}");
-        assert!(!row.contains('·'), "rendered row: {row:?}");
+        assert_eq!(
+            terminal.backend().buffer()[(1, 1)].symbol(),
+            "·",
+            "linked Checkout should use the root status column: {row:?}"
+        );
     }
 
     fn workspace_with_worktree_space(

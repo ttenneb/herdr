@@ -759,39 +759,49 @@ fn render_mobile_switcher_content(
         } else {
             ws.aggregate_state(&app.terminals)
         };
-        let (dot, dot_style) = if *depth > 0 && ws.checkout.is_some() {
-            (
-                "",
-                Style::default().fg(if selected || active {
-                    p.mauve
-                } else {
-                    p.overlay0
-                }),
-            )
+        let child_checkout = *depth > 0;
+        let linked_checkout = child_checkout
+            && ws
+                .checkout
+                .as_ref()
+                .is_some_and(|checkout| checkout.kind == crate::repository::CheckoutKind::Linked);
+        let (state_dot, state_dot_style) = state_dot(state, seen, p);
+        let branch_icon_style = Style::default().fg(if selected || active {
+            p.mauve
         } else {
-            state_dot(state, seen, p)
-        };
+            p.overlay0
+        });
 
         let mut title_spans = vec![Span::styled("  ", Style::default().bg(bg))];
         // Worktrees of the same space render as branches off their parent, so a
         // child gets an L/T connector on its name row and a matching vertical
-        // continuation on its detail row.
-        let detail_prefix = if *depth > 0 {
+        // continuation on its detail row. Its state marker stays aligned with
+        // the root Space's status column, while the branch icon stays by the tree.
+        let detail_prefix = if child_checkout {
+            if linked_checkout {
+                title_spans.push(Span::styled(state_dot, state_dot_style.bg(bg)));
+                title_spans.push(Span::styled(" ", Style::default().bg(bg)));
+            }
             let last_child = !next_entry_is_indented_workspace(&space_entries, entry_idx);
             title_spans.push(Span::styled(
                 if last_child { "└─ " } else { "├─ " },
                 Style::default().fg(p.overlay0).bg(bg),
             ));
-            if last_child {
-                "       "
-            } else {
-                "  │    "
+            match (linked_checkout, last_child) {
+                (true, true) => "         ",
+                (true, false) => "    │    ",
+                (false, true) => "       ",
+                (false, false) => "  │    ",
             }
         } else {
             "  "
         };
 
-        title_spans.push(Span::styled(dot, dot_style.bg(bg)));
+        if linked_checkout {
+            title_spans.push(Span::styled("", branch_icon_style.bg(bg)));
+        } else {
+            title_spans.push(Span::styled(state_dot, state_dot_style.bg(bg)));
+        }
         title_spans.push(Span::styled(" ", Style::default().bg(bg)));
         let raw_label = ws.display_name_from(&app.terminals, terminal_runtimes);
         let name = if *depth > 0 {
@@ -811,7 +821,13 @@ fn render_mobile_switcher_content(
         } else {
             raw_label
         };
-        let name_budget = content.width.saturating_sub(if *depth > 0 { 8 } else { 5 }) as usize;
+        let name_budget = content.width.saturating_sub(if linked_checkout {
+            10
+        } else if child_checkout {
+            8
+        } else {
+            5
+        }) as usize;
         title_spans.push(Span::styled(
             truncate_end(&name, name_budget),
             Style::default()
@@ -1571,6 +1587,11 @@ mod tests {
         let mut app = crate::app::state::AppState::test_new();
         let primary = worktree_workspace("main", "repo-key", false);
         let mut linked = worktree_workspace("feature", "repo-key", true);
+        linked.checkout = Some(crate::repository::CheckoutProvenance {
+            repository_id: "repo-key".into(),
+            checkout_path: "/repo/feature".into(),
+            kind: crate::repository::CheckoutKind::Linked,
+        });
         linked.cached_git_branch = Some("demo/shared".into());
         linked
             .resources
@@ -1624,6 +1645,12 @@ mod tests {
         assert!(
             checkout_row.contains("tab 1"),
             "checkout row: {checkout_row:?}"
+        );
+        assert!(checkout_row.contains(""), "checkout row: {checkout_row:?}");
+        assert_eq!(
+            terminal.backend().buffer()[(3, 7)].symbol(),
+            "·",
+            "linked Checkout status should align with root status column: {checkout_row:?}"
         );
         let resource_row = row(8);
         assert!(
