@@ -146,12 +146,12 @@ If a recorded parent is outside the collection, archived into another section, c
 
 Any child can be expanded inline beneath its row. Several child terminals may remain expanded simultaneously.
 
-- An expanded child starts at a standard, useful preview height.
-- Expanded previews can be resized independently.
+- A newly expanded child automatically receives at least half of the current collection height, making terminal interaction useful without requiring an immediate resize.
+- Expanded previews can be resized independently; an explicit size remains stable across collapse, re-expansion, and collection resizing.
 - The list scrolls vertically, so rows and expanded terminals can exist above and below the viewport.
 - Collapsing a child does not stop its process.
 - A collapsed live terminal retains its last authoritative PTY dimensions.
-- A child that has never been expanded receives the standard preview dimensions.
+- Before first expansion, a child keeps the compact standard preview geometry used during creation; expansion applies the adaptive height.
 
 The foreground full-app client owns geometry for expanded previews. It submits neutral per-terminal geometry claims derived from visible terminal rectangles. A writable direct attach has higher priority and temporarily owns that terminal's dimensions. Non-foreground app clients and observers render by clipping or padding and never resize shared PTYs.
 

@@ -10,7 +10,10 @@ use crate::{
         DelegationReorderParams, DelegationSiblingPosition, Method, SplitDirection,
     },
     app::{
-        collection_view::{CollectionHitKind, CollectionInteractionMode},
+        collection_view::{
+            automatic_preview_height, CollectionHitKind, CollectionInteractionMode,
+            DEFAULT_PREVIEW_HEIGHT, MIN_PREVIEW_HEIGHT,
+        },
         state::{ContextMenuKind, ContextMenuState, MenuListState, Mode},
         App, InputSourceId,
     },
@@ -577,17 +580,37 @@ impl App {
             view.expanded.insert(pane);
         }
     }
+    fn effective_preview_height(&self, collection_id: CollectionId, pane_id: PaneId) -> u16 {
+        if let Some(height) = self
+            .state
+            .collection_views
+            .get(&collection_id)
+            .and_then(|view| view.preview_heights.get(&pane_id))
+            .copied()
+        {
+            return height.max(MIN_PREVIEW_HEIGHT);
+        }
+        self.state
+            .view
+            .collection_layouts
+            .iter()
+            .find(|layout| layout.id == collection_id)
+            .map(|layout| automatic_preview_height(layout.rect.height))
+            .unwrap_or(DEFAULT_PREVIEW_HEIGHT)
+    }
     fn resize_selected_preview(&mut self, collection_id: CollectionId, delta: i16) {
         let Some((_, _, Some(pane))) = self.focused_collection() else {
             return;
         };
+        let current = self.effective_preview_height(collection_id, pane);
+        let next = (i32::from(current) + i32::from(delta))
+            .clamp(i32::from(MIN_PREVIEW_HEIGHT), i32::from(u16::MAX)) as u16;
         let view = self
             .state
             .collection_views
             .entry(collection_id)
             .or_default();
         view.expanded.insert(pane);
-        let next = (view.preview_height(pane) as i16 + delta).max(1) as u16;
         view.set_preview_height(pane, next);
     }
     pub(crate) fn toggle_collection_maximize(&mut self, collection_id: CollectionId) {
@@ -963,7 +986,10 @@ impl App {
                 MouseEventKind::Drag(MouseButton::Left) => {
                     let delta = mouse.row as i32 - start_row as i32;
                     if let Some(view) = self.state.collection_views.get_mut(&collection_id) {
-                        view.set_preview_height(pane, (start_height as i32 + delta).max(1) as u16);
+                        let height = (i32::from(start_height) + delta)
+                            .clamp(i32::from(MIN_PREVIEW_HEIGHT), i32::from(u16::MAX))
+                            as u16;
+                        view.set_preview_height(pane, height);
                     }
                     return true;
                 }
@@ -1178,12 +1204,13 @@ impl App {
                             );
                         }
                         CollectionHitKind::ResizeHandle => {
+                            let height = self.effective_preview_height(hit.collection_id, pane);
                             let view = self
                                 .state
                                 .collection_views
                                 .entry(hit.collection_id)
                                 .or_default();
-                            view.resize_drag = Some((pane, mouse.row, view.preview_height(pane)));
+                            view.resize_drag = Some((pane, mouse.row, height));
                         }
                         CollectionHitKind::Row => {
                             let view = self
@@ -1380,6 +1407,11 @@ mod tests {
         app.state.active = Some(0);
         app.state
             .enter_collection_terminal_from_foreground(0, collection, child);
+        app.state
+            .collection_views
+            .entry(collection)
+            .or_default()
+            .set_preview_height(child, 8);
         let surface = crate::ui::compute_tab_surface(
             &mut app.state,
             &TerminalRuntimeRegistry::new(),
@@ -1544,6 +1576,58 @@ mod tests {
             app.state.context_menu = None;
             app.state.mode = Mode::Terminal;
         }
+    }
+
+    #[tokio::test]
+    async fn visible_disclosure_toggles_while_selector_only_selects() {
+        let (mut app, collection, child, _rx) = collection_scroll_app(b"", 0);
+        let layout = app.state.view.collection_layouts[0].clone();
+        let row = layout
+            .rows
+            .iter()
+            .find(|row| row.pane_id == child)
+            .expect("child row");
+        let disclosure = layout
+            .hits
+            .iter()
+            .find(|hit| hit.pane_id == Some(child) && hit.kind == CollectionHitKind::Disclosure)
+            .expect("visible disclosure")
+            .rect;
+        assert_eq!(disclosure.x, row.row_rect.x + 2);
+        assert!(app.state.collection_views[&collection]
+            .expanded
+            .contains(&child));
+
+        app.handle_mouse(mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            row.row_rect.x,
+            row.row_rect.y,
+        ));
+        app.handle_mouse(mouse(
+            MouseEventKind::Up(MouseButton::Left),
+            row.row_rect.x,
+            row.row_rect.y,
+        ));
+        assert!(app.state.collection_views[&collection]
+            .expanded
+            .contains(&child));
+
+        app.handle_mouse(mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            disclosure.x,
+            disclosure.y,
+        ));
+        assert!(!app.state.collection_views[&collection]
+            .expanded
+            .contains(&child));
+        app.handle_mouse(mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            disclosure.x,
+            disclosure.y,
+        ));
+        assert!(app.state.collection_views[&collection]
+            .expanded
+            .contains(&child));
     }
 
     #[tokio::test]

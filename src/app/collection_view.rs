@@ -15,7 +15,10 @@ use crate::terminal::TerminalId;
 
 pub(crate) const DEFAULT_PREVIEW_HEIGHT: u16 = 8;
 pub(crate) const MIN_PREVIEW_HEIGHT: u16 = 3;
-pub(crate) const MAX_PREVIEW_HEIGHT: u16 = 40;
+
+pub(crate) fn automatic_preview_height(collection_height: u16) -> u16 {
+    DEFAULT_PREVIEW_HEIGHT.max(collection_height / 2 + collection_height % 2)
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct TerminalGeometry {
@@ -70,18 +73,20 @@ pub(crate) struct CollectionViewState {
     pub(crate) child_scrollbar_drag: Option<(PaneId, u16)>,
 }
 impl CollectionViewState {
-    pub(crate) fn preview_height(&self, pane_id: PaneId) -> u16 {
+    pub(crate) fn preview_height_for_collection(
+        &self,
+        pane_id: PaneId,
+        collection_height: u16,
+    ) -> u16 {
         self.preview_heights
             .get(&pane_id)
             .copied()
-            .unwrap_or(DEFAULT_PREVIEW_HEIGHT)
-            .clamp(MIN_PREVIEW_HEIGHT, MAX_PREVIEW_HEIGHT)
+            .unwrap_or_else(|| automatic_preview_height(collection_height))
+            .max(MIN_PREVIEW_HEIGHT)
     }
     pub(crate) fn set_preview_height(&mut self, pane_id: PaneId, height: u16) {
-        self.preview_heights.insert(
-            pane_id,
-            height.clamp(MIN_PREVIEW_HEIGHT, MAX_PREVIEW_HEIGHT),
-        );
+        self.preview_heights
+            .insert(pane_id, height.max(MIN_PREVIEW_HEIGHT));
     }
     pub(crate) fn terminal_entered(&self, pane_id: Option<PaneId>) -> bool {
         pane_id.is_some_and(|pane| {
@@ -267,7 +272,12 @@ mod tests {
         state.mode = CollectionInteractionMode::Terminal;
         state.entered = Some(stale);
         state.retain_members(&[first]);
-        assert_eq!(state.preview_height(first), MIN_PREVIEW_HEIGHT);
+        assert_eq!(
+            state.preview_height_for_collection(first, 100),
+            MIN_PREVIEW_HEIGHT
+        );
+        assert_eq!(automatic_preview_height(48), 24);
+        assert_eq!(automatic_preview_height(100), 50);
         assert!(!state.expanded.contains(&stale));
         assert_eq!(state.maximized, None);
         assert_eq!(state.mode, CollectionInteractionMode::List);
