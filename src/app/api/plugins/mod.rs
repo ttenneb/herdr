@@ -356,8 +356,12 @@ impl App {
             Some(menu) => menu.kind.clone(),
             None => return,
         };
-        // A Repository is an aggregate native target, never an implicit Checkout.
-        if matches!(kind, ContextMenuKind::Repository { .. }) {
+        // Repository and collection menus are aggregate/native targets, never an
+        // implicit Checkout or selected collection member.
+        if matches!(
+            kind,
+            ContextMenuKind::Repository { .. } | ContextMenuKind::Collection { .. }
+        ) {
             return;
         }
         let generation = self.state.next_context_menu_generation;
@@ -415,7 +419,7 @@ impl App {
                     crate::api::schema::PluginActionContext::Workspace,
                 )
             }
-            ContextMenuKind::Repository { .. } => return,
+            ContextMenuKind::Repository { .. } | ContextMenuKind::Collection { .. } => return,
             ContextMenuKind::Tab { ws_idx, tab_idx } => {
                 let Some(tab_id) = self.public_tab_id(ws_idx, tab_idx) else {
                     return;

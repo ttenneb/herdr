@@ -66,7 +66,7 @@ The full keymap and the binding syntax live in the [keybinding reference](/docs/
 
 A focused collection starts in **list mode**. Use `up`/`down` or `k`/`j` to select, Space to expand, and Enter to enter the selected terminal. Press the configured Herdr prefix followed by Esc to return to the list without interrupting the child. Bare Esc is sent to the child PTY, and prefix followed by prefix sends the literal prefix to it. Use `z` to maximize within the collection, `+`/`-` to resize a preview, `ctrl+up`/`ctrl+down` to reorder, `a` to archive or restore, `o` to promote, and `x` to close a member.
 
-`shift+x` shows lifecycle counts and asks whether to promote all members or cascade-close every PTY. `shift+a` shows archived live/exited/working/blocked counts before destructive archive cleanup. Archiving itself is non-destructive.
+The configured `close_pane` binding closes the focused collection through that same flow; `shift+x` remains its collection-close alias and bare list `x`/`Delete` still closes only the selected member. `shift+x` shows lifecycle counts and asks whether to promote all members or cascade-close every PTY. `shift+a` shows archived live/exited/working/blocked counts before destructive archive cleanup. Archiving itself is non-destructive.
 
 With the mouse, select rows, toggle disclosure, enter previews, and drag preview separators or rows. The wheel scrolls the list over rows/chrome; over an entered preview it follows normal terminal mouse and scrollback rules.
 

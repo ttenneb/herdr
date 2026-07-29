@@ -1002,7 +1002,6 @@ mod tests {
             collection_id: crate::layout::CollectionId::from_raw(1).expect("valid collection id"),
             member_ids: Vec::new(),
             collection_revision: 0,
-            group_close: None,
             cleanup_archive: false,
             active: 3,
             archived: 2,

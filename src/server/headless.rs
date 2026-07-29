@@ -7534,69 +7534,6 @@ next_tab = ""
     }
 
     #[test]
-    fn second_stage_collection_group_prompt_is_hidden_from_other_clients() {
-        let mut server = test_headless_server();
-        server.app.state.workspaces = vec![crate::workspace::Workspace::test_new("prompt")];
-        server.app.state.active = Some(0);
-        let root = server.app.state.workspaces[0].tabs[0]
-            .root_pane
-            .expect("root pane");
-        let collection = server.app.state.workspaces[0]
-            .create_collection_near(
-                0,
-                crate::layout::LayoutLeaf::Pane(root),
-                ratatui::layout::Direction::Horizontal,
-                0.5,
-                None,
-            )
-            .expect("collection");
-        let workspace_id = server.app.state.workspaces[0].id.clone();
-        let tab_id = crate::workspace::public_tab_id_for_number(
-            &workspace_id,
-            server.app.state.workspaces[0].tabs[0].number,
-        );
-        server.clients.insert(1, test_app_client(Some(true), 1));
-        server.clients.insert(2, test_app_client(Some(true), 2));
-        assert!(server.set_foreground_client(Some(1)));
-        server.app.state.pending_collection_close =
-            Some(crate::app::collection_view::PendingCollectionClose {
-                workspace_id: workspace_id.clone(),
-                tab_id,
-                collection_id: collection,
-                member_ids: vec![crate::layout::PaneId::from_raw(9)],
-                collection_revision: 7,
-                group_close: Some(crate::app::collection_view::PendingCollectionGroupClose {
-                    workspace_id: workspace_id.clone(),
-                    worktree_key: "repo".into(),
-                    workspace_member_ids: vec![workspace_id],
-                }),
-                cleanup_archive: false,
-                active: 1,
-                archived: 0,
-                live: 1,
-                exited: 0,
-                working: 0,
-                blocked: 0,
-            });
-        server.app.state.mode = crate::app::Mode::ConfirmClose;
-
-        assert!(server.set_foreground_client(Some(2)));
-        assert_eq!(server.app.state.mode, crate::app::Mode::Terminal);
-        assert!(server.app.state.pending_collection_close.is_none());
-        assert!(server.set_foreground_client(Some(1)));
-        assert_eq!(server.app.state.mode, crate::app::Mode::ConfirmClose);
-        assert_eq!(
-            server
-                .app
-                .state
-                .pending_collection_close
-                .as_ref()
-                .map(|pending| pending.collection_revision),
-            Some(7)
-        );
-    }
-
-    #[test]
     fn first_stage_collection_prompt_confirms_origin_after_foreground_handoff() {
         let mut server = test_headless_server();
         let mut origin = crate::workspace::Workspace::test_new("origin");
@@ -7637,7 +7574,6 @@ next_tab = ""
                 collection_id: collection,
                 member_ids: vec![root, child],
                 collection_revision: revision,
-                group_close: None,
                 cleanup_archive: false,
                 active: 2,
                 archived: 0,
@@ -7697,7 +7633,6 @@ next_tab = ""
                 .collection(collection)
                 .expect("collection")
                 .revision(),
-            group_close: None,
             cleanup_archive: false,
             active: 0,
             archived: 0,
@@ -7763,7 +7698,6 @@ next_tab = ""
             collection_id: collection,
             member_ids: vec![],
             collection_revision: 1,
-            group_close: None,
             cleanup_archive: false,
             active: 0,
             archived: 0,

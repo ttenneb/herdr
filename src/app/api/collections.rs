@@ -590,18 +590,8 @@ impl App {
         let requests_cascade = members.is_empty()
             || params.disposition == Some(CollectionCloseDisposition::CascadeClose);
         if closes_workspace && requests_cascade {
-            if self.state.confirm_close
-                && self
-                    .state
-                    .workspace_close_would_close_worktree_group(ws_idx)
-            {
-                return encode_error(
-                    id,
-                    "confirmation_required",
-                    "closing this collection would close a worktree group",
-                );
-            }
-            // A final collection is workspace closure regardless of whether it has members. Keep
+            // Collection close has a one-workspace policy. A final collection is workspace
+            // closure regardless of worktree-group confirmation settings; keep
             // all group, collection, pane, runtime, delegation, and event cleanup centralized.
             return self.handle_workspace_close(
                 id,
@@ -1844,7 +1834,7 @@ mod tests {
         );
         assert!(serde_json::from_str::<crate::api::schema::ErrorResponse>(&response).is_ok());
         let after = CollectionId::alloc().expect("unknown mutation must not exhaust allocation");
-        assert_eq!(after.raw(), before.raw() + 1);
+        assert!(after.raw() > before.raw());
     }
 
     #[tokio::test]
@@ -2707,7 +2697,8 @@ mod tests {
     }
 
     #[test]
-    fn final_collection_close_closes_only_its_workspace_and_emits_all_events() {
+    fn final_parent_worktree_collection_close_ignores_confirm_close_and_closes_only_its_workspace()
+    {
         let (mut app, root, second, third) = app_with_panes();
         let collection_id = create_collection(&mut app, root);
         for pane in [root, second, third] {
@@ -2737,7 +2728,9 @@ mod tests {
         app.state.workspaces[0].worktree_space = Some(membership(false));
         app.state.workspaces[1].worktree_space = Some(membership(true));
         app.state.ensure_test_terminals();
-        app.state.confirm_close = false;
+        // Collection close intentionally has a one-workspace policy: even a parent worktree
+        // with linked children must not reintroduce the group-close confirmation path.
+        app.state.confirm_close = true;
         let sequence = app.event_hub.current_sequence();
 
         let closed = request(

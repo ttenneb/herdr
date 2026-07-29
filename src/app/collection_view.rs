@@ -28,13 +28,6 @@ pub(crate) struct TerminalGeometry {
 pub(crate) type CollectionGeometryProjection = HashMap<TerminalId, TerminalGeometry>;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct PendingCollectionGroupClose {
-    pub(crate) workspace_id: String,
-    pub(crate) worktree_key: String,
-    pub(crate) workspace_member_ids: Vec<String>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct PendingCollectionClose {
     /// Stable origin identities keep the prompt independent of shared foreground navigation.
     pub(crate) workspace_id: String,
@@ -43,8 +36,6 @@ pub(crate) struct PendingCollectionClose {
     /// Exact destructive target captured when the prompt opened.
     pub(crate) member_ids: Vec<PaneId>,
     pub(crate) collection_revision: u64,
-    /// Second-stage confirmation remains attached to the originating client.
-    pub(crate) group_close: Option<PendingCollectionGroupClose>,
     /// Close only archived members, leaving the collection and active members intact.
     pub(crate) cleanup_archive: bool,
     pub(crate) active: usize,

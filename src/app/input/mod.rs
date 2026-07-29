@@ -504,11 +504,7 @@ impl App {
                         self.apply_rename_mouse_action_via_api(action)
                     }
                     MouseAction::ConfirmCloseAccept => self.confirm_close_accept_via_api(),
-                    MouseAction::ConfirmCloseCancel => {
-                        if !self.cancel_pending_collection_group_close() {
-                            modal::confirm_close_cancel(&mut self.state);
-                        }
-                    }
+                    MouseAction::ConfirmCloseCancel => modal::confirm_close_cancel(&mut self.state),
                     MouseAction::CollectionClosePromote => {
                         self.handle_collection_close_key(crossterm::event::KeyEvent::new(
                             crossterm::event::KeyCode::Char('p'),

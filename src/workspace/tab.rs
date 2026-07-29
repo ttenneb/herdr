@@ -290,7 +290,9 @@ impl Tab {
         if self.layout.leaf_count() <= 1 {
             return Err(CollectionMutationError::LastLayoutLeaf);
         }
-        if !self.layout.remove_collection(collection_id) {
+        if take_collection_mutation_failure_for_test()
+            || !self.layout.remove_collection(collection_id)
+        {
             return Err(CollectionMutationError::LayoutMutationFailed);
         }
         self.zoomed = false;

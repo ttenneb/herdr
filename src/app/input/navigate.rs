@@ -17,7 +17,7 @@ use crate::{
         App,
     },
     input::TerminalKey,
-    layout::NavDirection,
+    layout::{LayoutLeaf, NavDirection},
     terminal::TerminalRuntimeRegistry,
 };
 
@@ -409,7 +409,7 @@ impl App {
                 leave_navigate_mode(&mut self.state);
             }
             NavigateAction::ClosePane => {
-                if !self.close_focused_pane_via_api_requires_confirmation() {
+                if !self.close_focused_leaf_via_api_requires_confirmation() {
                     leave_navigate_mode(&mut self.state);
                 }
             }
@@ -610,6 +610,24 @@ impl App {
                 env: Default::default(),
             },
         );
+    }
+
+    /// Dispatch the shared close binding by the focused typed leaf. Collections
+    /// deliberately do not masquerade as their selected member.
+    pub(crate) fn close_focused_leaf_via_api_requires_confirmation(&mut self) -> bool {
+        let collection = self.state.active.and_then(|ws_idx| {
+            self.state.workspaces.get(ws_idx).and_then(|workspace| {
+                match workspace.layout.focused_leaf() {
+                    LayoutLeaf::Collection(collection_id) => Some(collection_id),
+                    LayoutLeaf::Pane(_) => None,
+                }
+            })
+        });
+        if let Some(collection_id) = collection {
+            self.open_collection_close_dialog(collection_id, false);
+            return self.state.mode == Mode::CollectionClose;
+        }
+        self.close_focused_pane_via_api_requires_confirmation()
     }
 
     pub(crate) fn close_focused_pane_via_api_requires_confirmation(&mut self) -> bool {
