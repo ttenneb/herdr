@@ -13,6 +13,9 @@ use super::scrollbar::{
     should_show_scrollbar,
 };
 
+const COLLECTION_SELECTOR_WIDTH: usize = 2;
+const COLLECTION_INDENT_WIDTH: usize = 2;
+
 use crate::{
     app::{
         collection_view::{
@@ -186,7 +189,12 @@ pub(crate) fn compute_collection_layouts(
         let archived = ordered_section(app, &archived);
         let heights: HashMap<_, _> = members
             .iter()
-            .map(|pane| (*pane, view.preview_height(*pane)))
+            .map(|pane| {
+                (
+                    *pane,
+                    view.preview_height_for_collection(*pane, rect.height),
+                )
+            })
             .collect();
         let expanded = view.expanded.clone();
         let mut content_height = 1usize;
@@ -243,19 +251,13 @@ pub(crate) fn compute_collection_layouts(
                     let virtual_y = *y;
                     let row_rect = clipped_line_rect(inner, virtual_y, scroll).unwrap_or_default();
                     *y += 1;
-                    let disclosure_rect = if row_rect.width > 0 {
-                        Rect::new(
-                            row_rect
-                                .x
-                                .saturating_add((depth as u16).saturating_mul(2))
-                                .min(row_rect.right().saturating_sub(1)),
-                            row_rect.y,
-                            1,
-                            1,
-                        )
-                    } else {
-                        Rect::default()
-                    };
+                    let disclosure_offset = COLLECTION_SELECTOR_WIDTH
+                        .saturating_add(depth.saturating_mul(COLLECTION_INDENT_WIDTH));
+                    let disclosure_rect = u16::try_from(disclosure_offset)
+                        .ok()
+                        .and_then(|offset| row_rect.x.checked_add(offset))
+                        .filter(|x| *x < row_rect.right())
+                        .map(|x| Rect::new(x, row_rect.y, 1, 1));
                     let mut preview_rect = None;
                     let mut preview_scrollbar_rect = None;
                     let mut preview_row_offset = 0;
@@ -296,13 +298,15 @@ pub(crate) fn compute_collection_layouts(
                             rect: row_rect,
                             terminal_row_offset: 0,
                         });
-                        hits.push(CollectionHitRegion {
-                            collection_id: collection.id,
-                            pane_id: Some(pane_id),
-                            kind: CollectionHitKind::Disclosure,
-                            rect: disclosure_rect,
-                            terminal_row_offset: 0,
-                        });
+                        if let Some(rect) = disclosure_rect {
+                            hits.push(CollectionHitRegion {
+                                collection_id: collection.id,
+                                pane_id: Some(pane_id),
+                                kind: CollectionHitKind::Disclosure,
+                                rect,
+                                terminal_row_offset: 0,
+                            });
+                        }
                     }
                     if let Some(rect) = preview_rect {
                         hits.push(CollectionHitRegion {
@@ -627,7 +631,7 @@ pub(crate) fn render_collections(
             } else {
                 "›"
             };
-            let indent = "  ".repeat(row.depth);
+            let indent = " ".repeat(row.depth.saturating_mul(COLLECTION_INDENT_WIDTH));
             let external = if row.external_parent { "↰ " } else { "" };
             let spans = vec![
                 Span::styled(
@@ -818,6 +822,127 @@ mod tests {
         assert!(surface.pane_infos.is_empty());
         assert_eq!(surface.collection_layouts.len(), 1);
         assert_eq!(surface.collection_layouts[0].rect, Rect::new(0, 0, 80, 20));
+    }
+
+    #[test]
+    fn fresh_expanded_preview_uses_half_height_and_manual_resize_stays_fixed() {
+        let mut ws = Workspace::test_new("adaptive-preview");
+        let root = ws.tabs[0].root_pane.expect("root");
+        let child = ws.test_split(Direction::Horizontal);
+        let terminal_id = ws.terminal_id(child).expect("terminal ID").clone();
+        let id = ws
+            .create_collection_near(0, LayoutLeaf::Pane(root), Direction::Vertical, 0.5, None)
+            .expect("collection");
+        ws.collect_pane(child, id).expect("collect");
+        ws.tabs[0].layout.focus_leaf(LayoutLeaf::Collection(id));
+        ws.zoomed = true;
+
+        let mut app = AppState::test_new();
+        app.workspaces = vec![ws];
+        app.active = Some(0);
+        app.collection_views
+            .entry(id)
+            .or_default()
+            .expanded
+            .insert(child);
+        let layouts = compute_collection_layouts(
+            &mut app,
+            &TerminalRuntimeRegistry::new(),
+            Rect::new(0, 0, 80, 100),
+            true,
+            Default::default(),
+        );
+        assert_eq!(layouts[0].rows[0].preview_size.map(|size| size.0), Some(50));
+        assert_eq!(app.collection_geometry[&terminal_id].rows, 50);
+
+        app.collection_views
+            .get_mut(&id)
+            .expect("view")
+            .set_preview_height(child, 11);
+        let layouts = compute_collection_layouts(
+            &mut app,
+            &TerminalRuntimeRegistry::new(),
+            Rect::new(0, 0, 80, 60),
+            true,
+            Default::default(),
+        );
+        assert_eq!(layouts[0].rows[0].preview_size.map(|size| size.0), Some(11));
+        assert_eq!(app.collection_geometry[&terminal_id].rows, 11);
+    }
+
+    #[test]
+    fn disclosure_hit_matches_rendered_column_and_is_absent_when_clipped() {
+        let mut ws = Workspace::test_new("nested-disclosure");
+        let root = ws.tabs[0].root_pane.expect("root");
+        let child = ws.test_split(Direction::Horizontal);
+        let grandchild = ws.test_split(Direction::Horizontal);
+        let id = ws
+            .create_collection_near(0, LayoutLeaf::Pane(root), Direction::Vertical, 0.5, None)
+            .expect("collection");
+        for pane in [child, grandchild] {
+            ws.collect_pane(pane, id).expect("collect");
+        }
+        let mut app = AppState::test_new();
+        let parent = app
+            .delegations
+            .create(Some(root), None, Some("parent".into()))
+            .expect("parent delegation");
+        let child_delegation = app
+            .delegations
+            .create(Some(child), Some(parent), Some("child".into()))
+            .expect("child delegation");
+        app.delegations
+            .create(
+                Some(grandchild),
+                Some(child_delegation),
+                Some("leaf".into()),
+            )
+            .expect("grandchild delegation");
+        app.workspaces = vec![ws];
+        app.active = Some(0);
+
+        let layouts = compute_collection_layouts(
+            &mut app,
+            &TerminalRuntimeRegistry::new(),
+            Rect::new(0, 0, 80, 20),
+            false,
+            Default::default(),
+        );
+        let row = layouts[0]
+            .rows
+            .iter()
+            .find(|row| row.pane_id == grandchild)
+            .expect("nested row");
+        let disclosure = layouts[0]
+            .hits
+            .iter()
+            .find(|hit| {
+                hit.pane_id == Some(grandchild) && hit.kind == CollectionHitKind::Disclosure
+            })
+            .expect("disclosure hit");
+        assert_eq!(
+            disclosure.rect.x,
+            row.row_rect.x
+                + COLLECTION_SELECTOR_WIDTH as u16
+                + (row.depth * COLLECTION_INDENT_WIDTH) as u16
+        );
+        assert_eq!(
+            layouts[0]
+                .hit_at(disclosure.rect.x, disclosure.rect.y)
+                .map(|hit| hit.kind),
+            Some(CollectionHitKind::Disclosure)
+        );
+
+        let narrow = compute_collection_layouts(
+            &mut app,
+            &TerminalRuntimeRegistry::new(),
+            Rect::new(0, 0, 4, 20),
+            false,
+            Default::default(),
+        );
+        assert!(!narrow[0].hits.iter().any(|hit| {
+            hit.pane_id == Some(grandchild) && hit.kind == CollectionHitKind::Disclosure
+        }));
     }
 
     #[test]
