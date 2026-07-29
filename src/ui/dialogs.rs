@@ -34,7 +34,7 @@ pub(crate) fn collection_close_button_rects(inner: Rect) -> (Rect, Rect, Rect) {
         &[
             ActionButtonSpec {
                 hint: Some("p"),
-                label: "promote members",
+                label: "promote to tabs",
             },
             ActionButtonSpec {
                 hint: Some("c"),
@@ -106,7 +106,7 @@ pub(super) fn render_collection_close_overlay(app: &AppState, frame: &mut Frame,
         Paragraph::new(if pending.cleanup_archive {
             "Only archived members are closed; active members and the collection remain."
         } else {
-            "Promote keeps processes running as ordinary panes."
+            "Promote keeps processes running in one standalone tab per member."
         })
         .style(Style::default().fg(app.palette.subtext0)),
         Rect::new(inner.x, inner.y.saturating_add(7), inner.width, 1),
@@ -117,7 +117,7 @@ pub(super) fn render_collection_close_overlay(app: &AppState, frame: &mut Frame,
             frame,
             promote,
             Some("p"),
-            "promote members",
+            "promote to tabs",
             Style::default()
                 .fg(panel_contrast_fg(&app.palette))
                 .bg(app.palette.accent)
@@ -1002,7 +1002,6 @@ mod tests {
             collection_id: crate::layout::CollectionId::from_raw(1).expect("valid collection id"),
             member_ids: Vec::new(),
             collection_revision: 0,
-            group_close: None,
             cleanup_archive: false,
             active: 3,
             archived: 2,
@@ -1026,7 +1025,7 @@ mod tests {
             .collect::<String>();
         assert!(text.contains("3 active · 2 archived · 4 live · 1 exited"));
         assert!(text.contains("2 working and 1 blocked"));
-        assert!(text.contains("promote members"));
+        assert!(text.contains("promote to tabs"));
         assert!(text.contains("cascade close"));
     }
 

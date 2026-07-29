@@ -11,12 +11,14 @@
 - Plugin actions can now declare bounded asynchronous `choices_command` providers for workspace, tab, pane, collection-member, and Workspace Resource context menus.
 
 ### Changed
+- `close_pane` now closes the focused collection through its promote-or-cascade flow when a collection leaf is focused; promotion preserves every member in its own standalone tab, `Shift+X` remains a collection-close alias, and bare list `x`/`Delete` still closes the selected member.
 - Grouped panes now count as seen only after a foreground human enters that child terminal; collection selection, API focus, reads, and passive observation do not acknowledge attention.
 - Repository rows are aggregate native targets: their menus do not expose Checkout or plugin actions, while Checkout menus retain workspace plugin choices.
 - Agent status indicators now use the same static workspace marks across the sidebar, navigator, and mobile views, eliminating continuous spinner rendering while agents work.
 - Relicensed Herdr from AGPL-3.0-or-later to Apache-2.0.
 
 ### Fixed
+- Collection context menus and close-dialog actions now receive mouse clicks instead of the underlying collection content consuming them.
 - Agent prompts now wait briefly after sending text before pressing Enter, preventing prompts from remaining in agent composers without starting a turn. (#1878)
 - Empty clipboard writes from pane applications no longer erase existing clipboard contents or show a copied confirmation. (#1893)
 - Plain mouse movement no longer triggers continuous full renders while preserving Herdr menu hover and pane application mouse tracking. (#1865)

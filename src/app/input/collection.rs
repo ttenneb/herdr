@@ -123,16 +123,7 @@ impl App {
             KeyCode::Char('x') | KeyCode::Delete => {
                 if selected.is_some() {
                     let _ = self.close_focused_pane_via_api_requires_confirmation();
-                } else {
-                    let _ = self.dispatch_runtime_mutation(
-                        "tui.collection.close_empty",
-                        Method::CollectionClose(CollectionCloseParams {
-                            collection_id: format!("collection_{}", collection_id.raw()),
-                            disposition: None,
-                            target_pane_id: None,
-                            focus_promoted: false,
-                        }),
-                    );
+                } else if self.close_collection_via_api(collection_id, None) {
                     self.state.collection_views.remove(&collection_id);
                 }
             }
@@ -148,7 +139,11 @@ impl App {
         true
     }
 
-    fn open_collection_close_dialog(&mut self, collection_id: CollectionId, cleanup_archive: bool) {
+    pub(crate) fn open_collection_close_dialog(
+        &mut self,
+        collection_id: CollectionId,
+        cleanup_archive: bool,
+    ) {
         let Some(ws_idx) = self.state.active else {
             return;
         };
@@ -156,7 +151,7 @@ impl App {
         self.open_collection_close_dialog_at(ws_idx, tab_idx, collection_id, cleanup_archive);
     }
 
-    fn open_collection_close_dialog_at(
+    pub(crate) fn open_collection_close_dialog_at(
         &mut self,
         ws_idx: usize,
         tab_idx: usize,
@@ -217,7 +212,6 @@ impl App {
                 collection_id,
                 member_ids: counted_members.clone(),
                 collection_revision: collection.revision(),
-                group_close: None,
                 cleanup_archive,
                 active,
                 archived,
@@ -227,27 +221,7 @@ impl App {
                 blocked,
             });
         self.state.mode = Mode::CollectionClose;
-        if collection_is_empty {
-            let final_collection = self.state.workspaces[ws_idx].tabs.len() == 1
-                && self.state.workspaces[ws_idx]
-                    .tabs
-                    .get(tab_idx)
-                    .is_some_and(|tab| tab.layout.leaf_count() == 1);
-            if final_collection
-                && self.state.confirm_close
-                && self.begin_pending_collection_group_close(ws_idx)
-            {
-                return;
-            }
-            let _ = self.dispatch_runtime_mutation(
-                "tui.collection.close_empty",
-                Method::CollectionClose(CollectionCloseParams {
-                    collection_id: format!("collection_{}", collection_id.raw()),
-                    disposition: None,
-                    target_pane_id: None,
-                    focus_promoted: false,
-                }),
-            );
+        if collection_is_empty && self.close_collection_via_api(collection_id, None) {
             self.state.pending_collection_close = None;
             self.state.collection_views.remove(&collection_id);
             self.state.mode = if self.state.active.is_some() {
@@ -258,42 +232,44 @@ impl App {
         }
     }
 
-    fn begin_pending_collection_group_close(&mut self, ws_idx: usize) -> bool {
-        let Some(space) = self.state.workspaces.get(ws_idx).and_then(|workspace| {
-            workspace
-                .worktree_space()
-                .filter(|space| !space.is_linked_worktree)
-        }) else {
-            return false;
+    fn close_collection_via_api(
+        &mut self,
+        collection_id: CollectionId,
+        disposition: Option<CollectionCloseDisposition>,
+    ) -> bool {
+        let response = self.dispatch_runtime_mutation(
+            "tui.collection.close",
+            Method::CollectionClose(CollectionCloseParams {
+                collection_id: format!("collection_{}", collection_id.raw()),
+                disposition,
+                target_pane_id: None,
+                focus_promoted: false,
+            }),
+        );
+        Self::runtime_mutation_succeeded(&response, |message| {
+            self.show_plugin_action_failure(message)
+        })
+    }
+
+    fn runtime_mutation_succeeded(response: &str, show_error: impl FnOnce(&str)) -> bool {
+        let Some(error) = serde_json::from_str::<serde_json::Value>(response)
+            .ok()
+            .and_then(|value| value.get("error").cloned())
+        else {
+            return true;
         };
-        let worktree_key = space.key.clone();
-        let workspace_member_ids = self
-            .state
-            .workspaces
-            .iter()
-            .enumerate()
-            .filter(|(_, workspace)| {
-                workspace
-                    .worktree_space()
-                    .is_some_and(|member| member.key == worktree_key)
+        let message = error
+            .as_str()
+            .map(ToOwned::to_owned)
+            .or_else(|| {
+                error
+                    .get("message")
+                    .and_then(serde_json::Value::as_str)
+                    .map(ToOwned::to_owned)
             })
-            .map(|(idx, _)| self.public_workspace_id(idx))
-            .collect::<Vec<_>>();
-        if workspace_member_ids.len() < 2 {
-            return false;
-        }
-        let workspace_id = self.public_workspace_id(ws_idx);
-        let Some(pending) = self.state.pending_collection_close.as_mut() else {
-            return false;
-        };
-        pending.group_close = Some(crate::app::collection_view::PendingCollectionGroupClose {
-            workspace_id,
-            worktree_key,
-            workspace_member_ids,
-        });
-        self.state.selected = ws_idx;
-        self.state.mode = Mode::ConfirmClose;
-        true
+            .unwrap_or_else(|| error.to_string());
+        show_error(&message);
+        false
     }
 
     fn pending_collection_origin_index(
@@ -346,82 +322,6 @@ impl App {
         );
     }
 
-    pub(super) fn confirm_pending_collection_group_close(&mut self) -> bool {
-        let Some(pending) = self.state.pending_collection_close.take() else {
-            return false;
-        };
-        let Some(group) = pending.group_close.as_ref() else {
-            self.state.pending_collection_close = Some(pending);
-            return false;
-        };
-        let target = self.pending_collection_matches(&pending);
-        let group_matches = target.is_some_and(|(ws_idx, tab_idx)| {
-            self.state.workspaces[ws_idx].tabs.len() == 1
-                && self.state.workspaces[ws_idx].tabs[tab_idx]
-                    .layout
-                    .leaf_count()
-                    == 1
-                && group.workspace_id == pending.workspace_id
-                && self.state.workspaces[ws_idx]
-                    .worktree_space()
-                    .is_some_and(|space| {
-                        !space.is_linked_worktree && space.key == group.worktree_key
-                    })
-                && self
-                    .state
-                    .workspaces
-                    .iter()
-                    .enumerate()
-                    .filter(|(_, workspace)| {
-                        workspace
-                            .worktree_space()
-                            .is_some_and(|member| member.key == group.worktree_key)
-                    })
-                    .map(|(idx, _)| self.public_workspace_id(idx))
-                    .eq(group.workspace_member_ids.iter().cloned())
-        });
-        if group_matches {
-            let _ = self.dispatch_runtime_mutation(
-                "tui.collection.close_group",
-                Method::WorkspaceClose(crate::api::schema::WorkspaceTarget {
-                    workspace_id: group.workspace_id.clone(),
-                }),
-            );
-            self.state.collection_views.remove(&pending.collection_id);
-            self.state.mode = if self.state.active.is_some() {
-                Mode::Terminal
-            } else {
-                Mode::Navigate
-            };
-        } else {
-            self.state.mode = if self.state.active.is_some() {
-                Mode::Terminal
-            } else {
-                Mode::Navigate
-            };
-            self.reopen_pending_collection_close(&pending);
-        }
-        true
-    }
-
-    pub(super) fn cancel_pending_collection_group_close(&mut self) -> bool {
-        if self
-            .state
-            .pending_collection_close
-            .as_ref()
-            .is_none_or(|pending| pending.group_close.is_none())
-        {
-            return false;
-        }
-        self.state.pending_collection_close = None;
-        self.state.mode = if self.state.active.is_some() {
-            Mode::Terminal
-        } else {
-            Mode::Navigate
-        };
-        true
-    }
-
     pub(crate) fn handle_collection_close_key(&mut self, key: crossterm::event::KeyEvent) {
         let cleanup_archive = self
             .state
@@ -440,55 +340,53 @@ impl App {
             }
             KeyCode::Esc => {
                 self.state.pending_collection_close = None;
-                self.state.mode = Mode::Terminal;
+                self.state.mode = if self.state.active.is_some() {
+                    Mode::Terminal
+                } else {
+                    Mode::Navigate
+                };
                 return;
             }
             _ => return,
         };
         let Some(pending) = self.state.pending_collection_close.take() else {
-            self.state.mode = Mode::Terminal;
+            self.state.mode = if self.state.active.is_some() {
+                Mode::Terminal
+            } else {
+                Mode::Navigate
+            };
             return;
         };
-        let Some((ws_idx, tab_idx)) = self.pending_collection_matches(&pending) else {
+        let Some((ws_idx, _tab_idx)) = self.pending_collection_matches(&pending) else {
             self.reopen_pending_collection_close(&pending);
             return;
         };
-        if !pending.cleanup_archive
-            && disposition == Some(CollectionCloseDisposition::CascadeClose)
-            && self.state.workspaces[ws_idx].tabs.len() == 1
-            && self.state.workspaces[ws_idx].tabs[tab_idx]
-                .layout
-                .leaf_count()
-                == 1
-        {
-            self.state.pending_collection_close = Some(pending.clone());
-            if self.begin_pending_collection_group_close(ws_idx) {
-                return;
-            }
-            self.state.pending_collection_close = None;
-        }
         if pending.cleanup_archive {
             for pane_id in pending.member_ids.iter().copied() {
                 if let Some(public) = self.public_pane_id(ws_idx, pane_id) {
-                    let _ = self.dispatch_runtime_mutation(
+                    let response = self.dispatch_runtime_mutation(
                         "tui.collection.archive_cleanup",
                         Method::PaneClose(crate::api::schema::PaneTarget { pane_id: public }),
                     );
+                    if !Self::runtime_mutation_succeeded(&response, |message| {
+                        self.show_plugin_action_failure(message)
+                    }) {
+                        self.reopen_pending_collection_close(&pending);
+                        return;
+                    }
                 }
             }
-        } else {
-            let _ = self.dispatch_runtime_mutation(
-                "tui.collection.close",
-                Method::CollectionClose(CollectionCloseParams {
-                    collection_id: format!("collection_{}", pending.collection_id.raw()),
-                    disposition,
-                    target_pane_id: None,
-                    focus_promoted: false,
-                }),
-            );
+        } else if self.close_collection_via_api(pending.collection_id, disposition) {
             self.state.collection_views.remove(&pending.collection_id);
+        } else {
+            self.reopen_pending_collection_close(&pending);
+            return;
         }
-        self.state.mode = Mode::Terminal;
+        self.state.mode = if self.state.active.is_some() {
+            Mode::Terminal
+        } else {
+            Mode::Navigate
+        };
     }
 
     pub(crate) fn select_collection_member_via_runtime(
@@ -959,12 +857,50 @@ impl App {
         {
             return true;
         }
-        let hit = self
-            .state
-            .view
-            .collection_layouts
-            .iter()
-            .find_map(|layout| layout.hit_at(mouse.column, mouse.row));
+        // A collection's outer frame belongs to its native menu. Test it before normal hits:
+        // maximized previews cover the whole layout and would otherwise hide that frame. This
+        // path is deliberately limited to a right-button down, so split-border resize gestures
+        // (including their drag/up continuation) retain the ordinary layout handler.
+        let outer_chrome_hit = matches!(mouse.kind, MouseEventKind::Down(MouseButton::Right))
+            .then(|| {
+                self.state
+                    .view
+                    .collection_layouts
+                    .iter()
+                    .find_map(|layout| {
+                        let in_outer = mouse.column >= layout.rect.x
+                            && mouse.column < layout.rect.right()
+                            && mouse.row >= layout.rect.y
+                            && mouse.row < layout.rect.bottom();
+                        let is_outer_frame = layout.maximized.is_some().then(|| {
+                            mouse.column == layout.rect.x
+                                || mouse.column == layout.rect.right().saturating_sub(1)
+                                || mouse.row == layout.rect.y
+                                || mouse.row == layout.rect.bottom().saturating_sub(1)
+                        });
+                        let outside_inner = mouse.column < layout.inner_rect.x
+                            || mouse.column >= layout.inner_rect.right()
+                            || mouse.row < layout.inner_rect.y
+                            || mouse.row >= layout.inner_rect.bottom();
+                        (in_outer && is_outer_frame.unwrap_or(outside_inner)).then_some(
+                            crate::app::collection_view::CollectionHitRegion {
+                                collection_id: layout.id,
+                                pane_id: None,
+                                kind: CollectionHitKind::Chrome,
+                                rect: layout.rect,
+                                terminal_row_offset: 0,
+                            },
+                        )
+                    })
+            })
+            .flatten();
+        let hit = outer_chrome_hit.or_else(|| {
+            self.state
+                .view
+                .collection_layouts
+                .iter()
+                .find_map(|layout| layout.hit_at(mouse.column, mouse.row))
+        });
         if let Some((collection_id, grab_row_offset)) = self
             .state
             .collection_views
@@ -1284,7 +1220,18 @@ impl App {
                 true
             }
             MouseEventKind::Down(MouseButton::Right) => {
-                if let Some(pane) = hit.pane_id {
+                // Pane-less collection surfaces (outer/inner chrome and its scrollbar) are
+                // native collection targets; only a member-owned hit opens a pane menu.
+                if hit.pane_id.is_none() {
+                    self.state.context_menu = Some(ContextMenuState::new(
+                        ContextMenuKind::Collection {
+                            collection_id: hit.collection_id,
+                        },
+                        mouse.column,
+                        mouse.row,
+                    ));
+                    self.state.mode = Mode::ContextMenu;
+                } else if let Some(pane) = hit.pane_id {
                     self.select_collection_member_via_runtime(
                         ws_idx,
                         hit.collection_id,
@@ -1373,12 +1320,19 @@ mod tests {
     use bytes::Bytes;
     use crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 
-    use super::CollectionHitKind;
+    use super::super::navigate::{ActionContext, NavigateAction};
+    use super::{CollectionHitKind, CollectionInteractionMode, KeyCode};
     use ratatui::layout::Rect;
     use tokio::sync::mpsc;
 
     use crate::{
-        app::AppState, layout::LayoutLeaf, terminal::TerminalRuntimeRegistry, workspace::Workspace,
+        app::{
+            state::{ContextMenuKind, ContextMenuState, Mode},
+            AppState,
+        },
+        layout::LayoutLeaf,
+        terminal::TerminalRuntimeRegistry,
+        workspace::Workspace,
     };
 
     fn collection_scroll_app(
@@ -1519,6 +1473,194 @@ mod tests {
                 app.public_pane_id(0, child).expect("public child pane")
             )
         );
+    }
+
+    #[tokio::test]
+    async fn collection_chrome_and_member_hit_regions_keep_their_distinct_context_menus() {
+        let (mut app, collection, child, _rx) = collection_scroll_app(b"", 12);
+        let layout = app.state.view.collection_layouts[0].clone();
+        let mut member_hits = [
+            CollectionHitKind::Row,
+            CollectionHitKind::Disclosure,
+            CollectionHitKind::Preview,
+            CollectionHitKind::PreviewScrollbar,
+            CollectionHitKind::ResizeHandle,
+        ]
+        .into_iter()
+        .map(|kind| {
+            layout
+                .hits
+                .iter()
+                .find(|hit| hit.kind == kind && hit.pane_id == Some(child))
+                .map(|hit| (kind, hit.rect.x, hit.rect.y))
+                .expect("rendered member hit")
+        })
+        .collect::<Vec<_>>();
+        // The active header is blank inner chrome; the remaining points are all outer borders.
+        let header = layout.active_header.expect("active header");
+        let collection_scrollbar = layout
+            .scrollbar_rect
+            .expect("rendered collection scrollbar");
+        let chrome_hits = [
+            (header.x, header.y),
+            (collection_scrollbar.x, collection_scrollbar.y),
+            (layout.rect.x, layout.rect.y),
+            (layout.rect.right().saturating_sub(1), layout.rect.y),
+            (layout.rect.x, layout.rect.bottom().saturating_sub(1)),
+            (
+                layout.rect.right().saturating_sub(1),
+                layout.rect.bottom().saturating_sub(1),
+            ),
+        ];
+
+        for (column, row) in chrome_hits {
+            app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Right), column, row));
+            let menu = app.state.context_menu.as_ref().expect("collection menu");
+            assert!(
+                matches!(menu.kind, ContextMenuKind::Collection { collection_id } if collection_id == collection)
+            );
+            assert_eq!(menu.items(), ["Close collection…"]);
+            assert!(
+                menu.plugin.is_none(),
+                "native collection menu has no plugin state"
+            );
+            app.state.context_menu = None;
+            app.state.mode = Mode::Terminal;
+        }
+        for (kind, column, row) in member_hits.drain(..) {
+            app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Right), column, row));
+            let menu = app.state.context_menu.as_ref().expect("member menu");
+            assert!(
+                matches!(menu.kind, ContextMenuKind::CollectionMember { collection_id, pane_id, .. } if collection_id == collection && pane_id == child),
+                "{kind:?}"
+            );
+            assert_eq!(
+                menu.plugin.as_ref().map(|plugin| &plugin.target),
+                Some(&crate::app::state::ContextMenuTarget::Pane(
+                    app.public_pane_id(0, child).expect("public child")
+                )),
+                "{kind:?} must retain pane plugin context"
+            );
+            app.state.context_menu = None;
+            app.state.mode = Mode::Terminal;
+        }
+    }
+
+    #[tokio::test]
+    async fn collection_context_menu_and_close_dialog_own_left_clicks_over_collection_content() {
+        let (mut app, collection, child, _rx) = collection_scroll_app(b"", 12);
+        let layout = app.state.view.collection_layouts[0].clone();
+        let header = layout.active_header.expect("active header");
+
+        app.handle_mouse(mouse(
+            MouseEventKind::Down(MouseButton::Right),
+            header.x,
+            header.y,
+        ));
+        let menu = app.state.context_menu_rect().expect("context menu rect");
+        app.handle_mouse(mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            menu.x + 1,
+            menu.y + 1,
+        ));
+        assert_eq!(app.state.mode, Mode::CollectionClose);
+        assert_eq!(
+            app.state
+                .pending_collection_close
+                .as_ref()
+                .map(|pending| pending.collection_id),
+            Some(collection)
+        );
+
+        let popup = crate::ui::collection_close_popup_rect(app.state.view.terminal_area)
+            .expect("collection close popup");
+        let inner = Rect::new(
+            popup.x + 1,
+            popup.y + 1,
+            popup.width.saturating_sub(2),
+            popup.height.saturating_sub(2),
+        );
+        let (promote, _, _) = crate::ui::collection_close_button_rects(inner);
+        app.handle_mouse(mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            promote.x,
+            promote.y,
+        ));
+
+        assert!(app.state.workspaces[0].tabs[0]
+            .collection(collection)
+            .is_none());
+        let promoted_tab = app.state.workspaces[0]
+            .find_tab_index_for_pane(child)
+            .expect("standalone promoted tab");
+        assert_ne!(promoted_tab, 0);
+        assert_eq!(app.state.workspaces[0].tabs[promoted_tab].pane_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn maximized_preview_keeps_member_menu_but_its_outer_border_opens_collection_menu() {
+        let (mut app, collection, child, _rx) = collection_scroll_app(b"", 0);
+        app.state
+            .collection_views
+            .get_mut(&collection)
+            .expect("view")
+            .maximized = Some(child);
+        let surface = crate::ui::compute_tab_surface(
+            &mut app.state,
+            &TerminalRuntimeRegistry::new(),
+            Rect::new(0, 0, 80, 20),
+            false,
+            Default::default(),
+        );
+        app.state.view.collection_layouts = surface.collection_layouts;
+        let layout = app.state.view.collection_layouts[0].clone();
+        let preview = layout.maximized_preview_rect.expect("maximized preview");
+
+        app.handle_mouse(mouse(
+            MouseEventKind::Down(MouseButton::Right),
+            preview.x + 2,
+            preview.y + 2,
+        ));
+        assert!(
+            matches!(app.state.context_menu.as_ref().map(|menu| menu.kind.clone()), Some(ContextMenuKind::CollectionMember { pane_id, .. }) if pane_id == child)
+        );
+        app.state.context_menu = None;
+        app.state.mode = Mode::Terminal;
+        app.handle_mouse(mouse(
+            MouseEventKind::Down(MouseButton::Right),
+            layout.rect.right().saturating_sub(1),
+            layout.rect.y + 2,
+        ));
+        assert!(
+            matches!(app.state.context_menu.as_ref().map(|menu| menu.kind.clone()), Some(ContextMenuKind::Collection { collection_id }) if collection_id == collection)
+        );
+
+        // In the normal layout the left frame remains unclaimed, so a surrounding split-border
+        // resize receives its complete down/drag/up gesture.
+        app.state
+            .collection_views
+            .get_mut(&collection)
+            .expect("view")
+            .maximized = None;
+        let surface = crate::ui::compute_tab_surface(
+            &mut app.state,
+            &TerminalRuntimeRegistry::new(),
+            Rect::new(0, 0, 80, 20),
+            false,
+            Default::default(),
+        );
+        app.state.view.collection_layouts = surface.collection_layouts;
+        let normal = app.state.view.collection_layouts[0].clone();
+        for kind in [
+            MouseEventKind::Down(MouseButton::Left),
+            MouseEventKind::Drag(MouseButton::Left),
+            MouseEventKind::Up(MouseButton::Left),
+        ] {
+            assert!(
+                !app.handle_collection_mouse(mouse(kind, normal.rect.x, normal.rect.y + 2)),
+                "{kind:?}"
+            );
+        }
     }
 
     #[tokio::test]
@@ -2161,6 +2303,183 @@ mod tests {
         app.state.confirm_close = true;
         (app, collection, child)
     }
+    #[tokio::test]
+    async fn close_pane_binding_targets_collection_in_list_and_entered_modes_but_bare_x_closes_member(
+    ) {
+        let (mut app, collection, child, _rx) = collection_scroll_app(b"", 0);
+        for (mode, context) in [
+            (CollectionInteractionMode::List, ActionContext::Direct),
+            (CollectionInteractionMode::Terminal, ActionContext::Prefix),
+        ] {
+            let view = app
+                .state
+                .collection_views
+                .get_mut(&collection)
+                .expect("view");
+            view.mode = mode;
+            view.entered = (mode == CollectionInteractionMode::Terminal).then_some(child);
+            app.state.mode = Mode::Terminal;
+            app.execute_tui_navigate_action(NavigateAction::ClosePane, context);
+            assert_eq!(app.state.mode, Mode::CollectionClose);
+            assert_eq!(
+                app.state
+                    .pending_collection_close
+                    .as_ref()
+                    .map(|pending| pending.collection_id),
+                Some(collection)
+            );
+            app.state.pending_collection_close = None;
+        }
+
+        app.state.mode = Mode::Terminal;
+        app.state
+            .collection_views
+            .get_mut(&collection)
+            .expect("view")
+            .mode = CollectionInteractionMode::List;
+        assert!(app.handle_collection_key(crate::input::TerminalKey::new(
+            KeyCode::Char('x'),
+            KeyModifiers::NONE,
+        )));
+        assert!(!app.state.workspaces[0].tabs[0]
+            .collection(collection)
+            .expect("collection remains")
+            .members()
+            .contains(&child));
+
+        // An empty focused collection takes the configured close binding too.
+        let mut empty_app = super::super::app_for_mouse_test();
+        let mut empty_workspace = Workspace::test_new("empty-bound-close");
+        let root = empty_workspace.tabs[0].root_pane.expect("root");
+        let empty_collection = empty_workspace
+            .create_collection_near(
+                0,
+                LayoutLeaf::Pane(root),
+                ratatui::layout::Direction::Vertical,
+                0.5,
+                None,
+            )
+            .expect("empty collection");
+        empty_workspace.tabs[0]
+            .layout
+            .focus_leaf(LayoutLeaf::Collection(empty_collection));
+        empty_app.state.workspaces = vec![empty_workspace];
+        empty_app.state.active = Some(0);
+        empty_app.execute_tui_navigate_action(NavigateAction::ClosePane, ActionContext::Direct);
+        assert_eq!(empty_app.state.workspaces.len(), 1);
+        assert!(empty_app.state.workspaces[0].tabs[0]
+            .collection(empty_collection)
+            .is_none());
+
+        // A regular pane still uses the ordinary pane-close dispatch.
+        let mut plain_app = super::super::app_for_mouse_test();
+        let mut plain_workspace = Workspace::test_new("plain-close");
+        let root = plain_workspace.tabs[0].root_pane.expect("root");
+        let sibling = plain_workspace.test_split(ratatui::layout::Direction::Horizontal);
+        plain_workspace.tabs[0]
+            .layout
+            .focus_leaf(LayoutLeaf::Pane(root));
+        plain_app.state.workspaces = vec![plain_workspace];
+        plain_app.state.active = Some(0);
+        plain_app.state.ensure_test_terminals();
+        plain_app.execute_tui_navigate_action(NavigateAction::ClosePane, ActionContext::Direct);
+        assert_eq!(plain_app.state.workspaces[0].tabs[0].pane_count(), 1);
+        assert!(plain_app.state.workspaces[0].pane_state(sibling).is_some());
+    }
+
+    #[tokio::test]
+    async fn cancelling_a_stale_collection_prompt_without_an_active_workspace_leaves_navigate_mode()
+    {
+        let (mut app, collection, _child, _rx) = collection_scroll_app(b"", 0);
+        app.open_collection_close_dialog(collection, false);
+        app.state.workspaces.clear();
+        app.state.active = None;
+
+        app.handle_collection_close_key(crossterm::event::KeyEvent::new(
+            KeyCode::Esc,
+            KeyModifiers::NONE,
+        ));
+
+        assert!(app.state.pending_collection_close.is_none());
+        assert_eq!(app.state.mode, Mode::Navigate);
+    }
+
+    #[test]
+    fn cascading_the_final_collection_in_the_final_workspace_leaves_navigate_mode() {
+        let mut app = super::super::app_for_mouse_test();
+        let mut workspace = Workspace::test_new("final-collection");
+        let root = workspace.tabs[0].root_pane.expect("root pane");
+        let child = workspace.test_split(ratatui::layout::Direction::Horizontal);
+        let collection = workspace
+            .create_collection_near(
+                0,
+                LayoutLeaf::Pane(root),
+                ratatui::layout::Direction::Vertical,
+                0.5,
+                None,
+            )
+            .expect("collection");
+        workspace
+            .collect_pane(root, collection)
+            .expect("collect root");
+        workspace
+            .collect_pane(child, collection)
+            .expect("collect child");
+        app.state.workspaces = vec![workspace];
+        app.state.ensure_test_terminals();
+        app.state.active = Some(0);
+        app.state.selected = 0;
+
+        app.open_collection_close_dialog(collection, false);
+        app.handle_collection_close_key(crossterm::event::KeyEvent::new(
+            KeyCode::Char('c'),
+            KeyModifiers::NONE,
+        ));
+
+        assert!(app.state.workspaces.is_empty());
+        assert_eq!(app.state.active, None);
+        assert_eq!(app.state.mode, Mode::Navigate);
+    }
+
+    #[test]
+    fn collection_menu_uses_stable_id_across_workspace_shifts_and_dismisses_when_stale() {
+        let (mut app, collection, _) = grouped_final_collection_app();
+        let original_workspace_id = app.public_workspace_id(0);
+        let menu = || {
+            ContextMenuState::new(
+                ContextMenuKind::Collection {
+                    collection_id: collection,
+                },
+                0,
+                0,
+            )
+        };
+        app.state
+            .workspaces
+            .insert(0, Workspace::test_new("inserted"));
+        app.state.active = Some(0);
+
+        app.apply_context_menu_action_via_api(menu(), 0);
+        assert_eq!(app.state.mode, Mode::CollectionClose);
+        assert_eq!(
+            app.state
+                .pending_collection_close
+                .as_ref()
+                .map(|pending| &pending.workspace_id),
+            Some(&original_workspace_id),
+            "the menu must resolve the original live collection, not shifted indices"
+        );
+
+        app.state.workspaces[1]
+            .cascade_close_collection(collection)
+            .expect("remove original collection");
+        app.state.mode = Mode::ContextMenu;
+        app.state.context_menu = Some(menu());
+        app.apply_context_menu_action_via_api(menu(), 0);
+        assert!(app.state.context_menu.is_none());
+        assert_eq!(app.state.mode, Mode::Terminal);
+    }
+
     #[test]
     fn archive_cleanup_confirmation_summarizes_only_archived_members() {
         let mut app = super::super::app_for_mouse_test();
@@ -2208,6 +2527,74 @@ mod tests {
                 .len(),
             2
         );
+    }
+
+    #[tokio::test]
+    async fn cascade_mutation_failure_reopens_close_dialog_without_touching_members_or_runtime() {
+        let (mut app, collection, child, _rx) = collection_scroll_app(b"", 0);
+        let before_members = app.state.workspaces[0].tabs[0]
+            .collection(collection)
+            .expect("collection")
+            .members()
+            .to_vec();
+        assert!(app.state.collection_views.contains_key(&collection));
+        assert!(app.state.workspaces[0].tabs[0]
+            .runtimes
+            .contains_key(&child));
+        app.open_collection_close_dialog(collection, false);
+
+        crate::workspace::fail_next_collection_mutation_for_test();
+        app.handle_collection_close_key(crossterm::event::KeyEvent::new(
+            KeyCode::Char('c'),
+            KeyModifiers::NONE,
+        ));
+
+        assert_eq!(app.state.mode, Mode::CollectionClose);
+        assert!(app.state.pending_collection_close.is_some());
+        assert!(app.state.collection_views.contains_key(&collection));
+        assert_eq!(
+            app.state.workspaces[0].tabs[0]
+                .collection(collection)
+                .expect("collection retained")
+                .members(),
+            before_members
+        );
+        assert!(app.state.workspaces[0].tabs[0]
+            .runtimes
+            .contains_key(&child));
+        assert!(app.state.terminal_runtime_shutdowns.is_empty());
+    }
+
+    #[test]
+    fn empty_collection_mutation_failure_keeps_pending_dialog_view_and_collection() {
+        let mut app = super::super::app_for_mouse_test();
+        let mut workspace = Workspace::test_new("empty-close-failure");
+        let root = workspace.tabs[0].root_pane.expect("root");
+        let collection = workspace
+            .create_collection_near(
+                0,
+                LayoutLeaf::Pane(root),
+                ratatui::layout::Direction::Vertical,
+                0.5,
+                None,
+            )
+            .expect("empty collection");
+        workspace.tabs[0]
+            .layout
+            .focus_leaf(LayoutLeaf::Collection(collection));
+        app.state.workspaces = vec![workspace];
+        app.state.active = Some(0);
+        app.state.collection_views.entry(collection).or_default();
+
+        crate::workspace::fail_next_collection_mutation_for_test();
+        app.open_collection_close_dialog(collection, false);
+
+        assert_eq!(app.state.mode, Mode::CollectionClose);
+        assert!(app.state.pending_collection_close.is_some());
+        assert!(app.state.collection_views.contains_key(&collection));
+        assert!(app.state.workspaces[0].tabs[0]
+            .collection(collection)
+            .is_some());
     }
 
     #[test]
@@ -2284,44 +2671,6 @@ mod tests {
             .is_none());
         assert_eq!(app.state.active, Some(1));
         assert!(app.state.pending_collection_close.is_none());
-    }
-
-    #[test]
-    fn second_stage_group_close_revalidates_collection_revision_before_dispatch() {
-        let (mut app, collection, child) = grouped_final_collection_app();
-        app.open_collection_close_dialog(collection, false);
-        app.handle_collection_close_key(crossterm::event::KeyEvent::new(
-            crossterm::event::KeyCode::Char('c'),
-            crossterm::event::KeyModifiers::empty(),
-        ));
-        assert_eq!(app.state.mode, crate::app::Mode::ConfirmClose);
-
-        app.state.workspaces[0]
-            .set_collection_member_archived(child, collection, true)
-            .expect("mutate between prompts");
-        assert!(app.confirm_pending_collection_group_close());
-
-        assert_eq!(app.state.workspaces.len(), 2);
-        assert_eq!(app.state.mode, crate::app::Mode::CollectionClose);
-        assert!(app.state.pending_collection_close.is_some());
-    }
-
-    #[test]
-    fn second_stage_group_close_revalidates_exact_group_membership_before_dispatch() {
-        let (mut app, collection, _) = grouped_final_collection_app();
-        app.open_collection_close_dialog(collection, false);
-        app.handle_collection_close_key(crossterm::event::KeyEvent::new(
-            crossterm::event::KeyCode::Char('c'),
-            crossterm::event::KeyModifiers::empty(),
-        ));
-        let mut added = Workspace::test_new("added");
-        added.worktree_space = Some(group_membership(true, "/repo-added"));
-        app.state.workspaces.push(added);
-
-        assert!(app.confirm_pending_collection_group_close());
-
-        assert_eq!(app.state.workspaces.len(), 3);
-        assert_eq!(app.state.mode, crate::app::Mode::CollectionClose);
     }
 
     #[test]

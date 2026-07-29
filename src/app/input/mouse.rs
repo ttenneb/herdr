@@ -300,7 +300,11 @@ impl AppState {
                         || !crate::app::collection_view::contains(popup, mouse.column, mouse.row)
                     {
                         self.pending_collection_close = None;
-                        self.mode = Mode::Terminal;
+                        self.mode = if self.active.is_some() {
+                            Mode::Terminal
+                        } else {
+                            Mode::Navigate
+                        };
                     }
                     return None;
                 }
@@ -2256,6 +2260,24 @@ mod tests {
             checkout_path: format!("/repo/worktree-{ws_idx}").into(),
             is_linked_worktree: ws_idx != 0,
         });
+    }
+
+    #[test]
+    fn mouse_cancel_without_an_active_workspace_leaves_collection_close_in_navigate_mode() {
+        let mut app = app_for_mouse_test();
+        app.state.workspaces.clear();
+        app.state.active = None;
+        app.state.mode = Mode::CollectionClose;
+        app.state.view.terminal_area = Rect::new(0, 0, 80, 24);
+
+        let (state, runtimes) = (&mut app.state, &mut app.terminal_runtimes);
+        let action = state.handle_mouse(
+            runtimes,
+            mouse(MouseEventKind::Down(MouseButton::Left), 0, 0),
+        );
+
+        assert!(action.is_none());
+        assert_eq!(state.mode, Mode::Navigate);
     }
 
     #[test]

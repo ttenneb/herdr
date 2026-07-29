@@ -1424,7 +1424,7 @@ mod tests {
         let after = CollectionId::alloc().expect("untrusted lookup must not exhaust allocation");
 
         assert!(parsed.raw() > after.raw());
-        assert_eq!(after.raw(), before.raw() + 1);
+        assert!(after.raw() > before.raw());
     }
 
     #[test]

@@ -278,10 +278,10 @@ herdr collection reorder <collection_id> <pane_id> --index N
 herdr collection archive <collection_id> <pane_id>
 herdr collection restore <collection_id> <pane_id>
 herdr collection promote <pane_id> --target-pane ID --direction right|down [--ratio FLOAT] [--focus|--no-focus]
-herdr collection close <collection_id> [--cascade-close|--promote-members] [--target-pane ID] [--focus-promoted]
+herdr collection close <collection_id> [--cascade-close|--promote-members] [--focus-promoted]
 ```
 
-成员仍是普通窗格和 PTY。把 `member-create` 返回的 `.result.created.pane.pane_id` 用于 `agent start --pane`。选择和 API 聚焦不会确认关注。输入或 `working` / `blocked` 会恢复归档;阈值只是警告。关闭非空集合必须使用 `--cascade-close` 或 `--promote-members`。
+成员仍是普通窗格和 PTY。把 `member-create` 返回的 `.result.created.pane.pane_id` 用于 `agent start --pane`。选择和 API 聚焦不会确认关注。输入或 `working` / `blocked` 会恢复归档;阈值只是警告。关闭非空集合必须使用 `--cascade-close` 或 `--promote-members`。`--promote-members` 会把每个进程移入同一工作区中的独立标签页;`--focus-promoted` 会聚焦第一个成员。
 
 ## 委派
 

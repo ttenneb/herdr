@@ -188,9 +188,8 @@ fn parse_close(args: &[String]) -> Result<CollectionCloseParams, String> {
         .cloned()
         .ok_or("missing collection_id")?;
     let mut disposition = None;
-    let mut target_pane_id = None;
     let mut focus_promoted = false;
-    parse_options(&args[1..], |name, value| match name {
+    parse_options(&args[1..], |name, _value| match name {
         "--cascade-close" => {
             if disposition
                 .replace(CollectionCloseDisposition::CascadeClose)
@@ -209,10 +208,6 @@ fn parse_close(args: &[String]) -> Result<CollectionCloseParams, String> {
             }
             Ok(())
         }
-        "--target-pane" => {
-            target_pane_id = Some(required_value(name, value)?);
-            Ok(())
-        }
         "--focus-promoted" => {
             focus_promoted = true;
             Ok(())
@@ -222,10 +217,11 @@ fn parse_close(args: &[String]) -> Result<CollectionCloseParams, String> {
     Ok(CollectionCloseParams {
         collection_id,
         disposition,
-        target_pane_id,
+        target_pane_id: None,
         focus_promoted,
     })
 }
+
 fn parse_member_create(args: &[String]) -> Result<CollectionCreateMemberParams, String> {
     let collection_id = args
         .first()
@@ -361,8 +357,6 @@ mod tests {
         let close = parse_close(&strings(&[
             "collection_1",
             "--promote-members",
-            "--target-pane",
-            "w1:p1",
             "--focus-promoted",
         ]))
         .expect("close");
@@ -371,6 +365,13 @@ mod tests {
             Some(CollectionCloseDisposition::PromoteMembers)
         );
         assert!(close.focus_promoted);
+        assert!(parse_close(&strings(&[
+            "collection_1",
+            "--promote-members",
+            "--target-pane",
+            "w1:p1",
+        ]))
+        .is_err());
 
         let member = parse_member_create(&strings(&[
             "collection_1",

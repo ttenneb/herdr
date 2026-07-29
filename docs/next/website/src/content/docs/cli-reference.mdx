@@ -312,12 +312,12 @@ herdr collection reorder <collection_id> <pane_id> --index N
 herdr collection archive <collection_id> <pane_id>
 herdr collection restore <collection_id> <pane_id>
 herdr collection promote <pane_id> --target-pane ID --direction right|down [--ratio FLOAT] [--focus|--no-focus]
-herdr collection close <collection_id> [--cascade-close|--promote-members] [--target-pane ID] [--focus-promoted]
+herdr collection close <collection_id> [--cascade-close|--promote-members] [--focus-promoted]
 ```
 
 Members remain independently addressable panes and PTYs. `add` collects a tiled pane; `move` transfers an existing member. `member-create` returns `.result.created.pane.pane_id` and an optional `.result.created.delegation_id`; start its agent separately. Creation and movement preserve focus unless requested. Selection and API focus do not enter or mark a grouped terminal seen.
 
-Archive is live and reversible. Input, `working`, or `blocked` restores a member; reads, observation, `idle`, and process exit do not. Lifecycle thresholds only warn. A non-empty close requires `--cascade-close` to close every member PTY or `--promote-members` to preserve processes as ordinary panes. Promotion uses `--target-pane` or a deterministic fallback/new tab.
+Archive is live and reversible. Input, `working`, or `blocked` restores a member; reads, observation, `idle`, and process exit do not. Lifecycle thresholds only warn. A non-empty close requires `--cascade-close` to close every member PTY or `--promote-members` to preserve every process in its own standalone tab. `--focus-promoted` focuses the first promoted member.
 
 ## Delegations
 

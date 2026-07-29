@@ -2726,6 +2726,7 @@
               "type": "boolean"
             },
             "target_pane_id": {
+              "description": "Legacy split-promotion target. Must be omitted: collection promotion now creates one\nstandalone tab per member.",
               "type": [
                 "string",
                 "null"

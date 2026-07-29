@@ -139,7 +139,10 @@ pub(super) fn keybind_help_groups(app: &AppState) -> Vec<HelpGroup> {
     let panes = vec![
         help_entry(keybind_label(&kb.split_vertical), "split vertical"),
         help_entry(keybind_label(&kb.split_horizontal), "split horizontal"),
-        help_entry(keybind_label(&kb.close_pane), "close pane"),
+        help_entry(
+            keybind_label(&kb.close_pane),
+            "close focused pane or collection",
+        ),
         help_entry(keybind_label(&kb.rename_pane), "rename pane"),
         help_entry(keybind_label(&kb.edit_scrollback), "edit scrollback"),
         help_entry(keybind_label(&kb.copy_mode), "copy mode"),
@@ -170,7 +173,7 @@ pub(super) fn keybind_help_groups(app: &AppState) -> Vec<HelpGroup> {
             help_entry("+ / -", "resize selected preview"),
             help_entry("ctrl+↑ / ctrl+↓", "reorder member"),
             help_entry("a / o / x", "archive / move out / close member"),
-            help_entry("shift+x", "close collection"),
+            help_entry("shift+x", "close collection (alias)"),
         ],
     ));
 

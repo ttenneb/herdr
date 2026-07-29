@@ -78,6 +78,8 @@ pub struct CollectionCloseParams {
     pub collection_id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub disposition: Option<CollectionCloseDisposition>,
+    /// Legacy split-promotion target. Must be omitted: collection promotion now creates one
+    /// standalone tab per member.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub target_pane_id: Option<String>,
     #[serde(default)]

@@ -1299,6 +1299,11 @@ pub enum ContextMenuKind {
         source_pane_id: Option<PaneId>,
         has_manual_label: bool,
     },
+    /// Native collection chrome. This intentionally stores only the stable layout identity:
+    /// workspace and tab positions are projections and may change while a menu is open.
+    Collection {
+        collection_id: CollectionId,
+    },
     CollectionMember {
         ws_idx: usize,
         collection_id: CollectionId,
@@ -1506,6 +1511,7 @@ impl ContextMenuState {
                 "Zoom",
                 "Close pane",
             ],
+            ContextMenuKind::Collection { .. } => &["Close collection…"],
             ContextMenuKind::CollectionMember {
                 archived: false, ..
             } => &["Maximize", "Archive", "Move out", "Close pane"],
@@ -2918,6 +2924,13 @@ impl AppState {
                 ContextMenuKind::Tab { ws_idx, tab_idx } => {
                     assert_tab_index(ws_idx, tab_idx, "context menu tab")
                 }
+                ContextMenuKind::Collection { collection_id } => assert!(
+                    self.workspaces.iter().any(|workspace| workspace
+                        .tabs
+                        .iter()
+                        .any(|tab| tab.collection(collection_id).is_some())),
+                    "collection context menu must reference a live collection"
+                ),
                 ContextMenuKind::CollectionMember {
                     ws_idx,
                     collection_id,

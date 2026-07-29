@@ -278,10 +278,10 @@ herdr collection reorder <collection_id> <pane_id> --index N
 herdr collection archive <collection_id> <pane_id>
 herdr collection restore <collection_id> <pane_id>
 herdr collection promote <pane_id> --target-pane ID --direction right|down [--ratio FLOAT] [--focus|--no-focus]
-herdr collection close <collection_id> [--cascade-close|--promote-members] [--target-pane ID] [--focus-promoted]
+herdr collection close <collection_id> [--cascade-close|--promote-members] [--focus-promoted]
 ```
 
-メンバーは通常のペインと PTY のままです。`member-create` の `.result.created.pane.pane_id` を `agent start --pane` に使います。選択や API フォーカスは確認済みにしません。アーカイブは入力または `working` / `blocked` で復元され、制限は警告だけです。空でないクローズには `--cascade-close` または `--promote-members` が必須です。
+メンバーは通常のペインと PTY のままです。`member-create` の `.result.created.pane.pane_id` を `agent start --pane` に使います。選択や API フォーカスは確認済みにしません。アーカイブは入力または `working` / `blocked` で復元され、制限は警告だけです。空でないクローズには `--cascade-close` または `--promote-members` が必須です。`--promote-members` は各プロセスを同じワークスペース内の独立したタブに移し、`--focus-promoted` は最初のメンバーにフォーカスします。
 
 ## デリゲーション
 

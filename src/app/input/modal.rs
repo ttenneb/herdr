@@ -1239,9 +1239,6 @@ impl App {
     }
 
     pub(super) fn confirm_close_accept_via_api(&mut self) {
-        if self.confirm_pending_collection_group_close() {
-            return;
-        }
         if let Some(repository_id) = self.state.confirm_repository_close_target.take() {
             self.dispatch_runtime_mutation(
                 "tui.repository.close",
@@ -1301,10 +1298,7 @@ impl App {
             Some(ModalAction::Confirm) => {
                 self.confirm_close_accept_via_api();
             }
-            Some(ModalAction::Cancel) if !self.cancel_pending_collection_group_close() => {
-                confirm_close_cancel(&mut self.state);
-            }
-            Some(ModalAction::Cancel) => {}
+            Some(ModalAction::Cancel) => confirm_close_cancel(&mut self.state),
             _ => {}
         }
     }
@@ -1361,6 +1355,19 @@ impl App {
                     repository_id: repository_id.clone(),
                     collapsed: *collapsed,
                 });
+        }
+        if let ContextMenuKind::Collection { collection_id } = menu.kind {
+            return self
+                .state
+                .workspaces
+                .iter()
+                .any(|workspace| {
+                    workspace
+                        .tabs
+                        .iter()
+                        .any(|tab| tab.collection(collection_id).is_some())
+                })
+                .then_some(ContextMenuKind::Collection { collection_id });
         }
         let target = &menu.plugin.as_ref()?.target;
         match (&menu.kind, target) {
@@ -1515,6 +1522,7 @@ impl App {
                 self.cancel_context_menu_plugin_generation(generation);
             }
             self.show_plugin_action_failure("menu target no longer exists");
+            self.state.context_menu = None;
             leave_modal(&mut self.state);
             return;
         };
@@ -1523,6 +1531,30 @@ impl App {
         }
         menu.kind = kind;
         match (menu.kind, item) {
+            (ContextMenuKind::Collection { collection_id }, Some("Close collection…")) => {
+                if let Some((ws_idx, tab_idx)) =
+                    self.state
+                        .workspaces
+                        .iter()
+                        .enumerate()
+                        .find_map(|(ws_idx, workspace)| {
+                            workspace
+                                .tabs
+                                .iter()
+                                .enumerate()
+                                .find_map(|(tab_idx, tab)| {
+                                    tab.collection(collection_id)
+                                        .is_some()
+                                        .then_some((ws_idx, tab_idx))
+                                })
+                        })
+                {
+                    self.open_collection_close_dialog_at(ws_idx, tab_idx, collection_id, false);
+                } else {
+                    self.state.context_menu = None;
+                    leave_modal(&mut self.state);
+                }
+            }
             (ContextMenuKind::Repository { repository_id, .. }, Some("New worktree")) => {
                 if let Some(ws_idx) = repository_workspace_index(&self.state, &repository_id) {
                     self.state.request_new_repository_worktree = Some((repository_id, ws_idx));

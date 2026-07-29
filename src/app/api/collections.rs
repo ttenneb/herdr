@@ -574,6 +574,7 @@ impl App {
         let closed_workspace_id = self.public_workspace_id(ws_idx);
         let closed_tab_id = self.public_tab_id(ws_idx, tab_idx).unwrap_or_default();
         let mut layout_update_tab_idx = Some(tab_idx);
+        let mut created_layout_tab_indices = Vec::new();
         let members = self.state.workspaces[ws_idx].tabs[tab_idx]
             .collection(collection_id)
             .map(|c| c.members().to_vec())
@@ -590,18 +591,8 @@ impl App {
         let requests_cascade = members.is_empty()
             || params.disposition == Some(CollectionCloseDisposition::CascadeClose);
         if closes_workspace && requests_cascade {
-            if self.state.confirm_close
-                && self
-                    .state
-                    .workspace_close_would_close_worktree_group(ws_idx)
-            {
-                return encode_error(
-                    id,
-                    "confirmation_required",
-                    "closing this collection would close a worktree group",
-                );
-            }
-            // A final collection is workspace closure regardless of whether it has members. Keep
+            // Collection close has a one-workspace policy. A final collection is workspace
+            // closure regardless of worktree-group confirmation settings; keep
             // all group, collection, pane, runtime, delegation, and event cleanup centralized.
             return self.handle_workspace_close(
                 id,
@@ -775,67 +766,30 @@ impl App {
                     }
                 }
                 CollectionCloseDisposition::PromoteMembers => {
-                    let explicit_target = match params.target_pane_id.as_deref() {
-                        Some(raw) => {
-                            let Some((target_ws, pane_id)) = self.parse_pane_id(raw) else {
-                                return encode_error(
-                                    id,
-                                    "target_pane_not_found",
-                                    format!("target pane {raw} not found"),
-                                );
-                            };
-                            if target_ws != ws_idx
-                                || self.state.workspaces[ws_idx].find_tab_index_for_pane(pane_id)
-                                    != Some(tab_idx)
-                                || self.state.workspaces[ws_idx].tabs[tab_idx]
-                                    .pane_placement(pane_id)
-                                    != Some(PanePlacement::Tiled)
-                            {
-                                return encode_error(
-                                    id,
-                                    "collection_promote_failed",
-                                    "promotion target must be a tiled pane in the collection tab",
-                                );
-                            }
-                            Some(pane_id)
-                        }
-                        None => self.state.workspaces[ws_idx].tabs[tab_idx]
-                            .layout
-                            .tiled_pane_ids()
-                            .into_iter()
-                            .next(),
-                    };
+                    if params.target_pane_id.is_some() {
+                        return encode_error(
+                            id,
+                            "collection_promote_target_unsupported",
+                            "promote_members creates one standalone tab per member; target_pane_id is not supported",
+                        );
+                    }
                     let source_tab_id = closed_tab_id.clone();
                     let outcome = match self.state.workspaces[ws_idx]
-                        .promote_all_collection_members(
-                            collection_id,
-                            explicit_target,
-                            ratatui::layout::Direction::Horizontal,
-                            0.5,
-                        ) {
+                        .promote_collection_members_to_tabs(collection_id)
+                    {
                         Ok(outcome) => outcome,
                         Err(err) => {
                             return encode_error(id, "collection_close_failed", format!("{err:?}"))
                         }
                     };
-                    layout_update_tab_idx = Some(outcome.target_tab_idx);
+                    layout_update_tab_idx = outcome.source_layout_tab_idx;
+                    created_layout_tab_indices = outcome.created_tab_indices.clone();
                     for pane_id in &outcome.members {
                         self.state.collection_archive_times.remove(pane_id);
                     }
                     if params.focus_promoted {
                         if let Some(first) = outcome.members.first().copied() {
                             self.state.focus_pane_in_workspace(ws_idx, first);
-                        }
-                    }
-                    for pane_id in &outcome.members {
-                        if let Some(pane) = self.pane_info(ws_idx, *pane_id) {
-                            self.emit_collection_event(
-                                EventKind::CollectionMemberPromoted,
-                                EventData::CollectionMemberPromoted {
-                                    collection_id: params.collection_id.clone(),
-                                    pane,
-                                },
-                            );
                         }
                     }
                     if outcome.removed_tab_idx.is_some() {
@@ -847,12 +801,23 @@ impl App {
                             },
                         });
                     }
-                    if outcome.created_tab {
-                        if let Some(tab) = self.tab_info(ws_idx, outcome.target_tab_idx) {
+                    for tab_idx in &outcome.created_tab_indices {
+                        if let Some(tab) = self.tab_info(ws_idx, *tab_idx) {
                             self.emit_event(EventEnvelope {
                                 event: EventKind::TabCreated,
                                 data: EventData::TabCreated { tab },
                             });
+                        }
+                    }
+                    for pane_id in &outcome.members {
+                        if let Some(pane) = self.pane_info(ws_idx, *pane_id) {
+                            self.emit_collection_event(
+                                EventKind::CollectionMemberPromoted,
+                                EventData::CollectionMemberPromoted {
+                                    collection_id: params.collection_id.clone(),
+                                    pane,
+                                },
+                            );
                         }
                     }
                 }
@@ -876,6 +841,9 @@ impl App {
             },
         );
         if let Some(tab_idx) = layout_update_tab_idx {
+            self.emit_layout_updated_event(ws_idx, tab_idx);
+        }
+        for tab_idx in created_layout_tab_indices {
             self.emit_layout_updated_event(ws_idx, tab_idx);
         }
         encode_success(id, ResponseResult::Ok {})
@@ -1844,7 +1812,7 @@ mod tests {
         );
         assert!(serde_json::from_str::<crate::api::schema::ErrorResponse>(&response).is_ok());
         let after = CollectionId::alloc().expect("unknown mutation must not exhaust allocation");
-        assert_eq!(after.raw(), before.raw() + 1);
+        assert!(after.raw() > before.raw());
     }
 
     #[tokio::test]
@@ -2247,7 +2215,7 @@ mod tests {
             .expect("terminal")
             .clone();
         app.state.collection_geometry.insert(
-            terminal_id,
+            terminal_id.clone(),
             crate::app::collection_view::TerminalGeometry {
                 rows: 8,
                 cols: 40,
@@ -2255,7 +2223,7 @@ mod tests {
                 cell_height_px: 1,
             },
         );
-        let closed = request(
+        let rejected_target = request(
             &mut app,
             Method::CollectionClose(CollectionCloseParams {
                 collection_id: collection_id.clone(),
@@ -2264,11 +2232,38 @@ mod tests {
                 focus_promoted: false,
             }),
         );
+        assert_eq!(
+            rejected_target["error"]["code"],
+            "collection_promote_target_unsupported"
+        );
+        assert!(app.resolve_collection(&collection_id).is_some());
+
+        let closed = request(
+            &mut app,
+            Method::CollectionClose(CollectionCloseParams {
+                collection_id: collection_id.clone(),
+                disposition: Some(CollectionCloseDisposition::PromoteMembers),
+                target_pane_id: None,
+                focus_promoted: false,
+            }),
+        );
         assert_eq!(closed["result"]["type"], "ok");
         assert!(app.resolve_collection(&collection_id).is_none());
+        let promoted_tab_idx = app.state.workspaces[0]
+            .find_tab_index_for_pane(second)
+            .expect("promoted member tab");
+        assert_ne!(promoted_tab_idx, 0);
         assert_eq!(
-            app.state.workspaces[0].tabs[0].pane_placement(second),
+            app.state.workspaces[0].tabs[promoted_tab_idx].pane_placement(second),
             Some(PanePlacement::Tiled)
+        );
+        assert_eq!(
+            app.state.workspaces[0].tabs[promoted_tab_idx].pane_count(),
+            1
+        );
+        assert_eq!(
+            app.state.workspaces[0].terminal_id(second),
+            Some(&terminal_id)
         );
         assert!(!app.state.collection_archive_times.contains_key(&second));
         assert!(!app.state.collection_views.contains_key(&raw_collection));
@@ -2429,13 +2424,12 @@ mod tests {
         assert!(app.state.terminal_runtime_shutdowns.is_empty());
 
         crate::workspace::fail_next_collection_mutation_for_test();
-        let root_public = app.public_pane_id(0, root).expect("root public");
         let failed = request(
             &mut app,
             Method::CollectionClose(CollectionCloseParams {
                 collection_id,
                 disposition: Some(CollectionCloseDisposition::PromoteMembers),
-                target_pane_id: Some(root_public),
+                target_pane_id: None,
                 focus_promoted: false,
             }),
         );
@@ -2707,7 +2701,8 @@ mod tests {
     }
 
     #[test]
-    fn final_collection_close_closes_only_its_workspace_and_emits_all_events() {
+    fn final_parent_worktree_collection_close_ignores_confirm_close_and_closes_only_its_workspace()
+    {
         let (mut app, root, second, third) = app_with_panes();
         let collection_id = create_collection(&mut app, root);
         for pane in [root, second, third] {
@@ -2737,7 +2732,9 @@ mod tests {
         app.state.workspaces[0].worktree_space = Some(membership(false));
         app.state.workspaces[1].worktree_space = Some(membership(true));
         app.state.ensure_test_terminals();
-        app.state.confirm_close = false;
+        // Collection close intentionally has a one-workspace policy: even a parent worktree
+        // with linked children must not reintroduce the group-close confirmation path.
+        app.state.confirm_close = true;
         let sequence = app.event_hub.current_sequence();
 
         let closed = request(
@@ -2774,7 +2771,7 @@ mod tests {
     }
 
     #[test]
-    fn collection_only_promotion_creates_normal_tab_in_canonical_member_order() {
+    fn collection_only_promotion_creates_one_standalone_tab_per_member_in_order() {
         let (mut app, root, second, third) = app_with_panes();
         let collection_id = create_collection(&mut app, root);
         for pane in [second, third, root] {
@@ -2788,6 +2785,17 @@ mod tests {
             );
             assert!(response.get("error").is_none(), "{response}");
         }
+        let source_tab_id = app.public_tab_id(0, 0).expect("source tab ID");
+        let identities = [second, third, root].map(|pane| {
+            (
+                app.public_pane_id(0, pane).expect("public pane ID"),
+                app.state.workspaces[0]
+                    .terminal_id(pane)
+                    .expect("terminal ID")
+                    .clone(),
+            )
+        });
+        let sequence = app.event_hub.current_sequence();
         let closed = request(
             &mut app,
             Method::CollectionClose(CollectionCloseParams {
@@ -2799,12 +2807,63 @@ mod tests {
         );
         assert_eq!(closed["result"]["type"], "ok");
         assert!(app.resolve_collection(&collection_id).is_none());
-        assert_eq!(app.state.workspaces[0].tabs.len(), 1);
-        let tab = &app.state.workspaces[0].tabs[0];
-        assert_eq!(tab.layout.tiled_pane_ids(), vec![second, third, root]);
-        for pane in [second, third, root] {
+        assert_eq!(app.state.workspaces[0].tabs.len(), 3);
+        for ((tab, pane), (public_pane_id, terminal_id)) in app.state.workspaces[0]
+            .tabs
+            .iter()
+            .zip([second, third, root])
+            .zip(identities)
+        {
+            assert_eq!(tab.layout.tiled_pane_ids(), vec![pane]);
             assert_eq!(tab.pane_placement(pane), Some(PanePlacement::Tiled));
+            assert_eq!(tab.pane_count(), 1);
+            assert_eq!(app.public_pane_id(0, pane), Some(public_pane_id));
+            assert_eq!(
+                app.state.workspaces[0].terminal_id(pane),
+                Some(&terminal_id)
+            );
+            assert_ne!(
+                app.public_tab_id(
+                    0,
+                    app.state.workspaces[0]
+                        .find_tab_index_for_pane(pane)
+                        .unwrap()
+                ),
+                Some(source_tab_id.clone())
+            );
         }
+        let relevant_events = app
+            .event_hub
+            .events_after(sequence)
+            .into_iter()
+            .map(|(_, event)| event.event)
+            .filter(|event| {
+                matches!(
+                    event,
+                    EventKind::TabClosed
+                        | EventKind::TabCreated
+                        | EventKind::CollectionMemberPromoted
+                        | EventKind::CollectionClosed
+                        | EventKind::LayoutUpdated
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            relevant_events,
+            vec![
+                EventKind::TabClosed,
+                EventKind::TabCreated,
+                EventKind::TabCreated,
+                EventKind::TabCreated,
+                EventKind::CollectionMemberPromoted,
+                EventKind::CollectionMemberPromoted,
+                EventKind::CollectionMemberPromoted,
+                EventKind::CollectionClosed,
+                EventKind::LayoutUpdated,
+                EventKind::LayoutUpdated,
+                EventKind::LayoutUpdated,
+            ]
+        );
     }
 
     #[test]

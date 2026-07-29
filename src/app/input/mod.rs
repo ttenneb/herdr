@@ -355,7 +355,11 @@ impl App {
             .as_ref()
             .and_then(|menu| menu.plugin.as_ref())
             .map(|plugin| plugin.generation);
-        if self.handle_collection_mouse_from(source_id, mouse) {
+        if !matches!(
+            self.state.mode,
+            crate::app::state::Mode::CollectionClose | crate::app::state::Mode::ContextMenu
+        ) && self.handle_collection_mouse_from(source_id, mouse)
+        {
             let current_context_menu_generation = self
                 .state
                 .context_menu
@@ -504,11 +508,7 @@ impl App {
                         self.apply_rename_mouse_action_via_api(action)
                     }
                     MouseAction::ConfirmCloseAccept => self.confirm_close_accept_via_api(),
-                    MouseAction::ConfirmCloseCancel => {
-                        if !self.cancel_pending_collection_group_close() {
-                            modal::confirm_close_cancel(&mut self.state);
-                        }
-                    }
+                    MouseAction::ConfirmCloseCancel => modal::confirm_close_cancel(&mut self.state),
                     MouseAction::CollectionClosePromote => {
                         self.handle_collection_close_key(crossterm::event::KeyEvent::new(
                             crossterm::event::KeyCode::Char('p'),
