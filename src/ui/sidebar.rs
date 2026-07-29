@@ -1820,7 +1820,12 @@ fn render_workspace_list(
         } else {
             p.overlay0
         });
-        let linked_checkout = card.indented
+        // A Workspace can be a visually indented Checkout even when its
+        // persisted provenance is Primary (for example, a second Workspace
+        // attached to the primary checkout). Its status still belongs in the
+        // root status column; only actual linked Checkouts receive the branch glyph.
+        let indented_checkout = card.indented && ws.checkout.is_some();
+        let linked_checkout = indented_checkout
             && ws
                 .checkout
                 .as_ref()
@@ -1837,7 +1842,7 @@ fn render_workspace_list(
         // The default fixed status column replaces its first state-icon token with
         // the branch glyph. For configurable layouts, retain every state-icon token
         // and render the branch glyph as tree chrome instead.
-        let fixed_status_column = linked_checkout && linked_status_marker_style.is_some();
+        let fixed_status_column = indented_checkout && linked_status_marker_style.is_some();
         let state_icon = state_dot(display_state, display_seen, p);
         let state_text_style = Style::default()
             .fg(state_label_color(display_state, display_seen, p))
@@ -1900,7 +1905,11 @@ fn render_workspace_list(
                 .map(|_| {
                     if fixed_status_column && !replaced_fixed_status_icon {
                         replaced_fixed_status_icon = true;
-                        ("", branch_style)
+                        if linked_checkout {
+                            ("", branch_style)
+                        } else {
+                            ("", Style::default())
+                        }
                     } else {
                         state_icon
                     }
@@ -1928,8 +1937,8 @@ fn render_workspace_list(
         if let Some(style) =
             linked_status_marker_style.filter(|_| fixed_status_column && card.rect.width > 1)
         {
-            // Linked Checkouts retain their branch icon beside the tree connector,
-            // but their state marker shares the fixed status column used by roots.
+            // Indented Checkouts share the fixed status column used by roots.
+            // Actual linked Checkouts retain their branch icon beside the tree connector.
             let child_state_icon = state_dot(agg_state, agg_seen, p);
             frame.buffer_mut()[(card.rect.x + 1, row_y)]
                 .set_symbol(child_state_icon.0)
@@ -3161,6 +3170,47 @@ rows = [[{ token = "git_status", fg = "#123456" }]]
             "·",
             "linked Checkout should use the root status column: {row:?}"
         );
+    }
+
+    #[test]
+    fn indented_primary_checkout_uses_root_status_column_without_branch_icon() {
+        let mut app = crate::app::state::AppState::test_new();
+        let mut ws = Workspace::test_new("duplicate primary");
+        ws.checkout = Some(crate::repository::CheckoutProvenance {
+            repository_id: "repo".into(),
+            checkout_path: "/repo".into(),
+            kind: crate::repository::CheckoutKind::Primary,
+        });
+        app.workspaces = vec![ws];
+        app.sidebar_spaces.rows = vec![vec![
+            crate::config::SpaceSidebarToken::StateIcon,
+            crate::config::SpaceSidebarToken::Workspace,
+        ]];
+        app.view.workspace_card_areas = vec![crate::app::state::WorkspaceCardArea {
+            target: crate::app::state::SpaceRowTarget::Workspace(0),
+            rect: Rect::new(0, 1, 20, 1),
+            depth: 1,
+            indented: true,
+        }];
+
+        let mut terminal = Terminal::new(TestBackend::new(20, 4)).expect("test terminal");
+        terminal
+            .draw(|frame| {
+                render_workspace_list(
+                    &app,
+                    &crate::terminal::TerminalRuntimeRegistry::new(),
+                    frame,
+                    Rect::new(0, 0, 20, 4),
+                    false,
+                )
+            })
+            .expect("workspace list should render");
+
+        let row = (0..20)
+            .map(|x| terminal.backend().buffer()[(x, 1)].symbol())
+            .collect::<String>();
+        assert_eq!(terminal.backend().buffer()[(1, 1)].symbol(), "·");
+        assert!(!row.contains(""), "rendered row: {row:?}");
     }
 
     fn workspace_with_worktree_space(
