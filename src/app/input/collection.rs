@@ -1140,7 +1140,9 @@ impl App {
             }
             MouseEventKind::Down(MouseButton::Left) => {
                 // A new left-button gesture owns exactly one drag surface, even if a malformed
-                // event stream omitted the previous release.
+                // event stream omitted the previous release. Cancel both ordinary host drags and
+                // collection-local drags so the newest press is the unambiguous owner.
+                self.state.drag = None;
                 for view in self.state.collection_views.values_mut() {
                     view.collection_scrollbar_drag = None;
                     view.child_scrollbar_drag = None;

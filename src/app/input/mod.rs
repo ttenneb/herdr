@@ -355,10 +355,20 @@ impl App {
             .as_ref()
             .and_then(|menu| menu.plugin.as_ref())
             .map(|plugin| plugin.generation);
-        if !matches!(
-            self.state.mode,
-            crate::app::state::Mode::CollectionClose | crate::app::state::Mode::ContextMenu
-        ) && self.handle_collection_mouse_from(source_id, mouse)
+        // Once an ordinary host drag starts, it owns drag/release events even when the pointer
+        // crosses a collection surface. Otherwise collection hit-testing consumes pane-split
+        // drags as soon as they move one cell into a collection, making resizing appear to stop.
+        let host_drag_continuation = self.state.drag.is_some()
+            && matches!(
+                mouse.kind,
+                MouseEventKind::Drag(MouseButton::Left) | MouseEventKind::Up(MouseButton::Left)
+            );
+        if !host_drag_continuation
+            && !matches!(
+                self.state.mode,
+                crate::app::state::Mode::CollectionClose | crate::app::state::Mode::ContextMenu
+            )
+            && self.handle_collection_mouse_from(source_id, mouse)
         {
             let current_context_menu_generation = self
                 .state
@@ -1020,6 +1030,19 @@ fn root_layout_ratio(snapshot: &crate::persist::SessionSnapshot) -> Option<f32> 
 }
 
 #[cfg(test)]
+fn active_root_layout_ratio(app: &App) -> f32 {
+    let root = app.state.workspaces[app.state.active.expect("active workspace")]
+        .active_tab()
+        .expect("active tab")
+        .layout
+        .typed_root();
+    match root {
+        crate::layout::TypedNode::Split { ratio, .. } => *ratio,
+        crate::layout::TypedNode::Leaf(_) => panic!("expected split layout"),
+    }
+}
+
+#[cfg(test)]
 fn unique_temp_path(name: &str) -> std::path::PathBuf {
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -1055,6 +1078,106 @@ mod tests {
             tokio::sync::mpsc::unbounded_channel().1,
             crate::api::EventHub::default(),
         )
+    }
+
+    #[test]
+    fn pane_split_drag_continues_across_collection_surface() {
+        for split_direction in [
+            ratatui::layout::Direction::Horizontal,
+            ratatui::layout::Direction::Vertical,
+        ] {
+            let mut app = app_for_mouse_test();
+            let mut workspace = crate::workspace::Workspace::test_new("collection-resize");
+            let root = workspace.tabs[0].root_pane.expect("root pane");
+            let collection_id = workspace
+                .create_collection_near(
+                    0,
+                    crate::layout::LayoutLeaf::Pane(root),
+                    split_direction,
+                    0.5,
+                    None,
+                )
+                .expect("create collection");
+            workspace.tabs[0]
+                .layout
+                .focus_leaf(crate::layout::LayoutLeaf::Collection(collection_id));
+            app.state.workspaces = vec![workspace];
+            app.state.active = Some(0);
+            app.state.selected = 0;
+            crate::ui::compute_view(&mut app.state, ratatui::layout::Rect::new(0, 0, 106, 20));
+
+            let border = app.state.view.split_borders[0].clone();
+            let collection = app.state.view.collection_layouts[0].clone();
+            let start = match border.direction {
+                ratatui::layout::Direction::Horizontal => (border.pos, collection.inner_rect.y),
+                ratatui::layout::Direction::Vertical => (collection.inner_rect.x, border.pos),
+            };
+            let inside_collection = match border.direction {
+                ratatui::layout::Direction::Horizontal => {
+                    let column = if collection.inner_rect.x > border.pos {
+                        collection.inner_rect.x
+                    } else {
+                        collection.inner_rect.right().saturating_sub(1)
+                    };
+                    (column, collection.inner_rect.y)
+                }
+                ratatui::layout::Direction::Vertical => {
+                    let row = if collection.inner_rect.y > border.pos {
+                        collection.inner_rect.y
+                    } else {
+                        collection.inner_rect.bottom().saturating_sub(1)
+                    };
+                    (collection.inner_rect.x, row)
+                }
+            };
+            assert!(collection
+                .hit_at(inside_collection.0, inside_collection.1)
+                .is_some());
+
+            let before = active_root_layout_ratio(&app);
+            app.handle_mouse(mouse(
+                crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left),
+                start.0,
+                start.1,
+            ));
+            assert!(matches!(
+                app.state.drag.as_ref().map(|drag| &drag.target),
+                Some(crate::app::state::DragTarget::PaneSplit { .. })
+            ));
+
+            app.handle_mouse(mouse(
+                crossterm::event::MouseEventKind::Drag(crossterm::event::MouseButton::Left),
+                inside_collection.0,
+                inside_collection.1,
+            ));
+            assert_ne!(active_root_layout_ratio(&app), before);
+            assert!(matches!(
+                app.state.drag.as_ref().map(|drag| &drag.target),
+                Some(crate::app::state::DragTarget::PaneSplit { .. })
+            ));
+
+            app.handle_mouse(mouse(
+                crossterm::event::MouseEventKind::Up(crossterm::event::MouseButton::Left),
+                inside_collection.0,
+                inside_collection.1,
+            ));
+            assert!(app.state.drag.is_none());
+
+            // If a release is lost, a newer press on collection content must replace the stale
+            // split gesture rather than sending its subsequent drag back to the old border.
+            app.handle_mouse(mouse(
+                crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left),
+                start.0,
+                start.1,
+            ));
+            assert!(app.state.drag.is_some());
+            app.handle_mouse(mouse(
+                crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left),
+                inside_collection.0,
+                inside_collection.1,
+            ));
+            assert!(app.state.drag.is_none());
+        }
     }
 
     #[test]
