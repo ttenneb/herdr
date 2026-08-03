@@ -19,6 +19,7 @@
 - Relicensed Herdr from AGPL-3.0-or-later to Apache-2.0.
 
 ### Fixed
+- Pane split-resize drags now continue smoothly when the pointer crosses collection content instead of stopping at the collection boundary.
 - Collection disclosure hit targets now align with their rendered expand/collapse icons instead of overlapping the selection marker.
 - Collection context menus and close-dialog actions now receive mouse clicks instead of the underlying collection content consuming them.
 - Agent prompts now wait briefly after sending text before pressing Enter, preventing prompts from remaining in agent composers without starting a turn. (#1878)
