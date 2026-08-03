@@ -734,31 +734,9 @@ fn render_mobile_switcher_content(
         let active = Some(*ws_idx) == app.active;
         let selected = app.selected_repository_id.is_none() && *ws_idx == app.selected;
         let bg = mobile_item_bg(selected, active, p);
-        let (state, seen) = if *depth == 0 {
-            ws.checkout
-                .as_ref()
-                .and_then(|checkout| app.repository(&checkout.repository_id))
-                .map(|repository| {
-                    repository
-                        .checkout_workspace_ids
-                        .iter()
-                        .filter_map(|id| {
-                            app.workspaces.iter().find(|workspace| &workspace.id == id)
-                        })
-                        .map(|workspace| workspace.aggregate_state(&app.terminals))
-                        .max_by_key(|(state, seen)| match (state, seen) {
-                            (crate::detect::AgentState::Blocked, _) => 4,
-                            (crate::detect::AgentState::Idle, false) => 3,
-                            (crate::detect::AgentState::Working, _) => 2,
-                            (crate::detect::AgentState::Idle, true) => 1,
-                            (crate::detect::AgentState::Unknown, _) => 0,
-                        })
-                        .unwrap_or((crate::detect::AgentState::Unknown, true))
-                })
-                .unwrap_or_else(|| ws.aggregate_state(&app.terminals))
-        } else {
-            ws.aggregate_state(&app.terminals)
-        };
+        // Every checkout row owns its status indicator. In particular, the
+        // depth-zero primary must not inherit attention from linked children.
+        let (state, seen) = ws.aggregate_state(&app.terminals);
         let child_checkout = *depth > 0;
         let indented_checkout = child_checkout && ws.checkout.is_some();
         let (state_dot, state_dot_style) = state_dot(state, seen, p);
@@ -1577,6 +1555,65 @@ mod tests {
         assert_eq!(mobile_switcher_workspace_doc_range(&app, 2).start, 4);
         let hit = mobile_switcher_target_at(&app, viewport.x + 2, viewport.y + 4);
         assert_eq!(hit, Some(MobileSwitcherTarget::Workspace(2)));
+    }
+
+    #[test]
+    fn switcher_keeps_primary_and_linked_checkout_statuses_independent() {
+        let mut app = crate::app::state::AppState::test_new();
+        let mut primary = crate::workspace::Workspace::test_new("main");
+        primary.checkout = Some(crate::repository::CheckoutProvenance {
+            repository_id: "repo".into(),
+            checkout_path: "/repo/main".into(),
+            kind: crate::repository::CheckoutKind::Primary,
+        });
+        let mut linked = crate::workspace::Workspace::test_new("feature");
+        linked.checkout = Some(crate::repository::CheckoutProvenance {
+            repository_id: "repo".into(),
+            checkout_path: "/repo/feature".into(),
+            kind: crate::repository::CheckoutKind::Linked,
+        });
+        let workspace_ids = vec![primary.id.clone(), linked.id.clone()];
+        app.workspaces = vec![primary, linked];
+        app.repositories = vec![crate::repository::Repository {
+            id: "repo".into(),
+            git_common_dir: "/repo/.git".into(),
+            label: "repo".into(),
+            custom_name: None,
+            preferred_base: None,
+            checkout_workspace_ids: workspace_ids,
+            last_focused_workspace_id: None,
+        }];
+        app.space_order = vec![crate::repository::SpaceRef::Repository("repo".into())];
+        app.ensure_test_terminals();
+        for (ws_idx, state) in [(0, AgentState::Working), (1, AgentState::Blocked)] {
+            let pane = app.workspaces[ws_idx].tabs[0].root_pane.unwrap();
+            let terminal_id = app.workspaces[ws_idx].tabs[0].panes[&pane]
+                .attached_terminal_id
+                .clone();
+            let terminal = app.terminals.get_mut(&terminal_id).unwrap();
+            terminal.detected_agent = Some(crate::detect::Agent::Claude);
+            terminal.state = state;
+        }
+
+        let primary_row = mobile_switcher_workspace_doc_range(&app, 0).start as u16;
+        let linked_row = mobile_switcher_workspace_doc_range(&app, 1).start as u16;
+        let area = Rect::new(0, 0, 60, 30);
+        let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(60, 30))
+            .expect("test terminal");
+        terminal
+            .draw(|frame| {
+                render_mobile_switcher_content(&app, &TerminalRuntimeRegistry::new(), frame, area)
+            })
+            .expect("mobile switcher should render");
+
+        let buffer = terminal.backend().buffer();
+        assert_eq!(buffer[(3, primary_row)].symbol(), "●");
+        assert_eq!(
+            buffer[(3, primary_row)].style().fg,
+            Some(app.palette.yellow)
+        );
+        assert_eq!(buffer[(3, linked_row)].symbol(), "●");
+        assert_eq!(buffer[(3, linked_row)].style().fg, Some(app.palette.red));
     }
 
     #[test]

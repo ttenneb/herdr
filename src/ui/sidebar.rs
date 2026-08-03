@@ -1150,11 +1150,7 @@ pub(super) fn render_sidebar_collapsed(app: &AppState, frame: &mut Frame, area: 
         if y >= ws_area.y + ws_area.height {
             break;
         }
-        let (agg_state, agg_seen) = ws
-            .checkout
-            .as_ref()
-            .map(|checkout| space_aggregate_state(app, &checkout.repository_id))
-            .unwrap_or_else(|| ws.aggregate_state(&app.terminals));
+        let (agg_state, agg_seen) = ws.aggregate_state(&app.terminals);
         let (icon, icon_style) = state_dot(agg_state, agg_seen, p);
         let is_selected = is_navigating
             && match &target {
@@ -1811,10 +1807,10 @@ fn render_workspace_list(
                     )
                 })
                 .is_none_or(|entry_idx| !next_entry_is_indented_workspace(&entries, entry_idx));
-        let (display_state, display_seen) = parent_group
-            .as_ref()
-            .map(|(key, _)| space_aggregate_state(app, key))
-            .unwrap_or((agg_state, agg_seen));
+        // A repository root is also a concrete Workspace. Its indicator must
+        // describe only that Workspace; linked children render their own state
+        // on their own rows and must never roll up into the root.
+        let (display_state, display_seen) = (agg_state, agg_seen);
         let branch_style = Style::default().fg(if selected || is_active {
             p.mauve
         } else {
@@ -3116,6 +3112,121 @@ rows = [[{ token = "git_status", fg = "#123456" }]]
                 render_workspace_list(&app, &runtimes, frame, Rect::new(0, 0, 15, 6), false)
             })
             .expect("workspace list should render");
+    }
+
+    fn app_with_blocked_linked_checkout() -> AppState {
+        let mut app = AppState::test_new();
+        let mut primary = Workspace::test_new("main");
+        primary.checkout = Some(crate::repository::CheckoutProvenance {
+            repository_id: "repo".into(),
+            checkout_path: "/repo/main".into(),
+            kind: crate::repository::CheckoutKind::Primary,
+        });
+        let mut linked = Workspace::test_new("feature");
+        linked.checkout = Some(crate::repository::CheckoutProvenance {
+            repository_id: "repo".into(),
+            checkout_path: "/repo/feature".into(),
+            kind: crate::repository::CheckoutKind::Linked,
+        });
+        let workspace_ids = vec![primary.id.clone(), linked.id.clone()];
+        app.workspaces = vec![primary, linked];
+        app.repositories = vec![crate::repository::Repository {
+            id: "repo".into(),
+            git_common_dir: "/repo/.git".into(),
+            label: "repo".into(),
+            custom_name: None,
+            preferred_base: None,
+            checkout_workspace_ids: workspace_ids,
+            last_focused_workspace_id: None,
+        }];
+        app.space_order = vec![crate::repository::SpaceRef::Repository("repo".into())];
+        app.sidebar_spaces.rows = vec![vec![
+            crate::config::SpaceSidebarToken::StateIcon,
+            crate::config::SpaceSidebarToken::Workspace,
+        ]];
+        app.ensure_test_terminals();
+        let linked_pane = app.workspaces[1].tabs[0].root_pane.expect("root pane");
+        let linked_terminal = app.workspaces[1].tabs[0].panes[&linked_pane]
+            .attached_terminal_id
+            .clone();
+        let terminal = app.terminals.get_mut(&linked_terminal).unwrap();
+        terminal.detected_agent = Some(Agent::Claude);
+        terminal.state = AgentState::Blocked;
+        app
+    }
+
+    #[test]
+    fn expanded_sidebar_keeps_root_and_linked_checkout_status_independent() {
+        let mut app = app_with_blocked_linked_checkout();
+        let area = Rect::new(0, 0, 30, 10);
+        app.view.workspace_card_areas = compute_workspace_list_areas(&app, area).0;
+        let root_row = app.view.workspace_card_areas[0].rect.y;
+        let linked_row = app.view.workspace_card_areas[1].rect.y;
+        let mut terminal = Terminal::new(TestBackend::new(area.width, area.height)).unwrap();
+
+        terminal
+            .draw(|frame| {
+                render_workspace_list(&app, &TerminalRuntimeRegistry::new(), frame, area, false)
+            })
+            .unwrap();
+
+        let buffer = terminal.backend().buffer();
+        assert_eq!(buffer[(1, root_row)].symbol(), "·");
+        assert_eq!(buffer[(1, linked_row)].symbol(), "●");
+        assert_eq!(buffer[(1, linked_row)].style().fg, Some(app.palette.red));
+    }
+
+    #[test]
+    fn linked_fallback_root_keeps_each_visible_checkout_status_local() {
+        let mut app = app_with_blocked_linked_checkout();
+        app.workspaces[0].checkout.as_mut().unwrap().kind = crate::repository::CheckoutKind::Linked;
+
+        let entries = workspace_list_entries(&app);
+        assert!(matches!(
+            entries.as_slice(),
+            [
+                WorkspaceListEntry::Workspace {
+                    ws_idx: 0,
+                    depth: 0
+                },
+                WorkspaceListEntry::Workspace {
+                    ws_idx: 1,
+                    depth: 1
+                }
+            ]
+        ));
+
+        let area = Rect::new(0, 0, 30, 10);
+        app.view.workspace_card_areas = compute_workspace_list_areas(&app, area).0;
+        let fallback_root_row = app.view.workspace_card_areas[0].rect.y;
+        let child_row = app.view.workspace_card_areas[1].rect.y;
+        let mut terminal = Terminal::new(TestBackend::new(area.width, area.height)).unwrap();
+        terminal
+            .draw(|frame| {
+                render_workspace_list(&app, &TerminalRuntimeRegistry::new(), frame, area, false)
+            })
+            .unwrap();
+
+        let buffer = terminal.backend().buffer();
+        assert_eq!(buffer[(1, fallback_root_row)].symbol(), "·");
+        assert_eq!(buffer[(1, child_row)].symbol(), "●");
+        assert_eq!(buffer[(1, child_row)].style().fg, Some(app.palette.red));
+    }
+
+    #[test]
+    fn collapsed_sidebar_root_status_ignores_linked_checkout_attention() {
+        let app = app_with_blocked_linked_checkout();
+        let area = Rect::new(0, 0, 4, 10);
+        let (spaces, _, _) = collapsed_sidebar_sections(area);
+        let mut terminal = Terminal::new(TestBackend::new(area.width, area.height)).unwrap();
+
+        terminal
+            .draw(|frame| render_sidebar_collapsed(&app, frame, area))
+            .unwrap();
+
+        let buffer = terminal.backend().buffer();
+        assert_eq!(buffer[(spaces.x + 2, spaces.y)].symbol(), "·");
+        assert_eq!(top_level_space_targets(&app).len(), 1);
     }
 
     #[test]
