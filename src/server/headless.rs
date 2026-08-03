@@ -803,6 +803,14 @@ impl HeadlessServer {
             crate::render_prof::event("full_render_cause.deferred_worktree_dialog");
         }
 
+        if let Some((repository_id, ws_idx)) = self.app.state.request_new_repository_worktree.take()
+        {
+            self.app
+                .open_new_repository_worktree_dialog(&repository_id, ws_idx);
+            needs_render = true;
+            crate::render_prof::event("full_render_cause.deferred_worktree_dialog");
+        }
+
         if let Some(ws_idx) = self.app.state.request_open_existing_worktree.take() {
             self.app.open_existing_worktree_dialog(ws_idx);
             needs_render = true;
@@ -4683,6 +4691,7 @@ mod tests {
 
     use crate::app::AppState;
     use crate::protocol::CursorState;
+    use crossterm::event::{KeyCode, KeyEvent};
 
     #[path = "pane_graphics.rs"]
     mod pane_graphics_tests;
@@ -4965,6 +4974,83 @@ mod tests {
         );
         shutdown_test_runtimes(&mut server);
         let _ = fs::remove_dir_all(cwd);
+    }
+
+    #[test]
+    fn headless_deferred_main_checkout_new_worktree_opens_repository_dialog() {
+        let mut server = test_headless_server();
+        let repo = std::env::temp_dir().join(format!(
+            "herdr-headless-repository-worktree-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        fs::create_dir_all(&repo).expect("create test repository directory");
+        let status = std::process::Command::new("git")
+            .args(["init", "--quiet"])
+            .current_dir(&repo)
+            .status()
+            .expect("initialize test repository");
+        assert!(status.success(), "git init failed");
+
+        let mut workspace = crate::workspace::Workspace::test_new("main");
+        workspace.identity_cwd = repo.clone();
+        workspace.cached_identity_cwd = repo.clone();
+        workspace.cached_git_space = crate::workspace::git_space_metadata(&repo);
+        let source_workspace_id = workspace.id.clone();
+        server.app.state.workspaces = vec![workspace];
+        server.app.state.active = Some(0);
+        server.app.state.selected = 0;
+        server.app.state.reconcile_repositories();
+        let repository_id = server.app.state.repositories[0].id.clone();
+
+        let mut menu = crate::app::state::ContextMenuState::new(
+            crate::app::state::ContextMenuKind::GitWorkspace {
+                ws_idx: 0,
+                is_linked_worktree: false,
+                is_repository_root: true,
+                has_worktree_children: true,
+                collapsed: false,
+            },
+            0,
+            0,
+        );
+        menu.list.highlighted = menu
+            .items()
+            .iter()
+            .position(|item| *item == "New worktree")
+            .expect("repository-root checkout has New worktree action");
+        server.app.state.context_menu = Some(menu);
+        server.app.state.mode = app::Mode::ContextMenu;
+        server.app.initialize_context_menu_plugins();
+
+        server
+            .app
+            .handle_context_menu_key_via_api(KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()));
+
+        assert_eq!(
+            server.app.state.request_new_repository_worktree,
+            Some((repository_id.clone(), 0))
+        );
+        assert!(server.handle_deferred_requests_headless());
+        assert_eq!(server.app.state.request_new_repository_worktree, None);
+        assert_eq!(server.app.state.mode, app::Mode::NewLinkedWorktree);
+        let create = server
+            .app
+            .state
+            .worktree_create
+            .as_ref()
+            .expect("repository-scoped New worktree dialog");
+        assert_eq!(
+            create.repository_id.as_deref(),
+            Some(repository_id.as_str())
+        );
+        assert_eq!(create.source_workspace_id, source_workspace_id);
+
+        shutdown_test_runtimes(&mut server);
+        let _ = fs::remove_dir_all(repo);
     }
 
     #[tokio::test]
