@@ -710,7 +710,96 @@ impl App {
                     state_labels: presentation.state_labels,
                 },
             });
+            self.emit_workspace_attention_updated(update.ws_idx);
         }
+    }
+
+    pub(crate) fn emit_pane_acknowledged(&mut self, ws_idx: usize, pane_id: crate::layout::PaneId) {
+        self.emit_pane_acknowledged_status(ws_idx, pane_id);
+        self.emit_workspace_attention_updated(ws_idx);
+    }
+
+    fn emit_pane_acknowledged_status(&mut self, ws_idx: usize, pane_id: crate::layout::PaneId) {
+        let Some(public_pane_id) = self.public_pane_id(ws_idx, pane_id) else {
+            return;
+        };
+        let Some(terminal) = self
+            .state
+            .workspaces
+            .get(ws_idx)
+            .and_then(|workspace| workspace.pane_state(pane_id))
+            .and_then(|pane| self.state.terminals.get(&pane.attached_terminal_id))
+        else {
+            return;
+        };
+        let presentation = terminal.effective_presentation();
+        let agent_status = pane_agent_status(terminal.state, true);
+        let agent = terminal.effective_agent_label().map(str::to_string);
+        self.emit_event(crate::api::schema::EventEnvelope {
+            event: crate::api::schema::EventKind::PaneAgentStatusChanged,
+            data: crate::api::schema::EventData::PaneAgentStatusChanged {
+                pane_id: public_pane_id,
+                workspace_id: self.public_workspace_id(ws_idx),
+                agent_status,
+                agent,
+                title: presentation.title,
+                display_agent: presentation.display_agent,
+                state_labels: presentation.state_labels,
+            },
+        });
+    }
+
+    pub(crate) fn acknowledge_terminal_input(&mut self, terminal_id: &crate::terminal::TerminalId) {
+        let Some((ws_idx, pane_id)) = self.state.mark_terminal_seen(terminal_id) else {
+            return;
+        };
+        self.state.mark_session_dirty();
+        self.emit_pane_acknowledged(ws_idx, pane_id);
+        self.schedule_session_save();
+    }
+
+    pub(crate) fn mark_active_tab_workspace_primary_seen_with_events(&mut self) {
+        let acknowledged = self.state.mark_active_tab_workspace_primary_seen();
+        self.persist_and_emit_acknowledged_panes(acknowledged);
+    }
+
+    fn persist_and_emit_acknowledged_panes(&mut self, acknowledged: Vec<crate::layout::PaneId>) {
+        let Some(ws_idx) = self.state.active else {
+            return;
+        };
+        if acknowledged.is_empty() {
+            return;
+        }
+        self.state.mark_session_dirty();
+        for pane_id in acknowledged {
+            self.emit_pane_acknowledged_status(ws_idx, pane_id);
+        }
+        self.emit_workspace_attention_updated(ws_idx);
+        self.schedule_session_save();
+    }
+
+    pub(crate) fn emit_workspace_attention_updates(
+        &mut self,
+        workspace_indices: impl IntoIterator<Item = usize>,
+    ) {
+        for ws_idx in workspace_indices {
+            self.emit_workspace_attention_updated(ws_idx);
+        }
+    }
+
+    pub(crate) fn emit_all_workspace_attention_updated(&mut self) {
+        for ws_idx in 0..self.state.workspaces.len() {
+            self.emit_workspace_attention_updated(ws_idx);
+        }
+    }
+
+    fn emit_workspace_attention_updated(&mut self, ws_idx: usize) {
+        self.emit_event(crate::api::schema::EventEnvelope {
+            event: crate::api::schema::EventKind::WorkspaceUpdated,
+            data: crate::api::schema::EventData::WorkspaceUpdated {
+                workspace: self.workspace_info(ws_idx),
+            },
+        });
     }
 
     fn emit_terminal_or_system_agent_notifications(

@@ -232,7 +232,7 @@ impl App {
                         },
                     });
                 }
-                self.emit_pane_destruction_events(destruction, &public_panes);
+                let affected = self.emit_pane_destruction_events(destruction, &public_panes);
                 self.emit_event(EventEnvelope {
                     event: EventKind::TabClosed,
                     data: EventData::TabClosed {
@@ -240,6 +240,7 @@ impl App {
                         workspace_id,
                     },
                 });
+                self.emit_workspace_attention_updates(affected);
             }
         }
 

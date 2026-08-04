@@ -11,13 +11,14 @@ use super::sidebar::{
     next_entry_is_indented_workspace, workspace_list_entries_expanded, AgentPanelEntry,
     WorkspaceListEntry,
 };
-use super::status::state_dot;
+use super::status::{descendant_attention_badge, state_dot};
 use super::text::{display_width_u16, truncate_end};
 use crate::app::state::{Palette, ToastKind, ToastNotification};
 use crate::app::AppState;
 use crate::detect::AgentState;
 use crate::layout::PaneId;
 use crate::terminal::TerminalRuntimeRegistry;
+use crate::workspace::AttentionSummary;
 
 const SWITCH_BUTTON_WIDTH: u16 = 10;
 
@@ -356,31 +357,40 @@ fn render_header_status(
         return;
     };
 
-    let (state, seen) = ws.aggregate_state(&app.terminals);
+    let attention = ws.attention_summary(&app.terminals, &app.delegations);
+    let (state, seen) = attention.display_state();
     let (dot, dot_style) = state_dot(state, seen, p);
+    let badge = descendant_attention_badge(attention, p);
+    let badge_width = badge
+        .as_ref()
+        .map_or(0, |(badge, _)| display_width_u16(badge));
     let tab_label = mobile_tab_status(ws);
     let row1 = Rect::new(area.x, area.y, area.width, 1);
+    let minimum_status_width = 3u16.saturating_add(badge_width);
     let tab_w = display_width_u16(&tab_label)
         .saturating_add(1)
-        .min(area.width);
+        .min(area.width.saturating_sub(minimum_status_width));
     let name_w = area.width.saturating_sub(tab_w);
 
-    frame.render_widget(
-        Paragraph::new(Line::from(vec![
-            Span::raw(" "),
-            Span::styled(dot, dot_style.bg(p.panel_bg)),
-            Span::raw(" "),
-            Span::styled(
-                truncate_end(
-                    &ws.display_name_from(&app.terminals, terminal_runtimes),
-                    name_w.saturating_sub(4) as usize,
-                ),
-                Style::default()
-                    .fg(p.text)
-                    .bg(p.panel_bg)
-                    .add_modifier(Modifier::BOLD),
+    let mut status_spans = vec![Span::raw(" "), Span::styled(dot, dot_style.bg(p.panel_bg))];
+    if let Some((badge, style)) = badge {
+        status_spans.push(Span::styled(badge, style.bg(p.panel_bg)));
+    }
+    status_spans.extend([
+        Span::raw(" "),
+        Span::styled(
+            truncate_end(
+                &ws.display_name_from(&app.terminals, terminal_runtimes),
+                name_w.saturating_sub(4).saturating_sub(badge_width) as usize,
             ),
-        ])),
+            Style::default()
+                .fg(p.text)
+                .bg(p.panel_bg)
+                .add_modifier(Modifier::BOLD),
+        ),
+    ]);
+    frame.render_widget(
+        Paragraph::new(Line::from(status_spans)),
         Rect::new(row1.x, row1.y, name_w, 1),
     );
     frame.render_widget(
@@ -627,20 +637,22 @@ fn render_mobile_switcher_content(
             };
             let selected = app.selected_repository_id.as_ref() == Some(repository_id);
             let bg = mobile_item_bg(selected, false, p);
-            let (state, seen) = repository
-                .checkout_workspace_ids
-                .iter()
-                .filter_map(|id| app.workspaces.iter().find(|workspace| &workspace.id == id))
-                .map(|workspace| workspace.aggregate_state(&app.terminals))
-                .max_by_key(|(state, seen)| match (state, seen) {
-                    (crate::detect::AgentState::Blocked, _) => 4,
-                    (crate::detect::AgentState::Idle, false) => 3,
-                    (crate::detect::AgentState::Working, _) => 2,
-                    (crate::detect::AgentState::Idle, true) => 1,
-                    (crate::detect::AgentState::Unknown, _) => 0,
-                })
-                .unwrap_or((crate::detect::AgentState::Unknown, true));
+            let attention = AttentionSummary::for_panes(
+                repository
+                    .checkout_workspace_ids
+                    .iter()
+                    .filter_map(|id| app.workspaces.iter().find(|workspace| &workspace.id == id))
+                    .flat_map(|workspace| {
+                        workspace.tabs.iter().flat_map(|tab| {
+                            tab.panes.iter().map(|(&pane_id, pane)| (pane_id, pane))
+                        })
+                    }),
+                &app.terminals,
+                &app.delegations,
+            );
+            let (state, seen) = attention.display_state();
             let (dot, dot_style) = state_dot(state, seen, p);
+            let badge = descendant_attention_badge(attention, p);
             render_two_line_item(
                 frame,
                 viewport,
@@ -648,18 +660,26 @@ fn render_mobile_switcher_content(
                 doc_y,
                 app.mobile_switcher_scroll,
                 bg,
-                Line::from(vec![
-                    Span::styled("  ", Style::default().bg(bg)),
-                    Span::styled(dot, dot_style.bg(bg)),
-                    Span::styled(" ", Style::default().bg(bg)),
-                    Span::styled(
-                        repository.display_label(),
-                        Style::default()
-                            .fg(p.text)
-                            .bg(bg)
-                            .add_modifier(Modifier::BOLD),
-                    ),
-                ]),
+                Line::from({
+                    let mut spans = vec![
+                        Span::styled("  ", Style::default().bg(bg)),
+                        Span::styled(dot, dot_style.bg(bg)),
+                    ];
+                    if let Some((badge, style)) = badge {
+                        spans.push(Span::styled(badge, style.bg(bg)));
+                    }
+                    spans.extend([
+                        Span::styled(" ", Style::default().bg(bg)),
+                        Span::styled(
+                            repository.display_label(),
+                            Style::default()
+                                .fg(p.text)
+                                .bg(bg)
+                                .add_modifier(Modifier::BOLD),
+                        ),
+                    ]);
+                    spans
+                }),
                 "    repository".to_string(),
                 p.overlay0,
             );
@@ -736,7 +756,12 @@ fn render_mobile_switcher_content(
         let bg = mobile_item_bg(selected, active, p);
         // Every checkout row owns its status indicator. In particular, the
         // depth-zero primary must not inherit attention from linked children.
-        let (state, seen) = ws.aggregate_state(&app.terminals);
+        let attention = ws.attention_summary(&app.terminals, &app.delegations);
+        let (state, seen) = attention.display_state();
+        let child_badge = descendant_attention_badge(attention, p);
+        let child_badge_width = child_badge
+            .as_ref()
+            .map_or(0, |(badge, _)| display_width_u16(badge));
         let child_checkout = *depth > 0;
         let indented_checkout = child_checkout && ws.checkout.is_some();
         let (state_dot, state_dot_style) = state_dot(state, seen, p);
@@ -755,6 +780,9 @@ fn render_mobile_switcher_content(
         let detail_prefix = if child_checkout {
             if indented_checkout {
                 title_spans.push(Span::styled(state_dot, state_dot_style.bg(bg)));
+                if let Some((badge, style)) = child_badge.as_ref() {
+                    title_spans.push(Span::styled(badge.clone(), style.bg(bg)));
+                }
                 title_spans.push(Span::styled(" ", Style::default().bg(bg)));
             }
             let last_child = !next_entry_is_indented_workspace(&space_entries, entry_idx);
@@ -777,6 +805,11 @@ fn render_mobile_switcher_content(
         } else {
             title_spans.push(Span::styled(state_dot, state_dot_style.bg(bg)));
         }
+        if !indented_checkout {
+            if let Some((badge, style)) = child_badge.as_ref() {
+                title_spans.push(Span::styled(badge.clone(), style.bg(bg)));
+            }
+        }
         title_spans.push(Span::styled(" ", Style::default().bg(bg)));
         let raw_label = ws.display_name_from(&app.terminals, terminal_runtimes);
         let name = if *depth > 0 {
@@ -796,13 +829,16 @@ fn render_mobile_switcher_content(
         } else {
             raw_label
         };
-        let name_budget = content.width.saturating_sub(if indented_checkout {
-            10
-        } else if child_checkout {
-            8
-        } else {
-            5
-        }) as usize;
+        let name_budget = content
+            .width
+            .saturating_sub(if indented_checkout {
+                10
+            } else if child_checkout {
+                8
+            } else {
+                5
+            })
+            .saturating_sub(child_badge_width) as usize;
         title_spans.push(Span::styled(
             truncate_end(&name, name_budget),
             Style::default()
@@ -1778,6 +1814,58 @@ mod tests {
     }
 
     #[cfg(unix)]
+    #[test]
+    fn mobile_header_renders_delegated_completion_badge() {
+        let mut app = crate::app::state::AppState::test_new();
+        let mut workspace = crate::workspace::Workspace::test_new("mobile-attention");
+        let root = workspace.tabs[0].root_pane.expect("root pane");
+        let children = (0..12)
+            .map(|_| workspace.test_split(ratatui::layout::Direction::Horizontal))
+            .collect::<Vec<_>>();
+        app.workspaces = vec![workspace];
+        app.ensure_test_terminals();
+        let root_terminal = app.workspaces[0].tabs[0].panes[&root]
+            .attached_terminal_id
+            .clone();
+        app.terminals.get_mut(&root_terminal).unwrap().state = AgentState::Working;
+        let parent = app.delegations.create(Some(root), None, None).unwrap();
+        for child in children {
+            let child_terminal = app.workspaces[0].tabs[0].panes[&child]
+                .attached_terminal_id
+                .clone();
+            app.terminals.get_mut(&child_terminal).unwrap().state = AgentState::Idle;
+            app.workspaces[0].tabs[0]
+                .panes
+                .get_mut(&child)
+                .unwrap()
+                .seen = false;
+            app.delegations
+                .create(Some(child), Some(parent), Some("review".into()))
+                .unwrap();
+        }
+        app.active = Some(0);
+        app.selected = 0;
+        app.view.mobile_menu_hit_area = Rect::new(15, 0, 5, 2);
+
+        let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(20, 2))
+            .expect("test terminal");
+        terminal
+            .draw(|frame| {
+                render_mobile_header(
+                    &app,
+                    &TerminalRuntimeRegistry::new(),
+                    frame,
+                    Rect::new(0, 0, 20, 2),
+                )
+            })
+            .unwrap();
+        let row = (0..20)
+            .map(|x| terminal.backend().buffer()[(x, 0)].symbol())
+            .collect::<String>();
+
+        assert!(row.contains("•12"), "header row: {row:?}");
+    }
+
     #[tokio::test]
     async fn mobile_header_uses_live_root_runtime_cwd_for_workspace_label() {
         let unique = format!(

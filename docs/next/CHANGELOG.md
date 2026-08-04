@@ -11,6 +11,7 @@
 - Plugin actions can now declare bounded asynchronous `choices_command` providers for workspace, tab, pane, collection-member, and Workspace Resource context menus.
 
 ### Changed
+- Space and tab activity now follow top-level agents while completed delegated subagents appear as a separate unread attention badge that clears when their terminal is entered; blocked descendants still make the primary status red.
 - Newly expanded collection previews now automatically use at least half of the collection height while preserving explicit manual sizes.
 - `close_pane` now closes the focused collection through its promote-or-cascade flow when a collection leaf is focused; promotion preserves every member in its own standalone tab, `Shift+X` remains a collection-close alias, and bare list `x`/`Delete` still closes the selected member.
 - Grouped panes now count as seen only after a foreground human enters that child terminal; collection selection, API focus, reads, and passive observation do not acknowledge attention.
@@ -19,6 +20,8 @@
 - Relicensed Herdr from AGPL-3.0-or-later to Apache-2.0.
 
 ### Fixed
+- Pi panes now report `ask_user_question` as blocked while waiting for a human response instead of remaining working.
+- Delegated-attention acknowledgement now requires input delivered to that terminal, persists across restart, and emits ordered pane/workspace projections for acknowledgement and destruction; API focus and passive host focus do not clear child attention, and clipped custom Space layouts retain the unread badge.
 - Pane split-resize drags now continue smoothly when the pointer crosses collection content instead of stopping at the collection boundary.
 - Collection disclosure hit targets now align with their rendered expand/collapse icons instead of overlapping the selection marker.
 - Collection context menus and close-dialog actions now receive mouse clicks instead of the underlying collection content consuming them.

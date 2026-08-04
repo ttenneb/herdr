@@ -1076,7 +1076,8 @@ impl HeadlessServer {
         apply_keybindings(&mut self.app, &keybindings);
         self.sync_visible_server_config_diagnostic(uses_local_keybindings);
         if outer_terminal_focus == Some(true) {
-            self.app.state.mark_active_tab_seen();
+            self.app
+                .mark_active_tab_workspace_primary_seen_with_events();
         }
         self.app.set_host_terminal_appearance_state(
             host_terminal_appearance,

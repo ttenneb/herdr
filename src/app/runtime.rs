@@ -108,6 +108,7 @@ impl App {
         event: crate::raw_input::RawInputEvent,
     ) -> bool {
         let previous_mode = self.state.mode;
+        let mut acknowledged_terminal = None;
         let changed = match event {
             crate::raw_input::RawInputEvent::Key(key) => {
                 let pressed_key_id = pressed_key_identity(super::LOCAL_INPUT_SOURCE, &key);
@@ -121,6 +122,7 @@ impl App {
                             self.suppressed_repeat_keys.insert(pressed_key_id);
                         }
                         if let Some(target) = self.handle_key(key).await {
+                            acknowledged_terminal = Some(target.terminal_id.clone());
                             if !key.is_text_commit {
                                 self.pressed_terminal_keys.insert(
                                     pressed_key_id,
@@ -136,10 +138,12 @@ impl App {
                         if let Some(pressed) =
                             self.pressed_terminal_keys.get(&pressed_key_id).cloned()
                         {
-                            if !self
+                            if self
                                 .forward_terminal_key_to_target(&pressed.target, key)
                                 .await
                             {
+                                acknowledged_terminal = Some(pressed.target.terminal_id.clone());
+                            } else {
                                 self.pressed_terminal_keys.remove(&pressed_key_id);
                             }
                             true
@@ -147,7 +151,9 @@ impl App {
                             || self.state.mode == crate::app::Mode::Terminal)
                             && !self.suppressed_repeat_keys.contains(&pressed_key_id)
                         {
-                            self.handle_key(key).await;
+                            if let Some(target) = self.handle_key(key).await {
+                                acknowledged_terminal = Some(target.terminal_id);
+                            }
                             true
                         } else {
                             false
@@ -165,7 +171,7 @@ impl App {
                 }
             }
             crate::raw_input::RawInputEvent::Paste(text) => {
-                self.handle_paste(text).await;
+                acknowledged_terminal = self.handle_paste(text).await;
                 true
             }
             crate::raw_input::RawInputEvent::Mouse(mouse) => {
@@ -174,7 +180,8 @@ impl App {
                 if self.state.popup_pane.is_some() || self.state.mouse_capture {
                     self.handle_mouse(mouse);
                 } else {
-                    self.state
+                    acknowledged_terminal = self
+                        .state
                         .handle_pane_mouse_only(&self.terminal_runtimes, mouse);
                 }
                 changes_view
@@ -185,7 +192,7 @@ impl App {
                     self.request_repaint();
                 }
                 self.state.outer_terminal_focus = Some(true);
-                self.state.mark_active_tab_seen();
+                self.mark_active_tab_workspace_primary_seen_with_events();
                 true
             }
             crate::raw_input::RawInputEvent::OuterFocusLost => {
@@ -206,6 +213,9 @@ impl App {
             }
             crate::raw_input::RawInputEvent::Unsupported => false,
         };
+        if let Some(terminal_id) = acknowledged_terminal {
+            self.acknowledge_terminal_input(&terminal_id);
+        }
         self.sync_prefix_input_source(previous_mode);
         self.shutdown_detached_terminal_runtimes();
         changed

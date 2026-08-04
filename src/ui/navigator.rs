@@ -8,7 +8,7 @@ use ratatui::{
 
 use super::{
     scrollbar::{render_scrollbar, should_show_scrollbar},
-    status::{state_dot, state_label_color},
+    status::{descendant_attention_badge_for_count, state_dot, state_label_color},
     text::{display_width_u16, middle_elide, truncate_end},
     widgets::{panel_contrast_fg, render_panel_shell},
 };
@@ -210,6 +210,10 @@ fn render_row(
         status_style.bg(p.panel_bg)
     };
 
+    let badge = descendant_attention_badge_for_count(row.descendant_attention_count, p);
+    let badge_width = badge
+        .as_ref()
+        .map_or(0, |(badge, _)| display_width_u16(badge));
     let prefix = tree_prefix(rows, idx);
     let current = if row.is_current { "◆" } else { " " };
     let gutter = format!(" {current} ");
@@ -234,17 +238,27 @@ fn render_row(
         .width
         .saturating_sub(meta_width)
         .saturating_sub(display_width_u16(&format!("{gutter}{prefix} ")))
-        .saturating_sub(3) as usize;
+        .saturating_sub(3)
+        .saturating_sub(badge_width) as usize;
     let title = truncate_end(&row.label, left_budget);
 
-    let spans = vec![
+    let mut spans = vec![
         Span::styled(gutter, gutter_style),
         Span::styled(prefix, tree_style),
         Span::styled(" ", base_style),
         Span::styled(status_icon, status_style),
-        Span::raw(" "),
-        Span::styled(title, text_style),
     ];
+    if let Some((badge, style)) = badge {
+        spans.push(Span::styled(
+            badge,
+            if selected {
+                base_style
+            } else {
+                style.bg(p.panel_bg)
+            },
+        ));
+    }
+    spans.extend([Span::raw(" "), Span::styled(title, text_style)]);
     frame.render_widget(Paragraph::new(Line::from(spans)).style(base_style), rect);
 
     if meta_width > 0 {
@@ -599,6 +613,7 @@ mod tests {
             meta: String::new(),
             status: AgentState::Idle,
             seen: true,
+            descendant_attention_count: 0,
             is_current: false,
             is_workspace,
             is_tab: false,
@@ -619,6 +634,25 @@ mod tests {
             row(0, true),  // workspace
             row(1, false), // pane (single child)
         ]
+    }
+
+    #[test]
+    fn navigator_row_renders_descendant_attention_count() {
+        let app = AppState::test_new();
+        let mut rows = vec![row(0, true)];
+        rows[0].label = "workspace".into();
+        rows[0].descendant_attention_count = 12;
+        let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(40, 2))
+            .expect("test terminal");
+
+        terminal
+            .draw(|frame| render_row(&app, frame, Rect::new(0, 0, 40, 1), &rows, 0, false))
+            .unwrap();
+        let rendered = (0..40)
+            .map(|x| terminal.backend().buffer()[(x, 0)].symbol())
+            .collect::<String>();
+
+        assert!(rendered.contains("•12"), "navigator row: {rendered:?}");
     }
 
     #[test]

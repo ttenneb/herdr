@@ -140,21 +140,24 @@ impl App {
         None
     }
 
-    pub(super) async fn handle_paste(&mut self, text: String) {
+    pub(super) async fn handle_paste(
+        &mut self,
+        text: String,
+    ) -> Option<crate::terminal::TerminalId> {
         if self.state.popup_pane.is_some() {
             if let Some(runtime) = self.popup_runtime() {
                 let _ = runtime.send_paste(text).await;
             } else {
                 self.close_popup_pane();
             }
-            return;
+            return None;
         }
         if self.state.mode != Mode::Terminal {
             self.paste_into_active_text_input(&text);
-            return;
+            return None;
         }
         if !self.collection_accepts_terminal_input() {
-            return;
+            return None;
         }
 
         if let Some(ws_idx) = self.state.active {
@@ -165,15 +168,17 @@ impl App {
                 .and_then(|ws| ws.focused_pane_id());
             if let Some(pane_id) = pane_id {
                 self.restore_archived_member_for_input(ws_idx, pane_id);
+                let terminal_id = self.state.terminal_id_for_pane(ws_idx, pane_id)?;
                 if let Some(rt) = self.state.runtime_for_pane_in_workspace(
                     &self.terminal_runtimes,
                     ws_idx,
                     pane_id,
                 ) {
-                    let _ = rt.send_paste(text).await;
+                    return rt.send_paste(text).await.is_ok().then_some(terminal_id);
                 }
             }
         }
+        None
     }
 
     pub(crate) fn paste_into_active_text_input(&mut self, text: &str) -> bool {
@@ -472,6 +477,12 @@ impl App {
                     MouseAction::FocusTab { tab_idx } => self.focus_tab_idx_via_api(tab_idx),
                     MouseAction::FocusPane { ws_idx, pane_id } => {
                         self.focus_pane_internal_via_api(ws_idx, pane_id)
+                    }
+                    MouseAction::DeliveredTerminalMouse { ws_idx, pane_id } => {
+                        if let Some(terminal_id) = self.state.terminal_id_for_pane(ws_idx, pane_id)
+                        {
+                            self.acknowledge_terminal_input(&terminal_id);
+                        }
                     }
                     MouseAction::FocusToastTarget => self.focus_toast_target_via_api(),
                     MouseAction::MoveWorkspace {

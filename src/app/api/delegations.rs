@@ -47,6 +47,7 @@ impl App {
                 delegation: delegation.clone(),
             },
         });
+        self.emit_all_workspace_attention_updated();
         encode_success(id, ResponseResult::DelegationInfo { delegation })
     }
 
@@ -172,6 +173,7 @@ impl App {
                 previous_parent_id,
             },
         });
+        self.emit_all_workspace_attention_updated();
         encode_success(id, ResponseResult::DelegationInfo { delegation })
     }
 

@@ -570,6 +570,7 @@ fn restore_tab(
             }
         };
 
+        let saved_seen = saved_pane.is_none_or(|pane| pane.seen);
         let saved_label = saved_pane.and_then(|p| p.label.clone());
         let saved_agent_name = saved_pane.and_then(|p| p.agent_name.clone());
         let saved_managed_agent = saved_pane
@@ -641,7 +642,9 @@ fn restore_tab(
                     std::time::Instant::now(),
                 );
             }
-            panes.insert(*id, PaneState::new(terminal_id));
+            let mut pane = PaneState::new(terminal_id);
+            pane.seen = saved_seen;
+            panes.insert(*id, pane);
             terminals.push(terminal);
             continue;
         }
@@ -737,7 +740,9 @@ fn restore_tab(
                         std::time::Instant::now(),
                     );
                 }
-                panes.insert(*id, PaneState::new(terminal_id.clone()));
+                let mut pane = PaneState::new(terminal_id.clone());
+                pane.seen = saved_seen;
+                panes.insert(*id, pane);
                 terminal_runtimes.insert(terminal_id, runtime);
                 terminals.push(terminal);
             }
@@ -1238,6 +1243,7 @@ mod tests {
     fn pane_snapshot(cwd: &std::path::Path) -> super::super::snapshot::PaneSnapshot {
         super::super::snapshot::PaneSnapshot {
             cwd: cwd.to_path_buf(),
+            seen: true,
             label: None,
             agent_name: None,
             managed_agent_kind: None,
@@ -1353,6 +1359,8 @@ mod tests {
         let cwd = std::env::current_dir().unwrap();
         let collection = CollectionId::alloc().expect("collection id");
         let collection_tab = |old_pane| {
+            let mut pane = pane_snapshot(&cwd);
+            pane.seen = old_pane != 20;
             tab_snapshot(
                 LayoutSnapshot::Collection(collection),
                 vec![CollectionSnapshot {
@@ -1362,7 +1370,7 @@ mod tests {
                     selected: Some(old_pane),
                     archived: Vec::new(),
                 }],
-                HashMap::from([(old_pane, pane_snapshot(&cwd))]),
+                HashMap::from([(old_pane, pane)]),
             )
         };
         let workspace = |id: &str, tabs: Vec<TabSnapshot>| WorkspaceSnapshot {
@@ -1422,6 +1430,7 @@ mod tests {
             assert_eq!(tab.panes.len(), 1);
             assert_eq!(tab.layout.tiled_pane_ids().len(), 1);
         }
+        assert!(!workspaces[0].tabs[1].panes.values().next().unwrap().seen);
         assert_eq!(terminals.len(), 3);
         assert_eq!(runtimes.len(), 3);
         let collection_count = workspaces
@@ -1725,6 +1734,7 @@ mod tests {
                         0,
                         super::super::snapshot::PaneSnapshot {
                             cwd,
+                            seen: true,
                             label: Some("reviewer".into()),
                             agent_name: Some("reviewer".into()),
                             managed_agent_kind: Some("opencode".into()),
@@ -1820,6 +1830,7 @@ mod tests {
                             10,
                             super::super::snapshot::PaneSnapshot {
                                 cwd: cwd.clone(),
+                                seen: true,
                                 label: None,
                                 agent_name: None,
                                 managed_agent_kind: None,
@@ -1831,6 +1842,7 @@ mod tests {
                             20,
                             super::super::snapshot::PaneSnapshot {
                                 cwd: cwd.clone(),
+                                seen: true,
                                 label: None,
                                 agent_name: None,
                                 managed_agent_kind: None,
@@ -2114,6 +2126,7 @@ mod tests {
                 id.parse::<u32>().unwrap(),
                 super::super::snapshot::PaneSnapshot {
                     cwd: cwd.clone(),
+                    seen: true,
                     label: None,
                     agent_name: None,
                     managed_agent_kind: None,
@@ -2124,6 +2137,7 @@ mod tests {
         };
         let final_pane = super::super::snapshot::PaneSnapshot {
             cwd: cwd.clone(),
+            seen: true,
             label: Some("planner".into()),
             agent_name: Some("planner".into()),
             managed_agent_kind: None,
@@ -2300,6 +2314,7 @@ mod tests {
                         0,
                         super::super::snapshot::PaneSnapshot {
                             cwd,
+                            seen: true,
                             label: None,
                             agent_name: None,
                             managed_agent_kind: None,
@@ -2478,6 +2493,7 @@ mod tests {
             0,
             super::super::snapshot::PaneSnapshot {
                 cwd: cwd.clone(),
+                seen: true,
                 label: None,
                 agent_name: None,
                 managed_agent_kind: None,

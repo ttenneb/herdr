@@ -500,13 +500,67 @@ impl AppState {
                     })
                 })
                 .unwrap_or_else(|| ws.display_name_from(&self.terminals, terminal_runtimes));
-            let activity = workspace_activity_summary(ws, &self.terminals);
+            let activity = if workspace_depth == 0 {
+                ws.checkout.as_ref().map_or_else(
+                    || workspace_activity_summary(ws, &self.terminals, &self.delegations),
+                    |checkout| {
+                        activity_summary_for_panes(
+                            self.workspaces
+                                .iter()
+                                .filter(|workspace| {
+                                    workspace.checkout.as_ref().is_some_and(|candidate| {
+                                        candidate.repository_id == checkout.repository_id
+                                    })
+                                })
+                                .flat_map(|workspace| {
+                                    workspace.tabs.iter().flat_map(|tab| {
+                                        tab.panes.iter().map(|(&pane_id, pane)| (pane_id, pane))
+                                    })
+                                }),
+                            &self.terminals,
+                            &self.delegations,
+                        )
+                    },
+                )
+            } else {
+                workspace_activity_summary(ws, &self.terminals, &self.delegations)
+            };
+            let attention = if workspace_depth == 0 {
+                ws.checkout.as_ref().map_or_else(
+                    || ws.attention_summary(&self.terminals, &self.delegations),
+                    |checkout| {
+                        crate::workspace::AttentionSummary::for_panes(
+                            self.workspaces
+                                .iter()
+                                .filter(|workspace| {
+                                    workspace.checkout.as_ref().is_some_and(|candidate| {
+                                        candidate.repository_id == checkout.repository_id
+                                    })
+                                })
+                                .flat_map(|workspace| {
+                                    workspace.tabs.iter().flat_map(|tab| {
+                                        tab.panes.iter().map(|(&pane_id, pane)| (pane_id, pane))
+                                    })
+                                }),
+                            &self.terminals,
+                            &self.delegations,
+                        )
+                    },
+                )
+            } else {
+                ws.attention_summary(&self.terminals, &self.delegations)
+            };
             let workspace_search_text = format!("{workspace_label} {activity}").to_lowercase();
             let workspace_matches = match query_kind {
                 NavigatorQueryKind::Empty => true,
                 NavigatorQueryKind::State(filter) => {
-                    let (state, seen) = ws.aggregate_state(&self.terminals);
-                    navigator_state_filter_matches(filter, state, seen)
+                    let (state, seen) = attention.display_state();
+                    navigator_attention_filter_matches(
+                        filter,
+                        state,
+                        seen,
+                        attention.descendant_attention_count(),
+                    )
                 }
                 NavigatorQueryKind::Text => navigator_matches(&query, &workspace_search_text),
             };
@@ -528,7 +582,7 @@ impl AppState {
 
             let expanded = !matches!(query_kind, NavigatorQueryKind::Empty)
                 || self.navigator.expanded_workspaces.contains(&expansion_id);
-            let (state, seen) = ws.aggregate_state(&self.terminals);
+            let (state, seen) = attention.display_state();
             let pane_count = ws.tabs.iter().map(|tab| tab.panes.len()).sum::<usize>();
             rows.push(NavigatorRow {
                 target: NavigatorTarget::Workspace { ws_idx },
@@ -537,6 +591,7 @@ impl AppState {
                 meta: activity,
                 status: state,
                 seen,
+                descendant_attention_count: attention.descendant_attention_count(),
                 is_current: self.active == Some(ws_idx),
                 is_workspace: true,
                 is_tab: false,
@@ -594,6 +649,7 @@ impl AppState {
                     meta: resource.detail.clone().unwrap_or_default(),
                     status,
                     seen,
+                    descendant_attention_count: 0,
                     is_current: false,
                     is_workspace: false,
                     is_tab: false,
@@ -620,10 +676,13 @@ impl AppState {
         };
         for tab_idx in 0..ws.tabs.len() {
             let mut tab_row = multi_tab.then(|| self.navigator_tab_row(ws_idx, tab_idx));
+            let tab_attention = ws.tabs[tab_idx]
+                .attention_summary(&self.terminals, &self.delegations)
+                .descendant_attention_count();
             let tab_matches = tab_row.as_ref().is_some_and(|row| match query_kind {
                 NavigatorQueryKind::Empty => true,
                 NavigatorQueryKind::State(filter) => {
-                    navigator_state_filter_matches(filter, row.status, row.seen)
+                    navigator_attention_filter_matches(filter, row.status, row.seen, tab_attention)
                 }
                 NavigatorQueryKind::Text => navigator_matches(query, &row.search_text),
             });
@@ -667,8 +726,9 @@ impl AppState {
         let label = ws
             .tab_display_name(tab_idx)
             .unwrap_or_else(|| (tab_idx + 1).to_string());
-        let (status, seen) = tab_aggregate_state(tab, &self.terminals);
-        let activity = tab_activity_summary(tab, &self.terminals);
+        let attention = tab.attention_summary(&self.terminals, &self.delegations);
+        let (status, seen) = attention.display_state();
+        let activity = tab_activity_summary(tab, &self.terminals, &self.delegations);
         let pane_count = tab.panes.len();
         let meta = if activity.is_empty() {
             format!("{pane_count} panes")
@@ -683,6 +743,7 @@ impl AppState {
             meta,
             status,
             seen,
+            descendant_attention_count: attention.descendant_attention_count(),
             is_current: false,
             is_workspace: false,
             is_tab: true,
@@ -760,6 +821,7 @@ impl AppState {
                 meta,
                 status: state,
                 seen: pane.seen,
+                descendant_attention_count: 0,
                 is_current,
                 is_workspace: false,
                 is_tab: false,
@@ -1065,6 +1127,16 @@ fn navigator_query_kind(
     }
 }
 
+fn navigator_attention_filter_matches(
+    filter: NavigatorStateFilter,
+    state: AgentState,
+    seen: bool,
+    descendant_attention_count: usize,
+) -> bool {
+    (filter == NavigatorStateFilter::Done && descendant_attention_count > 0)
+        || navigator_state_filter_matches(filter, state, seen)
+}
+
 fn navigator_state_filter_matches(
     filter: NavigatorStateFilter,
     state: AgentState,
@@ -1102,45 +1174,19 @@ fn state_label_text(state: AgentState, seen: bool) -> &'static str {
     }
 }
 
-fn tab_aggregate_state(
-    tab: &crate::workspace::Tab,
-    terminals: &std::collections::HashMap<
-        crate::terminal::TerminalId,
-        crate::terminal::TerminalState,
-    >,
-) -> (AgentState, bool) {
-    let mut aggregate = AgentState::Unknown;
-    let mut seen = true;
-    for pane in tab.panes.values() {
-        let Some(terminal) = terminals.get(&pane.attached_terminal_id) else {
-            continue;
-        };
-        if state_priority(terminal.state, pane.seen) > state_priority(aggregate, seen) {
-            aggregate = terminal.state;
-            seen = pane.seen;
-        }
-    }
-    (aggregate, seen)
-}
-
-fn state_priority(state: AgentState, seen: bool) -> u8 {
-    match (state, seen) {
-        (AgentState::Blocked, _) => 5,
-        (AgentState::Working, _) => 4,
-        (AgentState::Idle, false) => 3,
-        (AgentState::Idle, true) => 2,
-        (AgentState::Unknown, _) => 1,
-    }
-}
-
 fn tab_activity_summary(
     tab: &crate::workspace::Tab,
     terminals: &std::collections::HashMap<
         crate::terminal::TerminalId,
         crate::terminal::TerminalState,
     >,
+    delegations: &crate::delegation::Delegations,
 ) -> String {
-    activity_summary_for_panes(tab.panes.values(), terminals)
+    activity_summary_for_panes(
+        tab.panes.iter().map(|(&pane_id, pane)| (pane_id, pane)),
+        terminals,
+        delegations,
+    )
 }
 
 fn workspace_activity_summary(
@@ -1149,21 +1195,43 @@ fn workspace_activity_summary(
         crate::terminal::TerminalId,
         crate::terminal::TerminalState,
     >,
+    delegations: &crate::delegation::Delegations,
 ) -> String {
-    activity_summary_for_panes(ws.tabs.iter().flat_map(|tab| tab.panes.values()), terminals)
+    activity_summary_for_panes(
+        ws.tabs
+            .iter()
+            .flat_map(|tab| tab.panes.iter().map(|(&pane_id, pane)| (pane_id, pane))),
+        terminals,
+        delegations,
+    )
 }
 
 fn activity_summary_for_panes<'a>(
-    panes: impl Iterator<Item = &'a crate::pane::PaneState>,
+    panes: impl Iterator<Item = (PaneId, &'a crate::pane::PaneState)>,
     terminals: &std::collections::HashMap<
         crate::terminal::TerminalId,
         crate::terminal::TerminalState,
     >,
+    delegations: &crate::delegation::Delegations,
 ) -> String {
+    let panes = panes.collect::<Vec<_>>();
+    let scope_panes = panes
+        .iter()
+        .map(|(pane_id, _)| *pane_id)
+        .collect::<std::collections::HashSet<_>>();
     let mut blocked = 0usize;
     let mut working = 0usize;
     let mut done = 0usize;
-    for pane in panes {
+    for (pane_id, pane) in panes {
+        let delegated_descendant = delegations
+            .delegation_for_pane(pane_id)
+            .and_then(|record| record.parent_id)
+            .and_then(|parent_id| delegations.get(parent_id))
+            .and_then(|parent| parent.pane_id)
+            .is_some_and(|parent_pane| scope_panes.contains(&parent_pane));
+        if delegated_descendant {
+            continue;
+        }
         let Some(terminal) = terminals.get(&pane.attached_terminal_id) else {
             continue;
         };
@@ -1246,6 +1314,9 @@ impl AppState {
                     .expire_agent_metadata_at(scheduled_deadline, now)?;
                 let change = mutation.effective_state_change?;
                 let seen = self.apply_pane_state_change(ws_idx, pane_id, &change)?;
+                if seen != previous_seen {
+                    self.mark_session_dirty();
+                }
                 let update = PaneStateUpdate {
                     pane_id,
                     ws_idx,
@@ -1361,6 +1432,21 @@ impl AppState {
     }
 
     pub(crate) fn pane_suppresses_notifications(&self, ws_idx: usize, pane_id: PaneId) -> bool {
+        let delegated_descendant = self
+            .delegations
+            .delegation_for_pane(pane_id)
+            .is_some_and(|record| record.parent_id.is_some());
+        let grouped = self.workspaces.get(ws_idx).is_some_and(|workspace| {
+            workspace.tabs.iter().any(|tab| {
+                matches!(
+                    tab.pane_placement(pane_id),
+                    Some(crate::layout::PanePlacement::Collection(_))
+                )
+            })
+        });
+        if delegated_descendant && !grouped {
+            return false;
+        }
         active_tab_suppresses_notifications(
             self.pane_is_foreground_visible(ws_idx, pane_id),
             self.outer_terminal_focus,
@@ -1554,27 +1640,69 @@ impl AppState {
         }
     }
 
-    pub(crate) fn mark_active_tab_seen(&mut self) -> bool {
+    pub(crate) fn mark_active_tab_workspace_primary_seen(&mut self) -> Vec<PaneId> {
+        let delegated_descendants = self
+            .active
+            .and_then(|ws_idx| self.workspaces.get(ws_idx))
+            .and_then(crate::workspace::Workspace::active_tab)
+            .map(|tab| {
+                tab.panes
+                    .keys()
+                    .copied()
+                    .filter(|pane_id| {
+                        self.delegations
+                            .delegation_for_pane(*pane_id)
+                            .is_some_and(|record| record.parent_id.is_some())
+                    })
+                    .collect::<std::collections::HashSet<_>>()
+            })
+            .unwrap_or_default();
+        self.mark_active_tab_seen_where(|pane_id| !delegated_descendants.contains(&pane_id))
+    }
+
+    pub(crate) fn mark_terminal_seen(
+        &mut self,
+        terminal_id: &crate::terminal::TerminalId,
+    ) -> Option<(usize, PaneId)> {
+        for (ws_idx, workspace) in self.workspaces.iter_mut().enumerate() {
+            for tab in &mut workspace.tabs {
+                if let Some((&pane_id, pane)) = tab
+                    .panes
+                    .iter_mut()
+                    .find(|(_, pane)| &pane.attached_terminal_id == terminal_id)
+                {
+                    if pane.seen {
+                        return None;
+                    }
+                    pane.seen = true;
+                    return Some((ws_idx, pane_id));
+                }
+            }
+        }
+        None
+    }
+
+    fn mark_active_tab_seen_where(&mut self, include: impl Fn(PaneId) -> bool) -> Vec<PaneId> {
         let Some(ws_idx) = self.active else {
-            return false;
+            return Vec::new();
         };
         let Some(tab) = self
             .workspaces
             .get_mut(ws_idx)
             .and_then(crate::workspace::Workspace::active_tab_mut)
         else {
-            return false;
+            return Vec::new();
         };
 
         let visible_tiled: std::collections::HashSet<_> =
             tab.layout.tiled_pane_ids().into_iter().collect();
-        let mut changed = false;
+        let mut changed = Vec::new();
         for (pane_id, pane) in &mut tab.panes {
             // Collection membership is not visibility. A grouped child is acknowledged only by
             // the explicit foreground-human terminal-entry action.
-            if visible_tiled.contains(pane_id) && !pane.seen {
+            if visible_tiled.contains(pane_id) && include(*pane_id) && !pane.seen {
                 pane.seen = true;
-                changed = true;
+                changed.push(*pane_id);
             }
         }
         changed
@@ -3499,6 +3627,9 @@ impl AppState {
             }
         }
         let seen = self.apply_pane_state_change(ws_idx, pane_id, &change)?;
+        if seen != previous_seen {
+            self.mark_session_dirty();
+        }
         let update = PaneStateUpdate {
             pane_id,
             ws_idx,
@@ -5257,14 +5388,66 @@ mod tests {
     }
 
     #[test]
-    fn switch_workspace_marks_panes_seen() {
+    fn state_only_workspace_switch_does_not_acknowledge_panes() {
         let mut state = app_with_workspaces(&["a", "b"]);
-        // Mark a pane in workspace 1 as unseen
         let id = *state.workspaces[1].panes.keys().next().unwrap();
         state.workspaces[1].panes.get_mut(&id).unwrap().seen = false;
 
         state.switch_workspace(1);
-        assert!(state.workspaces[1].panes.get(&id).unwrap().seen);
+        assert!(!state.workspaces[1].panes.get(&id).unwrap().seen);
+    }
+
+    #[test]
+    fn primary_acknowledgement_preserves_delegated_completion() {
+        let mut state = app_with_workspaces(&["one"]);
+        let root = state.workspaces[0].tabs[0].root_pane.unwrap();
+        let child = state.workspaces[0].test_split(ratatui::layout::Direction::Horizontal);
+        state.workspaces[0].tabs[0]
+            .panes
+            .get_mut(&root)
+            .unwrap()
+            .seen = false;
+        state.workspaces[0].tabs[0]
+            .panes
+            .get_mut(&child)
+            .unwrap()
+            .seen = false;
+        let parent = state.delegations.create(Some(root), None, None).unwrap();
+        state
+            .delegations
+            .create(Some(child), Some(parent), Some("review".into()))
+            .unwrap();
+
+        let acknowledged = state.mark_active_tab_workspace_primary_seen();
+
+        assert_eq!(acknowledged, vec![root]);
+        assert!(state.workspaces[0].tabs[0].panes[&root].seen);
+        assert!(!state.workspaces[0].tabs[0].panes[&child].seen);
+    }
+
+    #[test]
+    fn passive_focus_preserves_delegated_completion_across_tabs() {
+        let mut state = app_with_workspaces(&["one"]);
+        let parent_pane = state.workspaces[0].tabs[0].root_pane.unwrap();
+        let child_tab = state.workspaces[0].test_add_tab(Some("child"));
+        let child_pane = state.workspaces[0].tabs[child_tab].root_pane.unwrap();
+        let parent = state
+            .delegations
+            .create(Some(parent_pane), None, None)
+            .unwrap();
+        state
+            .delegations
+            .create(Some(child_pane), Some(parent), Some("review".into()))
+            .unwrap();
+        state.workspaces[0].switch_tab(child_tab);
+        state.workspaces[0].tabs[child_tab]
+            .panes
+            .get_mut(&child_pane)
+            .unwrap()
+            .seen = false;
+
+        assert!(state.mark_active_tab_workspace_primary_seen().is_empty());
+        assert!(!state.workspaces[0].tabs[child_tab].panes[&child_pane].seen);
     }
 
     #[test]
@@ -5681,6 +5864,7 @@ mod tests {
             .attached_terminal_id
             .clone();
         state.terminals.get_mut(&bg_terminal_id).unwrap().state = AgentState::Working;
+        state.session_dirty = false;
 
         // Now transition to Idle while in background
         state.handle_app_event(AppEvent::StateChanged {
@@ -5695,6 +5879,7 @@ mod tests {
 
         let pane = state.workspaces[1].panes.get(&bg_pane_id).unwrap();
         assert!(!pane.seen);
+        assert!(state.session_dirty);
         assert!(matches!(
             state.toast.as_ref().map(|toast| toast.kind),
             Some(ToastKind::Finished)
@@ -5730,6 +5915,38 @@ mod tests {
         assert_eq!(terminal.state, AgentState::Idle);
         let pane = state.workspaces[0].panes.get(&pane_id).unwrap();
         assert!(pane.seen);
+    }
+
+    #[test]
+    fn active_tiled_delegated_completion_stays_unseen_until_terminal_input() {
+        let mut state = app_with_workspaces(&["active"]);
+        state.active = Some(0);
+        state.outer_terminal_focus = Some(true);
+        let root = state.workspaces[0].tabs[0].root_pane.unwrap();
+        let child = state.workspaces[0].test_split(ratatui::layout::Direction::Horizontal);
+        state.ensure_test_terminals();
+        let terminal_id = state.workspaces[0].tabs[0].panes[&child]
+            .attached_terminal_id
+            .clone();
+        state.terminals.get_mut(&terminal_id).unwrap().state = AgentState::Working;
+        let parent = state.delegations.create(Some(root), None, None).unwrap();
+        state
+            .delegations
+            .create(Some(child), Some(parent), Some("review".into()))
+            .unwrap();
+
+        state.handle_app_event(AppEvent::StateChanged {
+            pane_id: child,
+            agent: Some(Agent::Pi),
+            state: AgentState::Idle,
+            visible_blocker: false,
+            visible_working: false,
+            process_exited: false,
+            observed_at: std::time::Instant::now(),
+        });
+
+        assert!(!state.workspaces[0].tabs[0].panes[&child].seen);
+        assert!(!state.pane_suppresses_notifications(0, child));
     }
 
     #[test]

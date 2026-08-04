@@ -2800,6 +2800,34 @@ fn process_owned_integration_assets_do_not_report_release() {
 }
 
 #[test]
+fn pi_ask_user_question_reports_blocked_until_tool_finishes() {
+    let start = PI_EXTENSION_ASSET
+        .find("pi.on(\"tool_execution_start\"")
+        .expect("pi extension should observe tool starts");
+    let start_handler = &PI_EXTENSION_ASSET[start..];
+    start_handler
+        .find("event?.toolName !== \"ask_user_question\"")
+        .expect("only ask_user_question should block on tool start");
+    start_handler
+        .find("activateBlocked(\"Waiting for user response\");")
+        .expect("ask_user_question start should block the pane");
+
+    let end = PI_EXTENSION_ASSET
+        .find("pi.on(\"tool_execution_end\"")
+        .expect("pi extension should observe tool completion");
+    let end_handler = &PI_EXTENSION_ASSET[end..];
+    end_handler
+        .find("event?.toolName !== \"ask_user_question\"")
+        .expect("only ask_user_question should unblock on tool completion");
+    end_handler
+        .find("blockingToolCalls.delete(toolCallId)")
+        .expect("tool completion should match the original blocking call");
+    end_handler
+        .find("deactivateBlocked();")
+        .expect("ask_user_question completion should unblock the pane");
+}
+
+#[test]
 fn pi_extension_refreshes_session_ref_before_agent_start_state() {
     let agent_start = PI_EXTENSION_ASSET
         .find("pi.on(\"agent_start\", (_event, ctx)")

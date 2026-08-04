@@ -19,17 +19,17 @@ impl App {
                     .find(|workspace| &workspace.id == id)
             })
             .collect::<Vec<_>>();
-        let (state, seen) = members
-            .iter()
-            .map(|workspace| workspace.aggregate_state(&self.state.terminals))
-            .max_by_key(|(state, seen)| match (state, seen) {
-                (crate::detect::AgentState::Blocked, _) => 4,
-                (crate::detect::AgentState::Idle, false) => 3,
-                (crate::detect::AgentState::Working, _) => 2,
-                (crate::detect::AgentState::Idle, true) => 1,
-                (crate::detect::AgentState::Unknown, _) => 0,
-            })
-            .unwrap_or((crate::detect::AgentState::Unknown, true));
+        let attention = crate::workspace::AttentionSummary::for_panes(
+            members.iter().flat_map(|workspace| {
+                workspace
+                    .tabs
+                    .iter()
+                    .flat_map(|tab| tab.panes.iter().map(|(&pane_id, pane)| (pane_id, pane)))
+            }),
+            &self.state.terminals,
+            &self.state.delegations,
+        );
+        let (state, seen) = attention.display_state();
         let pane_count = members
             .iter()
             .map(|workspace| workspace.public_pane_numbers.len())
@@ -64,6 +64,7 @@ impl App {
             pane_count,
             active_agent_count,
             agent_status: super::super::api_helpers::pane_agent_status(state, seen),
+            descendant_attention_count: attention.descendant_attention_count(),
         })
     }
 

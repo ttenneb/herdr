@@ -12,6 +12,7 @@ use crate::{
     app::state::{CopyFeedback, Palette, ToastKind, ToastNotification},
     config::{ToastClipboardPosition, ToastHerdrPosition},
     detect::AgentState,
+    workspace::AttentionSummary,
 };
 
 pub(crate) fn copy_feedback_rect(
@@ -203,6 +204,32 @@ pub(super) fn state_dot(state: AgentState, seen: bool, p: &Palette) -> (&'static
     }
 }
 
+pub(super) fn descendant_attention_badge(
+    summary: AttentionSummary,
+    p: &Palette,
+) -> Option<(String, Style)> {
+    descendant_attention_badge_for_count(summary.descendant_attention_count(), p)
+}
+
+pub(super) fn descendant_attention_badge_for_count(
+    count: usize,
+    p: &Palette,
+) -> Option<(String, Style)> {
+    if count == 0 {
+        return None;
+    }
+    let color = p.teal;
+    let label = if count == 1 {
+        "•".to_string()
+    } else {
+        format!("•{count}")
+    };
+    Some((
+        label,
+        Style::default().fg(color).add_modifier(Modifier::BOLD),
+    ))
+}
+
 pub(super) fn state_label(state: AgentState, seen: bool) -> &'static str {
     match (state, seen) {
         (AgentState::Blocked, _) => "blocked",
@@ -301,6 +328,22 @@ mod tests {
             display_width_u16(&toast.title).max(display_width_u16(&toast.context)) + 6;
         assert_eq!(rect.width, expected_content_width);
         assert_eq!(rect.x + rect.width, area.x + area.width);
+    }
+
+    #[test]
+    fn descendant_attention_badge_compacts_counts() {
+        let palette = Palette::catppuccin();
+        assert!(descendant_attention_badge_for_count(0, &palette).is_none());
+        assert_eq!(
+            descendant_attention_badge_for_count(1, &palette).unwrap().0,
+            "•"
+        );
+        assert_eq!(
+            descendant_attention_badge_for_count(12, &palette)
+                .unwrap()
+                .0,
+            "•12"
+        );
     }
 
     #[test]

@@ -724,27 +724,7 @@ impl App {
                             },
                         });
                     }
-                    for (delegation_id, pane_id) in destruction.tombstoned_delegations {
-                        let public_pane_id = public_members
-                            .iter()
-                            .find_map(|(pane, public)| (*pane == pane_id).then(|| public.clone()))
-                            .unwrap_or_default();
-                        self.emit_event(EventEnvelope {
-                            event: EventKind::DelegationTombstoned,
-                            data: EventData::DelegationTombstoned {
-                                delegation_id: delegation_id.to_string(),
-                                pane_id: public_pane_id,
-                            },
-                        });
-                    }
-                    for delegation_id in destruction.garbage_collected_delegations {
-                        self.emit_event(EventEnvelope {
-                            event: EventKind::DelegationGarbageCollected,
-                            data: EventData::DelegationGarbageCollected {
-                                delegation_id: delegation_id.to_string(),
-                            },
-                        });
-                    }
+                    let affected = self.emit_pane_destruction_events(destruction, &public_members);
                     if outcome.removed_tab_idx.is_some() {
                         layout_update_tab_idx = None;
                         self.emit_event(EventEnvelope {
@@ -764,6 +744,7 @@ impl App {
                             },
                         });
                     }
+                    self.emit_workspace_attention_updates(affected);
                 }
                 CollectionCloseDisposition::PromoteMembers => {
                     if params.target_pane_id.is_some() {
@@ -1289,7 +1270,7 @@ fn collection_not_found(id: String, collection_id: &str) -> String {
 mod tests {
     use super::*;
     use crate::api::schema::{Method, Request};
-    use crate::{config::Config, workspace::Workspace};
+    use crate::{config::Config, detect::AgentState, workspace::Workspace};
 
     fn app_with_panes() -> (
         App,
@@ -2647,6 +2628,63 @@ mod tests {
         assert!(events
             .iter()
             .any(|(_, event)| event.event == EventKind::CollectionClosed));
+    }
+
+    #[test]
+    fn cascading_delegation_parent_emits_surviving_child_workspace_attention() {
+        let (mut app, root, child, _) = app_with_panes();
+        let collection_id = create_collection(&mut app, root);
+        let root_id = app.public_pane_id(0, root).expect("public root");
+        let added = request(
+            &mut app,
+            Method::CollectionAdd(CollectionAddParams {
+                collection_id: collection_id.clone(),
+                pane_id: root_id,
+            }),
+        );
+        assert!(added.get("error").is_none(), "{added}");
+        let child_terminal = app.state.workspaces[0].tabs[0].panes[&child]
+            .attached_terminal_id
+            .clone();
+        app.state.terminals.get_mut(&child_terminal).unwrap().state = AgentState::Idle;
+        app.state.workspaces[0].tabs[0]
+            .panes
+            .get_mut(&child)
+            .unwrap()
+            .seen = false;
+        let parent = app
+            .state
+            .delegations
+            .create(Some(root), None, None)
+            .unwrap();
+        app.state
+            .delegations
+            .create(Some(child), Some(parent), Some("review".into()))
+            .unwrap();
+        assert_eq!(app.workspace_info(0).descendant_attention_count, 1);
+        let sequence = app.event_hub.current_sequence();
+
+        let closed = request(
+            &mut app,
+            Method::CollectionClose(CollectionCloseParams {
+                collection_id,
+                disposition: Some(CollectionCloseDisposition::CascadeClose),
+                target_pane_id: None,
+                focus_promoted: false,
+            }),
+        );
+
+        assert_eq!(closed["result"]["type"], "ok");
+        let updated = app
+            .event_hub
+            .events_after(sequence)
+            .into_iter()
+            .find_map(|(_, event)| match event.data {
+                EventData::WorkspaceUpdated { workspace } => Some(workspace),
+                _ => None,
+            })
+            .expect("workspace attention update");
+        assert_eq!(updated.descendant_attention_count, 0);
     }
 
     #[test]

@@ -92,6 +92,9 @@ pub struct WorkspaceInfo {
     pub tab_count: usize,
     pub active_tab_id: String,
     pub agent_status: AgentStatus,
+    /// Completed delegated descendants that have not been explicitly acknowledged.
+    #[serde(default)]
+    pub descendant_attention_count: usize,
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     #[schemars(schema_with = "super::common::metadata_token_values_schema")]
     pub tokens: HashMap<String, String>,

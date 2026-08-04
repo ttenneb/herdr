@@ -13,6 +13,7 @@ use crate::pane::{PaneLaunchEnv, PaneState};
 use crate::terminal::{TerminalId, TerminalRuntime, TerminalRuntimeRegistry, TerminalState};
 
 mod aggregate;
+pub(crate) use aggregate::AttentionSummary;
 mod git;
 mod tab;
 
@@ -503,16 +504,6 @@ impl Workspace {
     pub fn switch_tab(&mut self, idx: usize) {
         if idx < self.tabs.len() {
             self.active_tab = idx;
-            if let Some(tab) = self.tabs.get_mut(idx) {
-                let visible_tiled: std::collections::HashSet<_> =
-                    tab.layout.tiled_pane_ids().into_iter().collect();
-                for (pane_id, pane) in &mut tab.panes {
-                    // Grouped children require explicit foreground terminal entry.
-                    if visible_tiled.contains(pane_id) {
-                        pane.seen = true;
-                    }
-                }
-            }
         }
     }
 

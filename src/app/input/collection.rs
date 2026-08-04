@@ -637,6 +637,7 @@ impl App {
             .enter_collection_terminal_from_foreground(ws_idx, collection_id, pane)
         {
             self.state.mark_session_dirty();
+            self.emit_pane_acknowledged(ws_idx, pane);
             self.schedule_session_save();
         }
     }

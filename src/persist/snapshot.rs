@@ -142,9 +142,15 @@ pub enum LayoutLeafSnapshot {
     Collection(crate::layout::CollectionId),
 }
 
+fn default_pane_seen() -> bool {
+    true
+}
+
 #[derive(Serialize, Deserialize)]
 pub struct PaneSnapshot {
     pub cwd: PathBuf,
+    #[serde(default = "default_pane_seen")]
+    pub seen: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub label: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -479,14 +485,11 @@ fn capture_tab(
     terminal_runtimes: &TerminalRuntimeRegistry,
 ) -> TabSnapshot {
     let mut panes = HashMap::new();
-    for id in tab.panes.keys() {
+    for (id, pane) in &tab.panes {
         let cwd = tab
             .cwd_for_pane(*id, terminals, terminal_runtimes)
             .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| "/".into()));
-        let terminal = tab
-            .panes
-            .get(id)
-            .and_then(|pane| terminals.get(&pane.attached_terminal_id));
+        let terminal = terminals.get(&pane.attached_terminal_id);
         let label = terminal.and_then(|terminal| terminal.manual_label.clone());
         let (agent_name, managed_agent_kind) = terminal
             .filter(|terminal| !terminal.managed_agent_launch_pending())
@@ -525,6 +528,7 @@ fn capture_tab(
             id.raw(),
             PaneSnapshot {
                 cwd,
+                seen: pane.seen,
                 label,
                 agent_name,
                 managed_agent_kind,
@@ -969,6 +973,7 @@ mod tests {
             0,
             PaneSnapshot {
                 cwd: PathBuf::from("/home/can/Projects/herdr"),
+                seen: true,
                 label: None,
                 agent_name: None,
                 managed_agent_kind: None,
@@ -980,6 +985,7 @@ mod tests {
             1,
             PaneSnapshot {
                 cwd: PathBuf::from("/home/can/Projects/website"),
+                seen: false,
                 label: Some("website".into()),
                 agent_name: None,
                 managed_agent_kind: None,
@@ -1049,8 +1055,15 @@ mod tests {
             restored.workspaces[0].tabs[0].panes[&1].label.as_deref(),
             Some("website")
         );
+        assert!(!restored.workspaces[0].tabs[0].panes[&1].seen);
         assert_eq!(restored.sidebar_width, Some(26));
         assert_eq!(restored.sidebar_section_split, Some(0.5));
+    }
+
+    #[test]
+    fn legacy_pane_snapshot_defaults_to_seen() {
+        let pane: PaneSnapshot = serde_json::from_str(r#"{"cwd":"/tmp"}"#).unwrap();
+        assert!(pane.seen);
     }
 
     #[test]
@@ -1658,6 +1671,7 @@ mod tests {
             0,
             PaneSnapshot {
                 cwd: PathBuf::from("/tmp/this-directory-does-not-exist-for-herdr-test"),
+                seen: true,
                 label: None,
                 agent_name: None,
                 managed_agent_kind: None,
@@ -1671,6 +1685,7 @@ mod tests {
                 cwd: std::env::var("HOME")
                     .map(PathBuf::from)
                     .unwrap_or_else(|_| PathBuf::from("/tmp")),
+                seen: true,
                 label: None,
                 agent_name: None,
                 managed_agent_kind: None,

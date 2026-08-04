@@ -481,7 +481,7 @@ impl App {
             .iter()
             .map(|(pane, public, _)| (*pane, public.clone()))
             .collect::<Vec<_>>();
-        self.emit_pane_destruction_events(destruction, &public_pairs);
+        let affected = self.emit_pane_destruction_events(destruction, &public_pairs);
         for (workspace_id, tab_id) in closed_tabs {
             self.emit_event(EventEnvelope {
                 event: EventKind::TabClosed,
@@ -510,6 +510,7 @@ impl App {
                 },
             });
         }
+        self.emit_workspace_attention_updates(affected);
     }
 
     /// Close a worktree group for the tab/pane implicit-close paths. Workspace/Checkout close
@@ -625,7 +626,7 @@ impl App {
             .iter()
             .map(|(pane, public, _)| (*pane, public.clone()))
             .collect::<Vec<_>>();
-        self.emit_pane_destruction_events(destruction, &public_pairs);
+        let affected = self.emit_pane_destruction_events(destruction, &public_pairs);
         for (workspace_id, tab_id) in closed_tabs {
             self.emit_event(EventEnvelope {
                 event: EventKind::TabClosed,
@@ -652,6 +653,7 @@ impl App {
                 });
             }
         }
+        self.emit_workspace_attention_updates(affected);
     }
 
     fn workspace_list_info(&self) -> Vec<crate::api::schema::WorkspaceInfo> {
