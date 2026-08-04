@@ -1777,6 +1777,8 @@ impl App {
                     workspace_id: workspace_id.clone(),
                 },
             });
+            let affected = self
+                .emit_pane_destruction_events(destruction, &[(pane_id, public_pane_id.clone())]);
             self.emit_event(EventEnvelope {
                 event: EventKind::WorkspaceClosed,
                 data: EventData::WorkspaceClosed {
@@ -1784,6 +1786,7 @@ impl App {
                     workspace: Some(workspace_snapshot),
                 },
             });
+            self.emit_workspace_attention_updates(affected);
         } else {
             self.state.remove_unattached_terminal_ids(terminal_id);
             self.shutdown_detached_terminal_runtimes();
@@ -1795,12 +1798,13 @@ impl App {
                     workspace_id,
                 },
             });
+            let affected =
+                self.emit_pane_destruction_events(destruction, &[(pane_id, public_pane_id)]);
             if let Some((ws_idx, tab_idx)) = layout_update_target {
                 self.emit_layout_updated_event(ws_idx, tab_idx);
             }
+            self.emit_workspace_attention_updates(affected);
         }
-
-        self.emit_pane_destruction_events(destruction, &[(pane_id, public_pane_id)]);
 
         Ok(())
     }
@@ -1809,13 +1813,13 @@ impl App {
         &mut self,
         destruction: crate::app::actions::PaneDestructionSummary,
         public_panes: &[(PaneId, String)],
-    ) {
+    ) -> Vec<usize> {
         let tombstoned_ids = destruction
             .tombstoned_delegations
             .iter()
             .map(|(delegation_id, _)| *delegation_id)
             .collect::<std::collections::HashSet<_>>();
-        let affected_workspace_indices = self
+        let mut affected_workspace_indices = self
             .state
             .delegations
             .records()
@@ -1833,6 +1837,12 @@ impl App {
                     .position(|workspace| workspace.pane_state(pane_id).is_some())
             })
             .collect::<std::collections::HashSet<_>>();
+        if !tombstoned_ids.is_empty() {
+            affected_workspace_indices.extend(public_panes.iter().filter_map(|(_, public_id)| {
+                let (workspace_id, _) = public_id.rsplit_once(":p")?;
+                self.parse_workspace_id(workspace_id)
+            }));
+        }
         for (delegation_id, pane_id) in destruction.tombstoned_delegations {
             self.emit_event(EventEnvelope {
                 event: EventKind::DelegationTombstoned,
@@ -1853,9 +1863,10 @@ impl App {
                 },
             });
         }
-        for ws_idx in affected_workspace_indices {
-            self.emit_workspace_attention_updated(ws_idx);
-        }
+        let mut affected_workspace_indices =
+            affected_workspace_indices.into_iter().collect::<Vec<_>>();
+        affected_workspace_indices.sort_unstable();
+        affected_workspace_indices
     }
 
     pub(super) fn handle_pane_send_keys(
@@ -2545,6 +2556,57 @@ mod tests {
         assert_eq!(success.id, "req");
         assert_eq!(app.state.request_remove_linked_worktree, None);
         assert!(app.state.workspaces.is_empty());
+    }
+
+    #[test]
+    fn closing_unread_delegated_pane_emits_updated_workspace_attention() {
+        let event_hub = crate::api::EventHub::default();
+        let (_api_tx, api_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = App::new(&Config::default(), true, None, api_rx, event_hub.clone());
+        let mut workspace = Workspace::test_new("delegated-close");
+        let root = workspace.tabs[0].root_pane.expect("root pane");
+        let child = workspace.test_split(ratatui::layout::Direction::Horizontal);
+        app.state.workspaces = vec![workspace];
+        app.state.ensure_test_terminals();
+        let child_terminal = app.state.workspaces[0].tabs[0].panes[&child]
+            .attached_terminal_id
+            .clone();
+        app.state.terminals.get_mut(&child_terminal).unwrap().state = AgentState::Idle;
+        app.state.workspaces[0].tabs[0]
+            .panes
+            .get_mut(&child)
+            .unwrap()
+            .seen = false;
+        let root_delegation = app
+            .state
+            .delegations
+            .create(Some(root), None, None)
+            .unwrap();
+        app.state
+            .delegations
+            .create(Some(child), Some(root_delegation), Some("review".into()))
+            .unwrap();
+        assert_eq!(app.workspace_info(0).descendant_attention_count, 1);
+        let public_child = app.public_pane_id(0, child).unwrap();
+        let sequence = event_hub.current_sequence();
+
+        let response = app.handle_pane_close(
+            "req".into(),
+            PaneTarget {
+                pane_id: public_child,
+            },
+        );
+
+        let _: SuccessResponse = serde_json::from_str(&response).unwrap();
+        let updated = event_hub
+            .events_after(sequence)
+            .into_iter()
+            .find_map(|(_, event)| match event.data {
+                EventData::WorkspaceUpdated { workspace } => Some(workspace),
+                _ => None,
+            })
+            .expect("workspace attention update");
+        assert_eq!(updated.descendant_attention_count, 0);
     }
 
     #[test]

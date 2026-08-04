@@ -47,6 +47,10 @@ pub(super) enum MouseAction {
         ws_idx: usize,
         pane_id: crate::layout::PaneId,
     },
+    DeliveredTerminalMouse {
+        ws_idx: usize,
+        pane_id: crate::layout::PaneId,
+    },
     FocusToastTarget,
     MoveWorkspace {
         source_ws_idx: usize,
@@ -91,9 +95,9 @@ impl AppState {
         &mut self,
         terminal_runtimes: &TerminalRuntimeRegistry,
         mouse: MouseEvent,
-    ) {
+    ) -> Option<crate::terminal::TerminalId> {
         if self.mode != Mode::Terminal || !self.focused_collection_terminal_entered() {
-            return;
+            return None;
         }
         let target = self
             .pane_at(mouse.column, mouse.row)
@@ -132,24 +136,28 @@ impl AppState {
                     )
                 })
             });
-        let Some((info, mouse)) = target else {
-            return;
-        };
+        let (info, mouse) = target?;
 
-        match mouse.kind {
+        let delivered = match mouse.kind {
             MouseEventKind::ScrollUp
             | MouseEventKind::ScrollDown
             | MouseEventKind::ScrollLeft
             | MouseEventKind::ScrollRight => {
-                self.forward_pane_reported_wheel(terminal_runtimes, &info, mouse);
+                self.forward_pane_reported_wheel(terminal_runtimes, &info, mouse)
             }
             MouseEventKind::Down(_) | MouseEventKind::Up(_) | MouseEventKind::Drag(_) => {
-                self.forward_pane_mouse_button(terminal_runtimes, &info, mouse);
+                self.forward_pane_mouse_button(terminal_runtimes, &info, mouse)
             }
             MouseEventKind::Moved => {
-                self.forward_pane_mouse_motion(terminal_runtimes, &info, mouse);
+                self.forward_pane_mouse_motion(terminal_runtimes, &info, mouse)
             }
-        }
+        };
+        delivered
+            .then(|| {
+                self.active
+                    .and_then(|ws_idx| self.terminal_id_for_pane(ws_idx, info.id))
+            })
+            .flatten()
     }
 
     pub(super) fn handle_mouse(
@@ -760,7 +768,12 @@ impl AppState {
                     if self.forward_pane_mouse_button(terminal_runtimes, &info, mouse) {
                         self.selection = None;
                         self.selection_autoscroll = None;
-                        return self.mouse_pane_focus_action(info.id);
+                        return self
+                            .active
+                            .map(|ws_idx| MouseAction::DeliveredTerminalMouse {
+                                ws_idx,
+                                pane_id: info.id,
+                            });
                     }
 
                     let (row, col) = (
@@ -1174,14 +1187,25 @@ impl AppState {
             MouseEventKind::ScrollUp | MouseEventKind::ScrollDown if !in_sidebar => {
                 self.selection = None;
                 self.selection_autoscroll = None;
-                self.handle_terminal_wheel(terminal_runtimes, mouse);
+                if let Some(pane_id) = self.handle_terminal_wheel(terminal_runtimes, mouse) {
+                    return self
+                        .active
+                        .map(|ws_idx| MouseAction::DeliveredTerminalMouse { ws_idx, pane_id });
+                }
             }
 
             MouseEventKind::ScrollLeft | MouseEventKind::ScrollRight
                 if self.mode == Mode::Terminal && !in_sidebar =>
             {
                 if let Some(info) = self.pane_at(mouse.column, mouse.row).cloned() {
-                    self.forward_pane_reported_wheel(terminal_runtimes, &info, mouse);
+                    if self.forward_pane_reported_wheel(terminal_runtimes, &info, mouse) {
+                        return self
+                            .active
+                            .map(|ws_idx| MouseAction::DeliveredTerminalMouse {
+                                ws_idx,
+                                pane_id: info.id,
+                            });
+                    }
                 }
             }
 
@@ -1239,7 +1263,14 @@ impl AppState {
 
             MouseEventKind::Moved if self.mode == Mode::Terminal && !in_sidebar => {
                 if let Some(info) = self.pane_at(mouse.column, mouse.row).cloned() {
-                    let _ = self.forward_pane_mouse_motion(terminal_runtimes, &info, mouse);
+                    if self.forward_pane_mouse_motion(terminal_runtimes, &info, mouse) {
+                        return self
+                            .active
+                            .map(|ws_idx| MouseAction::DeliveredTerminalMouse {
+                                ws_idx,
+                                pane_id: info.id,
+                            });
+                    }
                 }
             }
 
@@ -1932,13 +1963,13 @@ impl AppState {
         &mut self,
         terminal_runtimes: &TerminalRuntimeRegistry,
         mouse: MouseEvent,
-    ) {
+    ) -> Option<crate::layout::PaneId> {
         let lines_per_notch = self.mouse_scroll_lines;
 
         if let Some(info) = self.pane_at(mouse.column, mouse.row).cloned() {
             self.focus_pane(info.id);
             if self.forward_pane_wheel(terminal_runtimes, &info, mouse) {
-                return;
+                return Some(info.id);
             }
             match mouse.kind {
                 MouseEventKind::ScrollUp => {
@@ -1949,7 +1980,7 @@ impl AppState {
                 }
                 _ => {}
             }
-            return;
+            return None;
         }
 
         if let Some(info) = self.pane_frame_at(mouse.column, mouse.row).cloned() {
@@ -1963,7 +1994,7 @@ impl AppState {
                 }
                 _ => {}
             }
-            return;
+            return None;
         }
 
         if let Some(ws_idx) = self.active {
@@ -1975,6 +2006,7 @@ impl AppState {
                 }
             }
         }
+        None
     }
 
     pub(super) fn forward_pane_mouse_button(
@@ -1996,10 +2028,13 @@ impl AppState {
             return false;
         };
         rt.scroll_reset();
-        if let Err(err) = rt.try_send_bytes(Bytes::from(bytes)) {
-            warn!(pane = info.id.raw(), err = %err, kind = ?mouse.kind, "failed to forward mouse button event");
+        match rt.try_send_bytes(Bytes::from(bytes)) {
+            Ok(()) => true,
+            Err(err) => {
+                warn!(pane = info.id.raw(), err = %err, kind = ?mouse.kind, "failed to forward mouse button event");
+                false
+            }
         }
-        true
     }
 
     pub(super) fn forward_pane_mouse_motion(
@@ -2020,10 +2055,13 @@ impl AppState {
         let Some(bytes) = rt.encode_mouse_motion(mouse.kind, column, row, mouse.modifiers) else {
             return false;
         };
-        if let Err(err) = rt.try_send_bytes(Bytes::from(bytes)) {
-            warn!(pane = info.id.raw(), err = %err, kind = ?mouse.kind, "failed to forward mouse motion event");
+        match rt.try_send_bytes(Bytes::from(bytes)) {
+            Ok(()) => true,
+            Err(err) => {
+                warn!(pane = info.id.raw(), err = %err, kind = ?mouse.kind, "failed to forward mouse motion event");
+                false
+            }
         }
-        true
     }
 
     pub(super) fn forward_pane_reported_wheel(
@@ -2047,12 +2085,15 @@ impl AppState {
         let row = mouse.row.saturating_sub(info.inner_rect.y);
         let Some(bytes) = rt.encode_mouse_wheel(mouse.kind, column, row, mouse.modifiers) else {
             warn!(pane = info.id.raw(), kind = ?mouse.kind, "failed to encode mouse wheel event");
-            return true;
+            return false;
         };
-        if let Err(err) = rt.try_send_bytes(Bytes::from(bytes)) {
-            warn!(pane = info.id.raw(), err = %err, "failed to forward mouse wheel event");
+        match rt.try_send_bytes(Bytes::from(bytes)) {
+            Ok(()) => true,
+            Err(err) => {
+                warn!(pane = info.id.raw(), err = %err, "failed to forward mouse wheel event");
+                false
+            }
         }
-        true
     }
 
     pub(super) fn forward_pane_wheel(
@@ -2077,22 +2118,28 @@ impl AppState {
                 let Some(bytes) = rt.encode_mouse_wheel(mouse.kind, column, row, mouse.modifiers)
                 else {
                     warn!(pane = info.id.raw(), kind = ?mouse.kind, "failed to encode mouse wheel event");
-                    return true;
+                    return false;
                 };
-                if let Err(err) = rt.try_send_bytes(Bytes::from(bytes)) {
-                    warn!(pane = info.id.raw(), err = %err, "failed to forward mouse wheel event");
+                match rt.try_send_bytes(Bytes::from(bytes)) {
+                    Ok(()) => true,
+                    Err(err) => {
+                        warn!(pane = info.id.raw(), err = %err, "failed to forward mouse wheel event");
+                        false
+                    }
                 }
-                true
             }
             Some(crate::pane::WheelRouting::AlternateScroll) => {
                 rt.scroll_reset();
                 let Some(bytes) = rt.encode_alternate_scroll(mouse.kind) else {
-                    return true;
+                    return false;
                 };
-                if let Err(err) = rt.try_send_bytes(Bytes::from(bytes)) {
-                    warn!(pane = info.id.raw(), err = %err, "failed to forward alternate-scroll key");
+                match rt.try_send_bytes(Bytes::from(bytes)) {
+                    Ok(()) => true,
+                    Err(err) => {
+                        warn!(pane = info.id.raw(), err = %err, "failed to forward alternate-scroll key");
+                        false
+                    }
                 }
-                true
             }
         }
     }

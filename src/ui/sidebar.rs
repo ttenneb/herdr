@@ -1197,15 +1197,35 @@ pub(super) fn render_sidebar_collapsed(app: &AppState, frame: &mut Frame, area: 
         }
 
         let badge = descendant_attention_badge(attention, p);
+        let compact_attention = match attention.descendant_attention_count() {
+            0 => None,
+            1 => Some("•".to_string()),
+            count @ 2..=9 => Some(count.to_string()),
+            _ => Some("+".to_string()),
+        };
+        let ordinal = format!("{}", visible_idx + 1);
         let separator = badge
             .as_ref()
-            .map(|(_, style)| Span::styled("•", *style))
+            .zip(compact_attention)
+            .map(|((_, style), label)| Span::styled(label, *style))
             .unwrap_or_else(|| Span::styled(" ", row_style));
-        let status = vec![
-            Span::styled(format!("{}", visible_idx + 1), num_style),
-            separator,
-            Span::styled(icon, icon_style),
-        ];
+        let status = if display_width(&ordinal) + 2 <= usize::from(ws_area.width) {
+            vec![
+                Span::styled(ordinal, num_style),
+                separator,
+                Span::styled(icon, icon_style),
+            ]
+        } else {
+            let icon_style = if badge.is_some() {
+                icon_style.add_modifier(Modifier::BOLD | Modifier::UNDERLINED)
+            } else {
+                icon_style
+            };
+            vec![
+                Span::styled(ordinal, num_style),
+                Span::styled(icon, icon_style),
+            ]
+        };
         frame.render_widget(
             Paragraph::new(Line::from(status)),
             Rect::new(ws_area.x, y, ws_area.width, 1),
@@ -1883,6 +1903,12 @@ fn render_workspace_list(
             },
         );
 
+        let visible_row_count = usize::from(row_height.min(list_bottom.saturating_sub(row_y)));
+        let rows_have_state_icon = rows
+            .iter()
+            .take(visible_row_count)
+            .flatten()
+            .any(|token| matches!(token.kind, ResolvedTokenKind::StateIcon));
         let mut replaced_fixed_status_icon = false;
         for (row_index, resolved) in rows.iter().enumerate() {
             if row_index as u16 >= row_height || row_y + row_index as u16 >= list_bottom {
@@ -1934,6 +1960,17 @@ fn render_workspace_list(
                     }
                 })
                 .collect::<Vec<_>>();
+            let max_content_width =
+                card.rect
+                    .width
+                    .saturating_sub(prefix_width + trailing_width) as usize;
+            let fallback_badge = (!rows_have_state_icon && row_index == 0)
+                .then_some(token_descendant_badge)
+                .flatten();
+            let fallback_width = fallback_badge.map_or(0, |(badge, _)| display_width(badge) + 1);
+            if let Some((badge, style)) = fallback_badge {
+                spans.push(Span::styled(format!("{badge} "), *style));
+            }
             spans.extend(resolved_token_spans(
                 resolved,
                 state_icon,
@@ -1944,9 +1981,7 @@ fn render_workspace_list(
                 branch_style,
                 branch_style,
                 p,
-                card.rect
-                    .width
-                    .saturating_sub(prefix_width + trailing_width) as usize,
+                max_content_width.saturating_sub(fallback_width),
             ));
             frame.render_widget(
                 Paragraph::new(Line::from(spans)),
@@ -2393,6 +2428,79 @@ rows = [[{ token = "workspace", bold = false }, { token = "agent", dim = false }
     }
 
     #[test]
+    fn delegated_completion_badge_survives_state_text_only_custom_layout() {
+        let mut app = crate::app::state::AppState::test_new();
+        let mut workspace = Workspace::test_new("one");
+        let root = workspace.tabs[0].root_pane.expect("root");
+        let child = workspace.test_split(ratatui::layout::Direction::Horizontal);
+        app.workspaces = vec![workspace];
+        app.ensure_test_terminals();
+        let root_terminal = app.workspaces[0].tabs[0].panes[&root]
+            .attached_terminal_id
+            .clone();
+        app.terminals.get_mut(&root_terminal).unwrap().state = AgentState::Working;
+        let child_terminal = app.workspaces[0].tabs[0].panes[&child]
+            .attached_terminal_id
+            .clone();
+        app.terminals.get_mut(&child_terminal).unwrap().state = AgentState::Idle;
+        app.workspaces[0].tabs[0]
+            .panes
+            .get_mut(&child)
+            .unwrap()
+            .seen = false;
+        let delegation_root = app.delegations.create(Some(root), None, None).unwrap();
+        app.delegations
+            .create(Some(child), Some(delegation_root), Some("review".into()))
+            .unwrap();
+        app.sidebar_spaces.rows = vec![vec![
+            crate::config::SpaceSidebarToken::StateText,
+            crate::config::SpaceSidebarToken::Workspace,
+        ]];
+        app.active = Some(0);
+        app.mode = Mode::Terminal;
+
+        let area = Rect::new(0, 0, 26, 20);
+        app.view.workspace_card_areas = compute_workspace_card_areas(&app, area);
+        let row = app.view.workspace_card_areas[0].rect.y;
+        let mut terminal = Terminal::new(TestBackend::new(26, 20)).unwrap();
+        terminal
+            .draw(|frame| render_sidebar(&app, &TerminalRuntimeRegistry::new(), frame, area))
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+        let badge_x = find_symbol_x(buffer, row, 25, "•");
+
+        assert_eq!(buffer[(badge_x, row)].style().fg, Some(app.palette.teal));
+
+        app.sidebar_spaces.rows = vec![
+            vec![
+                crate::config::SpaceSidebarToken::StateText,
+                crate::config::SpaceSidebarToken::Workspace,
+            ],
+            vec![crate::config::SpaceSidebarToken::StateIcon],
+        ];
+        app.view.workspace_card_areas[0].rect = Rect::new(0, 1, 26, 2);
+        let mut clipped = Terminal::new(TestBackend::new(26, 4)).unwrap();
+        clipped
+            .draw(|frame| {
+                render_workspace_list(
+                    &app,
+                    &TerminalRuntimeRegistry::new(),
+                    frame,
+                    Rect::new(0, 0, 26, 3),
+                    false,
+                )
+            })
+            .unwrap();
+        let clipped_row = (0..26)
+            .map(|x| clipped.backend().buffer()[(x, 1)].symbol())
+            .collect::<String>();
+        assert!(
+            clipped_row.contains('•'),
+            "clipped custom row: {clipped_row:?}"
+        );
+    }
+
+    #[test]
     fn space_occurrence_style_applies_without_styling_separator() {
         let config: crate::config::Config = toml::from_str(
             r##"
@@ -2819,6 +2927,49 @@ rows = [[{ token = "git_status", fg = "#123456" }]]
     }
 
     #[test]
+    fn collapsed_sidebar_renders_delegated_completion_badge() {
+        let mut workspace = Workspace::test_new("attention");
+        let root = workspace.tabs[0].root_pane.expect("root pane");
+        let child = workspace.test_split(ratatui::layout::Direction::Horizontal);
+        let second_child = workspace.test_split(ratatui::layout::Direction::Vertical);
+        let mut app = crate::app::state::AppState::test_new();
+        app.workspaces = vec![workspace];
+        app.ensure_test_terminals();
+        let root_terminal = app.workspaces[0].tabs[0].panes[&root]
+            .attached_terminal_id
+            .clone();
+        app.terminals.get_mut(&root_terminal).unwrap().state = AgentState::Working;
+        for delegated in [child, second_child] {
+            let terminal_id = app.workspaces[0].tabs[0].panes[&delegated]
+                .attached_terminal_id
+                .clone();
+            app.terminals.get_mut(&terminal_id).unwrap().state = AgentState::Idle;
+            app.workspaces[0].tabs[0]
+                .panes
+                .get_mut(&delegated)
+                .unwrap()
+                .seen = false;
+        }
+        let parent = app.delegations.create(Some(root), None, None).unwrap();
+        for (delegated, purpose) in [(child, "review"), (second_child, "test")] {
+            app.delegations
+                .create(Some(delegated), Some(parent), Some(purpose.into()))
+                .unwrap();
+        }
+
+        let area = Rect::new(0, 0, 4, 12);
+        let (workspace_area, _, _) = collapsed_sidebar_sections(area);
+        let mut terminal = Terminal::new(TestBackend::new(area.width, area.height)).unwrap();
+        terminal
+            .draw(|frame| render_sidebar_collapsed(&app, frame, area))
+            .unwrap();
+        let badge = &terminal.backend().buffer()[(workspace_area.x + 1, workspace_area.y)];
+
+        assert_eq!(badge.symbol(), "2");
+        assert_eq!(badge.style().fg, Some(app.palette.teal));
+    }
+
+    #[test]
     fn collapsed_sidebar_keeps_status_visible_for_two_digit_positions() {
         let mut app = crate::app::state::AppState::test_new();
         app.workspaces = (1..=10)
@@ -2833,9 +2984,34 @@ rows = [[{ token = "git_status", fg = "#123456" }]]
                 .clone();
             app.terminals.get_mut(&terminal_id).unwrap().detected_agent = Some(Agent::Claude);
         }
+        let tenth_root = app.workspaces[9].tabs[0].root_pane.unwrap();
+        let tenth_child = app.workspaces[9].test_split(ratatui::layout::Direction::Horizontal);
+        app.ensure_test_terminals();
+        let child_terminal = app.workspaces[9].tabs[0].panes[&tenth_child]
+            .attached_terminal_id
+            .clone();
+        app.terminals.get_mut(&child_terminal).unwrap().state = AgentState::Idle;
+        app.workspaces[9].tabs[0]
+            .panes
+            .get_mut(&tenth_child)
+            .unwrap()
+            .seen = false;
+        let parent = app
+            .delegations
+            .create(Some(tenth_root), None, None)
+            .unwrap();
+        app.delegations
+            .create(Some(tenth_child), Some(parent), Some("review".into()))
+            .unwrap();
+        assert_eq!(
+            app.workspaces[9]
+                .attention_summary(&app.terminals, &app.delegations)
+                .descendant_attention_count(),
+            1
+        );
 
         let area = Rect::new(0, 0, 4, 25);
-        let (_, _, detail_area) = collapsed_sidebar_sections(area);
+        let (workspace_area, _, _) = collapsed_sidebar_sections(area);
         let mut terminal = Terminal::new(TestBackend::new(area.width, area.height))
             .expect("test terminal should initialize");
 
@@ -2843,11 +3019,15 @@ rows = [[{ token = "git_status", fg = "#123456" }]]
             .draw(|frame| render_sidebar_collapsed(&app, frame, area))
             .expect("collapsed sidebar should render");
 
-        let tenth_row = detail_area.y + 9;
+        let tenth_row = workspace_area.y + 9;
         let buffer = terminal.backend().buffer();
-        assert_eq!(buffer[(detail_area.x, tenth_row)].symbol(), "1");
-        assert_eq!(buffer[(detail_area.x + 1, tenth_row)].symbol(), "0");
-        assert_eq!(buffer[(detail_area.x + 2, tenth_row)].symbol(), "·");
+        assert_eq!(buffer[(workspace_area.x, tenth_row)].symbol(), "1");
+        assert_eq!(buffer[(workspace_area.x + 1, tenth_row)].symbol(), "0");
+        assert_eq!(buffer[(workspace_area.x + 2, tenth_row)].symbol(), "·");
+        assert!(buffer[(workspace_area.x + 2, tenth_row)]
+            .style()
+            .add_modifier
+            .contains(Modifier::UNDERLINED));
     }
 
     #[test]

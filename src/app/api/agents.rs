@@ -707,7 +707,7 @@ mod tests {
     }
 
     #[test]
-    fn agent_focus_marks_already_focused_done_agent_seen() {
+    fn agent_focus_does_not_acknowledge_primary_agent() {
         let mut app = app_with_agent();
         app.state.outer_terminal_focus = Some(false);
 
@@ -740,7 +740,53 @@ mod tests {
         let ResponseResult::AgentInfo { agent } = success.result else {
             panic!("expected agent info response");
         };
-        assert_eq!(agent.agent_status, AgentStatus::Idle);
+        assert_eq!(agent.agent_status, AgentStatus::Done);
+        assert!(!app.state.workspaces[0].tabs[0].panes[&pane_id].seen);
+    }
+
+    #[test]
+    fn agent_focus_does_not_acknowledge_delegated_completion() {
+        let mut app = app_with_agent();
+        app.state.outer_terminal_focus = Some(false);
+        let root = app.state.workspaces[0].tabs[0].root_pane.unwrap();
+        let child = app.state.workspaces[0].test_split(ratatui::layout::Direction::Horizontal);
+        app.state.ensure_test_terminals();
+        let child_terminal = app.state.workspaces[0].tabs[0].panes[&child]
+            .attached_terminal_id
+            .clone();
+        app.state
+            .terminals
+            .get_mut(&child_terminal)
+            .unwrap()
+            .set_detected_state(Some(Agent::Pi), AgentState::Idle);
+        app.state.workspaces[0].tabs[0]
+            .panes
+            .get_mut(&child)
+            .unwrap()
+            .seen = false;
+        let parent = app
+            .state
+            .delegations
+            .create(Some(root), None, None)
+            .unwrap();
+        app.state
+            .delegations
+            .create(Some(child), Some(parent), Some("review".into()))
+            .unwrap();
+
+        let response = app.handle_agent_focus(
+            "req".into(),
+            AgentTarget {
+                target: app.public_pane_id(0, child).unwrap(),
+            },
+        );
+
+        let success: SuccessResponse = serde_json::from_str(&response).unwrap();
+        let ResponseResult::AgentInfo { agent } = success.result else {
+            panic!("expected agent info response");
+        };
+        assert_eq!(agent.agent_status, AgentStatus::Done);
+        assert!(!app.state.workspaces[0].tabs[0].panes[&child].seen);
     }
 
     #[test]

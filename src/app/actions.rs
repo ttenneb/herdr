@@ -1314,6 +1314,9 @@ impl AppState {
                     .expire_agent_metadata_at(scheduled_deadline, now)?;
                 let change = mutation.effective_state_change?;
                 let seen = self.apply_pane_state_change(ws_idx, pane_id, &change)?;
+                if seen != previous_seen {
+                    self.mark_session_dirty();
+                }
                 let update = PaneStateUpdate {
                     pane_id,
                     ws_idx,
@@ -1429,6 +1432,21 @@ impl AppState {
     }
 
     pub(crate) fn pane_suppresses_notifications(&self, ws_idx: usize, pane_id: PaneId) -> bool {
+        let delegated_descendant = self
+            .delegations
+            .delegation_for_pane(pane_id)
+            .is_some_and(|record| record.parent_id.is_some());
+        let grouped = self.workspaces.get(ws_idx).is_some_and(|workspace| {
+            workspace.tabs.iter().any(|tab| {
+                matches!(
+                    tab.pane_placement(pane_id),
+                    Some(crate::layout::PanePlacement::Collection(_))
+                )
+            })
+        });
+        if delegated_descendant && !grouped {
+            return false;
+        }
         active_tab_suppresses_notifications(
             self.pane_is_foreground_visible(ws_idx, pane_id),
             self.outer_terminal_focus,
@@ -1622,7 +1640,49 @@ impl AppState {
         }
     }
 
-    pub(crate) fn mark_active_tab_seen(&mut self) -> Vec<PaneId> {
+    pub(crate) fn mark_active_tab_workspace_primary_seen(&mut self) -> Vec<PaneId> {
+        let delegated_descendants = self
+            .active
+            .and_then(|ws_idx| self.workspaces.get(ws_idx))
+            .and_then(crate::workspace::Workspace::active_tab)
+            .map(|tab| {
+                tab.panes
+                    .keys()
+                    .copied()
+                    .filter(|pane_id| {
+                        self.delegations
+                            .delegation_for_pane(*pane_id)
+                            .is_some_and(|record| record.parent_id.is_some())
+                    })
+                    .collect::<std::collections::HashSet<_>>()
+            })
+            .unwrap_or_default();
+        self.mark_active_tab_seen_where(|pane_id| !delegated_descendants.contains(&pane_id))
+    }
+
+    pub(crate) fn mark_terminal_seen(
+        &mut self,
+        terminal_id: &crate::terminal::TerminalId,
+    ) -> Option<(usize, PaneId)> {
+        for (ws_idx, workspace) in self.workspaces.iter_mut().enumerate() {
+            for tab in &mut workspace.tabs {
+                if let Some((&pane_id, pane)) = tab
+                    .panes
+                    .iter_mut()
+                    .find(|(_, pane)| &pane.attached_terminal_id == terminal_id)
+                {
+                    if pane.seen {
+                        return None;
+                    }
+                    pane.seen = true;
+                    return Some((ws_idx, pane_id));
+                }
+            }
+        }
+        None
+    }
+
+    fn mark_active_tab_seen_where(&mut self, include: impl Fn(PaneId) -> bool) -> Vec<PaneId> {
         let Some(ws_idx) = self.active else {
             return Vec::new();
         };
@@ -1640,7 +1700,7 @@ impl AppState {
         for (pane_id, pane) in &mut tab.panes {
             // Collection membership is not visibility. A grouped child is acknowledged only by
             // the explicit foreground-human terminal-entry action.
-            if visible_tiled.contains(pane_id) && !pane.seen {
+            if visible_tiled.contains(pane_id) && include(*pane_id) && !pane.seen {
                 pane.seen = true;
                 changed.push(*pane_id);
             }
@@ -3567,6 +3627,9 @@ impl AppState {
             }
         }
         let seen = self.apply_pane_state_change(ws_idx, pane_id, &change)?;
+        if seen != previous_seen {
+            self.mark_session_dirty();
+        }
         let update = PaneStateUpdate {
             pane_id,
             ws_idx,
@@ -5325,14 +5388,66 @@ mod tests {
     }
 
     #[test]
-    fn switch_workspace_marks_panes_seen() {
+    fn state_only_workspace_switch_does_not_acknowledge_panes() {
         let mut state = app_with_workspaces(&["a", "b"]);
-        // Mark a pane in workspace 1 as unseen
         let id = *state.workspaces[1].panes.keys().next().unwrap();
         state.workspaces[1].panes.get_mut(&id).unwrap().seen = false;
 
         state.switch_workspace(1);
-        assert!(state.workspaces[1].panes.get(&id).unwrap().seen);
+        assert!(!state.workspaces[1].panes.get(&id).unwrap().seen);
+    }
+
+    #[test]
+    fn primary_acknowledgement_preserves_delegated_completion() {
+        let mut state = app_with_workspaces(&["one"]);
+        let root = state.workspaces[0].tabs[0].root_pane.unwrap();
+        let child = state.workspaces[0].test_split(ratatui::layout::Direction::Horizontal);
+        state.workspaces[0].tabs[0]
+            .panes
+            .get_mut(&root)
+            .unwrap()
+            .seen = false;
+        state.workspaces[0].tabs[0]
+            .panes
+            .get_mut(&child)
+            .unwrap()
+            .seen = false;
+        let parent = state.delegations.create(Some(root), None, None).unwrap();
+        state
+            .delegations
+            .create(Some(child), Some(parent), Some("review".into()))
+            .unwrap();
+
+        let acknowledged = state.mark_active_tab_workspace_primary_seen();
+
+        assert_eq!(acknowledged, vec![root]);
+        assert!(state.workspaces[0].tabs[0].panes[&root].seen);
+        assert!(!state.workspaces[0].tabs[0].panes[&child].seen);
+    }
+
+    #[test]
+    fn passive_focus_preserves_delegated_completion_across_tabs() {
+        let mut state = app_with_workspaces(&["one"]);
+        let parent_pane = state.workspaces[0].tabs[0].root_pane.unwrap();
+        let child_tab = state.workspaces[0].test_add_tab(Some("child"));
+        let child_pane = state.workspaces[0].tabs[child_tab].root_pane.unwrap();
+        let parent = state
+            .delegations
+            .create(Some(parent_pane), None, None)
+            .unwrap();
+        state
+            .delegations
+            .create(Some(child_pane), Some(parent), Some("review".into()))
+            .unwrap();
+        state.workspaces[0].switch_tab(child_tab);
+        state.workspaces[0].tabs[child_tab]
+            .panes
+            .get_mut(&child_pane)
+            .unwrap()
+            .seen = false;
+
+        assert!(state.mark_active_tab_workspace_primary_seen().is_empty());
+        assert!(!state.workspaces[0].tabs[child_tab].panes[&child_pane].seen);
     }
 
     #[test]
@@ -5749,6 +5864,7 @@ mod tests {
             .attached_terminal_id
             .clone();
         state.terminals.get_mut(&bg_terminal_id).unwrap().state = AgentState::Working;
+        state.session_dirty = false;
 
         // Now transition to Idle while in background
         state.handle_app_event(AppEvent::StateChanged {
@@ -5763,6 +5879,7 @@ mod tests {
 
         let pane = state.workspaces[1].panes.get(&bg_pane_id).unwrap();
         assert!(!pane.seen);
+        assert!(state.session_dirty);
         assert!(matches!(
             state.toast.as_ref().map(|toast| toast.kind),
             Some(ToastKind::Finished)
@@ -5798,6 +5915,38 @@ mod tests {
         assert_eq!(terminal.state, AgentState::Idle);
         let pane = state.workspaces[0].panes.get(&pane_id).unwrap();
         assert!(pane.seen);
+    }
+
+    #[test]
+    fn active_tiled_delegated_completion_stays_unseen_until_terminal_input() {
+        let mut state = app_with_workspaces(&["active"]);
+        state.active = Some(0);
+        state.outer_terminal_focus = Some(true);
+        let root = state.workspaces[0].tabs[0].root_pane.unwrap();
+        let child = state.workspaces[0].test_split(ratatui::layout::Direction::Horizontal);
+        state.ensure_test_terminals();
+        let terminal_id = state.workspaces[0].tabs[0].panes[&child]
+            .attached_terminal_id
+            .clone();
+        state.terminals.get_mut(&terminal_id).unwrap().state = AgentState::Working;
+        let parent = state.delegations.create(Some(root), None, None).unwrap();
+        state
+            .delegations
+            .create(Some(child), Some(parent), Some("review".into()))
+            .unwrap();
+
+        state.handle_app_event(AppEvent::StateChanged {
+            pane_id: child,
+            agent: Some(Agent::Pi),
+            state: AgentState::Idle,
+            visible_blocker: false,
+            visible_working: false,
+            process_exited: false,
+            observed_at: std::time::Instant::now(),
+        });
+
+        assert!(!state.workspaces[0].tabs[0].panes[&child].seen);
+        assert!(!state.pane_suppresses_notifications(0, child));
     }
 
     #[test]

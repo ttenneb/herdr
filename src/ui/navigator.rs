@@ -637,6 +637,25 @@ mod tests {
     }
 
     #[test]
+    fn navigator_row_renders_descendant_attention_count() {
+        let app = AppState::test_new();
+        let mut rows = vec![row(0, true)];
+        rows[0].label = "workspace".into();
+        rows[0].descendant_attention_count = 12;
+        let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(40, 2))
+            .expect("test terminal");
+
+        terminal
+            .draw(|frame| render_row(&app, frame, Rect::new(0, 0, 40, 1), &rows, 0, false))
+            .unwrap();
+        let rendered = (0..40)
+            .map(|x| terminal.backend().buffer()[(x, 0)].symbol())
+            .collect::<String>();
+
+        assert!(rendered.contains("•12"), "navigator row: {rendered:?}");
+    }
+
+    #[test]
     fn workspace_rows_use_expand_caret() {
         let rows = multi_tab_rows();
         assert_eq!(tree_prefix(&rows, 0), "▾");

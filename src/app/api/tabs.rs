@@ -316,7 +316,7 @@ impl App {
                 },
             });
         }
-        self.emit_pane_destruction_events(destruction, &public_panes);
+        let affected = self.emit_pane_destruction_events(destruction, &public_panes);
         self.emit_event(EventEnvelope {
             event: EventKind::TabClosed,
             data: EventData::TabClosed {
@@ -324,6 +324,7 @@ impl App {
                 workspace_id,
             },
         });
+        self.emit_workspace_attention_updates(affected);
 
         encode_success(id, ResponseResult::Ok {})
     }
@@ -360,6 +361,7 @@ mod tests {
     use crate::{
         api::schema::SuccessResponse,
         config::{Config, ShellModeConfig},
+        detect::AgentState,
         workspace::Workspace,
     };
 
@@ -484,6 +486,50 @@ mod tests {
         assert!(events[..first_workspace]
             .iter()
             .any(|(_, event)| event.event == EventKind::TabClosed));
+    }
+
+    #[test]
+    fn api_tab_focus_does_not_acknowledge_attention() {
+        let event_hub = crate::api::EventHub::default();
+        let (_api_tx, api_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = App::new(&Config::default(), true, None, api_rx, event_hub.clone());
+        let mut workspace = Workspace::test_new("tab-focus");
+        let root = workspace.tabs[0].root_pane.unwrap();
+        let child = workspace.test_split(ratatui::layout::Direction::Horizontal);
+        app.state.workspaces = vec![workspace];
+        app.state.ensure_test_terminals();
+        for pane in [root, child] {
+            let terminal_id = app.state.workspaces[0].tabs[0].panes[&pane]
+                .attached_terminal_id
+                .clone();
+            app.state.terminals.get_mut(&terminal_id).unwrap().state = AgentState::Idle;
+            app.state.workspaces[0].tabs[0]
+                .panes
+                .get_mut(&pane)
+                .unwrap()
+                .seen = false;
+        }
+        let parent = app
+            .state
+            .delegations
+            .create(Some(root), None, None)
+            .unwrap();
+        app.state
+            .delegations
+            .create(Some(child), Some(parent), Some("review".into()))
+            .unwrap();
+        let tab_id = app.public_tab_id(0, 0).unwrap();
+
+        let response = app.handle_tab_focus("req".into(), TabTarget { tab_id });
+
+        let success: SuccessResponse = serde_json::from_str(&response).unwrap();
+        let ResponseResult::TabInfo { tab } = success.result else {
+            panic!("expected tab info");
+        };
+        assert!(!app.state.workspaces[0].tabs[0].panes[&root].seen);
+        assert!(!app.state.workspaces[0].tabs[0].panes[&child].seen);
+        assert_eq!(tab.descendant_attention_count, 1);
+        assert!(event_hub.events_after(0).is_empty());
     }
 
     #[test]

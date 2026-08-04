@@ -331,6 +331,22 @@ mod tests {
     }
 
     #[test]
+    fn descendant_attention_badge_compacts_counts() {
+        let palette = Palette::catppuccin();
+        assert!(descendant_attention_badge_for_count(0, &palette).is_none());
+        assert_eq!(
+            descendant_attention_badge_for_count(1, &palette).unwrap().0,
+            "•"
+        );
+        assert_eq!(
+            descendant_attention_badge_for_count(12, &palette)
+                .unwrap()
+                .0,
+            "•12"
+        );
+    }
+
+    #[test]
     fn copy_feedback_rect_uses_configured_position() {
         let area = Rect::new(10, 20, 100, 40);
         let feedback = feedback();

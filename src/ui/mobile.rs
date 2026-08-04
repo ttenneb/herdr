@@ -366,9 +366,10 @@ fn render_header_status(
         .map_or(0, |(badge, _)| display_width_u16(badge));
     let tab_label = mobile_tab_status(ws);
     let row1 = Rect::new(area.x, area.y, area.width, 1);
+    let minimum_status_width = 3u16.saturating_add(badge_width);
     let tab_w = display_width_u16(&tab_label)
         .saturating_add(1)
-        .min(area.width);
+        .min(area.width.saturating_sub(minimum_status_width));
     let name_w = area.width.saturating_sub(tab_w);
 
     let mut status_spans = vec![Span::raw(" "), Span::styled(dot, dot_style.bg(p.panel_bg))];
@@ -1813,6 +1814,58 @@ mod tests {
     }
 
     #[cfg(unix)]
+    #[test]
+    fn mobile_header_renders_delegated_completion_badge() {
+        let mut app = crate::app::state::AppState::test_new();
+        let mut workspace = crate::workspace::Workspace::test_new("mobile-attention");
+        let root = workspace.tabs[0].root_pane.expect("root pane");
+        let children = (0..12)
+            .map(|_| workspace.test_split(ratatui::layout::Direction::Horizontal))
+            .collect::<Vec<_>>();
+        app.workspaces = vec![workspace];
+        app.ensure_test_terminals();
+        let root_terminal = app.workspaces[0].tabs[0].panes[&root]
+            .attached_terminal_id
+            .clone();
+        app.terminals.get_mut(&root_terminal).unwrap().state = AgentState::Working;
+        let parent = app.delegations.create(Some(root), None, None).unwrap();
+        for child in children {
+            let child_terminal = app.workspaces[0].tabs[0].panes[&child]
+                .attached_terminal_id
+                .clone();
+            app.terminals.get_mut(&child_terminal).unwrap().state = AgentState::Idle;
+            app.workspaces[0].tabs[0]
+                .panes
+                .get_mut(&child)
+                .unwrap()
+                .seen = false;
+            app.delegations
+                .create(Some(child), Some(parent), Some("review".into()))
+                .unwrap();
+        }
+        app.active = Some(0);
+        app.selected = 0;
+        app.view.mobile_menu_hit_area = Rect::new(15, 0, 5, 2);
+
+        let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(20, 2))
+            .expect("test terminal");
+        terminal
+            .draw(|frame| {
+                render_mobile_header(
+                    &app,
+                    &TerminalRuntimeRegistry::new(),
+                    frame,
+                    Rect::new(0, 0, 20, 2),
+                )
+            })
+            .unwrap();
+        let row = (0..20)
+            .map(|x| terminal.backend().buffer()[(x, 0)].symbol())
+            .collect::<String>();
+
+        assert!(row.contains("•12"), "header row: {row:?}");
+    }
+
     #[tokio::test]
     async fn mobile_header_uses_live_root_runtime_cwd_for_workspace_label() {
         let unique = format!(

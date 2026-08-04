@@ -1740,6 +1740,7 @@ impl App {
                                 if let Some(target) =
                                     self.handle_terminal_key_headless_from(source_id, key)
                                 {
+                                    self.acknowledge_terminal_input(&target.terminal_id);
                                     if !key.is_text_commit {
                                         self.pressed_terminal_keys.insert(
                                             pressed_key_id,
@@ -1759,16 +1760,22 @@ impl App {
                             if let Some(pressed) =
                                 self.pressed_terminal_keys.get(&pressed_key_id).cloned()
                             {
-                                if !self
+                                if self
                                     .forward_terminal_key_to_target_headless(&pressed.target, key)
                                 {
+                                    self.acknowledge_terminal_input(&pressed.target.terminal_id);
+                                } else {
                                     self.pressed_terminal_keys.remove(&pressed_key_id);
                                 }
                             } else if (self.state.popup_pane.is_some()
                                 || self.state.mode == Mode::Terminal)
                                 && !self.suppressed_repeat_keys.contains(&pressed_key_id)
                             {
-                                let _ = self.handle_terminal_key_headless_from(source_id, key);
+                                if let Some(target) =
+                                    self.handle_terminal_key_headless_from(source_id, key)
+                                {
+                                    self.acknowledge_terminal_input(&target.terminal_id);
+                                }
                             }
                         }
                         crossterm::event::KeyEventKind::Release => {
@@ -1785,9 +1792,11 @@ impl App {
                 crate::raw_input::RawInputEvent::Mouse(mouse) => {
                     if self.state.popup_pane.is_some() || self.state.mouse_capture {
                         self.handle_mouse_event_headless(source_id, mouse);
-                    } else {
-                        self.state
-                            .handle_pane_mouse_only(&self.terminal_runtimes, mouse);
+                    } else if let Some(terminal_id) = self
+                        .state
+                        .handle_pane_mouse_only(&self.terminal_runtimes, mouse)
+                    {
+                        self.acknowledge_terminal_input(&terminal_id);
                     }
                 }
                 crate::raw_input::RawInputEvent::Paste(text) => {
@@ -1804,12 +1813,18 @@ impl App {
                                     .and_then(|ws| ws.focused_pane_id());
                                 if let Some(focused) = focused {
                                     self.restore_archived_member_for_input(ws_idx, focused);
+                                    let terminal_id =
+                                        self.state.terminal_id_for_pane(ws_idx, focused);
                                     if let Some(runtime) = self.state.runtime_for_pane_in_workspace(
                                         &self.terminal_runtimes,
                                         ws_idx,
                                         focused,
                                     ) {
-                                        let _ = runtime.try_send_paste(text);
+                                        if runtime.try_send_paste(text).is_ok() {
+                                            if let Some(terminal_id) = terminal_id {
+                                                self.acknowledge_terminal_input(&terminal_id);
+                                            }
+                                        }
                                     }
                                 }
                             }
@@ -1818,6 +1833,7 @@ impl App {
                 }
                 crate::raw_input::RawInputEvent::OuterFocusGained => {
                     self.send_outer_focus_event(crate::ghostty::FocusEvent::Gained);
+                    self.mark_active_tab_workspace_primary_seen_with_events();
                 }
                 crate::raw_input::RawInputEvent::OuterFocusLost => {
                     self.release_input_source_headless(source_id);
@@ -3543,6 +3559,12 @@ mod tests {
             TerminalRuntime::test_with_channel_and_scrollback_bytes(80, 24, 0, b"\x1b[>15u", 4);
         workspace.tabs[0].runtimes.insert(focused, runtime);
         app.state.workspaces = vec![workspace];
+        app.state.ensure_test_terminals();
+        app.state.workspaces[0].tabs[0]
+            .panes
+            .get_mut(&focused)
+            .unwrap()
+            .seen = false;
         app.state.active = Some(0);
         app.state.selected = 0;
         app.state.mode = Mode::Terminal;
@@ -3569,6 +3591,8 @@ mod tests {
             bytes::Bytes::from_static(b"\x1b[106;1:3u")
         );
         assert!(rx.try_recv().is_err());
+        assert!(app.state.workspaces[0].tabs[0].panes[&focused].seen);
+        assert!(app.state.session_dirty);
     }
 
     #[tokio::test]
@@ -3634,6 +3658,53 @@ mod tests {
         assert!(app.state.workspaces[0].tabs[0].panes[&root_pane].seen);
         assert!(app.state.workspaces[0].tabs[0].panes[&split_pane].seen);
         assert!(!app.state.workspaces[0].tabs[background_tab].panes[&background_pane].seen);
+        assert!(app.state.session_dirty);
+        let events = app.event_hub.events_after(0);
+        assert!(events.iter().any(|(_, event)| {
+            event.event == crate::api::schema::EventKind::PaneAgentStatusChanged
+        }));
+        assert!(events
+            .iter()
+            .any(|(_, event)| { event.event == crate::api::schema::EventKind::WorkspaceUpdated }));
+    }
+
+    #[tokio::test]
+    async fn outer_focus_gained_preserves_delegated_completion() {
+        let mut app = test_app();
+        let mut workspace = Workspace::test_new("focus-attention");
+        let root = workspace.tabs[0].root_pane.unwrap();
+        let child = workspace.test_split(ratatui::layout::Direction::Horizontal);
+        app.state.workspaces = vec![workspace];
+        app.state.ensure_test_terminals();
+        for pane in [root, child] {
+            let terminal_id = app.state.workspaces[0].tabs[0].panes[&pane]
+                .attached_terminal_id
+                .clone();
+            app.state.terminals.get_mut(&terminal_id).unwrap().state = AgentState::Idle;
+            app.state.workspaces[0].tabs[0]
+                .panes
+                .get_mut(&pane)
+                .unwrap()
+                .seen = false;
+        }
+        let parent = app
+            .state
+            .delegations
+            .create(Some(root), None, None)
+            .unwrap();
+        app.state
+            .delegations
+            .create(Some(child), Some(parent), Some("review".into()))
+            .unwrap();
+        app.state.active = Some(0);
+        app.state.selected = 0;
+        app.state.outer_terminal_focus = Some(false);
+
+        app.handle_raw_input_event(crate::raw_input::RawInputEvent::OuterFocusGained)
+            .await;
+
+        assert!(app.state.workspaces[0].tabs[0].panes[&root].seen);
+        assert!(!app.state.workspaces[0].tabs[0].panes[&child].seen);
     }
 
     #[tokio::test]
