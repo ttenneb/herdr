@@ -265,7 +265,8 @@ While the pointer is over an entered expanded terminal, mouse events—including
 A hidden or collapsed child changing state does not alter the user's expansion, scroll position, or keyboard focus.
 
 - Blocked and newly completed children are highlighted in their rows.
-- The nested-list pane rolls up child attention for its containing tab and workspace.
+- Tab, Workspace, and Repository activity follows top-level or locally promoted agents rather than allowing a completed delegated descendant to impersonate its parent.
+- Unseen completed descendants appear as a separate teal badge/count beside the primary state icon, while a blocked descendant still makes that primary icon red.
 - The initial version uses existing per-child notification delivery, but suppression is based on actual child visibility and entry rather than containing-tab membership.
 - Viewing or focusing the collection does not mark every child as seen.
 - Seen remains session-global initially.

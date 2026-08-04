@@ -1810,6 +1810,29 @@ impl App {
         destruction: crate::app::actions::PaneDestructionSummary,
         public_panes: &[(PaneId, String)],
     ) {
+        let tombstoned_ids = destruction
+            .tombstoned_delegations
+            .iter()
+            .map(|(delegation_id, _)| *delegation_id)
+            .collect::<std::collections::HashSet<_>>();
+        let affected_workspace_indices = self
+            .state
+            .delegations
+            .records()
+            .values()
+            .filter(|record| {
+                record
+                    .parent_id
+                    .is_some_and(|id| tombstoned_ids.contains(&id))
+            })
+            .filter_map(|record| record.pane_id)
+            .filter_map(|pane_id| {
+                self.state
+                    .workspaces
+                    .iter()
+                    .position(|workspace| workspace.pane_state(pane_id).is_some())
+            })
+            .collect::<std::collections::HashSet<_>>();
         for (delegation_id, pane_id) in destruction.tombstoned_delegations {
             self.emit_event(EventEnvelope {
                 event: EventKind::DelegationTombstoned,
@@ -1829,6 +1852,9 @@ impl App {
                     delegation_id: delegation_id.to_string(),
                 },
             });
+        }
+        for ws_idx in affected_workspace_indices {
+            self.emit_workspace_attention_updated(ws_idx);
         }
     }
 

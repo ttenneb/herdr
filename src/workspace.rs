@@ -13,6 +13,7 @@ use crate::pane::{PaneLaunchEnv, PaneState};
 use crate::terminal::{TerminalId, TerminalRuntime, TerminalRuntimeRegistry, TerminalState};
 
 mod aggregate;
+pub(crate) use aggregate::AttentionSummary;
 mod git;
 mod tab;
 

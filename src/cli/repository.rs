@@ -186,6 +186,7 @@ mod tests {
             pane_count: 3,
             active_agent_count: 1,
             agent_status: AgentStatus::Working,
+            descendant_attention_count: 0,
         }
     }
 

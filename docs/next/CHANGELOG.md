@@ -11,6 +11,7 @@
 - Plugin actions can now declare bounded asynchronous `choices_command` providers for workspace, tab, pane, collection-member, and Workspace Resource context menus.
 
 ### Changed
+- Space and tab activity now follow top-level agents while completed delegated subagents appear as a separate unread attention badge that clears when their terminal is entered; blocked descendants still make the primary status red.
 - Newly expanded collection previews now automatically use at least half of the collection height while preserving explicit manual sizes.
 - `close_pane` now closes the focused collection through its promote-or-cascade flow when a collection leaf is focused; promotion preserves every member in its own standalone tab, `Shift+X` remains a collection-close alias, and bare list `x`/`Delete` still closes the selected member.
 - Grouped panes now count as seen only after a foreground human enters that child terminal; collection selection, API focus, reads, and passive observation do not acknowledge attention.

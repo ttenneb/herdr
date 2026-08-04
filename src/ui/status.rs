@@ -12,6 +12,7 @@ use crate::{
     app::state::{CopyFeedback, Palette, ToastKind, ToastNotification},
     config::{ToastClipboardPosition, ToastHerdrPosition},
     detect::AgentState,
+    workspace::AttentionSummary,
 };
 
 pub(crate) fn copy_feedback_rect(
@@ -201,6 +202,32 @@ pub(super) fn state_dot(state: AgentState, seen: bool, p: &Palette) -> (&'static
         (AgentState::Idle, true) => ("○", Style::default().fg(p.green)),
         (AgentState::Unknown, _) => ("·", Style::default().fg(p.overlay0)),
     }
+}
+
+pub(super) fn descendant_attention_badge(
+    summary: AttentionSummary,
+    p: &Palette,
+) -> Option<(String, Style)> {
+    descendant_attention_badge_for_count(summary.descendant_attention_count(), p)
+}
+
+pub(super) fn descendant_attention_badge_for_count(
+    count: usize,
+    p: &Palette,
+) -> Option<(String, Style)> {
+    if count == 0 {
+        return None;
+    }
+    let color = p.teal;
+    let label = if count == 1 {
+        "•".to_string()
+    } else {
+        format!("•{count}")
+    };
+    Some((
+        label,
+        Style::default().fg(color).add_modifier(Modifier::BOLD),
+    ))
 }
 
 pub(super) fn state_label(state: AgentState, seen: bool) -> &'static str {

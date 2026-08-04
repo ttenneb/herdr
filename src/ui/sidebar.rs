@@ -10,12 +10,13 @@ use ratatui::{
 
 use self::tokens::{ResolvedToken, ResolvedTokenKind, SpaceTokenContext};
 use super::scrollbar::{render_scrollbar, should_show_scrollbar};
-use super::status::{state_dot, state_label, state_label_color};
+use super::status::{descendant_attention_badge, state_dot, state_label, state_label_color};
 use super::text::{display_width, display_width_u16, truncate_end};
 use crate::app::state::{AgentPanelSort, Palette};
 use crate::app::{AppState, Mode};
 use crate::detect::AgentState;
 use crate::terminal::TerminalRuntimeRegistry;
+use crate::workspace::AttentionSummary;
 
 const WORKSPACE_SECTION_HEADER_ROWS: u16 = 2;
 const AGENT_PANEL_HEADER_ROWS: u16 = 3;
@@ -247,15 +248,6 @@ fn hierarchical_agent_projection(
                 .rposition(|candidate| candidate.is_delegation_root)
         });
         if let Some(root_index) = root_index {
-            let priority = crate::app::api_helpers::tab_attention_priority(entry.state, entry.seen);
-            let root_priority = crate::app::api_helpers::tab_attention_priority(
-                output[root_index].state,
-                output[root_index].seen,
-            );
-            if priority > root_priority {
-                output[root_index].state = entry.state;
-                output[root_index].seen = entry.seen;
-            }
             output[root_index].hidden_descendants =
                 output[root_index].hidden_descendants.saturating_add(1);
         }
@@ -345,7 +337,7 @@ fn workspace_row_height(
     ws: &crate::workspace::Workspace,
     indented: bool,
 ) -> u16 {
-    let (state, seen) = ws.aggregate_state(&app.terminals);
+    let (state, seen) = workspace_attention_summary(app, ws).display_state();
     let label = workspace_display_label(app, ws_idx, ws, None, indented);
     let token_values = ws.metadata_tokens.values();
     tokens::space_rows(
@@ -389,16 +381,6 @@ fn workspace_entry_gap(
     }
 }
 
-fn workspace_attention_priority(state: AgentState, seen: bool) -> u8 {
-    match (state, seen) {
-        (AgentState::Blocked, _) => 4,
-        (AgentState::Idle, false) => 3,
-        (AgentState::Working, _) => 2,
-        (AgentState::Idle, true) => 1,
-        (AgentState::Unknown, _) => 0,
-    }
-}
-
 fn workspace_repository_key(workspace: &crate::workspace::Workspace) -> Option<&str> {
     workspace
         .checkout
@@ -433,13 +415,27 @@ fn repository_primary_upstream<'a>(app: &'a AppState, repository_id: &str) -> Op
         })
 }
 
-fn space_aggregate_state(app: &AppState, key: &str) -> (AgentState, bool) {
-    app.workspaces
-        .iter()
-        .filter(|workspace| workspace_repository_key(workspace) == Some(key))
-        .map(|ws| ws.aggregate_state(&app.terminals))
-        .max_by_key(|(state, seen)| workspace_attention_priority(*state, *seen))
-        .unwrap_or((AgentState::Unknown, true))
+fn workspace_attention_summary(
+    app: &AppState,
+    workspace: &crate::workspace::Workspace,
+) -> AttentionSummary {
+    workspace.attention_summary(&app.terminals, &app.delegations)
+}
+
+fn space_attention_summary(app: &AppState, key: &str) -> AttentionSummary {
+    AttentionSummary::for_panes(
+        app.workspaces
+            .iter()
+            .filter(|workspace| workspace_repository_key(workspace) == Some(key))
+            .flat_map(|workspace| {
+                workspace
+                    .tabs
+                    .iter()
+                    .flat_map(|tab| tab.panes.iter().map(|(&pane_id, pane)| (pane_id, pane)))
+            }),
+        &app.terminals,
+        &app.delegations,
+    )
 }
 
 pub(crate) fn workspace_parent_group_state(
@@ -1150,7 +1146,14 @@ pub(super) fn render_sidebar_collapsed(app: &AppState, frame: &mut Frame, area: 
         if y >= ws_area.y + ws_area.height {
             break;
         }
-        let (agg_state, agg_seen) = ws.aggregate_state(&app.terminals);
+        let attention = match &target {
+            crate::app::state::SpaceRowTarget::Repository(id) => space_attention_summary(app, id),
+            crate::app::state::SpaceRowTarget::Workspace(_) => workspace_attention_summary(app, ws),
+            crate::app::state::SpaceRowTarget::WorkspaceResource { .. } => {
+                AttentionSummary::empty()
+            }
+        };
+        let (agg_state, agg_seen) = attention.display_state();
         let (icon, icon_style) = state_dot(agg_state, agg_seen, p);
         let is_selected = is_navigating
             && match &target {
@@ -1193,12 +1196,18 @@ pub(super) fn render_sidebar_collapsed(app: &AppState, frame: &mut Frame, area: 
             }
         }
 
+        let badge = descendant_attention_badge(attention, p);
+        let separator = badge
+            .as_ref()
+            .map(|(_, style)| Span::styled("•", *style))
+            .unwrap_or_else(|| Span::styled(" ", row_style));
+        let status = vec![
+            Span::styled(format!("{}", visible_idx + 1), num_style),
+            separator,
+            Span::styled(icon, icon_style),
+        ];
         frame.render_widget(
-            Paragraph::new(Line::from(vec![
-                Span::styled(format!("{}", visible_idx + 1), num_style),
-                Span::styled(" ", row_style),
-                Span::styled(icon, icon_style),
-            ])),
+            Paragraph::new(Line::from(status)),
             Rect::new(ws_area.x, y, ws_area.width, 1),
         );
     }
@@ -1319,6 +1328,7 @@ fn resolved_token_spans(
     resolved: &[ResolvedToken],
     state_icon: (&str, Style),
     state_icon_overrides: &[(&str, Style)],
+    state_badge: Option<&(String, Style)>,
     state_text_style: Style,
     workspace_style: Style,
     secondary_style: Style,
@@ -1329,7 +1339,10 @@ fn resolved_token_spans(
     let fixed_widths = resolved
         .iter()
         .map(|token| match &token.kind {
-            ResolvedTokenKind::StateIcon => display_width(state_icon.0),
+            ResolvedTokenKind::StateIcon => {
+                display_width(state_icon.0)
+                    + state_badge.map_or(0, |(badge, _)| display_width(badge))
+            }
             ResolvedTokenKind::GitStatus { ahead, behind } => {
                 usize::from(*ahead > 0) * display_width(&format!("↑{ahead}"))
                     + usize::from(*behind > 0) * display_width(&format!("↓{behind}"))
@@ -1445,6 +1458,12 @@ fn resolved_token_spans(
                     icon.0.to_string(),
                     apply_token_style(icon.1, token.style),
                 ));
+                if let Some((badge, style)) = state_badge {
+                    spans.push(Span::styled(
+                        badge.clone(),
+                        apply_token_style(*style, token.style),
+                    ));
+                }
             }
             ResolvedTokenKind::StateText(text) => {
                 spans.push(Span::styled(
@@ -1676,7 +1695,8 @@ fn render_workspace_list(
                     buf[(x, card.rect.y)].set_style(Style::default().bg(p.surface0));
                 }
             }
-            let (state, seen) = space_aggregate_state(app, repository_id);
+            let attention = space_attention_summary(app, repository_id);
+            let (state, seen) = attention.display_state();
             let (icon, icon_style) = state_dot(state, seen, p);
             let collapsed = app.collapsed_space_keys.contains(repository_id);
             let style = Style::default()
@@ -1688,9 +1708,14 @@ fn render_workspace_list(
                     Style::default().fg(p.accent),
                 ),
                 Span::styled(icon, icon_style),
+            ];
+            if let Some((badge, badge_style)) = descendant_attention_badge(attention, p) {
+                spans.push(Span::styled(badge, badge_style));
+            }
+            spans.extend([
                 Span::raw(" "),
                 Span::styled(repository.display_label(), style),
-            ];
+            ]);
             if let Some(upstream) = repository_primary_upstream(app, repository_id) {
                 spans.push(Span::raw("  "));
                 spans.push(Span::styled(upstream, Style::default().fg(p.overlay0)));
@@ -1765,7 +1790,8 @@ fn render_workspace_list(
         let is_active = Some(i) == app.active;
         let is_dragged = dragged_target == Some(&card.target);
         let highlighted = selected || is_active || is_dragged;
-        let (agg_state, agg_seen) = ws.aggregate_state(&app.terminals);
+        let attention = workspace_attention_summary(app, ws);
+        let (agg_state, agg_seen) = attention.display_state();
 
         if highlighted {
             let bg = if selected {
@@ -1835,6 +1861,12 @@ fn render_workspace_list(
         // and render the branch glyph as tree chrome instead.
         let fixed_status_column = indented_checkout && linked_status_marker_style.is_some();
         let state_icon = state_dot(display_state, display_seen, p);
+        let descendant_badge = descendant_attention_badge(attention, p);
+        let token_descendant_badge = if fixed_status_column {
+            None
+        } else {
+            descendant_badge.as_ref()
+        };
         let state_text_style = Style::default()
             .fg(state_label_color(display_state, display_seen, p))
             .add_modifier(Modifier::DIM);
@@ -1906,6 +1938,7 @@ fn render_workspace_list(
                 resolved,
                 state_icon,
                 &state_icon_overrides,
+                token_descendant_badge,
                 state_text_style,
                 name_style,
                 branch_style,
@@ -1930,6 +1963,13 @@ fn render_workspace_list(
             frame.buffer_mut()[(card.rect.x + 1, row_y)]
                 .set_symbol(child_state_icon.0)
                 .set_style(apply_token_style(child_state_icon.1, style));
+            if let Some((_, badge_style)) =
+                descendant_badge.as_ref().filter(|_| card.rect.width > 2)
+            {
+                frame.buffer_mut()[(card.rect.x + 2, row_y)]
+                    .set_symbol("•")
+                    .set_style(apply_token_style(*badge_style, style));
+            }
         }
 
         if let Some((_, collapsed)) = parent_group {
@@ -2093,6 +2133,7 @@ fn render_agent_detail(
                 resolved,
                 state_icon,
                 &[],
+                None,
                 status_style,
                 name_style,
                 agent_style,
@@ -2308,6 +2349,50 @@ rows = [[{ token = "workspace", bold = false }, { token = "agent", dim = false }
     }
 
     #[test]
+    fn delegated_completion_adds_badge_without_replacing_working_space_dot() {
+        let mut app = crate::app::state::AppState::test_new();
+        let mut workspace = Workspace::test_new("one");
+        let root = workspace.tabs[0].root_pane.expect("root");
+        let child = workspace.test_split(ratatui::layout::Direction::Horizontal);
+        app.workspaces = vec![workspace];
+        app.ensure_test_terminals();
+        let root_terminal = app.workspaces[0].tabs[0].panes[&root]
+            .attached_terminal_id
+            .clone();
+        app.terminals.get_mut(&root_terminal).unwrap().state = AgentState::Working;
+        let child_terminal = app.workspaces[0].tabs[0].panes[&child]
+            .attached_terminal_id
+            .clone();
+        app.terminals.get_mut(&child_terminal).unwrap().state = AgentState::Idle;
+        app.workspaces[0].tabs[0]
+            .panes
+            .get_mut(&child)
+            .unwrap()
+            .seen = false;
+        let delegation_root = app.delegations.create(Some(root), None, None).unwrap();
+        app.delegations
+            .create(Some(child), Some(delegation_root), Some("review".into()))
+            .unwrap();
+        app.active = Some(0);
+        app.mode = Mode::Terminal;
+
+        let area = Rect::new(0, 0, 26, 20);
+        app.view.workspace_card_areas = compute_workspace_card_areas(&app, area);
+        let row = app.view.workspace_card_areas[0].rect.y;
+        let mut terminal = Terminal::new(TestBackend::new(26, 20)).unwrap();
+        terminal
+            .draw(|frame| render_sidebar(&app, &TerminalRuntimeRegistry::new(), frame, area))
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+        let dot_x = find_symbol_x(buffer, row, 25, "●");
+        let badge_x = find_symbol_x(buffer, row, 25, "•");
+
+        assert_eq!(buffer[(dot_x, row)].style().fg, Some(app.palette.yellow));
+        assert_eq!(buffer[(badge_x, row)].style().fg, Some(app.palette.teal));
+        assert!(badge_x > dot_x);
+    }
+
+    #[test]
     fn space_occurrence_style_applies_without_styling_separator() {
         let config: crate::config::Config = toml::from_str(
             r##"
@@ -2369,6 +2454,7 @@ rows = [[{ token = "git_status", fg = "#123456" }]]
             }],
             ("", Style::default()),
             &[],
+            None,
             Style::default(),
             Style::default(),
             Style::default(),
@@ -2481,6 +2567,7 @@ rows = [[{ token = "git_status", fg = "#123456" }]]
             ))],
             ("", Style::default()),
             &[],
+            None,
             Style::default(),
             Style::default(),
             Style::default(),

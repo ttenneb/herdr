@@ -717,6 +717,8 @@ herdr agent wait w1:p1 --until blocked
 }
 ```
 
+`TabInfo`、`WorkspaceInfo`、`RepositoryInfo` には `descendant_attention_count` が含まれます。`agent_status` はトップレベルのエージェントに従い、このカウントは、子ターミナルに入って確認されていない完了済みの委任子孫を表します。ブロック中の子孫は引き続き集約ステータスを `blocked` にします。
+
 `server.agent_manifests` は、ルールをリロードせずに、アクティブなエージェント検出マニフェストのソースとリモート更新の診断情報を返します:
 
 ```json
