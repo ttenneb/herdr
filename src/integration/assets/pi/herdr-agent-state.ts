@@ -2,7 +2,7 @@
 // managed by herdr; reinstalling or updating the integration overwrites this file.
 // add custom hooks/plugins beside this file instead of editing it.
 // HERDR_INTEGRATION_ID=pi
-// HERDR_INTEGRATION_VERSION=7
+// HERDR_INTEGRATION_VERSION=8
 // @ts-nocheck
 
 import net from "node:net";
@@ -204,22 +204,55 @@ export default function (pi) {
     queueState(next.state, next.message);
   }
 
+  const blockingToolCalls = new Set<string>();
+
+  function activateBlocked(label?: string) {
+    blockedCount += 1;
+    blockedMessage = label;
+    publishState();
+  }
+
+  function deactivateBlocked() {
+    blockedCount = Math.max(0, blockedCount - 1);
+    if (blockedCount === 0) {
+      blockedMessage = undefined;
+    }
+    publishState();
+  }
+
   pi.events.on("herdr:blocked", (data) => {
     if (!rootSession) {
       return;
     }
     if (!data?.active) {
-      blockedCount = Math.max(0, blockedCount - 1);
-      if (blockedCount === 0) {
-        blockedMessage = undefined;
-      }
-      publishState();
+      deactivateBlocked();
       return;
     }
 
-    blockedCount += 1;
-    blockedMessage = data.label;
-    publishState();
+    activateBlocked(data.label);
+  });
+
+  pi.on("tool_execution_start", (event) => {
+    if (!rootSession || event?.toolName !== "ask_user_question") {
+      return;
+    }
+    const toolCallId = String(event.toolCallId ?? "");
+    if (!toolCallId || blockingToolCalls.has(toolCallId)) {
+      return;
+    }
+    blockingToolCalls.add(toolCallId);
+    activateBlocked("Waiting for user response");
+  });
+
+  pi.on("tool_execution_end", (event) => {
+    if (!rootSession || event?.toolName !== "ask_user_question") {
+      return;
+    }
+    const toolCallId = String(event.toolCallId ?? "");
+    if (!blockingToolCalls.delete(toolCallId)) {
+      return;
+    }
+    deactivateBlocked();
   });
 
   pi.on("session_start", async (event, ctx) => {

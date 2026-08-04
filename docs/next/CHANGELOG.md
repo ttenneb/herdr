@@ -20,6 +20,7 @@
 - Relicensed Herdr from AGPL-3.0-or-later to Apache-2.0.
 
 ### Fixed
+- Pi panes now report `ask_user_question` as blocked while waiting for a human response instead of remaining working.
 - Delegated-attention acknowledgement now requires input delivered to that terminal, persists across restart, and emits ordered pane/workspace projections for acknowledgement and destruction; API focus and passive host focus do not clear child attention, and clipped custom Space layouts retain the unread badge.
 - Pane split-resize drags now continue smoothly when the pointer crosses collection content instead of stopping at the collection boundary.
 - Collection disclosure hit targets now align with their rendered expand/collapse icons instead of overlapping the selection marker.
