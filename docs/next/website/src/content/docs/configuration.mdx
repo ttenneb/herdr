@@ -242,6 +242,7 @@ You can override individual colors:
 
 ```toml
 [theme.custom]
+sidebar_bg = "#181825"
 panel_bg = "reset"
 accent = "#a6e3a1"
 green = "#a6e3a1"
@@ -249,6 +250,8 @@ blue = "#89b4fa"
 red = "#f38ba8"
 yellow = "#f9e2af"
 ```
+
+`sidebar_bg` optionally gives the desktop sidebar its own background. When omitted, the sidebar keeps the host terminal background.
 
 Color values accept hex, named colors, `rgb(r,g,b)`, or reset aliases like `reset`, `default`, `none`, and `transparent`.
 
@@ -268,6 +271,17 @@ concurrency = 8
 These warn when an archive member reaches the configured age, archived membership exceeds the configured count, or combined `working` and `blocked` membership exceeds the configured concurrency. Set an individual value to `0` to disable that warning.
 
 The thresholds are advisory. They never archive, stop, close, or reject input. Archive cleanup and cascade-close remain explicit confirmed actions; input or renewed `working`/`blocked` state restores an archived member.
+
+Set `tab_bar_position = "bottom"` under `[ui]` to place the desktop tab row below the terminal panes. Prefix, Navigate, Copy, and Resize mode bars temporarily replace the bottom tab row while active. The default is `"top"`.
+
+Agent status uses compact colored dots by default. To distinguish blocked, working, done, idle, and unknown states by shape as well as color, choose **distinct symbols** in Settings or configure:
+
+```toml
+[ui]
+status_indicators = "symbols"
+```
+
+The symbols are static, so this option does not enable spinner animation.
 
 ### Sidebar row layouts
 
@@ -384,6 +398,8 @@ position = "bottom-right"
 
 Choose `herdr` for an in-app toast, `terminal` for an outer-terminal notification that works well over SSH, `system` for the local OS notification service, or `off` to disable popups. Herdr suppresses popups for the active tab. Search `ui.toast` in the [Config reference](/docs/config-reference/) for positions, delay behavior, and clipboard feedback settings.
 
+On macOS, `system` tries `terminal-notifier` first and falls back to `/usr/bin/osascript` when it is unavailable or fails. The fallback appears as Script Editor in Notification Center and cannot activate the hosting terminal. Install `terminal-notifier` with `brew install terminal-notifier`. For a supported, detected terminal, it can activate the terminal app when you click the notification. Alternatively, choose `terminal` to let a supported outer terminal own the notification.
+
 ## Sound
 
 Sound notifications play through the local Herdr client. Custom sounds must be mp3 files; relative paths are resolved from the config file's directory.
@@ -465,6 +481,7 @@ On Windows, support is currently limited to the Korean IME. With an IME for any 
 | `HERDR_CONFIG_PATH` | Override the config file path. |
 | `HERDR_SESSION` | Select a named session for CLI commands. |
 | `HERDR_SOCKET_PATH` | Low-level socket path override. |
+| `HERDR_PROCESS_DETECTION` | Linux process detection strategy: `native` (default) or opt-in `child-groups`. |
 | `HERDR_LOG` | Set log filtering, for example `HERDR_LOG=herdr=debug`. |
 | `HERDR_DISABLE_SOUND` | Disable sound playback even when `[ui.sound] enabled = true`. |
 

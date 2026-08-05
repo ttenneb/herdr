@@ -256,7 +256,9 @@ export default function (pi) {
   });
 
   pi.on("session_start", async (event, ctx) => {
-    if (ctx?.hasUI !== true) {
+    // TUI only: RPC/JSON/print modes are headless (no PTY herdr can display),
+    // and RPC still reports hasUI=true, so mode is the reliable gate.
+    if (ctx?.mode !== "tui") {
       return;
     }
     rootSession = true;

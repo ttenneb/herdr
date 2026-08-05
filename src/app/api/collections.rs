@@ -896,6 +896,7 @@ impl App {
             cwd,
             self.state.pane_scrollback_limit_bytes,
             self.state.host_terminal_theme,
+            self.state.host_terminal_appearance,
             shell_config,
             extra_env,
         ) {

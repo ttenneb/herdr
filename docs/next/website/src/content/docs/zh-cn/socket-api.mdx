@@ -117,6 +117,16 @@ herdr pane read w1:p2 --source recent --lines 50
 
 CLI 的 `herdr api snapshot` 会把当前 `session.snapshot` 响应输出为 JSON,让客户端和智能体可以简单地完成引导。
 
+### 临时工作区资源
+
+插件可以使用 `workspace.resources.report` 将有界的临时运行时资源附加到 Checkout 或独立 Workspace。报告会原子替换某个插件在该 Workspace 上的完整资源集；空数组会清除它。资源会附加显示在 `WorkspaceInfo` 和会话快照中，但不会持久化，并可通过 `ttl_ms` 过期。
+
+```json
+{"id":"jails","method":"workspace.resources.report","params":{"workspace_id":"w1","plugin_id":"hs.jail","resources":[{"resource_id":"immutable-container-id","label":"🔒 jail-a","detail":"/project"}],"seq":4,"ttl_ms":30000}}
+```
+
+Shell 集成可使用 `herdr workspace report-resources w1 --plugin hs.jail --file resources.json --ttl-ms 30000` 避免 JSON 参数引用问题（使用 `--file -` 从标准输入读取）。
+
 窗格控制方法使用 `w1:p1` 这类公开窗格 id。schema 中 `pane_id` 可选的方法,在省略它时使用服务器当前聚焦的活动窗格。`pane.move` 总是要求来源 `pane_id`。
 
 `pane.send_keys` 和 `pane.send_input.keys` 接受 Herdr 组合键字符串: 普通可打印键、`enter` 和 `esc` 这类特殊键、`ctrl+h`、`control+j`、`alt+x`、`shift+tab` 这类修饰组合键、`f1` 这类功能键,以及 `minus` 和 `plus` 这类命名标点。它们不接受 `prefix+` 绑定字符串。
