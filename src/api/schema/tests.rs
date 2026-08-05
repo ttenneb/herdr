@@ -64,7 +64,7 @@ fn legacy_pane_layout_response_deserializes_without_collection_fields() {
 #[test]
 fn collection_schema_uses_bumped_compatibility_versions() {
     assert_eq!(protocol_schema_document()["schema_version"], 2);
-    assert_eq!(crate::protocol::PROTOCOL_VERSION, 18);
+    assert_eq!(crate::protocol::PROTOCOL_VERSION, 19);
 }
 
 #[test]
@@ -434,10 +434,13 @@ fn pane_read_defaults_to_text_format() {
     "#;
 
     let request: Request = serde_json::from_str(json).unwrap();
+    let serialized = serde_json::to_value(&request).unwrap();
+    assert!(serialized["params"].get("intent").is_none());
     let Method::PaneRead(params) = request.method else {
         panic!("wrong method parsed");
     };
     assert_eq!(params.format, ReadFormat::Text);
+    assert_eq!(params.intent, ReadIntent::Interactive);
 }
 
 #[test]

@@ -282,6 +282,9 @@ pub struct TileLayout {
     legacy_focus: PaneId,
     legacy_root: Node,
     collections: HashMap<CollectionId, PaneCollection>,
+    /// Pane focused before the current leaf/member. Targeted tree edits do not
+    /// disturb this history, so closing a newly focused pane can return there.
+    prev_focus: Option<PaneId>,
 }
 
 impl TileLayout {
@@ -294,6 +297,7 @@ impl TileLayout {
                 legacy_focus: root_id,
                 legacy_root: Node::Pane(root_id),
                 collections: HashMap::new(),
+                prev_focus: None,
             },
             root_id,
         )
@@ -387,11 +391,39 @@ impl TileLayout {
         result
     }
 
+    #[cfg(test)]
     pub fn split_focused(&mut self, direction: Direction) -> PaneId {
         self.split_focused_with_ratio(direction, 0.5)
     }
 
+    #[cfg(test)]
     pub fn split_focused_with_ratio(&mut self, direction: Direction, ratio: f32) -> PaneId {
+        let target = match self.focused_leaf() {
+            LayoutLeaf::Pane(pane_id) => pane_id,
+            LayoutLeaf::Collection(_) => self
+                .prev_focus
+                .filter(|pane_id| matches!(self.placement(*pane_id), Some(PanePlacement::Tiled)))
+                .or_else(|| self.tiled_pane_ids().into_iter().next())
+                .expect("layout has a tiled pane"),
+        };
+        let new_id = self
+            .split_pane(target, direction, ratio)
+            .expect("target pane is in the tiled layout");
+        self.focus_pane(new_id);
+        new_id
+    }
+
+    /// Split a tiled target without moving focus. Collection members do not
+    /// occupy BSP leaves and therefore cannot be split directly.
+    pub fn split_pane(
+        &mut self,
+        target: PaneId,
+        direction: Direction,
+        ratio: f32,
+    ) -> Option<PaneId> {
+        if self.placement(target) != Some(PanePlacement::Tiled) {
+            return None;
+        }
         let new_id = PaneId::alloc();
         let old = std::mem::replace(
             &mut self.root,
@@ -399,15 +431,13 @@ impl TileLayout {
         );
         self.root = typed_split_at(
             old,
-            self.focus,
+            LayoutLeaf::Pane(target),
             direction,
             LayoutLeaf::Pane(new_id),
             valid_split_ratio(ratio),
         );
-        self.focus = LayoutLeaf::Pane(new_id);
-        self.legacy_focus = new_id;
         self.refresh_legacy_root();
-        new_id
+        Some(new_id)
     }
 
     pub fn insert_pane_near(
@@ -416,6 +446,7 @@ impl TileLayout {
         moved: PaneId,
         direction: Direction,
         ratio: f32,
+        focus: bool,
     ) -> bool {
         if target == moved
             || self.placement(target) != Some(PanePlacement::Tiled)
@@ -434,9 +465,10 @@ impl TileLayout {
             LayoutLeaf::Pane(moved),
             valid_split_ratio(ratio),
         );
-        self.focus = LayoutLeaf::Pane(moved);
-        self.legacy_focus = moved;
         self.refresh_legacy_root();
+        if focus {
+            self.focus_pane(moved);
+        }
         true
     }
 
@@ -470,7 +502,10 @@ impl TileLayout {
         if !self.leaves().contains(&leaf) {
             return false;
         }
-        self.focus = leaf;
+        if self.focus != leaf {
+            self.prev_focus = Some(self.focused());
+            self.focus = leaf;
+        }
         if let LayoutLeaf::Pane(pane_id) = leaf {
             self.legacy_focus = pane_id;
         }
@@ -625,21 +660,63 @@ impl TileLayout {
         let LayoutLeaf::Pane(pane) = self.focus else {
             return false;
         };
-        self.remove_leaf(LayoutLeaf::Pane(pane))
+        let previous = self
+            .prev_focus
+            .filter(|previous| *previous != pane && self.placement(*previous).is_some());
+        if !self.remove_leaf(LayoutLeaf::Pane(pane)) {
+            return false;
+        }
+        if let Some(previous) = previous {
+            self.focus_pane(previous);
+        }
+        self.prev_focus = None;
+        true
+    }
+
+    /// Close any placed pane without changing focus unless it is focused.
+    pub fn close_pane(&mut self, id: PaneId) -> bool {
+        match self.placement(id) {
+            Some(PanePlacement::Tiled) if self.focus == LayoutLeaf::Pane(id) => {
+                self.close_focused()
+            }
+            Some(PanePlacement::Tiled) => {
+                let removed = self.remove_leaf(LayoutLeaf::Pane(id));
+                if removed && self.prev_focus == Some(id) {
+                    self.prev_focus = None;
+                }
+                removed
+            }
+            Some(PanePlacement::Collection(collection_id)) => {
+                let removed = self.remove_collection_member(collection_id, id);
+                if removed && self.prev_focus == Some(id) {
+                    self.prev_focus = None;
+                }
+                removed
+            }
+            None => false,
+        }
     }
 
     pub fn focus_pane(&mut self, id: PaneId) {
-        match self.placement(id) {
+        let previous = self.focused();
+        let focused = match self.placement(id) {
             Some(PanePlacement::Tiled) => {
-                let _ = self.focus_leaf(LayoutLeaf::Pane(id));
-            }
-            Some(PanePlacement::Collection(collection_id))
-                if self.select_collection_member(collection_id, id) =>
-            {
-                let _ = self.focus_leaf(LayoutLeaf::Collection(collection_id));
+                self.focus = LayoutLeaf::Pane(id);
                 self.legacy_focus = id;
+                true
             }
-            Some(PanePlacement::Collection(_)) | None => {}
+            Some(PanePlacement::Collection(collection_id)) => {
+                if !self.select_collection_member(collection_id, id) {
+                    return;
+                }
+                self.focus = LayoutLeaf::Collection(collection_id);
+                self.legacy_focus = id;
+                true
+            }
+            None => false,
+        };
+        if focused && previous != id {
+            self.prev_focus = Some(previous);
         }
     }
 
@@ -802,6 +879,7 @@ impl TileLayout {
             legacy_focus,
             legacy_root,
             collections: collection_map,
+            prev_focus: None,
         })
     }
 
@@ -818,6 +896,7 @@ impl TileLayout {
             legacy_focus: focus,
             legacy_root: root,
             collections: HashMap::new(),
+            prev_focus: None,
         }
     }
 
@@ -1597,7 +1676,7 @@ mod tests {
         let (mut layout, root) = TileLayout::new();
         let moved = pane(99);
 
-        assert!(layout.insert_pane_near(root, moved, Direction::Horizontal, 0.25));
+        assert!(layout.insert_pane_near(root, moved, Direction::Horizontal, 0.25, true));
 
         assert_eq!(layout.pane_count(), 2);
         assert_eq!(layout.pane_ids(), vec![root, moved]);

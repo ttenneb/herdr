@@ -35,6 +35,13 @@ pub(crate) fn pane_custom_command_pty_builder(command: &str) -> portable_pty::Co
     pane_custom_command_pty_builder_platform(command)
 }
 
+pub(crate) fn apply_pane_runtime_marker(command: &mut portable_pty::CommandBuilder) {
+    apply_pane_runtime_marker_platform(command);
+}
+
+#[cfg(not(windows))]
+fn apply_pane_runtime_marker_platform(_command: &mut portable_pty::CommandBuilder) {}
+
 pub(crate) fn configure_background_command(command: &mut std::process::Command) {
     configure_background_command_platform(command);
 }
@@ -117,6 +124,11 @@ pub(crate) const fn capabilities() -> PlatformCapabilities {
         direct_terminal_attach: cfg!(unix),
         preserve_legacy_doubled_escape_input: cfg!(target_os = "macos"),
     }
+}
+
+#[cfg(not(windows))]
+pub fn launch_server_daemon_command(command: &mut std::process::Command) -> std::io::Result<u32> {
+    command.spawn().map(|child| child.id())
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]

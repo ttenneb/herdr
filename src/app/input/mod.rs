@@ -51,6 +51,7 @@ fn modified_url_click_modifier_matches_terminal_mouse_reporting() {
 mod clipboard;
 mod collection;
 mod copy_mode;
+mod lease;
 mod modal;
 mod mouse;
 mod navigate;
@@ -61,6 +62,7 @@ mod sidebar;
 mod terminal;
 
 pub(crate) use self::{
+    lease::{ConsumedInputLease, ForwardedInputLease, InputLeaseKey, InputLeaseTable, RepeatPlan},
     modal::{
         handle_global_menu_key, handle_keybind_help_key, handle_navigator_key,
         insert_keybind_help_query_text, insert_navigator_search_text, insert_rename_input_text,
@@ -103,7 +105,7 @@ impl App {
 
         match self.state.mode {
             Mode::Terminal => {
-                if self.handle_collection_key(key) {
+                if self.handle_collection_key(key.clone()) {
                     return None;
                 }
                 return self.handle_terminal_key(key).await;
@@ -138,6 +140,103 @@ impl App {
             },
         }
         None
+    }
+
+    pub(crate) fn handle_text_commit_headless(&mut self, text: &str) {
+        if text.is_empty() {
+            return;
+        }
+        if self.state.popup_pane.is_some() {
+            if let Some(runtime) = self.popup_runtime() {
+                let _ = runtime.try_send_bytes(Bytes::copy_from_slice(text.as_bytes()));
+            } else {
+                self.close_popup_pane();
+            }
+            return;
+        }
+        if self.state.mode != Mode::Terminal {
+            self.paste_into_active_text_input(text);
+            return;
+        }
+        if !self.collection_accepts_terminal_input() {
+            return;
+        }
+
+        self.state.clear_selection();
+        self.selection_autoscroll_deadline = None;
+        self.state.update_dismissed = true;
+        if let Some(ws_idx) = self.state.active {
+            let pane_id = self
+                .state
+                .workspaces
+                .get(ws_idx)
+                .and_then(|workspace| workspace.focused_pane_id());
+            if let Some(pane_id) = pane_id {
+                self.restore_archived_member_for_input(ws_idx, pane_id);
+                let terminal_id = self.state.terminal_id_for_pane(ws_idx, pane_id);
+                if let Some(runtime) = self.state.runtime_for_pane_in_workspace(
+                    &self.terminal_runtimes,
+                    ws_idx,
+                    pane_id,
+                ) {
+                    if runtime
+                        .try_send_bytes(Bytes::copy_from_slice(text.as_bytes()))
+                        .is_ok()
+                    {
+                        if let Some(terminal_id) = terminal_id {
+                            self.acknowledge_terminal_input(&terminal_id);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    pub(super) async fn handle_text_commit(&mut self, text: String) {
+        if text.is_empty() {
+            return;
+        }
+        if self.state.popup_pane.is_some() {
+            if let Some(runtime) = self.popup_runtime() {
+                let _ = runtime.send_bytes(Bytes::from(text)).await;
+            } else {
+                self.close_popup_pane();
+            }
+            return;
+        }
+        if self.state.mode != Mode::Terminal {
+            self.paste_into_active_text_input(&text);
+            return;
+        }
+        if !self.collection_accepts_terminal_input() {
+            return;
+        }
+
+        self.state.clear_selection();
+        self.selection_autoscroll_deadline = None;
+        self.state.update_dismissed = true;
+        if let Some(ws_idx) = self.state.active {
+            let pane_id = self
+                .state
+                .workspaces
+                .get(ws_idx)
+                .and_then(|workspace| workspace.focused_pane_id());
+            if let Some(pane_id) = pane_id {
+                self.restore_archived_member_for_input(ws_idx, pane_id);
+                let terminal_id = self.state.terminal_id_for_pane(ws_idx, pane_id);
+                if let Some(runtime) = self.state.runtime_for_pane_in_workspace(
+                    &self.terminal_runtimes,
+                    ws_idx,
+                    pane_id,
+                ) {
+                    if runtime.send_bytes(Bytes::from(text)).await.is_ok() {
+                        if let Some(terminal_id) = terminal_id {
+                            self.acknowledge_terminal_input(&terminal_id);
+                        }
+                    }
+                }
+            }
+        }
     }
 
     pub(super) async fn handle_paste(
@@ -417,18 +516,15 @@ impl App {
                     }
                     MouseAction::Settings(action) => match action {
                         SettingsAction::SaveTheme(name) => self.save_theme(&name),
+                        SettingsAction::SaveStatusIndicators(style) => {
+                            self.save_status_indicators(style)
+                        }
                         SettingsAction::SaveSound(enabled) => self.save_sound(enabled),
                         SettingsAction::SaveToastDelivery(delivery) => {
                             self.save_toast_delivery(delivery)
                         }
                         SettingsAction::SaveAgentBorderLabels(enabled) => {
                             self.save_agent_border_labels(enabled)
-                        }
-                        SettingsAction::SavePaneHistory(enabled) => {
-                            self.save_pane_history_persistence(enabled)
-                        }
-                        SettingsAction::SaveSwitchAsciiInputSourceInPrefix(enabled) => {
-                            self.save_switch_ascii_input_source_in_prefix(enabled)
                         }
                         SettingsAction::InstallRecommendedIntegrations => {
                             self.install_recommended_integrations()
@@ -940,6 +1036,7 @@ impl AppState {
                 cwd,
                 self.pane_scrollback_limit_bytes,
                 self.host_terminal_theme,
+                self.host_terminal_appearance,
                 crate::pane::PaneShellConfig::new(&self.default_shell, self.shell_mode),
                 Vec::new(),
             ) {

@@ -117,6 +117,16 @@ herdr pane read w1:p2 --source recent --lines 50
 
 CLI の `herdr api snapshot` は、クライアントやエージェントが簡単にブートストラップできるよう、現在の `session.snapshot` レスポンスを JSON で出力します。
 
+### 一時的なワークスペースリソース
+
+プラグインは `workspace.resources.report` を使って、Checkout または単独の Workspace に上限付きの一時的なランタイムリソースを関連付けられます。レポートは、その Workspace に対する 1 つのプラグインの完全なリソースセットをアトミックに置き換えます。空の配列はセットをクリアします。リソースは `WorkspaceInfo` とセッションスナップショットに追加されますが永続化されず、`ttl_ms` で期限切れにできます。
+
+```json
+{"id":"jails","method":"workspace.resources.report","params":{"workspace_id":"w1","plugin_id":"hs.jail","resources":[{"resource_id":"immutable-container-id","label":"🔒 jail-a","detail":"/project"}],"seq":4,"ttl_ms":30000}}
+```
+
+シェル連携では、JSON 引数のクォートを避けるために `herdr workspace report-resources w1 --plugin hs.jail --file resources.json --ttl-ms 30000` を使えます（標準入力には `--file -` を使います）。
+
 ペイン制御メソッドは `w1:p1` のような公開ペイン id を使います。スキーマ上 `pane_id` が省略可能なメソッドは、省略時にサーバーのアクティブなフォーカス中ペインを使います。`pane.move` は常に送信元の `pane_id` を要求します。
 
 `pane.send_keys` と `pane.send_input.keys` は Herdr のキーコンボ文字列を受け付けます: 通常の印字可能キー、`enter` や `esc` のような特殊キー、`ctrl+h`、`control+j`、`alt+x`、`shift+tab` のような修飾キーコード、`f1` のようなファンクションキー、`minus` や `plus` のような名前付き記号です。`prefix+` のバインド文字列は受け付けません。

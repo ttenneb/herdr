@@ -86,12 +86,12 @@ impl App {
 
         // Preserve Herdr's configured prefix/direct command language while preventing ordinary
         // list-mode keys from leaking into the selected PTY.
-        if self.state.is_prefix_key(key)
-            || super::terminal_direct_non_indexed_navigation_action(&self.state, key).is_some()
-            || super::terminal_direct_indexed_navigation_action(&self.state, key).is_some()
+        if self.state.is_prefix_key(&key)
+            || super::terminal_direct_non_indexed_navigation_action(&self.state, &key).is_some()
+            || super::terminal_direct_indexed_navigation_action(&self.state, &key).is_some()
             || super::navigate::command_for_key(
                 &self.state,
-                key,
+                &key,
                 super::navigate::BindingDispatch::Direct,
             )
             .is_some()
@@ -2788,7 +2788,7 @@ mod tests {
             crossterm::event::KeyCode::Esc,
             crossterm::event::KeyModifiers::empty(),
         );
-        assert!(!app.handle_collection_key(escape));
+        assert!(!app.handle_collection_key(escape.clone()));
         assert!(app.state.focused_collection_terminal_entered());
 
         let prefix = crate::input::TerminalKey::new(
