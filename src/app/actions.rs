@@ -1444,15 +1444,7 @@ impl AppState {
             .delegations
             .delegation_for_pane(pane_id)
             .is_some_and(|record| record.parent_id.is_some());
-        let grouped = self.workspaces.get(ws_idx).is_some_and(|workspace| {
-            workspace.tabs.iter().any(|tab| {
-                matches!(
-                    tab.pane_placement(pane_id),
-                    Some(crate::layout::PanePlacement::Collection(_))
-                )
-            })
-        });
-        if delegated_descendant && !grouped {
+        if delegated_descendant {
             return false;
         }
         active_tab_suppresses_notifications(
@@ -1671,23 +1663,75 @@ impl AppState {
     pub(crate) fn mark_terminal_seen(
         &mut self,
         terminal_id: &crate::terminal::TerminalId,
-    ) -> Option<(usize, PaneId)> {
-        for (ws_idx, workspace) in self.workspaces.iter_mut().enumerate() {
-            for tab in &mut workspace.tabs {
-                if let Some((&pane_id, pane)) = tab
-                    .panes
-                    .iter_mut()
+    ) -> Vec<(usize, PaneId)> {
+        let Some(input_pane_id) = self.workspaces.iter().find_map(|workspace| {
+            workspace.tabs.iter().find_map(|tab| {
+                tab.panes
+                    .iter()
                     .find(|(_, pane)| &pane.attached_terminal_id == terminal_id)
-                {
-                    if pane.seen {
-                        return None;
-                    }
-                    pane.seen = true;
-                    return Some((ws_idx, pane_id));
+                    .map(|(&pane_id, _)| pane_id)
+            })
+        }) else {
+            return Vec::new();
+        };
+
+        let mut pane_ids = vec![input_pane_id];
+        if let Some(record) = self.delegations.delegation_for_pane(input_pane_id) {
+            // A delegated child with a live parent never acknowledges completion attention itself.
+            // Input to the top-level agent acknowledges every surviving pane in its delegated
+            // subtree. If that parent pane is gone, the surviving child becomes an effective root
+            // and can acknowledge its own subtree instead of leaving attention permanently stuck.
+            let mut ancestor_id = record.parent_id;
+            while let Some(id) = ancestor_id {
+                let Some(ancestor) = self.delegations.get(id) else {
+                    break;
+                };
+                let live_ancestor = ancestor.pane_id.is_some_and(|ancestor_pane_id| {
+                    self.workspaces.iter().any(|workspace| {
+                        workspace
+                            .tabs
+                            .iter()
+                            .any(|tab| tab.panes.contains_key(&ancestor_pane_id))
+                    })
+                });
+                if live_ancestor {
+                    return Vec::new();
                 }
+                ancestor_id = ancestor.parent_id;
+            }
+            if let Ok(descendants) = self.delegations.descendants(record.id) {
+                pane_ids.extend(descendants.into_iter().filter_map(|id| {
+                    self.delegations
+                        .get(id)
+                        .and_then(|descendant| descendant.pane_id)
+                }));
             }
         }
-        None
+
+        let mut acknowledged = Vec::new();
+        for pane_id in pane_ids {
+            if acknowledged.iter().any(|(_, seen_id)| *seen_id == pane_id) {
+                continue;
+            }
+            for (ws_idx, workspace) in self.workspaces.iter_mut().enumerate() {
+                let Some(pane) = workspace
+                    .tabs
+                    .iter_mut()
+                    .find_map(|tab| tab.panes.get_mut(&pane_id))
+                else {
+                    continue;
+                };
+                if !pane.seen {
+                    pane.seen = true;
+                    acknowledged.push((ws_idx, pane_id));
+                }
+                break;
+            }
+        }
+        for (_, pane_id) in &acknowledged {
+            self.pending_agent_notifications.remove(pane_id);
+        }
+        acknowledged
     }
 
     fn mark_active_tab_seen_where(&mut self, include: impl Fn(PaneId) -> bool) -> Vec<PaneId> {
@@ -3843,8 +3887,7 @@ impl AppState {
         }
 
         let is_foreground_visible = self.pane_is_foreground_visible(ws_idx, pane_id);
-        let suppress_active_tab_notifications =
-            active_tab_suppresses_notifications(is_foreground_visible, self.outer_terminal_focus);
+        let suppress_active_tab_notifications = self.pane_suppresses_notifications(ws_idx, pane_id);
         let sound = sound_for_toast_kind(kind, suppress_active_tab_notifications)
             .filter(|_| self.sound.allows(known_agent));
         let build_toast = || {
@@ -5481,6 +5524,153 @@ mod tests {
     }
 
     #[test]
+    fn top_level_terminal_input_acknowledges_delegated_subtree() {
+        let mut state = app_with_workspaces(&["one"]);
+        let root = state.workspaces[0].tabs[0].root_pane.unwrap();
+        let child = state.workspaces[0].test_split(ratatui::layout::Direction::Horizontal);
+        let grandchild = state.workspaces[0].test_split(ratatui::layout::Direction::Vertical);
+        let parent = state.delegations.create(Some(root), None, None).unwrap();
+        let child_record = state
+            .delegations
+            .create(Some(child), Some(parent), Some("review".into()))
+            .unwrap();
+        state
+            .delegations
+            .create(Some(grandchild), Some(child_record), Some("test".into()))
+            .unwrap();
+        for pane_id in [root, child, grandchild] {
+            state.workspaces[0].tabs[0]
+                .panes
+                .get_mut(&pane_id)
+                .unwrap()
+                .seen = false;
+        }
+        let terminal_id = state.workspaces[0].terminal_id(root).cloned().unwrap();
+
+        let acknowledged = state.mark_terminal_seen(&terminal_id);
+
+        assert_eq!(acknowledged, vec![(0, root), (0, child), (0, grandchild)]);
+        for pane_id in [root, child, grandchild] {
+            assert!(state.workspaces[0].tabs[0].panes[&pane_id].seen);
+        }
+    }
+
+    #[test]
+    fn delegated_child_terminal_input_does_not_acknowledge_attention() {
+        let mut state = app_with_workspaces(&["one"]);
+        let root = state.workspaces[0].tabs[0].root_pane.unwrap();
+        let child = state.workspaces[0].test_split(ratatui::layout::Direction::Horizontal);
+        let parent = state.delegations.create(Some(root), None, None).unwrap();
+        state
+            .delegations
+            .create(Some(child), Some(parent), Some("review".into()))
+            .unwrap();
+        state.workspaces[0].tabs[0]
+            .panes
+            .get_mut(&child)
+            .unwrap()
+            .seen = false;
+        let terminal_id = state.workspaces[0].terminal_id(child).cloned().unwrap();
+
+        assert!(state.mark_terminal_seen(&terminal_id).is_empty());
+        assert!(!state.workspaces[0].tabs[0].panes[&child].seen);
+    }
+
+    #[test]
+    fn orphaned_delegated_child_input_acknowledges_its_subtree() {
+        let mut state = app_with_workspaces(&["one"]);
+        let root = state.workspaces[0].tabs[0].root_pane.unwrap();
+        let child = state.workspaces[0].test_split(ratatui::layout::Direction::Horizontal);
+        let grandchild = state.workspaces[0].test_split(ratatui::layout::Direction::Vertical);
+        let parent = state.delegations.create(Some(root), None, None).unwrap();
+        let child_record = state
+            .delegations
+            .create(Some(child), Some(parent), Some("review".into()))
+            .unwrap();
+        state
+            .delegations
+            .create(Some(grandchild), Some(child_record), Some("test".into()))
+            .unwrap();
+        state.delegations.tombstone_pane(root);
+        for pane_id in [child, grandchild] {
+            state.workspaces[0].tabs[0]
+                .panes
+                .get_mut(&pane_id)
+                .unwrap()
+                .seen = false;
+        }
+        let terminal_id = state.workspaces[0].terminal_id(child).cloned().unwrap();
+
+        assert_eq!(
+            state.mark_terminal_seen(&terminal_id),
+            vec![(0, child), (0, grandchild)]
+        );
+    }
+
+    #[test]
+    fn tombstoned_intermediate_does_not_bypass_live_top_level_parent() {
+        let mut state = app_with_workspaces(&["one"]);
+        let root = state.workspaces[0].tabs[0].root_pane.unwrap();
+        let child = state.workspaces[0].test_split(ratatui::layout::Direction::Horizontal);
+        let grandchild = state.workspaces[0].test_split(ratatui::layout::Direction::Vertical);
+        let parent = state.delegations.create(Some(root), None, None).unwrap();
+        let child_record = state
+            .delegations
+            .create(Some(child), Some(parent), Some("review".into()))
+            .unwrap();
+        state
+            .delegations
+            .create(Some(grandchild), Some(child_record), Some("test".into()))
+            .unwrap();
+        state.delegations.tombstone_pane(child);
+        state.workspaces[0].tabs[0]
+            .panes
+            .get_mut(&grandchild)
+            .unwrap()
+            .seen = false;
+        let terminal_id = state.workspaces[0]
+            .terminal_id(grandchild)
+            .cloned()
+            .unwrap();
+
+        assert!(state.mark_terminal_seen(&terminal_id).is_empty());
+        assert!(!state.workspaces[0].tabs[0].panes[&grandchild].seen);
+    }
+
+    #[test]
+    fn parent_terminal_input_cancels_pending_descendant_notification() {
+        let mut state = app_with_workspaces(&["one"]);
+        state.active = Some(0);
+        state.toast_config.delivery = crate::config::ToastDelivery::Herdr;
+        state.toast_config.delay_seconds = 1;
+        let root = state.workspaces[0].tabs[0].root_pane.unwrap();
+        let child = state.workspaces[0].test_split(ratatui::layout::Direction::Horizontal);
+        state.ensure_test_terminals();
+        let parent = state.delegations.create(Some(root), None, None).unwrap();
+        state
+            .delegations
+            .create(Some(child), Some(parent), Some("review".into()))
+            .unwrap();
+        let child_terminal = state.workspaces[0].terminal_id(child).cloned().unwrap();
+        state.terminals.get_mut(&child_terminal).unwrap().state = AgentState::Working;
+        state.handle_app_event(AppEvent::StateChanged {
+            pane_id: child,
+            agent: Some(Agent::Pi),
+            state: AgentState::Idle,
+            visible_blocker: false,
+            visible_working: false,
+            process_exited: false,
+            observed_at: std::time::Instant::now(),
+        });
+        assert!(state.pending_agent_notifications.contains_key(&child));
+        let root_terminal = state.workspaces[0].terminal_id(root).cloned().unwrap();
+
+        state.mark_terminal_seen(&root_terminal);
+
+        assert!(state.pending_agent_notifications.is_empty());
+    }
+
+    #[test]
     fn passive_focus_preserves_delegated_completion_across_tabs() {
         let mut state = app_with_workspaces(&["one"]);
         let parent_pane = state.workspaces[0].tabs[0].root_pane.unwrap();
@@ -6005,7 +6195,7 @@ mod tests {
     }
 
     #[test]
-    fn grouped_completion_requires_foreground_terminal_entry_for_seen_and_suppression() {
+    fn grouped_delegated_completion_stays_unseen_after_terminal_entry() {
         let mut state = app_with_workspaces(&["active"]);
         state.active = Some(0);
         state.outer_terminal_focus = Some(true);
@@ -6030,6 +6220,11 @@ mod tests {
         state.workspaces[0]
             .select_collection_member(child, collection)
             .expect("select child");
+        let parent = state.delegations.create(Some(root), None, None).unwrap();
+        state
+            .delegations
+            .create(Some(child), Some(parent), Some("review".into()))
+            .unwrap();
         let terminal_id = state.workspaces[0]
             .terminal_id(child)
             .cloned()
@@ -6049,7 +6244,8 @@ mod tests {
         assert!(!state.pane_suppresses_notifications(0, child));
 
         assert!(state.enter_collection_terminal_from_foreground(0, collection, child));
-        assert!(state.pane_suppresses_notifications(0, child));
+        assert!(!state.workspaces[0].pane_state(child).expect("pane").seen);
+        assert!(!state.pane_suppresses_notifications(0, child));
     }
 
     #[test]

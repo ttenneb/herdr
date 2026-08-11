@@ -124,6 +124,7 @@ impl App {
         if let Some(restore) = self.begin_archived_member_input(resolved.ws_idx, resolved.pane_id) {
             self.commit_archived_member_input(restore);
         }
+        self.acknowledge_terminal_input(&terminal_id);
         let Some(agent) = self.agent_info(resolved.ws_idx, resolved.pane_id) else {
             return agent_not_found(id, &params.target);
         };
@@ -256,13 +257,14 @@ impl App {
             .workspaces
             .get(resolved.ws_idx)
             .and_then(|workspace| workspace.terminal_id(resolved.pane_id))
+            .cloned()
         else {
             return agent_not_found(id, &params.target);
         };
         let Some(expected_agent) = self
             .state
             .terminals
-            .get(terminal_id)
+            .get(&terminal_id)
             .and_then(|terminal| terminal.effective_known_agent())
         else {
             return agent_not_ready(id, &params.target);
@@ -280,7 +282,8 @@ impl App {
             }
         };
         let bytes: Vec<u8> = encoded.into_iter().flatten().collect();
-        let restore = (!bytes.is_empty())
+        let accepted = !bytes.is_empty();
+        let restore = accepted
             .then(|| self.begin_archived_member_input(resolved.ws_idx, resolved.pane_id))
             .flatten();
         let result = self
@@ -295,6 +298,9 @@ impl App {
         }
         if let Some(restore) = restore {
             self.commit_archived_member_input(restore);
+        }
+        if accepted {
+            self.acknowledge_terminal_input(&terminal_id);
         }
 
         encode_success(id, ResponseResult::Ok {})

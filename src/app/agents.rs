@@ -214,6 +214,7 @@ impl App {
             terminal.clear_agent_name();
             return Err(AgentStartError::InputFailed(err.to_string()));
         }
+        self.acknowledge_terminal_input(&terminal_id);
         self.state.mark_session_dirty();
         self.schedule_session_save();
 

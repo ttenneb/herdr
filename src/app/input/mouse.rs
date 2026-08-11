@@ -24,6 +24,12 @@ use super::{
     ScrollbarClickTarget, TAB_DRAG_THRESHOLD, WORKSPACE_DRAG_THRESHOLD,
 };
 
+pub(super) enum RightClickPassthroughResult {
+    NotHandled,
+    Handled,
+    Delivered(crate::layout::PaneId),
+}
+
 pub(super) enum MouseAction {
     NewWorkspace,
     Settings(SettingsAction),
@@ -252,8 +258,13 @@ impl AppState {
             && mouse.row >= sidebar.y
             && mouse.row < sidebar.y + sidebar.height;
 
-        if self.handle_right_click_passthrough(terminal_runtimes, mouse, in_sidebar, None) {
-            return None;
+        match self.handle_right_click_passthrough(terminal_runtimes, mouse, in_sidebar, None) {
+            RightClickPassthroughResult::NotHandled => {}
+            RightClickPassthroughResult::Handled => return None,
+            RightClickPassthroughResult::Delivered(pane_id) => {
+                let ws_idx = self.active?;
+                return Some(MouseAction::DeliveredTerminalMouse { ws_idx, pane_id });
+            }
         }
 
         if self.mode == Mode::OpenExistingWorktree {
@@ -816,7 +827,12 @@ impl AppState {
                         if self.forward_pane_mouse_button(terminal_runtimes, &info, mouse) {
                             self.selection = None;
                             self.selection_autoscroll = None;
-                            return None;
+                            return self
+                                .active
+                                .map(|ws_idx| MouseAction::DeliveredTerminalMouse {
+                                    ws_idx,
+                                    pane_id: info.id,
+                                });
                         }
                     }
                 }
@@ -1009,7 +1025,12 @@ impl AppState {
                             self.workspace_press = None;
                             self.tab_press = None;
                             self.drag = None;
-                            return None;
+                            return self
+                                .active
+                                .map(|ws_idx| MouseAction::DeliveredTerminalMouse {
+                                    ws_idx,
+                                    pane_id: info.id,
+                                });
                         }
                     }
                 }
@@ -1137,7 +1158,14 @@ impl AppState {
                 if !in_sidebar =>
             {
                 if let Some(info) = self.pane_mouse_target(mouse.column, mouse.row).cloned() {
-                    let _ = self.forward_pane_mouse_button(terminal_runtimes, &info, mouse);
+                    if self.forward_pane_mouse_button(terminal_runtimes, &info, mouse) {
+                        return self
+                            .active
+                            .map(|ws_idx| MouseAction::DeliveredTerminalMouse {
+                                ws_idx,
+                                pane_id: info.id,
+                            });
+                    }
                 }
             }
 
@@ -1892,7 +1920,7 @@ impl AppState {
         mouse: MouseEvent,
         in_sidebar: bool,
         explicit_target: Option<(PaneInfo, u16, u16)>,
-    ) -> bool {
+    ) -> RightClickPassthroughResult {
         if let Some(gesture) = self.right_click_passthrough.clone() {
             match mouse.kind {
                 MouseEventKind::Drag(MouseButton::Right)
@@ -1905,7 +1933,7 @@ impl AppState {
                         },
                         gesture.modifiers,
                     );
-                    let _ = self.forward_pane_mouse_button(
+                    let delivered = self.forward_pane_mouse_button(
                         terminal_runtimes,
                         &gesture.pane_info,
                         forwarded_mouse,
@@ -1913,7 +1941,11 @@ impl AppState {
                     if matches!(mouse.kind, MouseEventKind::Up(MouseButton::Right)) {
                         self.right_click_passthrough = None;
                     }
-                    return true;
+                    return if delivered {
+                        RightClickPassthroughResult::Delivered(gesture.pane_info.id)
+                    } else {
+                        RightClickPassthroughResult::Handled
+                    };
                 }
                 _ => {
                     self.right_click_passthrough = None;
@@ -1925,14 +1957,14 @@ impl AppState {
             || in_sidebar
             || !matches!(mouse.kind, MouseEventKind::Down(MouseButton::Right))
         {
-            return false;
+            return RightClickPassthroughResult::NotHandled;
         }
 
         let Some(modifiers) = self.right_click_passthrough_modifiers else {
-            return false;
+            return RightClickPassthroughResult::NotHandled;
         };
         if mouse.modifiers != modifiers {
-            return false;
+            return RightClickPassthroughResult::NotHandled;
         }
 
         let target = explicit_target.or_else(|| {
@@ -1941,13 +1973,13 @@ impl AppState {
                 .map(|info| (info, 0, 0))
         });
         let Some((info, logical_row_offset, logical_column_offset)) = target else {
-            return false;
+            return RightClickPassthroughResult::NotHandled;
         };
 
         self.focus_pane(info.id);
         let forwarded_mouse = self.strip_right_click_passthrough_modifiers(mouse, modifiers);
         if !self.forward_pane_mouse_button(terminal_runtimes, &info, forwarded_mouse) {
-            return false;
+            return RightClickPassthroughResult::NotHandled;
         }
 
         self.selection = None;
@@ -1956,13 +1988,14 @@ impl AppState {
         self.tab_press = None;
         self.drag = None;
         self.context_menu = None;
+        let pane_id = info.id;
         self.right_click_passthrough = Some(RightClickPassthroughGesture {
             pane_info: info,
             modifiers,
             logical_row_offset,
             logical_column_offset,
         });
-        true
+        RightClickPassthroughResult::Delivered(pane_id)
     }
 
     fn strip_right_click_passthrough_modifiers(
@@ -2535,6 +2568,49 @@ mod tests {
             );
         }
         assert!(input_rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn delivered_tiled_mouse_drag_and_release_acknowledge_terminal() {
+        let mut app = app_for_mouse_test();
+        let mut ws = Workspace::test_new("test");
+        let pane_id = ws.tabs[0].root_pane.expect("test tab has root pane");
+        let pane_infos = ws.tabs[0].layout.panes(Rect::new(26, 2, 80, 18));
+        let info = pane_infos[0].clone();
+        let (runtime, mut input_rx) =
+            crate::terminal::TerminalRuntime::test_with_channel_and_scrollback_bytes(
+                info.inner_rect.width,
+                info.inner_rect.height,
+                0,
+                b"\x1b[?1002h\x1b[?1006h",
+                8,
+            );
+        ws.insert_test_runtime(pane_id, runtime);
+        app.state.workspaces = vec![ws];
+        app.state.ensure_test_terminals();
+        app.state.active = Some(0);
+        app.state.selected = 0;
+        app.state.mode = Mode::Terminal;
+        app.state.view.pane_infos = pane_infos;
+
+        for kind in [
+            MouseEventKind::Drag(MouseButton::Left),
+            MouseEventKind::Up(MouseButton::Left),
+            MouseEventKind::Drag(MouseButton::Middle),
+            MouseEventKind::Up(MouseButton::Middle),
+        ] {
+            app.state.workspaces[0].tabs[0]
+                .panes
+                .get_mut(&pane_id)
+                .unwrap()
+                .seen = false;
+            app.handle_mouse(mouse(kind, info.inner_rect.x + 1, info.inner_rect.y + 1));
+            assert!(input_rx.try_recv().is_ok(), "{kind:?} must reach the PTY");
+            assert!(
+                app.state.workspaces[0].tabs[0].panes[&pane_id].seen,
+                "{kind:?} must acknowledge delivered terminal input"
+            );
+        }
     }
 
     #[tokio::test]

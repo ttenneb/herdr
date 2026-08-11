@@ -119,9 +119,10 @@ impl App {
     ) -> bool {
         match plan {
             super::input::RepeatPlan::Forwarded(target) => {
-                if self.forward_terminal_key_to_target(&target, key).await {
+                let result = self.forward_terminal_key_to_target(&target, key).await;
+                if result.delivered() {
                     self.acknowledge_terminal_input(&target.terminal_id);
-                } else {
+                } else if !result.succeeded() {
                     self.input_leases.remove(&lease_key);
                 }
                 true
@@ -137,12 +138,12 @@ impl App {
                 let mut forwarded_target = None;
                 for _ in 0..repetitions {
                     if let Some(target) = &forwarded_target {
-                        if self
+                        let result = self
                             .forward_terminal_key_to_target(target, key.clone())
-                            .await
-                        {
+                            .await;
+                        if result.delivered() {
                             self.acknowledge_terminal_input(&target.terminal_id);
-                        } else {
+                        } else if !result.succeeded() {
                             self.input_leases.remove(&lease_key);
                             break;
                         }
@@ -214,9 +215,13 @@ impl App {
                     }
                     crossterm::event::KeyEventKind::Release => {
                         if let Some(lease) = self.input_leases.remove_forwarded(&lease_key) {
-                            let _ = self
+                            if self
                                 .forward_terminal_key_to_target(&lease.target, key)
-                                .await;
+                                .await
+                                .delivered()
+                            {
+                                acknowledged_terminal = Some(lease.target.terminal_id);
+                            }
                         }
                         false
                     }

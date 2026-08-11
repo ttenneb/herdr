@@ -7,6 +7,23 @@ use crate::{
     input::TerminalKey,
 };
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum TerminalKeyForwardResult {
+    Failed,
+    Handled,
+    Delivered,
+}
+
+impl TerminalKeyForwardResult {
+    pub(crate) fn succeeded(self) -> bool {
+        !matches!(self, Self::Failed)
+    }
+
+    pub(crate) fn delivered(self) -> bool {
+        matches!(self, Self::Delivered)
+    }
+}
+
 struct PreparedPaneInput {
     ws_idx: usize,
     pane_id: crate::layout::PaneId,
@@ -332,7 +349,7 @@ impl App {
         &mut self,
         target: &TerminalInputTarget,
         key: TerminalKey,
-    ) -> bool {
+    ) -> TerminalKeyForwardResult {
         if let Some((ws_idx, pane_id)) =
             self.state
                 .workspaces
@@ -350,17 +367,23 @@ impl App {
             self.restore_archived_member_for_input(ws_idx, pane_id);
         }
         let Some(runtime) = self.terminal_input_runtime(target) else {
-            return false;
+            return TerminalKeyForwardResult::Failed;
         };
         let bytes = runtime.encode_terminal_key(key.clone());
-        bytes.is_empty() || runtime.try_send_bytes(Bytes::from(bytes)).is_ok()
+        if bytes.is_empty() {
+            TerminalKeyForwardResult::Handled
+        } else if runtime.try_send_bytes(Bytes::from(bytes)).is_ok() {
+            TerminalKeyForwardResult::Delivered
+        } else {
+            TerminalKeyForwardResult::Failed
+        }
     }
 
     pub(crate) async fn forward_terminal_key_to_target(
         &mut self,
         target: &TerminalInputTarget,
         key: TerminalKey,
-    ) -> bool {
+    ) -> TerminalKeyForwardResult {
         if let Some((ws_idx, pane_id)) =
             self.state
                 .workspaces
@@ -378,10 +401,16 @@ impl App {
             self.restore_archived_member_for_input(ws_idx, pane_id);
         }
         let Some(runtime) = self.terminal_input_runtime(target) else {
-            return false;
+            return TerminalKeyForwardResult::Failed;
         };
         let bytes = runtime.encode_terminal_key(key.clone());
-        bytes.is_empty() || runtime.send_bytes(Bytes::from(bytes)).await.is_ok()
+        if bytes.is_empty() {
+            TerminalKeyForwardResult::Handled
+        } else if runtime.send_bytes(Bytes::from(bytes)).await.is_ok() {
+            TerminalKeyForwardResult::Delivered
+        } else {
+            TerminalKeyForwardResult::Failed
+        }
     }
 
     fn take_pressed_keys_for_source(
@@ -396,7 +425,12 @@ impl App {
             let release = pressed
                 .key
                 .with_kind(crossterm::event::KeyEventKind::Release);
-            let _ = self.forward_terminal_key_to_target_headless(&pressed.target, release);
+            if self
+                .forward_terminal_key_to_target_headless(&pressed.target, release)
+                .delivered()
+            {
+                self.acknowledge_terminal_input(&pressed.target.terminal_id);
+            }
         }
     }
 
@@ -406,7 +440,12 @@ impl App {
             let release = pressed
                 .key
                 .with_kind(crossterm::event::KeyEventKind::Release);
-            let _ = self.forward_terminal_key_to_target_headless(&pressed.target, release);
+            if self
+                .forward_terminal_key_to_target_headless(&pressed.target, release)
+                .delivered()
+            {
+                self.acknowledge_terminal_input(&pressed.target.terminal_id);
+            }
         }
     }
 
@@ -416,9 +455,13 @@ impl App {
             let release = pressed
                 .key
                 .with_kind(crossterm::event::KeyEventKind::Release);
-            let _ = self
+            if self
                 .forward_terminal_key_to_target(&pressed.target, release)
-                .await;
+                .await
+                .delivered()
+            {
+                self.acknowledge_terminal_input(&pressed.target.terminal_id);
+            }
         }
     }
 

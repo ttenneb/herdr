@@ -714,11 +714,6 @@ impl App {
         }
     }
 
-    pub(crate) fn emit_pane_acknowledged(&mut self, ws_idx: usize, pane_id: crate::layout::PaneId) {
-        self.emit_pane_acknowledged_status(ws_idx, pane_id);
-        self.emit_workspace_attention_updated(ws_idx);
-    }
-
     fn emit_pane_acknowledged_status(&mut self, ws_idx: usize, pane_id: crate::layout::PaneId) {
         let Some(public_pane_id) = self.public_pane_id(ws_idx, pane_id) else {
             return;
@@ -750,11 +745,21 @@ impl App {
     }
 
     pub(crate) fn acknowledge_terminal_input(&mut self, terminal_id: &crate::terminal::TerminalId) {
-        let Some((ws_idx, pane_id)) = self.state.mark_terminal_seen(terminal_id) else {
+        let acknowledged = self.state.mark_terminal_seen(terminal_id);
+        if acknowledged.is_empty() {
             return;
-        };
+        }
         self.state.mark_session_dirty();
-        self.emit_pane_acknowledged(ws_idx, pane_id);
+        let mut affected_workspaces = Vec::new();
+        for (ws_idx, pane_id) in acknowledged {
+            self.emit_pane_acknowledged_status(ws_idx, pane_id);
+            if !affected_workspaces.contains(&ws_idx) {
+                affected_workspaces.push(ws_idx);
+            }
+        }
+        for ws_idx in affected_workspaces {
+            self.emit_workspace_attention_updated(ws_idx);
+        }
         self.schedule_session_save();
     }
 

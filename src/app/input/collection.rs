@@ -21,7 +21,7 @@ use crate::{
     layout::{CollectionId, LayoutLeaf, PaneId, PaneInfo},
 };
 
-use super::PaneUrlClickTarget;
+use super::{mouse::RightClickPassthroughResult, PaneUrlClickTarget};
 
 impl App {
     fn focused_collection(&self) -> Option<(usize, CollectionId, Option<PaneId>)> {
@@ -632,14 +632,8 @@ impl App {
         let Some((_, _, Some(pane))) = self.focused_collection() else {
             return;
         };
-        if self
-            .state
-            .enter_collection_terminal_from_foreground(ws_idx, collection_id, pane)
-        {
-            self.state.mark_session_dirty();
-            self.emit_pane_acknowledged(ws_idx, pane);
-            self.schedule_session_save();
-        }
+        self.state
+            .enter_collection_terminal_from_foreground(ws_idx, collection_id, pane);
     }
     pub(crate) fn toggle_selected_archive(&mut self, ws_idx: usize, collection_id: CollectionId) {
         let Some((_, _, Some(pane))) = self.focused_collection() else {
@@ -761,6 +755,20 @@ impl App {
         None
     }
 
+    fn acknowledge_collection_terminal_mouse(
+        &mut self,
+        ws_idx: usize,
+        pane_id: PaneId,
+        delivered: bool,
+    ) {
+        if !delivered {
+            return;
+        }
+        if let Some(terminal_id) = self.state.workspaces[ws_idx].terminal_id(pane_id).cloned() {
+            self.acknowledge_terminal_input(&terminal_id);
+        }
+    }
+
     fn scroll_collection_child_wheel(
         &mut self,
         ws_idx: usize,
@@ -788,12 +796,14 @@ impl App {
             borders: Borders::NONE,
             is_focused: true,
         };
-        if allow_terminal_routing
-            && self
-                .state
-                .forward_pane_wheel(&self.terminal_runtimes, &info, logical_mouse)
-        {
-            return;
+        if allow_terminal_routing {
+            let delivered =
+                self.state
+                    .forward_pane_wheel(&self.terminal_runtimes, &info, logical_mouse);
+            if delivered {
+                self.acknowledge_collection_terminal_mouse(ws_idx, pane_id, true);
+                return;
+            }
         }
         if let Some(runtime) =
             self.state
@@ -871,15 +881,22 @@ impl App {
         // A passthrough gesture remains owned by the pane where it started. Continue it before
         // collection hit-testing so clipped-preview coordinates survive chrome and off-layout
         // drag/up events.
-        if self.state.right_click_passthrough.is_some()
-            && self.state.handle_right_click_passthrough(
+        if self.state.right_click_passthrough.is_some() {
+            match self.state.handle_right_click_passthrough(
                 &self.terminal_runtimes,
                 mouse,
                 false,
                 None,
-            )
-        {
-            return true;
+            ) {
+                RightClickPassthroughResult::NotHandled => {}
+                RightClickPassthroughResult::Handled => return true,
+                RightClickPassthroughResult::Delivered(pane_id) => {
+                    if let Some(ws_idx) = self.state.active {
+                        self.acknowledge_collection_terminal_mouse(ws_idx, pane_id, true);
+                    }
+                    return true;
+                }
+            }
         }
         // A collection's outer frame belongs to its native menu. Test it before normal hits:
         // maximized previews cover the whole layout and would otherwise hide that frame. This
@@ -1075,7 +1092,7 @@ impl App {
             })
             .flatten();
         let preview_info = preview_geometry.as_ref().map(|(info, _)| info.clone());
-        if self.state.handle_right_click_passthrough(
+        match self.state.handle_right_click_passthrough(
             &self.terminal_runtimes,
             terminal_mouse,
             false,
@@ -1083,7 +1100,12 @@ impl App {
                 .clone()
                 .map(|info| (info, hit.terminal_row_offset, 0)),
         ) {
-            return true;
+            RightClickPassthroughResult::NotHandled => {}
+            RightClickPassthroughResult::Handled => return true,
+            RightClickPassthroughResult::Delivered(pane_id) => {
+                self.acknowledge_collection_terminal_mouse(ws_idx, pane_id, true);
+                return true;
+            }
         }
         if preview_geometry
             .as_ref()
@@ -1131,11 +1153,13 @@ impl App {
             }
             MouseEventKind::ScrollLeft | MouseEventKind::ScrollRight if entered_preview => {
                 if let Some(info) = preview_info.as_ref() {
-                    let _ = self.state.forward_pane_reported_wheel(
+                    let pane_id = info.id;
+                    let delivered = self.state.forward_pane_reported_wheel(
                         &self.terminal_runtimes,
                         info,
                         terminal_mouse,
                     );
+                    self.acknowledge_collection_terminal_mouse(ws_idx, pane_id, delivered);
                 }
                 true
             }
@@ -1200,11 +1224,12 @@ impl App {
                                 borders: Borders::NONE,
                                 is_focused: true,
                             };
-                            let _ = self.state.forward_pane_mouse_button(
+                            let delivered = self.state.forward_pane_mouse_button(
                                 &self.terminal_runtimes,
                                 &info,
                                 terminal_mouse,
                             );
+                            self.acknowledge_collection_terminal_mouse(ws_idx, pane, delivered);
                         }
                         CollectionHitKind::ResizeHandle => {
                             let height = self.effective_preview_height(hit.collection_id, pane);
@@ -1294,11 +1319,13 @@ impl App {
                     self.restore_archived_member_for_input(ws_idx, pane);
                 }
                 if let Some(info) = preview_info.as_ref() {
-                    let _ = self.state.forward_pane_mouse_button(
+                    let pane_id = info.id;
+                    let delivered = self.state.forward_pane_mouse_button(
                         &self.terminal_runtimes,
                         info,
                         terminal_mouse,
                     );
+                    self.acknowledge_collection_terminal_mouse(ws_idx, pane_id, delivered);
                 }
                 true
             }
@@ -1323,19 +1350,20 @@ impl App {
                             borders: Borders::NONE,
                             is_focused: true,
                         };
-                        if matches!(mouse.kind, MouseEventKind::Moved) {
-                            let _ = self.state.forward_pane_mouse_motion(
+                        let delivered = if matches!(mouse.kind, MouseEventKind::Moved) {
+                            self.state.forward_pane_mouse_motion(
                                 &self.terminal_runtimes,
                                 &info,
                                 terminal_mouse,
-                            );
+                            )
                         } else {
-                            let _ = self.state.forward_pane_mouse_button(
+                            self.state.forward_pane_mouse_button(
                                 &self.terminal_runtimes,
                                 &info,
                                 terminal_mouse,
-                            );
-                        }
+                            )
+                        };
+                        self.acknowledge_collection_terminal_mouse(ws_idx, pane, delivered);
                     }
                 }
                 true
@@ -1985,6 +2013,17 @@ mod tests {
         let preview = app.state.view.collection_layouts[0].rows[0]
             .preview_rect
             .expect("preview");
+        app.state.ensure_test_terminals();
+        let descendant = app.state.workspaces[0].tabs[0].root_pane.unwrap();
+        let parent = app
+            .state
+            .delegations
+            .create(Some(child), None, None)
+            .unwrap();
+        app.state
+            .delegations
+            .create(Some(descendant), Some(parent), Some("review".into()))
+            .unwrap();
 
         for kind in [
             MouseEventKind::Moved,
@@ -1996,6 +2035,11 @@ mod tests {
             assert!(rx.try_recv().is_ok(), "{kind:?} must reach the child PTY");
         }
 
+        app.state.workspaces[0].tabs[0]
+            .panes
+            .get_mut(&descendant)
+            .unwrap()
+            .seen = false;
         app.state.right_click_passthrough_modifiers = Some(KeyModifiers::CONTROL);
         for kind in [
             MouseEventKind::Down(MouseButton::Right),
@@ -2009,11 +2053,47 @@ mod tests {
         }
         assert!(app.state.right_click_passthrough.is_none());
         assert!(app.state.context_menu.is_none());
+        assert!(
+            app.state.workspaces[0].tabs[0].panes[&descendant].seen,
+            "modified right-click passthrough must acknowledge parent input"
+        );
         assert_eq!(
             app.state.workspaces[0].focused_pane_id(),
             Some(child),
             "preview routing must retain typed child focus"
         );
+    }
+
+    #[tokio::test]
+    async fn delivered_collection_mouse_to_top_level_parent_acknowledges_descendants() {
+        let (mut app, _collection, parent_pane, mut rx) =
+            collection_scroll_app(b"\x1b[?1003h\x1b[?1006h", 0);
+        app.state.ensure_test_terminals();
+        let descendant = app.state.workspaces[0].tabs[0].root_pane.unwrap();
+        let parent = app
+            .state
+            .delegations
+            .create(Some(parent_pane), None, None)
+            .unwrap();
+        app.state
+            .delegations
+            .create(Some(descendant), Some(parent), Some("review".into()))
+            .unwrap();
+        app.state.workspaces[0].tabs[0]
+            .panes
+            .get_mut(&descendant)
+            .unwrap()
+            .seen = false;
+        let preview = app.state.view.collection_layouts[0].rows[0]
+            .preview_rect
+            .expect("preview");
+
+        assert!(app.handle_collection_mouse(mouse(MouseEventKind::Moved, preview.x, preview.y,)));
+        assert!(
+            rx.try_recv().is_ok(),
+            "mouse motion must reach the parent PTY"
+        );
+        assert!(app.state.workspaces[0].tabs[0].panes[&descendant].seen);
     }
 
     #[tokio::test]
@@ -2806,9 +2886,9 @@ mod tests {
         assert_eq!(app.state.mode, crate::app::Mode::Terminal);
 
         assert!(
-            !app.state
+            app.state
                 .enter_collection_terminal_from_foreground(0, collection, child),
-            "pane was already acknowledged"
+            "valid child terminal can be re-entered"
         );
         app.toggle_selected_expanded(collection);
         assert!(
@@ -2898,7 +2978,10 @@ mod tests {
 
         assert!(app.enter_collection_terminal_from_foreground(0, id, child));
         assert!(app.focused_collection_terminal_entered());
-        assert!(app.workspaces[0].tabs[0].panes[&child].seen);
+        assert!(
+            !app.workspaces[0].tabs[0].panes[&child].seen,
+            "entering a delegated child must not acknowledge its completion"
+        );
         assert!(app.is_active_pane(0, 0, child));
     }
 }

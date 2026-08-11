@@ -1647,7 +1647,8 @@ impl App {
             return pane_not_found(id, &params.pane_id);
         }
         let bytes = Bytes::from(params.text);
-        let restore = (!bytes.is_empty())
+        let accepted = !bytes.is_empty();
+        let restore = accepted
             .then(|| self.begin_archived_member_input(ws_idx, pane_id))
             .flatten();
         let result = self
@@ -1662,6 +1663,11 @@ impl App {
         }
         if let Some(restore) = restore {
             self.commit_archived_member_input(restore);
+        }
+        if accepted {
+            if let Some(terminal_id) = self.state.workspaces[ws_idx].terminal_id(pane_id).cloned() {
+                self.acknowledge_terminal_input(&terminal_id);
+            }
         }
 
         encode_success(id, ResponseResult::Ok {})
@@ -1686,7 +1692,8 @@ impl App {
             Ok(bytes) => bytes,
             Err(key) => return encode_error(id, "invalid_key", format!("unsupported key {key}")),
         };
-        let restore = (!bytes.is_empty())
+        let accepted = !bytes.is_empty();
+        let restore = accepted
             .then(|| self.begin_archived_member_input(ws_idx, pane_id))
             .flatten();
         let result = self
@@ -1701,6 +1708,11 @@ impl App {
         }
         if let Some(restore) = restore {
             self.commit_archived_member_input(restore);
+        }
+        if accepted {
+            if let Some(terminal_id) = self.state.workspaces[ws_idx].terminal_id(pane_id).cloned() {
+                self.acknowledge_terminal_input(&terminal_id);
+            }
         }
 
         encode_success(id, ResponseResult::Ok {})
@@ -1898,12 +1910,24 @@ impl App {
                         self.rollback_archived_member_input(restore);
                     }
                 }
+                if accepted {
+                    if let Some(terminal_id) =
+                        self.state.workspaces[ws_idx].terminal_id(pane_id).cloned()
+                    {
+                        self.acknowledge_terminal_input(&terminal_id);
+                    }
+                }
                 return encode_error(id, "pane_send_failed", err.to_string());
             }
             accepted |= nonempty;
         }
         if let Some(restore) = restore {
             self.commit_archived_member_input(restore);
+        }
+        if accepted {
+            if let Some(terminal_id) = self.state.workspaces[ws_idx].terminal_id(pane_id).cloned() {
+                self.acknowledge_terminal_input(&terminal_id);
+            }
         }
 
         encode_success(id, ResponseResult::Ok {})
@@ -2570,6 +2594,112 @@ mod tests {
         assert_eq!(success.id, "req");
         assert_eq!(app.state.request_remove_linked_worktree, None);
         assert!(app.state.workspaces.is_empty());
+    }
+
+    #[tokio::test]
+    async fn parent_terminal_input_acknowledges_descendant_attention_with_events() {
+        let event_hub = crate::api::EventHub::default();
+        let (_api_tx, api_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = App::new(&Config::default(), true, None, api_rx, event_hub.clone());
+        let mut workspace = Workspace::test_new("parent-ack");
+        let root = workspace.tabs[0].root_pane.expect("root pane");
+        let child = workspace.test_split(ratatui::layout::Direction::Horizontal);
+        app.state.workspaces = vec![workspace];
+        app.state.ensure_test_terminals();
+        let child_terminal = app.state.workspaces[0].tabs[0].panes[&child]
+            .attached_terminal_id
+            .clone();
+        app.state.terminals.get_mut(&child_terminal).unwrap().state = AgentState::Idle;
+        app.state.workspaces[0].tabs[0]
+            .panes
+            .get_mut(&child)
+            .unwrap()
+            .seen = false;
+        let root_delegation = app
+            .state
+            .delegations
+            .create(Some(root), None, None)
+            .unwrap();
+        app.state
+            .delegations
+            .create(Some(child), Some(root_delegation), Some("review".into()))
+            .unwrap();
+        let public_root = app.public_pane_id(0, root).unwrap();
+        let public_child = app.public_pane_id(0, child).unwrap();
+        let (runtime, _rx) =
+            crate::terminal::TerminalRuntime::test_with_channel_capacity(80, 24, 4);
+        app.state.insert_test_runtime(root, runtime);
+        let sequence = event_hub.current_sequence();
+
+        let response = app.handle_pane_send_text(
+            "ack".into(),
+            PaneSendTextParams {
+                pane_id: public_root,
+                text: "x".into(),
+            },
+        );
+
+        let _: SuccessResponse = serde_json::from_str(&response).unwrap();
+        assert_eq!(app.workspace_info(0).descendant_attention_count, 0);
+        assert!(app.state.session_dirty);
+        let events = event_hub.events_after(sequence);
+        assert!(events.iter().any(|(_, event)| matches!(
+            &event.data,
+            EventData::PaneAgentStatusChanged { pane_id, .. } if pane_id == &public_child
+        )));
+        assert!(events.iter().any(|(_, event)| matches!(
+            &event.data,
+            EventData::WorkspaceUpdated { workspace }
+                if workspace.descendant_attention_count == 0
+        )));
+    }
+
+    #[tokio::test]
+    async fn child_terminal_input_does_not_acknowledge_descendant_attention() {
+        let event_hub = crate::api::EventHub::default();
+        let (_api_tx, api_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = App::new(&Config::default(), true, None, api_rx, event_hub.clone());
+        let mut workspace = Workspace::test_new("child-no-ack");
+        let root = workspace.tabs[0].root_pane.expect("root pane");
+        let child = workspace.test_split(ratatui::layout::Direction::Horizontal);
+        app.state.workspaces = vec![workspace];
+        app.state.ensure_test_terminals();
+        let child_terminal = app.state.workspaces[0].tabs[0].panes[&child]
+            .attached_terminal_id
+            .clone();
+        app.state.terminals.get_mut(&child_terminal).unwrap().state = AgentState::Idle;
+        app.state.workspaces[0].tabs[0]
+            .panes
+            .get_mut(&child)
+            .unwrap()
+            .seen = false;
+        let root_delegation = app
+            .state
+            .delegations
+            .create(Some(root), None, None)
+            .unwrap();
+        app.state
+            .delegations
+            .create(Some(child), Some(root_delegation), Some("review".into()))
+            .unwrap();
+        let public_child = app.public_pane_id(0, child).unwrap();
+        let (runtime, _rx) =
+            crate::terminal::TerminalRuntime::test_with_channel_capacity(80, 24, 4);
+        app.state.insert_test_runtime(child, runtime);
+        let sequence = event_hub.current_sequence();
+
+        let response = app.handle_pane_send_text(
+            "no-ack".into(),
+            PaneSendTextParams {
+                pane_id: public_child,
+                text: "x".into(),
+            },
+        );
+
+        let _: SuccessResponse = serde_json::from_str(&response).unwrap();
+        assert_eq!(app.workspace_info(0).descendant_attention_count, 1);
+        assert!(!app.state.workspaces[0].tabs[0].panes[&child].seen);
+        assert!(event_hub.events_after(sequence).is_empty());
     }
 
     #[test]
