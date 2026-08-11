@@ -1835,8 +1835,10 @@ impl App {
                         }
                         crossterm::event::KeyEventKind::Release => {
                             if let Some(lease) = self.input_leases.remove_forwarded(&lease_key) {
-                                let _ = self
-                                    .forward_terminal_key_to_target_headless(&lease.target, key);
+                                if self.forward_terminal_key_to_target_headless(&lease.target, key)
+                                {
+                                    self.acknowledge_terminal_input(&lease.target.terminal_id);
+                                }
                             }
                         }
                     }
@@ -3721,14 +3723,21 @@ mod tests {
         app.state.selected = 0;
         app.state.mode = Mode::Terminal;
 
-        for kind in [
-            KeyEventKind::Press,
-            KeyEventKind::Repeat,
-            KeyEventKind::Release,
-        ] {
+        for kind in [KeyEventKind::Press, KeyEventKind::Repeat] {
             app.handle_raw_input_event(raw_key(KeyCode::Char('j'), KeyModifiers::empty(), kind))
                 .await;
         }
+        app.state.workspaces[0].tabs[0]
+            .panes
+            .get_mut(&focused)
+            .unwrap()
+            .seen = false;
+        app.handle_raw_input_event(raw_key(
+            KeyCode::Char('j'),
+            KeyModifiers::empty(),
+            KeyEventKind::Release,
+        ))
+        .await;
 
         assert_eq!(
             rx.recv().await.unwrap(),
@@ -6000,6 +6009,7 @@ last_pane = "prefix+tab"
             .runtimes
             .insert(second_pane, second_runtime);
         app.state.workspaces = vec![workspace];
+        app.state.ensure_test_terminals();
         app.state.active = Some(0);
         app.state.selected = 0;
         app.state.mode = Mode::Terminal;
@@ -6023,6 +6033,13 @@ last_pane = "prefix+tab"
             )],
             false,
         );
+        for pane_id in [first_pane, second_pane] {
+            app.state.workspaces[0].tabs[0]
+                .panes
+                .get_mut(&pane_id)
+                .unwrap()
+                .seen = false;
+        }
         app.route_client_events_from(
             1,
             vec![raw_key(
@@ -6042,6 +6059,8 @@ last_pane = "prefix+tab"
             false,
         );
 
+        assert!(app.state.workspaces[0].tabs[0].panes[&first_pane].seen);
+        assert!(app.state.workspaces[0].tabs[0].panes[&second_pane].seen);
         for rx in [&mut first_rx, &mut second_rx] {
             assert_eq!(
                 rx.recv().await.unwrap(),

@@ -827,7 +827,12 @@ impl AppState {
                         if self.forward_pane_mouse_button(terminal_runtimes, &info, mouse) {
                             self.selection = None;
                             self.selection_autoscroll = None;
-                            return None;
+                            return self
+                                .active
+                                .map(|ws_idx| MouseAction::DeliveredTerminalMouse {
+                                    ws_idx,
+                                    pane_id: info.id,
+                                });
                         }
                     }
                 }
@@ -1020,7 +1025,12 @@ impl AppState {
                             self.workspace_press = None;
                             self.tab_press = None;
                             self.drag = None;
-                            return None;
+                            return self
+                                .active
+                                .map(|ws_idx| MouseAction::DeliveredTerminalMouse {
+                                    ws_idx,
+                                    pane_id: info.id,
+                                });
                         }
                     }
                 }
@@ -1148,7 +1158,14 @@ impl AppState {
                 if !in_sidebar =>
             {
                 if let Some(info) = self.pane_mouse_target(mouse.column, mouse.row).cloned() {
-                    let _ = self.forward_pane_mouse_button(terminal_runtimes, &info, mouse);
+                    if self.forward_pane_mouse_button(terminal_runtimes, &info, mouse) {
+                        return self
+                            .active
+                            .map(|ws_idx| MouseAction::DeliveredTerminalMouse {
+                                ws_idx,
+                                pane_id: info.id,
+                            });
+                    }
                 }
             }
 
@@ -2551,6 +2568,49 @@ mod tests {
             );
         }
         assert!(input_rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn delivered_tiled_mouse_drag_and_release_acknowledge_terminal() {
+        let mut app = app_for_mouse_test();
+        let mut ws = Workspace::test_new("test");
+        let pane_id = ws.tabs[0].root_pane.expect("test tab has root pane");
+        let pane_infos = ws.tabs[0].layout.panes(Rect::new(26, 2, 80, 18));
+        let info = pane_infos[0].clone();
+        let (runtime, mut input_rx) =
+            crate::terminal::TerminalRuntime::test_with_channel_and_scrollback_bytes(
+                info.inner_rect.width,
+                info.inner_rect.height,
+                0,
+                b"\x1b[?1002h\x1b[?1006h",
+                8,
+            );
+        ws.insert_test_runtime(pane_id, runtime);
+        app.state.workspaces = vec![ws];
+        app.state.ensure_test_terminals();
+        app.state.active = Some(0);
+        app.state.selected = 0;
+        app.state.mode = Mode::Terminal;
+        app.state.view.pane_infos = pane_infos;
+
+        for kind in [
+            MouseEventKind::Drag(MouseButton::Left),
+            MouseEventKind::Up(MouseButton::Left),
+            MouseEventKind::Drag(MouseButton::Middle),
+            MouseEventKind::Up(MouseButton::Middle),
+        ] {
+            app.state.workspaces[0].tabs[0]
+                .panes
+                .get_mut(&pane_id)
+                .unwrap()
+                .seen = false;
+            app.handle_mouse(mouse(kind, info.inner_rect.x + 1, info.inner_rect.y + 1));
+            assert!(input_rx.try_recv().is_ok(), "{kind:?} must reach the PTY");
+            assert!(
+                app.state.workspaces[0].tabs[0].panes[&pane_id].seen,
+                "{kind:?} must acknowledge delivered terminal input"
+            );
+        }
     }
 
     #[tokio::test]

@@ -214,9 +214,12 @@ impl App {
                     }
                     crossterm::event::KeyEventKind::Release => {
                         if let Some(lease) = self.input_leases.remove_forwarded(&lease_key) {
-                            let _ = self
+                            if self
                                 .forward_terminal_key_to_target(&lease.target, key)
-                                .await;
+                                .await
+                            {
+                                acknowledged_terminal = Some(lease.target.terminal_id);
+                            }
                         }
                         false
                     }
