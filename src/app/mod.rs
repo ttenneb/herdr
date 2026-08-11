@@ -1716,9 +1716,10 @@ impl App {
     ) {
         match plan {
             input::RepeatPlan::Forwarded(target) => {
-                if self.forward_terminal_key_to_target_headless(&target, key) {
+                let result = self.forward_terminal_key_to_target_headless(&target, key);
+                if result.delivered() {
                     self.acknowledge_terminal_input(&target.terminal_id);
-                } else {
+                } else if !result.succeeded() {
                     self.input_leases.remove(&lease_key);
                 }
             }
@@ -1733,9 +1734,11 @@ impl App {
                 let mut forwarded_target = None;
                 for _ in 0..repetitions {
                     if let Some(target) = &forwarded_target {
-                        if self.forward_terminal_key_to_target_headless(target, key.clone()) {
+                        let result =
+                            self.forward_terminal_key_to_target_headless(target, key.clone());
+                        if result.delivered() {
                             self.acknowledge_terminal_input(&target.terminal_id);
-                        } else {
+                        } else if !result.succeeded() {
                             self.input_leases.remove(&lease_key);
                             break;
                         }
@@ -1835,7 +1838,9 @@ impl App {
                         }
                         crossterm::event::KeyEventKind::Release => {
                             if let Some(lease) = self.input_leases.remove_forwarded(&lease_key) {
-                                if self.forward_terminal_key_to_target_headless(&lease.target, key)
+                                if self
+                                    .forward_terminal_key_to_target_headless(&lease.target, key)
+                                    .delivered()
                                 {
                                     self.acknowledge_terminal_input(&lease.target.terminal_id);
                                 }
@@ -3754,6 +3759,44 @@ mod tests {
         assert!(rx.try_recv().is_err());
         assert!(app.state.workspaces[0].tabs[0].panes[&focused].seen);
         assert!(app.state.session_dirty);
+    }
+
+    #[tokio::test]
+    async fn unencoded_key_release_does_not_acknowledge_terminal() {
+        let mut app = test_app();
+        let mut workspace = Workspace::test_new("test");
+        let focused = workspace.focused_pane_id().unwrap();
+        let (runtime, mut rx) =
+            TerminalRuntime::test_with_channel_and_scrollback_bytes(80, 24, 0, b"", 2);
+        workspace.tabs[0].runtimes.insert(focused, runtime);
+        app.state.workspaces = vec![workspace];
+        app.state.ensure_test_terminals();
+        app.state.active = Some(0);
+        app.state.selected = 0;
+        app.state.mode = Mode::Terminal;
+
+        app.handle_raw_input_event(raw_key(
+            KeyCode::Char('j'),
+            KeyModifiers::empty(),
+            KeyEventKind::Press,
+        ))
+        .await;
+        assert_eq!(rx.try_recv().unwrap(), bytes::Bytes::from_static(b"j"));
+        app.state.workspaces[0].tabs[0]
+            .panes
+            .get_mut(&focused)
+            .unwrap()
+            .seen = false;
+
+        app.handle_raw_input_event(raw_key(
+            KeyCode::Char('j'),
+            KeyModifiers::empty(),
+            KeyEventKind::Release,
+        ))
+        .await;
+
+        assert!(rx.try_recv().is_err());
+        assert!(!app.state.workspaces[0].tabs[0].panes[&focused].seen);
     }
 
     #[tokio::test]
@@ -5743,21 +5786,25 @@ last_pane = "prefix+tab"
             TerminalRuntime::test_with_channel_and_scrollback_bytes(80, 24, 0, b"\x1b[>15u", 3);
         workspace.tabs[0].runtimes.insert(focused, runtime);
         app.state.workspaces = vec![workspace];
+        app.state.ensure_test_terminals();
         app.state.active = Some(0);
         app.state.selected = 0;
         app.state.mode = Mode::Terminal;
 
         app.route_client_events(
-            vec![
-                raw_key(
-                    KeyCode::Char('j'),
-                    KeyModifiers::empty(),
-                    KeyEventKind::Press,
-                ),
-                crate::raw_input::RawInputEvent::OuterFocusLost,
-            ],
+            vec![raw_key(
+                KeyCode::Char('j'),
+                KeyModifiers::empty(),
+                KeyEventKind::Press,
+            )],
             false,
         );
+        app.state.workspaces[0].tabs[0]
+            .panes
+            .get_mut(&focused)
+            .unwrap()
+            .seen = false;
+        app.route_client_events(vec![crate::raw_input::RawInputEvent::OuterFocusLost], false);
 
         assert_eq!(
             rx.try_recv().expect("forwarded press"),
@@ -5768,6 +5815,7 @@ last_pane = "prefix+tab"
             bytes::Bytes::from_static(b"\x1b[106;1:3u")
         );
         assert!(app.input_leases.is_empty());
+        assert!(app.state.workspaces[0].tabs[0].panes[&focused].seen);
     }
 
     #[tokio::test]
