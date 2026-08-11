@@ -444,7 +444,7 @@ A first complete UX should satisfy the following:
 - Delegation uses stable session-wide records with parent, derived root, purpose, cycle prevention, and parent-close tombstones.
 - The list renders sibling order as a depth-first forest; reorder moves sibling subtrees and reparenting is explicit.
 - Background state changes highlight children without changing focus, scroll, expansion, ordering, or archive membership.
-- Entering a child from the foreground full-app client marks only that child seen; focus, reads, observers, and viewing the collection do not.
+- Successfully delivered terminal input to a top-level parent marks its surviving delegated subtree seen; entering or interacting directly with a delegated child, focus, reads, observers, and viewing the collection do not.
 - Archival is explicit and does not claim completion or result delivery.
 - Input or renewed working/blocked state atomically returns an archived child to active.
 - Initial count and age limits warn but never close live PTYs automatically.
