@@ -220,17 +220,7 @@ impl AppState {
         view.expanded.insert(pane_id);
         view.mode = CollectionInteractionMode::Terminal;
         view.entered = Some(pane_id);
-        let Some(pane) = self
-            .workspaces
-            .get_mut(ws_idx)
-            .and_then(|ws| ws.active_tab_mut())
-            .and_then(|tab| tab.panes.get_mut(&pane_id))
-        else {
-            return false;
-        };
-        let changed = !pane.seen;
-        pane.seen = true;
-        changed
+        true
     }
 
     pub(crate) fn focused_collection_terminal_entered(&self) -> bool {

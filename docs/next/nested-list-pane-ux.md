@@ -267,17 +267,16 @@ A hidden or collapsed child changing state does not alter the user's expansion, 
 - Blocked and newly completed children are highlighted in their rows.
 - Tab, Workspace, and Repository activity follows top-level or locally promoted agents rather than allowing a completed delegated descendant to impersonate its parent.
 - Unseen completed descendants appear as a separate teal badge/count beside the primary state icon, while a blocked descendant still makes that primary icon red.
-- The initial version uses existing per-child notification delivery, but suppression is based on actual child visibility and entry rather than containing-tab membership.
-- Viewing or focusing the collection does not mark every child as seen.
+- Viewing or focusing the collection does not mark children as seen.
 - Seen remains session-global initially.
-- A child becomes seen only when a human enters that child's terminal from the foreground full-app client.
-- API focus, API reads, passive observation, and non-foreground clients do not mark a child seen.
+- Input successfully delivered to a top-level agent terminal marks that agent and every surviving pane in its delegated subtree as seen.
+- Entering or typing in an individual delegated child with a live parent does not acknowledge completion attention; users do not need to visit child terminals merely to clear the rollup.
+- If a parent pane has been closed, its surviving child becomes an effective root and input to that child can acknowledge its remaining subtree.
+- API focus, API reads, and passive observation do not mark descendants seen. API and direct-attach terminal input follow the same top-level-parent rule as full-app interactive input.
 
-This keeps attention reliable without allowing background work to rearrange the interface.
+This keeps attention reliable without allowing background work to rearrange the interface or requiring users to clear descendants one by one.
 
-> **TODO:** Design an explicit agent/subagent acknowledgment mechanism so orchestrating agents can intentionally clear or roll up attention without treating API reads, focus calls, or detected `done` state as acknowledgment.
-
-Notification batching or parent-level notification policies can be considered separately from the nested-list pane.
+Notification batching policies can be considered separately from the nested-list pane.
 
 ## Completion and archival
 
@@ -427,7 +426,7 @@ The product semantics and core runtime boundaries are settled. Detailed implemen
 7. Whether local expansion, scroll, preview-height, and maximize state is optionally persisted per client across detach.
 8. How older protocol clients receive or reject collection layouts after the required protocol-version change.
 9. How delegation tombstones are compacted after their last retained descendant disappears.
-10. The future agent/subagent acknowledgment mechanism for seen state and attention rollups.
+10. Whether a future explicit acknowledgment API is needed in addition to top-level terminal-input rollups.
 
 ## Acceptance criteria
 

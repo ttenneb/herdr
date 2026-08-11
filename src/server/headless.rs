@@ -348,7 +348,7 @@ fn apply_terminal_attach_scroll(
     column: Option<u16>,
     row: Option<u16>,
     modifiers: u8,
-) -> Result<(), String> {
+) -> Result<bool, String> {
     let wheel_kind = match direction {
         AttachScrollDirection::Up => MouseEventKind::ScrollUp,
         AttachScrollDirection::Down => MouseEventKind::ScrollDown,
@@ -362,9 +362,11 @@ fn apply_terminal_attach_scroll(
                 AttachScrollDirection::Up => runtime.scroll_up(lines.max(1) as usize),
                 AttachScrollDirection::Down => runtime.scroll_down(lines.max(1) as usize),
             }
-            return Ok(());
+            return Ok(false);
         }
-        return apply_terminal_attach_input(runtime, input);
+        let accepted = !input.is_empty();
+        apply_terminal_attach_input(runtime, input)?;
+        return Ok(accepted);
     }
 
     match runtime.wheel_routing() {
@@ -382,25 +384,29 @@ fn apply_terminal_attach_scroll(
                     "failed to encode terminal attach mouse wheel event: {wheel_kind:?}"
                 ));
             };
+            let accepted = !bytes.is_empty();
             runtime
                 .try_send_bytes(Bytes::from(bytes))
                 .map_err(|err| format!("terminal attach mouse wheel input failed: {err}"))?;
+            return Ok(accepted);
         }
         Some(crate::pane::WheelRouting::AlternateScroll) => {
             runtime.scroll_reset();
             let Some(bytes) = runtime.encode_alternate_scroll(wheel_kind) else {
-                return Ok(());
+                return Ok(false);
             };
+            let accepted = !bytes.is_empty();
             runtime
                 .try_send_bytes(Bytes::from(bytes))
                 .map_err(|err| format!("terminal attach alternate scroll input failed: {err}"))?;
+            return Ok(accepted);
         }
         Some(crate::pane::WheelRouting::HostScroll) | None => match direction {
             AttachScrollDirection::Up => runtime.scroll_up(lines.max(1) as usize),
             AttachScrollDirection::Down => runtime.scroll_down(lines.max(1) as usize),
         },
     }
-    Ok(())
+    Ok(false)
 }
 
 fn apply_terminal_attach_input(
@@ -1500,6 +1506,15 @@ impl HeadlessServer {
     }
 
     fn pane_suppresses_notifications(&self, ws_idx: usize, pane_id: PaneId) -> bool {
+        if self
+            .app
+            .state
+            .delegations
+            .delegation_for_pane(pane_id)
+            .is_some_and(|record| record.parent_id.is_some())
+        {
+            return false;
+        }
         crate::app::actions::active_tab_suppresses_notifications(
             self.app.state.pane_is_foreground_visible(ws_idx, pane_id),
             self.foreground_client_outer_focus(),
@@ -1882,15 +1897,32 @@ impl HeadlessServer {
     }
 
     fn paste_client_clipboard_image_path(&mut self, client_id: u64, path: String) -> bool {
-        if let Some(ClientConnection {
-            mode: ClientConnectionMode::TerminalAttach { terminal_id },
-            ..
-        }) = self.clients.get(&client_id)
+        if let Some(terminal_id) =
+            self.clients
+                .get(&client_id)
+                .and_then(|client| match &client.mode {
+                    ClientConnectionMode::TerminalAttach { terminal_id } => {
+                        Some(terminal_id.clone())
+                    }
+                    _ => None,
+                })
         {
-            if let Some(runtime) = self.runtime_for_terminal_id_string(terminal_id) {
+            let accepted = if let Some(runtime) = self.runtime_for_terminal_id_string(&terminal_id)
+            {
                 let payload = paste_payload_for_runtime(runtime, &path);
+                let nonempty = !payload.is_empty();
                 if let Err(err) = runtime.try_send_bytes(Bytes::from(payload)) {
                     warn!(client_id, terminal_id = %terminal_id, err = %err, "terminal attach clipboard image paste failed");
+                    false
+                } else {
+                    nonempty
+                }
+            } else {
+                false
+            };
+            if accepted {
+                if let Some(id) = self.terminal_id_by_string(&terminal_id) {
+                    self.app.acknowledge_terminal_input(&id);
                 }
             }
             return true;
@@ -1993,21 +2025,34 @@ impl HeadlessServer {
         row: Option<u16>,
         modifiers: u8,
     ) -> bool {
-        let Some(ClientConnection {
-            mode: ClientConnectionMode::TerminalAttach { terminal_id },
-            ..
-        }) = self.clients.get(&client_id)
+        let Some(terminal_id) =
+            self.clients
+                .get(&client_id)
+                .and_then(|client| match &client.mode {
+                    ClientConnectionMode::TerminalAttach { terminal_id } => {
+                        Some(terminal_id.clone())
+                    }
+                    _ => None,
+                })
         else {
             return false;
         };
-        let Some(runtime) = self.runtime_for_terminal_id_string(terminal_id) else {
+        let Some(runtime) = self.runtime_for_terminal_id_string(&terminal_id) else {
             return false;
         };
 
-        if let Err(err) =
-            apply_terminal_attach_scroll(runtime, source, direction, lines, column, row, modifiers)
-        {
-            warn!(client_id, terminal_id = %terminal_id, err = %err, "terminal attach scroll failed");
+        match apply_terminal_attach_scroll(
+            runtime, source, direction, lines, column, row, modifiers,
+        ) {
+            Ok(true) => {
+                if let Some(id) = self.terminal_id_by_string(&terminal_id) {
+                    self.app.acknowledge_terminal_input(&id);
+                }
+            }
+            Ok(false) => {}
+            Err(err) => {
+                warn!(client_id, terminal_id = %terminal_id, err = %err, "terminal attach scroll failed");
+            }
         }
         true
     }
@@ -3056,14 +3101,30 @@ impl HeadlessServer {
                     return false;
                 }
                 debug!(client_id, len = data.len(), "client input received");
-                if let Some(ClientConnection {
-                    mode: ClientConnectionMode::TerminalAttach { terminal_id },
-                    ..
-                }) = self.clients.get(&client_id)
+                if let Some(terminal_id) =
+                    self.clients
+                        .get(&client_id)
+                        .and_then(|client| match &client.mode {
+                            ClientConnectionMode::TerminalAttach { terminal_id } => {
+                                Some(terminal_id.clone())
+                            }
+                            _ => None,
+                        })
                 {
-                    if let Some(runtime) = self.runtime_for_terminal_id_string(terminal_id) {
-                        if let Err(err) = apply_terminal_attach_input(runtime, data) {
-                            warn!(client_id, terminal_id = %terminal_id, err = %err);
+                    let accepted = !data.is_empty()
+                        && self
+                            .runtime_for_terminal_id_string(&terminal_id)
+                            .is_some_and(|runtime| {
+                                if let Err(err) = apply_terminal_attach_input(runtime, data) {
+                                    warn!(client_id, terminal_id = %terminal_id, err = %err);
+                                    false
+                                } else {
+                                    true
+                                }
+                            });
+                    if accepted {
+                        if let Some(id) = self.terminal_id_by_string(&terminal_id) {
+                            self.app.acknowledge_terminal_input(&id);
                         }
                     }
                     return true;

@@ -894,7 +894,7 @@ Successful responses look like this:
 }
 ```
 
-`TabInfo`, `WorkspaceInfo`, and `RepositoryInfo` include `descendant_attention_count`. Their `agent_status` follows top-level agents; this count reports completed delegated descendants that have not yet been acknowledged by entering their terminal. Blocked descendants continue to make the aggregate status `blocked`.
+`TabInfo`, `WorkspaceInfo`, and `RepositoryInfo` include `descendant_attention_count`. Their `agent_status` follows top-level agents; this count reports completed delegated descendants that have not yet been acknowledged by successful terminal input to their top-level parent. Input to a delegated child with a live parent does not clear the count. If the parent pane has closed, the surviving child becomes an effective root for acknowledgement. Blocked descendants continue to make the aggregate status `blocked`.
 
 `server.agent_manifests` returns the active agent detection manifest sources and remote update diagnostics without reloading rules:
 

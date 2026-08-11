@@ -863,6 +863,9 @@ impl App {
         if bytes.is_empty() || rt.try_send_bytes(Bytes::from(bytes)).is_err() {
             return false;
         }
+        if let Some(terminal_id) = self.state.workspaces[ws_idx].terminal_id(pane_id).cloned() {
+            self.acknowledge_terminal_input(&terminal_id);
+        }
 
         self.state.mode = Mode::Terminal;
         true

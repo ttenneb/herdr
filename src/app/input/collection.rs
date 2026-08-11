@@ -632,14 +632,8 @@ impl App {
         let Some((_, _, Some(pane))) = self.focused_collection() else {
             return;
         };
-        if self
-            .state
-            .enter_collection_terminal_from_foreground(ws_idx, collection_id, pane)
-        {
-            self.state.mark_session_dirty();
-            self.emit_pane_acknowledged(ws_idx, pane);
-            self.schedule_session_save();
-        }
+        self.state
+            .enter_collection_terminal_from_foreground(ws_idx, collection_id, pane);
     }
     pub(crate) fn toggle_selected_archive(&mut self, ws_idx: usize, collection_id: CollectionId) {
         let Some((_, _, Some(pane))) = self.focused_collection() else {
@@ -2806,9 +2800,9 @@ mod tests {
         assert_eq!(app.state.mode, crate::app::Mode::Terminal);
 
         assert!(
-            !app.state
+            app.state
                 .enter_collection_terminal_from_foreground(0, collection, child),
-            "pane was already acknowledged"
+            "valid child terminal can be re-entered"
         );
         app.toggle_selected_expanded(collection);
         assert!(
@@ -2898,7 +2892,10 @@ mod tests {
 
         assert!(app.enter_collection_terminal_from_foreground(0, id, child));
         assert!(app.focused_collection_terminal_entered());
-        assert!(app.workspaces[0].tabs[0].panes[&child].seen);
+        assert!(
+            !app.workspaces[0].tabs[0].panes[&child].seen,
+            "entering a delegated child must not acknowledge its completion"
+        );
         assert!(app.is_active_pane(0, 0, child));
     }
 }
