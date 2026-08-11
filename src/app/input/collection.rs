@@ -21,7 +21,7 @@ use crate::{
     layout::{CollectionId, LayoutLeaf, PaneId, PaneInfo},
 };
 
-use super::PaneUrlClickTarget;
+use super::{mouse::RightClickPassthroughResult, PaneUrlClickTarget};
 
 impl App {
     fn focused_collection(&self) -> Option<(usize, CollectionId, Option<PaneId>)> {
@@ -881,15 +881,22 @@ impl App {
         // A passthrough gesture remains owned by the pane where it started. Continue it before
         // collection hit-testing so clipped-preview coordinates survive chrome and off-layout
         // drag/up events.
-        if self.state.right_click_passthrough.is_some()
-            && self.state.handle_right_click_passthrough(
+        if self.state.right_click_passthrough.is_some() {
+            match self.state.handle_right_click_passthrough(
                 &self.terminal_runtimes,
                 mouse,
                 false,
                 None,
-            )
-        {
-            return true;
+            ) {
+                RightClickPassthroughResult::NotHandled => {}
+                RightClickPassthroughResult::Handled => return true,
+                RightClickPassthroughResult::Delivered(pane_id) => {
+                    if let Some(ws_idx) = self.state.active {
+                        self.acknowledge_collection_terminal_mouse(ws_idx, pane_id, true);
+                    }
+                    return true;
+                }
+            }
         }
         // A collection's outer frame belongs to its native menu. Test it before normal hits:
         // maximized previews cover the whole layout and would otherwise hide that frame. This
@@ -1085,7 +1092,7 @@ impl App {
             })
             .flatten();
         let preview_info = preview_geometry.as_ref().map(|(info, _)| info.clone());
-        if self.state.handle_right_click_passthrough(
+        match self.state.handle_right_click_passthrough(
             &self.terminal_runtimes,
             terminal_mouse,
             false,
@@ -1093,7 +1100,12 @@ impl App {
                 .clone()
                 .map(|info| (info, hit.terminal_row_offset, 0)),
         ) {
-            return true;
+            RightClickPassthroughResult::NotHandled => {}
+            RightClickPassthroughResult::Handled => return true,
+            RightClickPassthroughResult::Delivered(pane_id) => {
+                self.acknowledge_collection_terminal_mouse(ws_idx, pane_id, true);
+                return true;
+            }
         }
         if preview_geometry
             .as_ref()
@@ -2001,6 +2013,17 @@ mod tests {
         let preview = app.state.view.collection_layouts[0].rows[0]
             .preview_rect
             .expect("preview");
+        app.state.ensure_test_terminals();
+        let descendant = app.state.workspaces[0].tabs[0].root_pane.unwrap();
+        let parent = app
+            .state
+            .delegations
+            .create(Some(child), None, None)
+            .unwrap();
+        app.state
+            .delegations
+            .create(Some(descendant), Some(parent), Some("review".into()))
+            .unwrap();
 
         for kind in [
             MouseEventKind::Moved,
@@ -2012,6 +2035,11 @@ mod tests {
             assert!(rx.try_recv().is_ok(), "{kind:?} must reach the child PTY");
         }
 
+        app.state.workspaces[0].tabs[0]
+            .panes
+            .get_mut(&descendant)
+            .unwrap()
+            .seen = false;
         app.state.right_click_passthrough_modifiers = Some(KeyModifiers::CONTROL);
         for kind in [
             MouseEventKind::Down(MouseButton::Right),
@@ -2025,6 +2053,10 @@ mod tests {
         }
         assert!(app.state.right_click_passthrough.is_none());
         assert!(app.state.context_menu.is_none());
+        assert!(
+            app.state.workspaces[0].tabs[0].panes[&descendant].seen,
+            "modified right-click passthrough must acknowledge parent input"
+        );
         assert_eq!(
             app.state.workspaces[0].focused_pane_id(),
             Some(child),

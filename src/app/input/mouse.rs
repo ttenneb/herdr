@@ -24,6 +24,12 @@ use super::{
     ScrollbarClickTarget, TAB_DRAG_THRESHOLD, WORKSPACE_DRAG_THRESHOLD,
 };
 
+pub(super) enum RightClickPassthroughResult {
+    NotHandled,
+    Handled,
+    Delivered(crate::layout::PaneId),
+}
+
 pub(super) enum MouseAction {
     NewWorkspace,
     Settings(SettingsAction),
@@ -252,8 +258,13 @@ impl AppState {
             && mouse.row >= sidebar.y
             && mouse.row < sidebar.y + sidebar.height;
 
-        if self.handle_right_click_passthrough(terminal_runtimes, mouse, in_sidebar, None) {
-            return None;
+        match self.handle_right_click_passthrough(terminal_runtimes, mouse, in_sidebar, None) {
+            RightClickPassthroughResult::NotHandled => {}
+            RightClickPassthroughResult::Handled => return None,
+            RightClickPassthroughResult::Delivered(pane_id) => {
+                let ws_idx = self.active?;
+                return Some(MouseAction::DeliveredTerminalMouse { ws_idx, pane_id });
+            }
         }
 
         if self.mode == Mode::OpenExistingWorktree {
@@ -1892,7 +1903,7 @@ impl AppState {
         mouse: MouseEvent,
         in_sidebar: bool,
         explicit_target: Option<(PaneInfo, u16, u16)>,
-    ) -> bool {
+    ) -> RightClickPassthroughResult {
         if let Some(gesture) = self.right_click_passthrough.clone() {
             match mouse.kind {
                 MouseEventKind::Drag(MouseButton::Right)
@@ -1905,7 +1916,7 @@ impl AppState {
                         },
                         gesture.modifiers,
                     );
-                    let _ = self.forward_pane_mouse_button(
+                    let delivered = self.forward_pane_mouse_button(
                         terminal_runtimes,
                         &gesture.pane_info,
                         forwarded_mouse,
@@ -1913,7 +1924,11 @@ impl AppState {
                     if matches!(mouse.kind, MouseEventKind::Up(MouseButton::Right)) {
                         self.right_click_passthrough = None;
                     }
-                    return true;
+                    return if delivered {
+                        RightClickPassthroughResult::Delivered(gesture.pane_info.id)
+                    } else {
+                        RightClickPassthroughResult::Handled
+                    };
                 }
                 _ => {
                     self.right_click_passthrough = None;
@@ -1925,14 +1940,14 @@ impl AppState {
             || in_sidebar
             || !matches!(mouse.kind, MouseEventKind::Down(MouseButton::Right))
         {
-            return false;
+            return RightClickPassthroughResult::NotHandled;
         }
 
         let Some(modifiers) = self.right_click_passthrough_modifiers else {
-            return false;
+            return RightClickPassthroughResult::NotHandled;
         };
         if mouse.modifiers != modifiers {
-            return false;
+            return RightClickPassthroughResult::NotHandled;
         }
 
         let target = explicit_target.or_else(|| {
@@ -1941,13 +1956,13 @@ impl AppState {
                 .map(|info| (info, 0, 0))
         });
         let Some((info, logical_row_offset, logical_column_offset)) = target else {
-            return false;
+            return RightClickPassthroughResult::NotHandled;
         };
 
         self.focus_pane(info.id);
         let forwarded_mouse = self.strip_right_click_passthrough_modifiers(mouse, modifiers);
         if !self.forward_pane_mouse_button(terminal_runtimes, &info, forwarded_mouse) {
-            return false;
+            return RightClickPassthroughResult::NotHandled;
         }
 
         self.selection = None;
@@ -1956,13 +1971,14 @@ impl AppState {
         self.tab_press = None;
         self.drag = None;
         self.context_menu = None;
+        let pane_id = info.id;
         self.right_click_passthrough = Some(RightClickPassthroughGesture {
             pane_info: info,
             modifiers,
             logical_row_offset,
             logical_column_offset,
         });
-        true
+        RightClickPassthroughResult::Delivered(pane_id)
     }
 
     fn strip_right_click_passthrough_modifiers(
