@@ -78,9 +78,26 @@ impl AttentionSummary {
         let delegated_descendant = delegations
             .delegation_for_pane(pane_id)
             .and_then(|record| record.parent_id)
-            .and_then(|parent_id| delegations.get(parent_id))
-            .and_then(|parent| parent.pane_id)
-            .is_some_and(|parent_pane| scope_panes.contains(&parent_pane));
+            .is_some_and(|parent_id| {
+                let mut ancestor_id = Some(parent_id);
+                let mut visited = HashSet::new();
+                while let Some(id) = ancestor_id {
+                    if !visited.insert(id) {
+                        break;
+                    }
+                    let Some(ancestor) = delegations.get(id) else {
+                        break;
+                    };
+                    if ancestor
+                        .pane_id
+                        .is_some_and(|ancestor_pane| scope_panes.contains(&ancestor_pane))
+                    {
+                        return true;
+                    }
+                    ancestor_id = ancestor.parent_id;
+                }
+                false
+            });
         if delegated_descendant {
             self.unseen_descendant_done += usize::from(state == AgentState::Idle && !seen);
             self.blocked_descendants += usize::from(state == AgentState::Blocked);
@@ -359,6 +376,37 @@ mod tests {
         assert_eq!(summary.display_state(), (AgentState::Working, true));
         assert_eq!(summary.unseen_descendant_done(), 1);
         assert_eq!(summary.blocked_descendants(), 0);
+    }
+
+    #[test]
+    fn tombstoned_intermediate_keeps_grandchild_in_root_rollup() {
+        let mut ws = Workspace::test_new("test");
+        let child_id = ws.test_split(Direction::Horizontal);
+        let grandchild_id = ws.test_split(Direction::Vertical);
+        let root_id = ws.tabs[0].root_pane.expect("root");
+        let mut terminals = HashMap::new();
+        let mut root_terminal = terminal_for_pane(&ws, root_id);
+        root_terminal.state = AgentState::Working;
+        terminals.insert(root_terminal.id.clone(), root_terminal);
+        let mut grandchild_terminal = terminal_for_pane(&ws, grandchild_id);
+        grandchild_terminal.state = AgentState::Idle;
+        terminals.insert(grandchild_terminal.id.clone(), grandchild_terminal);
+        ws.tabs[0].panes.get_mut(&grandchild_id).unwrap().seen = false;
+
+        let mut delegations = Delegations::new();
+        let root = delegations.create(Some(root_id), None, None).unwrap();
+        let child = delegations
+            .create(Some(child_id), Some(root), Some("child".into()))
+            .unwrap();
+        delegations
+            .create(Some(grandchild_id), Some(child), Some("grandchild".into()))
+            .unwrap();
+        delegations.tombstone_pane(child_id);
+        ws.tabs[0].panes.remove(&child_id);
+
+        let summary = ws.attention_summary(&terminals, &delegations);
+        assert_eq!(summary.display_state(), (AgentState::Working, true));
+        assert_eq!(summary.unseen_descendant_done(), 1);
     }
 
     #[test]
