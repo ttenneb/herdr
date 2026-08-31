@@ -519,6 +519,16 @@ pub struct EventEnvelope {
     pub data: EventData,
 }
 
+/// An EventHub event as delivered by a subscription. `sequence` is the
+/// session-global EventHub cursor, not a per-subscription counter.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct SequencedEventEnvelope {
+    #[serde(default)]
+    pub sequence: u64,
+    #[serde(flatten)]
+    pub event: EventEnvelope,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub enum SubscriptionEventKind {
     #[serde(rename = "pane.output_matched")]
@@ -531,8 +541,27 @@ pub enum SubscriptionEventKind {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct SubscriptionEventEnvelope {
+    /// Session-global sequence reserved for this subscribed observation.
+    #[serde(default)]
+    pub sequence: u64,
     pub event: SubscriptionEventKind,
     pub data: SubscriptionEventData,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(untagged)]
+pub enum StreamEventEnvelope {
+    Event(Box<SequencedEventEnvelope>),
+    Subscription(SubscriptionEventEnvelope),
+}
+
+impl StreamEventEnvelope {
+    pub fn sequence(&self) -> u64 {
+        match self {
+            Self::Event(event) => event.sequence,
+            Self::Subscription(event) => event.sequence,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]

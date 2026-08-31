@@ -1097,6 +1097,7 @@ impl HeadlessServer {
                 respond_to,
                 response_write_complete: None,
                 stream_active: None,
+                observation_sequence: false,
             },
             true,
         );
@@ -3857,6 +3858,7 @@ impl HeadlessServer {
         msg: api::ApiRequestMessage,
         skip_default_workspace_for_request: bool,
     ) -> bool {
+        let observation_sequence = msg.observation_sequence;
         if self.shutting_down {
             // During shutdown, respond with server_unavailable.
             let response = serde_json::to_string(&api::schema::ErrorResponse {
@@ -4053,6 +4055,9 @@ impl HeadlessServer {
         if let (Some(params), Some(active)) = (stream_open.as_ref(), stream_active) {
             self.app
                 .attach_pane_graphics_stream_active(params, active, &response);
+        }
+        if observation_sequence {
+            api::attach_observation_sequence(&mut response, &self.app.event_hub);
         }
         if let Some(spec) = alt_screen_read_spec {
             if let Ok(success) = serde_json::from_str::<api::schema::SuccessResponse>(&response) {
@@ -5829,6 +5834,7 @@ mod tests {
             respond_to,
             response_write_complete: None,
             stream_active: None,
+            observation_sequence: false,
         });
         let response: api::schema::SuccessResponse =
             serde_json::from_str(&response_rx.recv().unwrap()).unwrap();
@@ -5887,6 +5893,7 @@ mod tests {
                 respond_to,
                 response_write_complete: None,
                 stream_active: None,
+                observation_sequence: false,
             })
         );
         let response = response_rx
@@ -9453,6 +9460,7 @@ next_tab = ""
             respond_to,
             response_write_complete: None,
             stream_active: None,
+            observation_sequence: false,
         });
         let response = response_rx.recv().expect("API response");
         assert!(response.contains("\"type\":\"ok\""), "{response}");
@@ -11795,6 +11803,7 @@ next_tab = ""
             respond_to,
             response_write_complete: None,
             stream_active: None,
+            observation_sequence: false,
         });
 
         assert!(changed);
@@ -11882,6 +11891,7 @@ next_tab = ""
             respond_to,
             response_write_complete: None,
             stream_active: None,
+            observation_sequence: false,
         });
 
         assert!(changed);
@@ -11935,6 +11945,7 @@ next_tab = ""
             respond_to,
             response_write_complete: None,
             stream_active: None,
+            observation_sequence: false,
         });
 
         assert!(changed);
@@ -11968,6 +11979,7 @@ next_tab = ""
             respond_to,
             response_write_complete: None,
             stream_active: None,
+            observation_sequence: false,
         });
 
         assert!(changed);
@@ -12006,6 +12018,7 @@ next_tab = ""
                 respond_to,
                 response_write_complete: None,
                 stream_active: None,
+                observation_sequence: false,
             })
         );
 
@@ -12063,6 +12076,7 @@ next_tab = ""
                 respond_to,
                 response_write_complete: None,
                 stream_active: None,
+                observation_sequence: false,
             })
         );
 
@@ -12427,6 +12441,7 @@ next_tab = ""
             respond_to,
             response_write_complete: None,
             stream_active: None,
+            observation_sequence: false,
         });
 
         assert!(changed);

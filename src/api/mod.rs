@@ -86,6 +86,26 @@ pub struct ApiRequestMessage {
     pub respond_to: std::sync::mpsc::Sender<String>,
     pub response_write_complete: Option<std::sync::mpsc::Receiver<()>>,
     pub stream_active: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    /// Reserve and attach a session-global sequence atomically with this app
+    /// response. Used only by internal subscription observation probes.
+    pub observation_sequence: bool,
+}
+
+pub(crate) fn attach_observation_sequence(response: &mut String, event_hub: &EventHub) {
+    let Ok(mut value) = serde_json::from_str::<serde_json::Value>(response) else {
+        return;
+    };
+    if value.get("error").is_some() {
+        return;
+    }
+    let Some(object) = value.as_object_mut() else {
+        return;
+    };
+    let sequence = event_hub.reserve_sequence();
+    object.insert("observation_sequence".into(), sequence.into());
+    if let Ok(encoded) = serde_json::to_string(&value) {
+        *response = encoded;
+    }
 }
 
 pub type ApiRequestSender = mpsc::UnboundedSender<ApiRequestMessage>;

@@ -197,6 +197,7 @@ pub enum ResponseResult {
         cell_width_px: u32,
         cell_height_px: u32,
         /// True only when this pane is on the currently rendered terminal surface.
+        #[serde(default)]
         pane_visible: bool,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         file_frame_directory: Option<String>,
@@ -219,7 +220,11 @@ pub enum ResponseResult {
     AgentExplain {
         explain: serde_json::Value,
     },
-    SubscriptionStarted {},
+    SubscriptionStarted {
+        /// Common EventHub cursor accepted for every subscription in this request.
+        #[serde(default)]
+        sequence: u64,
+    },
     WaitMatched {
         event: EventEnvelope,
     },

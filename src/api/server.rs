@@ -376,7 +376,7 @@ fn handle_request(
         );
     }
 
-    dispatch_to_app(request, api_tx, None, response_write_complete, None)
+    dispatch_to_app(request, api_tx, None, response_write_complete, None, false)
 }
 
 fn api_method_name(method: &Method) -> &'static str {
@@ -751,7 +751,9 @@ fn stream_subscriptions(
         &mut stream,
         &SuccessResponse {
             id: request_id,
-            result: ResponseResult::SubscriptionStarted {},
+            result: ResponseResult::SubscriptionStarted {
+                sequence: event_start_sequence,
+            },
         },
     ) {
         if is_connection_closed_error(&err) {
@@ -760,21 +762,72 @@ fn stream_subscriptions(
         return Err(err);
     }
 
+    // Poll against one stable watermark at a time. A candidate is a lower bound
+    // for its subscription; after emitting it, refill only through the same
+    // watermark before choosing again. Events that arrive during the cycle are
+    // therefore deferred to the next cycle rather than racing earlier events.
+    let mut pending = vec![None; subscriptions.len()];
     loop {
         if should_stop_connection(&mut stream, running)? {
             return Ok(());
         }
 
-        for subscription in &mut subscriptions {
-            if let Some(event) = subscription.poll(api_tx, event_hub) {
-                if let Err(err) = write_json_line(&mut stream, &event) {
-                    if is_connection_closed_error(&err) {
-                        return Ok(());
+        let watermark = event_hub.current_sequence();
+        for (index, subscription) in subscriptions.iter_mut().enumerate() {
+            if pending[index].is_some() {
+                continue;
+            }
+            match subscription.poll_through(api_tx, event_hub, watermark) {
+                Ok(event) => pending[index] = event,
+                Err(response) => {
+                    if let Err(err) = write_json_line(&mut stream, &response) {
+                        if is_connection_closed_error(&err) {
+                            return Ok(());
+                        }
+                        return Err(err);
                     }
-                    return Err(err);
+                    return Ok(());
                 }
             }
         }
+
+        loop {
+            let next = pending
+                .iter()
+                .enumerate()
+                .filter_map(|(index, event)| {
+                    event
+                        .as_ref()
+                        .filter(|event| event.sequence() <= watermark)
+                        .map(|event| (index, event.sequence()))
+                })
+                .min_by_key(|(index, sequence)| (*sequence, *index));
+            let Some((index, _)) = next else {
+                break;
+            };
+
+            let event = pending[index].take().expect("selected pending event");
+            if let Err(err) = write_json_line(&mut stream, &event) {
+                if is_connection_closed_error(&err) {
+                    return Ok(());
+                }
+                return Err(err);
+            }
+
+            match subscriptions[index].poll_through(api_tx, event_hub, watermark) {
+                Ok(event) => pending[index] = event,
+                Err(response) => {
+                    if let Err(err) = write_json_line(&mut stream, &response) {
+                        if is_connection_closed_error(&err) {
+                            return Ok(());
+                        }
+                        return Err(err);
+                    }
+                    return Ok(());
+                }
+            }
+        }
+
         std::thread::sleep(CONNECTION_POLL_INTERVAL);
     }
 }
@@ -826,7 +879,15 @@ pub(super) fn dispatch_to_app_with_timeout(
     api_tx: &ApiRequestSender,
     timeout: Option<Duration>,
 ) -> String {
-    dispatch_to_app(request, api_tx, timeout, None, None)
+    dispatch_to_app(request, api_tx, timeout, None, None, false)
+}
+
+pub(super) fn dispatch_observation_to_app_with_timeout(
+    request: Request,
+    api_tx: &ApiRequestSender,
+    timeout: Option<Duration>,
+) -> String {
+    dispatch_to_app(request, api_tx, timeout, None, None, true)
 }
 
 pub(super) fn dispatch_stream_open(
@@ -835,7 +896,7 @@ pub(super) fn dispatch_stream_open(
     timeout: Duration,
     active: Arc<AtomicBool>,
 ) -> String {
-    dispatch_to_app(request, api_tx, Some(timeout), None, Some(active))
+    dispatch_to_app(request, api_tx, Some(timeout), None, Some(active), false)
 }
 
 pub(super) fn dispatch_stream_frame(
@@ -849,6 +910,7 @@ pub(super) fn dispatch_stream_frame(
         Some(crate::app::pane_graphics::DIRECT_OUTER_TIMEOUT),
         None,
         Some(active),
+        false,
     )
 }
 
@@ -858,6 +920,7 @@ fn dispatch_to_app(
     timeout: Option<Duration>,
     response_write_complete: Option<std::sync::mpsc::Receiver<()>>,
     stream_active: Option<Arc<AtomicBool>>,
+    observation_sequence: bool,
 ) -> String {
     let request_id = request.id.clone();
     let request_active = stream_active.clone();
@@ -867,6 +930,7 @@ fn dispatch_to_app(
         respond_to,
         response_write_complete,
         stream_active,
+        observation_sequence,
     }) {
         if let Some(active) = request_active {
             active.store(false, Ordering::Release);
@@ -957,6 +1021,12 @@ mod tests {
         line
     }
 
+    fn read_json_line(reader: &mut impl BufRead) -> serde_json::Value {
+        let mut line = String::new();
+        reader.read_line(&mut line).unwrap();
+        serde_json::from_str(&line).unwrap()
+    }
+
     fn local_stream_pair(name: &str) -> (LocalStream, LocalStream, PathBuf) {
         let path = unique_test_path(name);
         let listener = crate::ipc::bind_local_listener(&path).unwrap();
@@ -1000,18 +1070,19 @@ mod tests {
         let responder = std::thread::spawn(move || {
             while let Some(msg) = api_rx.blocking_recv() {
                 match msg.request.method {
-                    Method::PaneGet(_) => msg
-                        .respond_to
-                        .send(
-                            serde_json::to_string(&SuccessResponse {
-                                id: msg.request.id,
-                                result: ResponseResult::PaneInfo {
-                                    pane: pane_info("pane_1", agent_status),
-                                },
-                            })
-                            .unwrap(),
-                        )
-                        .unwrap(),
+                    Method::PaneGet(_) => {
+                        let mut response = serde_json::to_value(SuccessResponse {
+                            id: msg.request.id,
+                            result: ResponseResult::PaneInfo {
+                                pane: pane_info("pane_1", agent_status),
+                            },
+                        })
+                        .unwrap();
+                        if msg.observation_sequence {
+                            response["observation_sequence"] = 1.into();
+                        }
+                        msg.respond_to.send(response.to_string()).unwrap();
+                    }
                     Method::EventsWait(_) => msg
                         .respond_to
                         .send(error_response_json(
@@ -1405,6 +1476,174 @@ mod tests {
         server_thread.join().unwrap();
         drop(running);
         responder.join().unwrap();
+    }
+
+    #[test]
+    fn subscription_cycle_defers_events_arriving_between_polls() {
+        let event_hub = EventHub::default();
+        let responder_hub = event_hub.clone();
+        let (api_tx, mut api_rx) = mpsc::unbounded_channel::<ApiRequestMessage>();
+        let responder = std::thread::spawn(move || {
+            let mut probes = 0;
+            while let Some(msg) = api_rx.blocking_recv() {
+                let Method::PaneGet(_) = msg.request.method else {
+                    panic!("unexpected request: {:?}", msg.request.method);
+                };
+                probes += 1;
+                let mut pane = pane_info("pane_1", crate::api::schema::AgentStatus::Unknown);
+                pane.scroll = Some(crate::api::schema::PaneScrollInfo {
+                    offset_from_bottom: u64::from(probes > 1),
+                    max_offset_from_bottom: 10,
+                    viewport_rows: 5,
+                });
+                if probes == 2 {
+                    responder_hub.push(crate::api::schema::EventEnvelope {
+                        event: crate::api::schema::EventKind::WorkspaceFocused,
+                        data: crate::api::schema::EventData::WorkspaceFocused {
+                            workspace_id: "workspace_first".into(),
+                        },
+                    });
+                    responder_hub.push(crate::api::schema::EventEnvelope {
+                        event: crate::api::schema::EventKind::TabFocused,
+                        data: crate::api::schema::EventData::TabFocused {
+                            workspace_id: "workspace_first".into(),
+                            tab_id: "tab_second".into(),
+                        },
+                    });
+                }
+                let mut response = serde_json::to_string(&SuccessResponse {
+                    id: msg.request.id,
+                    result: ResponseResult::PaneInfo { pane },
+                })
+                .unwrap();
+                if msg.observation_sequence {
+                    crate::api::attach_observation_sequence(&mut response, &responder_hub);
+                }
+                msg.respond_to.send(response).unwrap();
+            }
+        });
+
+        let (mut client, server, _path) = local_stream_pair("api-sub-cycle-watermark");
+        client
+            .write_all(br#"{"id":"sub_cycle","method":"events.subscribe","params":{"subscriptions":[{"type":"workspace.focused"},{"type":"pane.scroll_changed","pane_id":"pane_1"},{"type":"tab.focused"}]}}"#)
+            .unwrap();
+        client.write_all(b"\n").unwrap();
+        client.flush().unwrap();
+
+        let running = Arc::new(AtomicBool::new(true));
+        let server_running = Arc::clone(&running);
+        let server_hub = event_hub.clone();
+        let server_thread = std::thread::spawn(move || {
+            handle_connection(server, &api_tx, &server_hub, &server_running, None).unwrap();
+        });
+
+        let mut reader = BufReader::new(&mut client);
+        let ack = read_json_line(&mut reader);
+        assert_eq!(ack["result"]["sequence"], 0);
+        let events: Vec<serde_json::Value> = (0..3).map(|_| read_json_line(&mut reader)).collect();
+        assert_eq!(
+            events
+                .iter()
+                .map(|event| (event["sequence"].as_u64(), event["event"].as_str()))
+                .collect::<Vec<_>>(),
+            vec![
+                (Some(1), Some("workspace_focused")),
+                (Some(2), Some("tab_focused")),
+                (Some(3), Some("pane.scroll_changed")),
+            ]
+        );
+
+        drop(reader);
+        drop(client);
+        server_thread.join().unwrap();
+        responder.join().unwrap();
+    }
+
+    #[test]
+    fn equal_sequence_duplicate_subscriptions_both_make_progress() {
+        let (api_tx, _api_rx) = mpsc::unbounded_channel::<ApiRequestMessage>();
+        let (mut client, server, _path) = local_stream_pair("api-sub-equal-progress");
+        client
+            .write_all(br#"{"id":"sub_equal","method":"events.subscribe","params":{"subscriptions":[{"type":"workspace.focused"},{"type":"workspace.focused"}]}}"#)
+            .unwrap();
+        client.write_all(b"\n").unwrap();
+        client.flush().unwrap();
+
+        let running = Arc::new(AtomicBool::new(true));
+        let server_running = Arc::clone(&running);
+        let event_hub = EventHub::default();
+        let server_event_hub = event_hub.clone();
+        let server_thread = std::thread::spawn(move || {
+            handle_connection(server, &api_tx, &server_event_hub, &server_running, None).unwrap();
+        });
+
+        let mut reader = BufReader::new(&mut client);
+        let _ = read_json_line(&mut reader);
+        event_hub.push(crate::api::schema::EventEnvelope {
+            event: crate::api::schema::EventKind::WorkspaceFocused,
+            data: crate::api::schema::EventData::WorkspaceFocused {
+                workspace_id: "workspace_1".into(),
+            },
+        });
+        let first = read_json_line(&mut reader);
+        let second = read_json_line(&mut reader);
+        assert_eq!(first["sequence"], 1);
+        assert_eq!(second["sequence"], 1);
+
+        drop(reader);
+        drop(client);
+        server_thread.join().unwrap();
+    }
+
+    #[test]
+    fn subscriptions_merge_reverse_request_order_by_global_sequence() {
+        let (api_tx, _api_rx) = mpsc::unbounded_channel::<ApiRequestMessage>();
+        let (mut client, server, _path) = local_stream_pair("api-sub-global-order");
+        client
+            .write_all(br#"{"id":"sub_order","method":"events.subscribe","params":{"subscriptions":[{"type":"tab.focused"},{"type":"workspace.focused"}]}}"#)
+            .unwrap();
+        client.write_all(b"\n").unwrap();
+        client.flush().unwrap();
+
+        let running = Arc::new(AtomicBool::new(true));
+        let server_running = Arc::clone(&running);
+        let event_hub = EventHub::default();
+        let server_event_hub = event_hub.clone();
+        let server_thread = std::thread::spawn(move || {
+            handle_connection(server, &api_tx, &server_event_hub, &server_running, None).unwrap();
+        });
+
+        let mut reader = BufReader::new(&mut client);
+        let ack = read_json_line(&mut reader);
+        assert_eq!(ack["result"]["sequence"], 0);
+        event_hub.push(crate::api::schema::EventEnvelope {
+            event: crate::api::schema::EventKind::WorkspaceFocused,
+            data: crate::api::schema::EventData::WorkspaceFocused {
+                workspace_id: "workspace_first".into(),
+            },
+        });
+        event_hub.push(crate::api::schema::EventEnvelope {
+            event: crate::api::schema::EventKind::TabFocused,
+            data: crate::api::schema::EventData::TabFocused {
+                workspace_id: "workspace_first".into(),
+                tab_id: "tab_second".into(),
+            },
+        });
+
+        let first = read_json_line(&mut reader);
+        let second = read_json_line(&mut reader);
+        assert_eq!(
+            (first["sequence"].as_u64(), first["event"].as_str()),
+            (Some(1), Some("workspace_focused"))
+        );
+        assert_eq!(
+            (second["sequence"].as_u64(), second["event"].as_str()),
+            (Some(2), Some("tab_focused"))
+        );
+
+        drop(reader);
+        drop(client);
+        server_thread.join().unwrap();
     }
 
     #[test]

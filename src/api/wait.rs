@@ -374,7 +374,15 @@ fn wait_for_resolved_agent(
 
         let mut should_probe = false;
         let mut matched_event_status = None;
-        for (sequence, event) in event_hub.events_after(last_event_sequence) {
+        let events = match event_hub.checked_events_after(last_event_sequence) {
+            Ok(events) => events,
+            Err(gap) => {
+                return event_history_resync_response(request_id, gap)
+                    .map(AgentWaitOutcome::Response)
+                    .map(Some);
+            }
+        };
+        for (sequence, event) in events {
             last_event_sequence = sequence;
             match event.data {
                 EventData::PaneAgentDetected {
@@ -640,6 +648,23 @@ fn agent_wait_timeout(
     .map_err(std::io::Error::other)
 }
 
+fn event_history_resync_response(
+    request_id: String,
+    gap: crate::api::event_hub::EventHistoryGap,
+) -> std::io::Result<String> {
+    serde_json::to_string(&ErrorResponse {
+        id: request_id,
+        error: ErrorBody {
+            code: "resync_required".into(),
+            message: format!(
+                "event history after sequence {} is unavailable; oldest available is {} (current {})",
+                gap.requested_sequence, gap.oldest_available_sequence, gap.current_sequence
+            ),
+        },
+    })
+    .map_err(std::io::Error::other)
+}
+
 fn agent_wait_not_running(request_id: String) -> std::io::Result<String> {
     serde_json::to_string(&ErrorResponse {
         id: request_id,
@@ -694,7 +719,10 @@ pub(super) fn wait_for_event(
         match active.poll_for_wait(api_tx, event_hub) {
             Ok(Some(event)) => return Ok(Some(wait_matched_response(&request_id, event))),
             Ok(None) => {}
-            Err(mut response) if response.error.code == "pane_not_found" => {
+            Err(mut response)
+                if response.error.code == "pane_not_found"
+                    || response.error.code == "resync_required" =>
+            {
                 response.id = request_id;
                 return serde_json::to_string(&response)
                     .map(Some)

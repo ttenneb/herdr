@@ -105,7 +105,7 @@ Raw socket method names use dot notation:
 | Workspace compatibility | `workspace.create`, `workspace.list`, `workspace.get`, `workspace.focus`, `workspace.rename`, `workspace.move`, `workspace.move_block`, `workspace.report_metadata`, `workspace.resources.report`, `workspace.close` |
 | Worktree | `worktree.list`, `worktree.create`, `worktree.open`, `worktree.remove` |
 | Tab | `tab.create`, `tab.list`, `tab.get`, `tab.focus`, `tab.rename`, `tab.move`, `tab.close` |
-| Pane | `pane.split`, `pane.swap`, `pane.move`, `pane.zoom`, `pane.layout`, `pane.process_info`, `pane.neighbor`, `pane.edges`, `pane.focus_direction`, `pane.resize`, `pane.list`, `pane.current`, `pane.get`, `pane.rename`, `pane.send_text`, `pane.send_keys`, `pane.send_input`, `pane.read`, `pane.graphics.info`, `pane.graphics.set`, `pane.graphics.clear`, `pane.graphics.stream`, `pane.report_agent`, `pane.report_agent_session`, `pane.report_metadata`, `pane.clear_agent_authority`, `pane.release_agent`, `pane.close`, `pane.wait_for_output` |
+| Pane | `pane.split`, `pane.swap`, `pane.move`, `pane.zoom`, `pane.layout`, `pane.process_info`, `pane.neighbor`, `pane.edges`, `pane.focus_direction`, `pane.resize`, `pane.list`, `pane.current`, `pane.get`, `pane.rename`, `pane.send_text`, `pane.send_keys`, `pane.send_input`, `pane.input.set`, `pane.read`, `pane.graphics.info`, `pane.graphics.set`, `pane.graphics.clear`, `pane.graphics.stream`, `pane.report_agent`, `pane.report_agent_session`, `pane.report_metadata`, `pane.clear_agent_authority`, `pane.release_agent`, `pane.close`, `pane.wait_for_output` |
 | Collection | `collection.list`, `collection.get`, `collection.create`, `collection.add`, `collection.move`, `collection.promote`, `collection.select`, `collection.reorder`, `collection.archive`, `collection.restore`, `collection.member_create`, `collection.close` |
 | Delegation | `delegation.create`, `delegation.get`, `delegation.tree`, `delegation.root`, `delegation.descendants`, `delegation.reparent`, `delegation.reorder` |
 | Popup | `popup.close` |
@@ -123,16 +123,23 @@ Raw socket method names use dot notation:
 
 `session.snapshot` returns a one-time bootstrap snapshot for clients that keep
 their own local runtime cache. The response includes version/protocol metadata,
-focused workspace/tab/pane ids, workspace records, tab records, pane records,
-tab layout snapshots, and agent records. It is not a subscription. To avoid a
-bootstrap gap, first open `events.subscribe` on another connection and wait for
-its acknowledgement. Buffer that stream while calling `session.snapshot`,
-install the snapshot, then apply the buffered events in order and continue
-streaming. Call `session.snapshot` again after reconnecting or when the local
-cache may be stale. Workspace records add `repository_id` and `checkout`
-provenance while retaining legacy `worktree` provenance. Repository records own
-checkout ordering, preferred base, and MRU focus. Full Git worktree discovery
-remains `worktree.list`.
+a `result.snapshot.sequence` watermark, focused workspace/tab/pane ids,
+workspace records, tab records, pane records, tab layout snapshots, and agent
+records. It is not a subscription. To avoid a bootstrap gap, first open
+`events.subscribe` on another connection and wait for the
+`subscription_started` acknowledgement. Its `result.sequence` is the one
+session-global cursor accepted for every subscription in that request. Buffer
+that stream while calling `session.snapshot`, install the snapshot, discard
+buffered lines whose top-level `sequence` is at or below the snapshot watermark,
+then apply the remaining lines in received order and continue streaming. Each
+custom observation reserves a fresh global value, while duplicate lifecycle
+subscriptions can repeat the lifecycle event's value. Do not treat `sequence`
+as a per-subscription counter or require every stream line to be unique. Call
+`session.snapshot` again after reconnecting or when the local cache
+may be stale. Workspace records add `repository_id` and `checkout` provenance
+while retaining legacy `worktree` provenance. Repository records own checkout
+ordering, preferred base, and MRU focus. Full Git worktree discovery remains
+`worktree.list`.
 
 From the CLI, `herdr api snapshot` prints the live `session.snapshot` response
 as JSON for clients and agents that want a simple bootstrap command.
@@ -868,9 +875,22 @@ Subscribe to events when you need a long-lived stream:
 }
 ```
 
-The first response acknowledges the subscription. Later lines are pushed events.
-Lifecycle subscriptions start when the request is accepted and do not replay
-events retained before that point.
+The first response acknowledges the subscription as
+`{"type":"subscription_started","sequence":N}` inside `result`. `N` is the
+common session-global acceptance cursor for every requested subscription.
+Later lifecycle and custom-event lines carry their session-global `sequence` at
+the top level and are merged in cursor order; request order breaks ties. Each
+probe-backed custom observation reserves the next global sequence, so snapshot
+watermarks also order those observations. Lifecycle subscriptions start at the
+accepted cursor and do not replay events
+retained before it.
+
+Herdr retains the latest 512 lifecycle events for a stream to catch up. If a
+subscriber falls far enough behind that the next required cursor is no longer
+available, the server writes an error response with code `resync_required` and
+closes that socket. Do not continue from the partial cache: open a fresh
+subscription, obtain a new `session.snapshot`, and repeat the watermark-based
+bootstrap procedure above.
 
 Repository event subscriptions include `repository.created`, `repository.renamed`, `repository.moved`, `repository.closed`, and `repository.focused`. Checkout lifecycle subscriptions include `checkout.opened`, `checkout.renamed`, `checkout.moved`, `checkout.closed`, and `checkout.focused`; each is emitted as an additive alias after its compatibility `workspace.*` event. Repository creation precedes the first child `workspace.created`; closing the final Checkout emits `workspace.closed`, `checkout.closed`, then `repository.closed`.
 

@@ -8310,6 +8310,36 @@
     },
     "subscription_event": {
       "$defs": {
+        "AgentSessionInfo": {
+          "properties": {
+            "agent": {
+              "type": "string"
+            },
+            "kind": {
+              "$ref": "#/schemas/subscription_event/$defs/AgentSessionRefKind"
+            },
+            "source": {
+              "type": "string"
+            },
+            "value": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "source",
+            "agent",
+            "kind",
+            "value"
+          ],
+          "type": "object"
+        },
+        "AgentSessionRefKind": {
+          "enum": [
+            "id",
+            "path"
+          ],
+          "type": "string"
+        },
         "AgentStatus": {
           "enum": [
             "idle",
@@ -8319,6 +8349,1437 @@
             "unknown"
           ],
           "type": "string"
+        },
+        "CheckoutInfo": {
+          "properties": {
+            "checkout_path": {
+              "type": "string"
+            },
+            "kind": {
+              "$ref": "#/schemas/subscription_event/$defs/CheckoutKind"
+            },
+            "repository_id": {
+              "type": "string"
+            },
+            "workspace_id": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "workspace_id",
+            "repository_id",
+            "checkout_path",
+            "kind"
+          ],
+          "type": "object"
+        },
+        "CheckoutKind": {
+          "enum": [
+            "primary",
+            "linked"
+          ],
+          "type": "string"
+        },
+        "CollectionInfo": {
+          "properties": {
+            "collection_id": {
+              "type": "string"
+            },
+            "focused": {
+              "type": "boolean"
+            },
+            "label": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "lifecycle": {
+              "$ref": "#/schemas/subscription_event/$defs/CollectionLifecycleSummary"
+            },
+            "members": {
+              "items": {
+                "$ref": "#/schemas/subscription_event/$defs/CollectionMemberInfo"
+              },
+              "type": "array"
+            },
+            "selected_pane_id": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "tab_id": {
+              "type": "string"
+            },
+            "warnings": {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            "workspace_id": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "collection_id",
+            "workspace_id",
+            "tab_id",
+            "focused",
+            "members",
+            "lifecycle"
+          ],
+          "type": "object"
+        },
+        "CollectionLifecycleSummary": {
+          "properties": {
+            "active": {
+              "format": "uint",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "archived": {
+              "format": "uint",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "blocked": {
+              "format": "uint",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "exited": {
+              "format": "uint",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "live": {
+              "format": "uint",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "working": {
+              "format": "uint",
+              "minimum": 0,
+              "type": "integer"
+            }
+          },
+          "required": [
+            "active",
+            "archived",
+            "live",
+            "working",
+            "blocked",
+            "exited"
+          ],
+          "type": "object"
+        },
+        "CollectionMemberInfo": {
+          "properties": {
+            "archived": {
+              "type": "boolean"
+            },
+            "index": {
+              "format": "uint",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "pane_id": {
+              "type": "string"
+            },
+            "selected": {
+              "type": "boolean"
+            }
+          },
+          "required": [
+            "pane_id",
+            "index",
+            "archived",
+            "selected"
+          ],
+          "type": "object"
+        },
+        "DelegationInfo": {
+          "properties": {
+            "delegation_id": {
+              "type": "string"
+            },
+            "pane_id": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "parent_id": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "purpose": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "sibling_rank": {
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "tombstone": {
+              "type": "boolean"
+            }
+          },
+          "required": [
+            "delegation_id",
+            "sibling_rank",
+            "tombstone"
+          ],
+          "type": "object"
+        },
+        "EventData": {
+          "oneOf": [
+            {
+              "properties": {
+                "type": {
+                  "const": "workspace_created",
+                  "type": "string"
+                },
+                "workspace": {
+                  "$ref": "#/schemas/subscription_event/$defs/WorkspaceInfo"
+                }
+              },
+              "required": [
+                "type",
+                "workspace"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "type": {
+                  "const": "workspace_updated",
+                  "type": "string"
+                },
+                "workspace": {
+                  "$ref": "#/schemas/subscription_event/$defs/WorkspaceInfo"
+                }
+              },
+              "required": [
+                "type",
+                "workspace"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "type": {
+                  "const": "workspace_metadata_updated",
+                  "type": "string"
+                },
+                "workspace": {
+                  "$ref": "#/schemas/subscription_event/$defs/WorkspaceInfo"
+                }
+              },
+              "required": [
+                "type",
+                "workspace"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "type": {
+                  "const": "workspace_resources_updated",
+                  "type": "string"
+                },
+                "workspace": {
+                  "$ref": "#/schemas/subscription_event/$defs/WorkspaceInfo"
+                }
+              },
+              "required": [
+                "type",
+                "workspace"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "type": {
+                  "const": "workspace_closed",
+                  "type": "string"
+                },
+                "workspace": {
+                  "anyOf": [
+                    {
+                      "$ref": "#/schemas/subscription_event/$defs/WorkspaceInfo"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
+                },
+                "workspace_id": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type",
+                "workspace_id"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "label": {
+                  "type": "string"
+                },
+                "type": {
+                  "const": "workspace_renamed",
+                  "type": "string"
+                },
+                "workspace_id": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type",
+                "workspace_id",
+                "label"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "insert_index": {
+                  "format": "uint",
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                "type": {
+                  "const": "workspace_moved",
+                  "type": "string"
+                },
+                "workspace_id": {
+                  "type": "string"
+                },
+                "workspaces": {
+                  "items": {
+                    "$ref": "#/schemas/subscription_event/$defs/WorkspaceInfo"
+                  },
+                  "type": "array"
+                }
+              },
+              "required": [
+                "type",
+                "workspace_id",
+                "insert_index",
+                "workspaces"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "before_workspace_id": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "type": {
+                  "const": "workspace_reordered",
+                  "type": "string"
+                },
+                "workspace_ids": {
+                  "items": {
+                    "type": "string"
+                  },
+                  "type": "array"
+                },
+                "workspaces": {
+                  "items": {
+                    "$ref": "#/schemas/subscription_event/$defs/WorkspaceInfo"
+                  },
+                  "type": "array"
+                }
+              },
+              "required": [
+                "type",
+                "workspace_ids",
+                "workspaces"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "type": {
+                  "const": "workspace_focused",
+                  "type": "string"
+                },
+                "workspace_id": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type",
+                "workspace_id"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "checkout": {
+                  "$ref": "#/schemas/subscription_event/$defs/WorkspaceInfo"
+                },
+                "type": {
+                  "const": "checkout_opened",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type",
+                "checkout"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "label": {
+                  "type": "string"
+                },
+                "type": {
+                  "const": "checkout_renamed",
+                  "type": "string"
+                },
+                "workspace_id": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type",
+                "workspace_id",
+                "label"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "insert_index": {
+                  "format": "uint",
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                "type": {
+                  "const": "checkout_moved",
+                  "type": "string"
+                },
+                "workspace_id": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type",
+                "workspace_id",
+                "insert_index"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "checkout": {
+                  "anyOf": [
+                    {
+                      "$ref": "#/schemas/subscription_event/$defs/WorkspaceInfo"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
+                },
+                "type": {
+                  "const": "checkout_closed",
+                  "type": "string"
+                },
+                "workspace_id": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type",
+                "workspace_id"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "type": {
+                  "const": "checkout_focused",
+                  "type": "string"
+                },
+                "workspace_id": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type",
+                "workspace_id"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "repository": {
+                  "$ref": "#/schemas/subscription_event/$defs/RepositoryInfo"
+                },
+                "type": {
+                  "const": "repository_created",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type",
+                "repository"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "label": {
+                  "type": "string"
+                },
+                "repository_id": {
+                  "type": "string"
+                },
+                "type": {
+                  "const": "repository_renamed",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type",
+                "repository_id",
+                "label"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "insert_index": {
+                  "format": "uint",
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                "repository_id": {
+                  "type": "string"
+                },
+                "type": {
+                  "const": "repository_moved",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type",
+                "repository_id",
+                "insert_index"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "repository_id": {
+                  "type": "string"
+                },
+                "type": {
+                  "const": "repository_closed",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type",
+                "repository_id"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "repository_id": {
+                  "type": "string"
+                },
+                "type": {
+                  "const": "repository_focused",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type",
+                "repository_id"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "type": {
+                  "const": "worktree_created",
+                  "type": "string"
+                },
+                "workspace": {
+                  "$ref": "#/schemas/subscription_event/$defs/WorkspaceInfo"
+                },
+                "worktree": {
+                  "$ref": "#/schemas/subscription_event/$defs/WorktreeInfo"
+                }
+              },
+              "required": [
+                "type",
+                "workspace",
+                "worktree"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "already_open": {
+                  "type": "boolean"
+                },
+                "type": {
+                  "const": "worktree_opened",
+                  "type": "string"
+                },
+                "workspace": {
+                  "$ref": "#/schemas/subscription_event/$defs/WorkspaceInfo"
+                },
+                "worktree": {
+                  "$ref": "#/schemas/subscription_event/$defs/WorktreeInfo"
+                }
+              },
+              "required": [
+                "type",
+                "workspace",
+                "worktree",
+                "already_open"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "forced": {
+                  "type": "boolean"
+                },
+                "type": {
+                  "const": "worktree_removed",
+                  "type": "string"
+                },
+                "workspace": {
+                  "anyOf": [
+                    {
+                      "$ref": "#/schemas/subscription_event/$defs/WorkspaceInfo"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
+                },
+                "workspace_id": {
+                  "type": "string"
+                },
+                "worktree": {
+                  "$ref": "#/schemas/subscription_event/$defs/WorktreeInfo"
+                }
+              },
+              "required": [
+                "type",
+                "workspace_id",
+                "worktree",
+                "forced"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "tab": {
+                  "$ref": "#/schemas/subscription_event/$defs/TabInfo"
+                },
+                "type": {
+                  "const": "tab_created",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type",
+                "tab"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "tab_id": {
+                  "type": "string"
+                },
+                "type": {
+                  "const": "tab_closed",
+                  "type": "string"
+                },
+                "workspace_id": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type",
+                "tab_id",
+                "workspace_id"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "label": {
+                  "type": "string"
+                },
+                "tab_id": {
+                  "type": "string"
+                },
+                "type": {
+                  "const": "tab_renamed",
+                  "type": "string"
+                },
+                "workspace_id": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type",
+                "tab_id",
+                "workspace_id",
+                "label"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "insert_index": {
+                  "format": "uint",
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                "tab_id": {
+                  "type": "string"
+                },
+                "tabs": {
+                  "items": {
+                    "$ref": "#/schemas/subscription_event/$defs/TabInfo"
+                  },
+                  "type": "array"
+                },
+                "type": {
+                  "const": "tab_moved",
+                  "type": "string"
+                },
+                "workspace_id": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type",
+                "tab_id",
+                "workspace_id",
+                "insert_index",
+                "tabs"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "tab_id": {
+                  "type": "string"
+                },
+                "type": {
+                  "const": "tab_focused",
+                  "type": "string"
+                },
+                "workspace_id": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type",
+                "tab_id",
+                "workspace_id"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "collection": {
+                  "$ref": "#/schemas/subscription_event/$defs/CollectionInfo"
+                },
+                "type": {
+                  "const": "collection_created",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type",
+                "collection"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "collection": {
+                  "$ref": "#/schemas/subscription_event/$defs/CollectionInfo"
+                },
+                "pane": {
+                  "$ref": "#/schemas/subscription_event/$defs/PaneInfo"
+                },
+                "type": {
+                  "const": "collection_member_added",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type",
+                "collection",
+                "pane"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "collection": {
+                  "$ref": "#/schemas/subscription_event/$defs/CollectionInfo"
+                },
+                "pane": {
+                  "$ref": "#/schemas/subscription_event/$defs/PaneInfo"
+                },
+                "previous_collection_id": {
+                  "type": "string"
+                },
+                "type": {
+                  "const": "collection_member_moved",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type",
+                "previous_collection_id",
+                "collection",
+                "pane"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "collection_id": {
+                  "type": "string"
+                },
+                "pane_id": {
+                  "type": "string"
+                },
+                "type": {
+                  "const": "collection_member_removed",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type",
+                "collection_id",
+                "pane_id"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "collection_id": {
+                  "type": "string"
+                },
+                "pane": {
+                  "$ref": "#/schemas/subscription_event/$defs/PaneInfo"
+                },
+                "type": {
+                  "const": "collection_member_promoted",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type",
+                "collection_id",
+                "pane"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "collection": {
+                  "$ref": "#/schemas/subscription_event/$defs/CollectionInfo"
+                },
+                "pane_id": {
+                  "type": "string"
+                },
+                "type": {
+                  "const": "collection_member_selected",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type",
+                "collection",
+                "pane_id"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "collection": {
+                  "$ref": "#/schemas/subscription_event/$defs/CollectionInfo"
+                },
+                "type": {
+                  "const": "collection_members_reordered",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type",
+                "collection"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "collection": {
+                  "$ref": "#/schemas/subscription_event/$defs/CollectionInfo"
+                },
+                "pane_id": {
+                  "type": "string"
+                },
+                "type": {
+                  "const": "collection_member_archived",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type",
+                "collection",
+                "pane_id"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "collection": {
+                  "$ref": "#/schemas/subscription_event/$defs/CollectionInfo"
+                },
+                "pane_id": {
+                  "type": "string"
+                },
+                "type": {
+                  "const": "collection_member_restored",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type",
+                "collection",
+                "pane_id"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "collection_id": {
+                  "type": "string"
+                },
+                "tab_id": {
+                  "type": "string"
+                },
+                "type": {
+                  "const": "collection_closed",
+                  "type": "string"
+                },
+                "workspace_id": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type",
+                "collection_id",
+                "workspace_id",
+                "tab_id"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "delegation": {
+                  "$ref": "#/schemas/subscription_event/$defs/DelegationInfo"
+                },
+                "type": {
+                  "const": "delegation_created",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type",
+                "delegation"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "delegation": {
+                  "$ref": "#/schemas/subscription_event/$defs/DelegationInfo"
+                },
+                "previous_parent_id": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "type": {
+                  "const": "delegation_reparented",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type",
+                "delegation"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "delegation": {
+                  "$ref": "#/schemas/subscription_event/$defs/DelegationInfo"
+                },
+                "type": {
+                  "const": "delegation_reordered",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type",
+                "delegation"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "delegation_id": {
+                  "type": "string"
+                },
+                "pane_id": {
+                  "type": "string"
+                },
+                "type": {
+                  "const": "delegation_tombstoned",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type",
+                "delegation_id",
+                "pane_id"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "delegation_id": {
+                  "type": "string"
+                },
+                "type": {
+                  "const": "delegation_garbage_collected",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type",
+                "delegation_id"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "pane": {
+                  "$ref": "#/schemas/subscription_event/$defs/PaneInfo"
+                },
+                "type": {
+                  "const": "pane_created",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type",
+                "pane"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "pane_id": {
+                  "type": "string"
+                },
+                "type": {
+                  "const": "pane_closed",
+                  "type": "string"
+                },
+                "workspace_id": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type",
+                "pane_id",
+                "workspace_id"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "pane": {
+                  "$ref": "#/schemas/subscription_event/$defs/PaneInfo"
+                },
+                "type": {
+                  "const": "pane_updated",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type",
+                "pane"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "pane_id": {
+                  "type": "string"
+                },
+                "type": {
+                  "const": "pane_focused",
+                  "type": "string"
+                },
+                "workspace_id": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type",
+                "pane_id",
+                "workspace_id"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "closed_tab_id": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "closed_workspace_id": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "created_tab": {
+                  "anyOf": [
+                    {
+                      "$ref": "#/schemas/subscription_event/$defs/TabInfo"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
+                },
+                "created_workspace": {
+                  "anyOf": [
+                    {
+                      "$ref": "#/schemas/subscription_event/$defs/WorkspaceInfo"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
+                },
+                "pane": {
+                  "$ref": "#/schemas/subscription_event/$defs/PaneInfo"
+                },
+                "previous_pane_id": {
+                  "type": "string"
+                },
+                "previous_tab_id": {
+                  "type": "string"
+                },
+                "previous_workspace_id": {
+                  "type": "string"
+                },
+                "type": {
+                  "const": "pane_moved",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type",
+                "previous_pane_id",
+                "previous_workspace_id",
+                "previous_tab_id",
+                "pane"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "pane_id": {
+                  "type": "string"
+                },
+                "revision": {
+                  "format": "uint64",
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                "type": {
+                  "const": "pane_output_changed",
+                  "type": "string"
+                },
+                "workspace_id": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type",
+                "pane_id",
+                "workspace_id",
+                "revision"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "pane_id": {
+                  "type": "string"
+                },
+                "type": {
+                  "const": "pane_exited",
+                  "type": "string"
+                },
+                "workspace_id": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type",
+                "pane_id",
+                "workspace_id"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "agent": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "final_status": {
+                  "anyOf": [
+                    {
+                      "$ref": "#/schemas/subscription_event/$defs/AgentStatus"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
+                },
+                "pane_id": {
+                  "type": "string"
+                },
+                "released": {
+                  "type": "boolean"
+                },
+                "type": {
+                  "const": "pane_agent_detected",
+                  "type": "string"
+                },
+                "workspace_id": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type",
+                "pane_id",
+                "workspace_id"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "agent": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "agent_status": {
+                  "$ref": "#/schemas/subscription_event/$defs/AgentStatus"
+                },
+                "display_agent": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "pane_id": {
+                  "type": "string"
+                },
+                "state_labels": {
+                  "additionalProperties": {
+                    "type": "string"
+                  },
+                  "type": "object"
+                },
+                "title": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "type": {
+                  "const": "pane_agent_status_changed",
+                  "type": "string"
+                },
+                "workspace_id": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type",
+                "pane_id",
+                "workspace_id",
+                "agent_status"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "layout": {
+                  "$ref": "#/schemas/subscription_event/$defs/PaneLayoutSnapshot"
+                },
+                "type": {
+                  "const": "layout_updated",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type",
+                "layout"
+              ],
+              "type": "object"
+            }
+          ]
+        },
+        "EventKind": {
+          "enum": [
+            "workspace_created",
+            "workspace_updated",
+            "workspace_metadata_updated",
+            "workspace_resources_updated",
+            "workspace_closed",
+            "workspace_renamed",
+            "workspace_moved",
+            "workspace_reordered",
+            "workspace_focused",
+            "checkout_opened",
+            "checkout_renamed",
+            "checkout_moved",
+            "checkout_closed",
+            "checkout_focused",
+            "repository_created",
+            "repository_renamed",
+            "repository_moved",
+            "repository_closed",
+            "repository_focused",
+            "worktree_created",
+            "worktree_opened",
+            "worktree_removed",
+            "tab_created",
+            "tab_closed",
+            "tab_renamed",
+            "tab_moved",
+            "tab_focused",
+            "collection_created",
+            "collection_member_added",
+            "collection_member_moved",
+            "collection_member_removed",
+            "collection_member_promoted",
+            "collection_member_selected",
+            "collection_members_reordered",
+            "collection_member_archived",
+            "collection_member_restored",
+            "collection_closed",
+            "delegation_created",
+            "delegation_reparented",
+            "delegation_reordered",
+            "delegation_tombstoned",
+            "delegation_garbage_collected",
+            "pane_created",
+            "pane_closed",
+            "pane_updated",
+            "pane_focused",
+            "pane_moved",
+            "pane_output_changed",
+            "pane_exited",
+            "pane_agent_detected",
+            "pane_agent_status_changed",
+            "layout_updated"
+          ],
+          "type": "string"
+        },
+        "LayoutFocusInfo": {
+          "oneOf": [
+            {
+              "properties": {
+                "pane_id": {
+                  "type": "string"
+                },
+                "type": {
+                  "const": "pane",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type",
+                "pane_id"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "collection_id": {
+                  "type": "string"
+                },
+                "selected_pane_id": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "type": {
+                  "const": "collection",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type",
+                "collection_id"
+              ],
+              "type": "object"
+            }
+          ]
         },
         "PaneAgentStatusChangedEvent": {
           "properties": {
@@ -8363,6 +9824,273 @@
           ],
           "type": "object"
         },
+        "PaneInfo": {
+          "properties": {
+            "agent": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "agent_session": {
+              "anyOf": [
+                {
+                  "$ref": "#/schemas/subscription_event/$defs/AgentSessionInfo"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "agent_status": {
+              "$ref": "#/schemas/subscription_event/$defs/AgentStatus"
+            },
+            "cwd": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "display_agent": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "focused": {
+              "type": "boolean"
+            },
+            "foreground_cwd": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "label": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "pane_id": {
+              "type": "string"
+            },
+            "placement": {
+              "$ref": "#/schemas/subscription_event/$defs/PanePlacementInfo",
+              "default": {
+                "type": "tiled"
+              }
+            },
+            "revision": {
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "scroll": {
+              "anyOf": [
+                {
+                  "$ref": "#/schemas/subscription_event/$defs/PaneScrollInfo"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "state_labels": {
+              "additionalProperties": {
+                "type": "string"
+              },
+              "type": "object"
+            },
+            "tab_id": {
+              "type": "string"
+            },
+            "terminal_id": {
+              "type": "string"
+            },
+            "terminal_title": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "terminal_title_stripped": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "title": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "tokens": {
+              "additionalProperties": {
+                "type": "string"
+              },
+              "maxProperties": 32,
+              "propertyNames": {
+                "pattern": "^[A-Za-z0-9_-]{1,32}$"
+              },
+              "type": "object"
+            },
+            "workspace_id": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "pane_id",
+            "terminal_id",
+            "workspace_id",
+            "tab_id",
+            "focused",
+            "agent_status",
+            "revision"
+          ],
+          "type": "object"
+        },
+        "PaneLayoutPane": {
+          "properties": {
+            "focused": {
+              "type": "boolean"
+            },
+            "pane_id": {
+              "type": "string"
+            },
+            "placement": {
+              "$ref": "#/schemas/subscription_event/$defs/PanePlacementInfo",
+              "default": {
+                "type": "tiled"
+              }
+            },
+            "rect": {
+              "$ref": "#/schemas/subscription_event/$defs/PaneLayoutRect"
+            }
+          },
+          "required": [
+            "pane_id",
+            "focused",
+            "rect"
+          ],
+          "type": "object"
+        },
+        "PaneLayoutRect": {
+          "properties": {
+            "height": {
+              "format": "uint16",
+              "maximum": 65535,
+              "minimum": 0,
+              "type": "integer"
+            },
+            "width": {
+              "format": "uint16",
+              "maximum": 65535,
+              "minimum": 0,
+              "type": "integer"
+            },
+            "x": {
+              "format": "uint16",
+              "maximum": 65535,
+              "minimum": 0,
+              "type": "integer"
+            },
+            "y": {
+              "format": "uint16",
+              "maximum": 65535,
+              "minimum": 0,
+              "type": "integer"
+            }
+          },
+          "required": [
+            "x",
+            "y",
+            "width",
+            "height"
+          ],
+          "type": "object"
+        },
+        "PaneLayoutSnapshot": {
+          "properties": {
+            "area": {
+              "$ref": "#/schemas/subscription_event/$defs/PaneLayoutRect"
+            },
+            "collections": {
+              "items": {
+                "$ref": "#/schemas/subscription_event/$defs/CollectionInfo"
+              },
+              "type": "array"
+            },
+            "focused": {
+              "$ref": "#/schemas/subscription_event/$defs/LayoutFocusInfo",
+              "default": {
+                "pane_id": "",
+                "type": "pane"
+              }
+            },
+            "focused_pane_id": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "panes": {
+              "items": {
+                "$ref": "#/schemas/subscription_event/$defs/PaneLayoutPane"
+              },
+              "type": "array"
+            },
+            "splits": {
+              "items": {
+                "$ref": "#/schemas/subscription_event/$defs/PaneLayoutSplit"
+              },
+              "type": "array"
+            },
+            "tab_id": {
+              "type": "string"
+            },
+            "workspace_id": {
+              "type": "string"
+            },
+            "zoomed": {
+              "type": "boolean"
+            }
+          },
+          "required": [
+            "workspace_id",
+            "tab_id",
+            "zoomed",
+            "area",
+            "panes",
+            "splits"
+          ],
+          "type": "object"
+        },
+        "PaneLayoutSplit": {
+          "properties": {
+            "direction": {
+              "$ref": "#/schemas/subscription_event/$defs/SplitDirection"
+            },
+            "id": {
+              "type": "string"
+            },
+            "ratio": {
+              "format": "float",
+              "type": "number"
+            },
+            "rect": {
+              "$ref": "#/schemas/subscription_event/$defs/PaneLayoutRect"
+            }
+          },
+          "required": [
+            "id",
+            "direction",
+            "ratio",
+            "rect"
+          ],
+          "type": "object"
+        },
         "PaneOutputMatchedEvent": {
           "properties": {
             "matched_line": {
@@ -8381,6 +10109,52 @@
             "read"
           ],
           "type": "object"
+        },
+        "PanePlacementInfo": {
+          "oneOf": [
+            {
+              "properties": {
+                "type": {
+                  "const": "tiled",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "archived": {
+                  "type": "boolean"
+                },
+                "collection_id": {
+                  "type": "string"
+                },
+                "member_index": {
+                  "format": "uint",
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                "selected": {
+                  "type": "boolean"
+                },
+                "type": {
+                  "const": "collection",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type",
+                "collection_id",
+                "member_index",
+                "archived",
+                "selected"
+              ],
+              "type": "object"
+            }
+          ]
         },
         "PaneReadResult": {
           "properties": {
@@ -8483,6 +10257,100 @@
           ],
           "type": "string"
         },
+        "RepositoryInfo": {
+          "properties": {
+            "active_agent_count": {
+              "format": "uint",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "agent_status": {
+              "$ref": "#/schemas/subscription_event/$defs/AgentStatus"
+            },
+            "checkout_workspace_ids": {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            "descendant_attention_count": {
+              "default": 0,
+              "description": "Completed delegated descendants that have not been explicitly acknowledged.",
+              "format": "uint",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "focused": {
+              "type": "boolean"
+            },
+            "git_common_dir": {
+              "type": "string"
+            },
+            "label": {
+              "type": "string"
+            },
+            "last_focused_workspace_id": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "pane_count": {
+              "format": "uint",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "preferred_base": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "repository_id": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "repository_id",
+            "label",
+            "git_common_dir",
+            "checkout_workspace_ids",
+            "focused",
+            "pane_count",
+            "active_agent_count",
+            "agent_status"
+          ],
+          "type": "object"
+        },
+        "SequencedEventEnvelope": {
+          "description": "An EventHub event as delivered by a subscription. `sequence` is the\nsession-global EventHub cursor, not a per-subscription counter.",
+          "properties": {
+            "data": {
+              "$ref": "#/schemas/subscription_event/$defs/EventData"
+            },
+            "event": {
+              "$ref": "#/schemas/subscription_event/$defs/EventKind"
+            },
+            "sequence": {
+              "default": 0,
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            }
+          },
+          "required": [
+            "event",
+            "data"
+          ],
+          "type": "object"
+        },
+        "SplitDirection": {
+          "enum": [
+            "right",
+            "down"
+          ],
+          "type": "string"
+        },
         "SubscriptionEventData": {
           "anyOf": [
             {
@@ -8496,6 +10364,28 @@
             }
           ]
         },
+        "SubscriptionEventEnvelope": {
+          "properties": {
+            "data": {
+              "$ref": "#/schemas/subscription_event/$defs/SubscriptionEventData"
+            },
+            "event": {
+              "$ref": "#/schemas/subscription_event/$defs/SubscriptionEventKind"
+            },
+            "sequence": {
+              "default": 0,
+              "description": "Session-global sequence reserved for this subscribed observation.",
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            }
+          },
+          "required": [
+            "event",
+            "data"
+          ],
+          "type": "object"
+        },
         "SubscriptionEventKind": {
           "enum": [
             "pane.output_matched",
@@ -8503,23 +10393,258 @@
             "pane.scroll_changed"
           ],
           "type": "string"
+        },
+        "TabInfo": {
+          "properties": {
+            "agent_status": {
+              "$ref": "#/schemas/subscription_event/$defs/AgentStatus"
+            },
+            "descendant_attention_count": {
+              "default": 0,
+              "description": "Completed delegated descendants that have not been explicitly acknowledged.",
+              "format": "uint",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "focused": {
+              "type": "boolean"
+            },
+            "label": {
+              "type": "string"
+            },
+            "number": {
+              "format": "uint",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "pane_count": {
+              "format": "uint",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "tab_id": {
+              "type": "string"
+            },
+            "workspace_id": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "tab_id",
+            "workspace_id",
+            "number",
+            "label",
+            "focused",
+            "pane_count",
+            "agent_status"
+          ],
+          "type": "object"
+        },
+        "WorkspaceInfo": {
+          "properties": {
+            "active_tab_id": {
+              "type": "string"
+            },
+            "agent_status": {
+              "$ref": "#/schemas/subscription_event/$defs/AgentStatus"
+            },
+            "checkout": {
+              "anyOf": [
+                {
+                  "$ref": "#/schemas/subscription_event/$defs/CheckoutInfo"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "descendant_attention_count": {
+              "default": 0,
+              "description": "Completed delegated descendants that have not been explicitly acknowledged.",
+              "format": "uint",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "focused": {
+              "type": "boolean"
+            },
+            "label": {
+              "type": "string"
+            },
+            "number": {
+              "format": "uint",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "pane_count": {
+              "format": "uint",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "repository_id": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "resources": {
+              "items": {
+                "$ref": "#/schemas/subscription_event/$defs/WorkspaceResourceInfo"
+              },
+              "type": "array"
+            },
+            "tab_count": {
+              "format": "uint",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "tokens": {
+              "additionalProperties": {
+                "type": "string"
+              },
+              "maxProperties": 32,
+              "propertyNames": {
+                "pattern": "^[A-Za-z0-9_-]{1,32}$"
+              },
+              "type": "object"
+            },
+            "workspace_id": {
+              "type": "string"
+            },
+            "worktree": {
+              "anyOf": [
+                {
+                  "$ref": "#/schemas/subscription_event/$defs/WorkspaceWorktreeInfo"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            }
+          },
+          "required": [
+            "workspace_id",
+            "number",
+            "label",
+            "focused",
+            "pane_count",
+            "tab_count",
+            "active_tab_id",
+            "agent_status"
+          ],
+          "type": "object"
+        },
+        "WorkspaceResourceInfo": {
+          "properties": {
+            "data": true,
+            "detail": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "label": {
+              "type": "string"
+            },
+            "plugin_id": {
+              "type": "string"
+            },
+            "resource_id": {
+              "type": "string"
+            },
+            "workspace_id": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "workspace_id",
+            "plugin_id",
+            "resource_id",
+            "label"
+          ],
+          "type": "object"
+        },
+        "WorkspaceWorktreeInfo": {
+          "properties": {
+            "checkout_path": {
+              "type": "string"
+            },
+            "is_linked_worktree": {
+              "type": "boolean"
+            },
+            "repo_key": {
+              "type": "string"
+            },
+            "repo_name": {
+              "type": "string"
+            },
+            "repo_root": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "repo_key",
+            "repo_name",
+            "repo_root",
+            "checkout_path",
+            "is_linked_worktree"
+          ],
+          "type": "object"
+        },
+        "WorktreeInfo": {
+          "properties": {
+            "branch": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "is_bare": {
+              "type": "boolean"
+            },
+            "is_detached": {
+              "type": "boolean"
+            },
+            "is_linked_worktree": {
+              "type": "boolean"
+            },
+            "is_prunable": {
+              "type": "boolean"
+            },
+            "label": {
+              "type": "string"
+            },
+            "open_workspace_id": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "path": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "path",
+            "is_bare",
+            "is_detached",
+            "is_prunable",
+            "is_linked_worktree",
+            "label"
+          ],
+          "type": "object"
         }
       },
       "$schema": "https://json-schema.org/draft/2020-12/schema",
-      "properties": {
-        "data": {
-          "$ref": "#/schemas/subscription_event/$defs/SubscriptionEventData"
+      "anyOf": [
+        {
+          "$ref": "#/schemas/subscription_event/$defs/SequencedEventEnvelope"
         },
-        "event": {
-          "$ref": "#/schemas/subscription_event/$defs/SubscriptionEventKind"
+        {
+          "$ref": "#/schemas/subscription_event/$defs/SubscriptionEventEnvelope"
         }
-      },
-      "required": [
-        "event",
-        "data"
       ],
-      "title": "SubscriptionEventEnvelope",
-      "type": "object"
+      "title": "StreamEventEnvelope"
     },
     "success_response": {
       "$defs": {
@@ -12908,6 +15033,7 @@
                   "type": "integer"
                 },
                 "pane_visible": {
+                  "default": false,
                   "description": "True only when this pane is on the currently rendered terminal surface.",
                   "type": "boolean"
                 },
@@ -12923,8 +15049,7 @@
               "required": [
                 "type",
                 "cell_width_px",
-                "cell_height_px",
-                "pane_visible"
+                "cell_height_px"
               ],
               "type": "object"
             },
@@ -12944,6 +15069,13 @@
             },
             {
               "properties": {
+                "sequence": {
+                  "default": 0,
+                  "description": "Common EventHub cursor accepted for every subscription in this request.",
+                  "format": "uint64",
+                  "minimum": 0,
+                  "type": "integer"
+                },
                 "type": {
                   "const": "subscription_started",
                   "type": "string"
@@ -13431,6 +15563,13 @@
                 "$ref": "#/schemas/success_response/$defs/RepositoryInfo"
               },
               "type": "array"
+            },
+            "sequence": {
+              "default": 0,
+              "description": "EventHub watermark captured atomically with this snapshot's app state.",
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
             },
             "tabs": {
               "items": {

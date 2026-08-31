@@ -4,7 +4,11 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from scripts.docs_translation_parity import check_docs_translation_parity, heading_outline
+from scripts.docs_translation_parity import (
+    check_docs_translation_parity,
+    heading_outline,
+    socket_method_inventory,
+)
 
 
 class DocsTranslationParityTests(unittest.TestCase):
@@ -17,6 +21,23 @@ class DocsTranslationParityTests(unittest.TestCase):
             )
 
             self.assertEqual(heading_outline(path), [1, 2])
+
+    def test_socket_method_inventory_detects_table_without_server_stop(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "socket-api.mdx"
+            path.write_text(
+                "`pane.prose.only` is mentioned here.\n\n"
+                "| Area | Methods |\n"
+                "| --- | --- |\n"
+                "| Server | `ping`, `server.reload_config` |\n"
+                "| Pane | `pane.list`, `pane.input.set` |\n",
+                encoding="utf-8",
+            )
+
+            self.assertEqual(
+                socket_method_inventory(path),
+                {"ping", "server.reload_config", "pane.list", "pane.input.set"},
+            )
 
     def test_parity_accepts_translated_heading_text_with_same_shape(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -58,6 +79,33 @@ class DocsTranslationParityTests(unittest.TestCase):
             self.assertEqual(len(errors), 1)
             self.assertIn(str(Path("ja") / "cli-reference.mdx"), errors[0])
             self.assertIn("heading outline differs", errors[0])
+
+    def test_parity_reports_socket_method_inventory_drift(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "ja").mkdir()
+            (root / "zh-cn").mkdir()
+            source = (
+                "# Socket API\n\n"
+                "| Area | Methods |\n| --- | --- |\n"
+                "| Server | `ping`, `server.stop` |\n"
+                "| Pane | `pane.list`, `pane.input.set` |\n"
+            )
+            translated = (
+                "# Socket API\n\n"
+                "| 領域 | メソッド |\n| --- | --- |\n"
+                "| サーバー | `ping`, `server.stop` |\n"
+                "| ペイン | `pane.list` |\n"
+            )
+            (root / "socket-api.mdx").write_text(source, encoding="utf-8")
+            (root / "ja" / "socket-api.mdx").write_text(translated, encoding="utf-8")
+            (root / "zh-cn" / "socket-api.mdx").write_text(source, encoding="utf-8")
+
+            errors = check_docs_translation_parity(root)
+
+            self.assertEqual(len(errors), 1)
+            self.assertIn("socket method inventory differs", errors[0])
+            self.assertIn("missing pane.input.set", errors[0])
 
     def test_parity_reports_missing_and_stale_files(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

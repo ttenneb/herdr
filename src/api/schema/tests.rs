@@ -40,7 +40,7 @@ fn protocol_schema_document() -> serde_json::Value {
             "success_response": protocol_schema_entry::<SuccessResponse>("success_response"),
             "error_response": protocol_schema_entry::<ErrorResponse>("error_response"),
             "event": protocol_schema_entry::<EventEnvelope>("event"),
-            "subscription_event": protocol_schema_entry::<SubscriptionEventEnvelope>("subscription_event"),
+            "subscription_event": protocol_schema_entry::<StreamEventEnvelope>("subscription_event"),
         },
     })
 }
@@ -59,6 +59,44 @@ fn legacy_pane_layout_response_deserializes_without_collection_fields() {
     let layout: PaneLayoutSnapshot = serde_json::from_value(legacy).expect("legacy layout");
     assert!(layout.collections.is_empty());
     assert!(matches!(layout.focused, LayoutFocusInfo::Pane { .. }));
+}
+
+#[test]
+fn legacy_pane_graphics_info_response_defaults_visibility_to_false() {
+    let legacy = serde_json::json!({
+        "id": "graphics-info",
+        "result": {
+            "type": "pane_graphics_info",
+            "cell_width_px": 8,
+            "cell_height_px": 16
+        }
+    });
+
+    let response: SuccessResponse = serde_json::from_value(legacy).expect("legacy response");
+    assert!(matches!(
+        response.result,
+        ResponseResult::PaneGraphicsInfo {
+            pane_visible: false,
+            ..
+        }
+    ));
+
+    let schema = protocol_schema_entry::<SuccessResponse>("success_response");
+    let pane_graphics_info = schema["$defs"]["ResponseResult"]["oneOf"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|variant| variant["properties"]["type"]["const"] == "pane_graphics_info")
+        .expect("pane graphics info schema");
+    assert_eq!(
+        pane_graphics_info["properties"]["pane_visible"]["default"],
+        false
+    );
+    assert!(!pane_graphics_info["required"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|field| field == "pane_visible"));
 }
 
 #[test]
@@ -671,6 +709,7 @@ fn subscribe_request_parses_parameterized_subscriptions() {
 #[test]
 fn subscription_event_envelope_round_trips() {
     let event = SubscriptionEventEnvelope {
+        sequence: 42,
         event: SubscriptionEventKind::PaneOutputMatched,
         data: SubscriptionEventData::PaneOutputMatched(PaneOutputMatchedEvent {
             pane_id: "p_1_1".into(),
@@ -697,6 +736,7 @@ fn subscription_event_envelope_round_trips() {
 #[test]
 fn scroll_changed_subscription_event_round_trips() {
     let event = SubscriptionEventEnvelope {
+        sequence: 43,
         event: SubscriptionEventKind::ScrollChanged,
         data: SubscriptionEventData::ScrollChanged(PaneScrollChangedEvent {
             pane_id: "p_1_1".into(),
@@ -713,6 +753,54 @@ fn scroll_changed_subscription_event_round_trips() {
     assert!(json.contains("\"event\":\"pane.scroll_changed\""));
     let restored: SubscriptionEventEnvelope = serde_json::from_str(&json).unwrap();
     assert_eq!(restored, event);
+}
+
+#[test]
+fn legacy_lifecycle_subscription_event_defaults_sequence_to_zero() {
+    let event: StreamEventEnvelope = serde_json::from_value(serde_json::json!({
+        "event": "workspace_focused",
+        "data": {"type": "workspace_focused", "workspace_id": "workspace_1"}
+    }))
+    .expect("legacy lifecycle event");
+
+    assert_eq!(event.sequence(), 0);
+    let StreamEventEnvelope::Event(event) = event else {
+        panic!("expected lifecycle event");
+    };
+    assert!(matches!(
+        *event,
+        SequencedEventEnvelope {
+            event: EventEnvelope {
+                event: EventKind::WorkspaceFocused,
+                ..
+            },
+            ..
+        }
+    ));
+}
+
+#[test]
+fn subscription_started_sequence_round_trips_and_defaults_for_legacy_servers() {
+    let response = SuccessResponse {
+        id: "sub".into(),
+        result: ResponseResult::SubscriptionStarted { sequence: 42 },
+    };
+    let json = serde_json::to_value(&response).unwrap();
+    assert_eq!(json["result"]["sequence"], 42);
+    assert_eq!(
+        serde_json::from_value::<SuccessResponse>(json).unwrap(),
+        response
+    );
+
+    let legacy: SuccessResponse = serde_json::from_value(serde_json::json!({
+        "id": "sub",
+        "result": {"type": "subscription_started"}
+    }))
+    .unwrap();
+    assert!(matches!(
+        legacy.result,
+        ResponseResult::SubscriptionStarted { sequence: 0 }
+    ));
 }
 
 #[test]
@@ -751,6 +839,7 @@ fn session_snapshot_request_and_response_round_trip() {
             snapshot: Box::new(SessionSnapshot {
                 version: "0.1.2".into(),
                 protocol: 16,
+                sequence: 44,
                 focused_workspace_id: None,
                 focused_tab_id: None,
                 focused_pane_id: None,

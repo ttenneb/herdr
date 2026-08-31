@@ -283,7 +283,15 @@ pub(crate) struct WorktreeBase {
 }
 
 pub(crate) fn resolve_worktree_base(repo_root: &Path, reference: &str) -> Option<WorktreeBase> {
-    let output = repository_git_command(repo_root, false)
+    resolve_worktree_base_with_trust(repo_root, reference, false)
+}
+
+pub(crate) fn resolve_worktree_base_with_trust(
+    repo_root: &Path,
+    reference: &str,
+    trust_repository: bool,
+) -> Option<WorktreeBase> {
+    let output = repository_git_command(repo_root, trust_repository)
         .args(["rev-parse", "--verify"])
         .arg(format!("{reference}^{{commit}}"))
         .output()
@@ -303,11 +311,20 @@ pub(crate) fn resolve_repository_base(
     repo_root: &Path,
     preferred: Option<&str>,
 ) -> Option<WorktreeBase> {
-    if let Some(base) = preferred.and_then(|reference| resolve_worktree_base(repo_root, reference))
-    {
+    resolve_repository_base_with_trust(repo_root, preferred, false)
+}
+
+pub(crate) fn resolve_repository_base_with_trust(
+    repo_root: &Path,
+    preferred: Option<&str>,
+    trust_repository: bool,
+) -> Option<WorktreeBase> {
+    if let Some(base) = preferred.and_then(|reference| {
+        resolve_worktree_base_with_trust(repo_root, reference, trust_repository)
+    }) {
         return Some(base);
     }
-    let remote_head = repository_git_command(repo_root, false)
+    let remote_head = repository_git_command(repo_root, trust_repository)
         .args([
             "symbolic-ref",
             "--quiet",
@@ -322,10 +339,12 @@ pub(crate) fn resolve_repository_base(
         .filter(|reference| !reference.is_empty());
     remote_head
         .as_deref()
-        .and_then(|reference| resolve_worktree_base(repo_root, reference))
-        .or_else(|| resolve_worktree_base(repo_root, "main"))
-        .or_else(|| resolve_worktree_base(repo_root, "master"))
-        .or_else(|| resolve_worktree_base(repo_root, "HEAD"))
+        .and_then(|reference| {
+            resolve_worktree_base_with_trust(repo_root, reference, trust_repository)
+        })
+        .or_else(|| resolve_worktree_base_with_trust(repo_root, "main", trust_repository))
+        .or_else(|| resolve_worktree_base_with_trust(repo_root, "master", trust_repository))
+        .or_else(|| resolve_worktree_base_with_trust(repo_root, "HEAD", trust_repository))
 }
 
 pub(crate) fn resolve_checkout_head(repo_root: &Path) -> Option<WorktreeBase> {
@@ -339,7 +358,7 @@ pub(crate) fn local_branch_exists(repo_root: &Path, branch: &str) -> Result<bool
     local_branch_exists_with_trust(repo_root, branch, false)
 }
 
-fn local_branch_exists_with_trust(
+pub(crate) fn local_branch_exists_with_trust(
     repo_root: &Path,
     branch: &str,
     trust_repository: bool,
@@ -633,6 +652,27 @@ mod tests {
             repository_git_args(Path::new("/repo/herdr"), true),
             ["-c", "safe.directory=/repo/herdr", "-C", "/repo/herdr",]
         );
+    }
+
+    #[test]
+    fn trusted_create_preflight_covers_branch_and_base_resolution_without_persisting_trust() {
+        let repo = create_committed_repo("trusted-create-preflight");
+        run_git(&repo, &["branch", "existing"]);
+
+        assert!(local_branch_exists_with_trust(&repo, "existing", true).unwrap());
+        assert!(!local_branch_exists_with_trust(&repo, "missing", true).unwrap());
+        assert!(resolve_worktree_base_with_trust(&repo, "HEAD", true).is_some());
+        assert!(resolve_repository_base_with_trust(&repo, Some("HEAD"), true).is_some());
+        assert!(resolve_repository_base_with_trust(&repo, None, true).is_some());
+
+        let safe_directory = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&repo)
+            .args(["config", "--local", "--get-all", "safe.directory"])
+            .output()
+            .unwrap();
+        assert!(safe_directory.stdout.is_empty());
+        std::fs::remove_dir_all(repo).unwrap();
     }
 
     #[test]

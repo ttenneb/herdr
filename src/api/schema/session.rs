@@ -10,6 +10,9 @@ use super::workspaces::WorkspaceInfo;
 pub struct SessionSnapshot {
     pub version: String,
     pub protocol: u32,
+    /// EventHub watermark captured atomically with this snapshot's app state.
+    #[serde(default)]
+    pub sequence: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub focused_workspace_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

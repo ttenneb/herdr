@@ -2,10 +2,13 @@ use regex::Regex;
 
 use crate::api::schema::{
     ErrorBody, ErrorResponse, EventKind, Method, PaneAgentStatusChangedEvent,
-    PaneOutputMatchedEvent, PaneScrollChangedEvent, PaneScrollInfo, Request, Subscription,
-    SubscriptionEventData, SubscriptionEventEnvelope, SubscriptionEventKind,
+    PaneOutputMatchedEvent, PaneScrollChangedEvent, PaneScrollInfo, Request,
+    SequencedEventEnvelope, StreamEventEnvelope, Subscription, SubscriptionEventData,
+    SubscriptionEventEnvelope, SubscriptionEventKind,
 };
-use crate::api::server::{dispatch_to_app_with_timeout, APP_RESPONSE_TIMEOUT};
+use crate::api::server::{
+    dispatch_observation_to_app_with_timeout, dispatch_to_app_with_timeout, APP_RESPONSE_TIMEOUT,
+};
 use crate::api::{ApiRequestSender, EventHub};
 
 pub(super) fn output_match_read_source(
@@ -53,6 +56,7 @@ pub(super) struct ActiveAgentStatusChangedSubscription {
     last_presentation: Option<PanePresentationSnapshot>,
     last_sequence: u64,
     initial_event: Option<PaneAgentStatusChangedEvent>,
+    request_id: String,
     request_prefix: String,
 }
 
@@ -94,6 +98,7 @@ impl PanePresentationSnapshot {
 pub(super) struct ActiveEventSubscription {
     event_kind: crate::api::schema::EventKind,
     last_sequence: u64,
+    request_id: String,
 }
 
 pub(super) enum ActiveSubscription {
@@ -109,13 +114,14 @@ impl ActiveSubscription {
         request_id: &str,
         index: usize,
         api_tx: &ApiRequestSender,
-        event_hub: &EventHub,
+        _event_hub: &EventHub,
         event_start_sequence: u64,
     ) -> Result<Self, ErrorResponse> {
         let event_subscription = |event_kind| {
             Self::Event(ActiveEventSubscription {
                 event_kind,
                 last_sequence: event_start_sequence,
+                request_id: request_id.to_string(),
             })
         };
 
@@ -254,7 +260,8 @@ impl ActiveSubscription {
                     lines,
                     strip_ansi,
                     api_tx,
-                );
+                )
+                .map_err(|response| with_request_id(response, request_id));
                 probe?;
 
                 Ok(Self::OutputMatched(ActiveOutputMatchedSubscription {
@@ -272,8 +279,13 @@ impl ActiveSubscription {
                 pane_id,
                 agent_status,
             } => {
-                let last_sequence = event_hub.current_sequence();
-                let probe = pane_get(format!("{request_id}:sub:{index}:probe"), &pane_id, api_tx)?;
+                // Every subscription in one request starts from the cursor
+                // accepted by stream_subscriptions. The probe may reflect a
+                // later state, but replay from that common cursor wins so a
+                // transient setup-window transition cannot be lost.
+                let last_sequence = event_start_sequence;
+                let probe = pane_get(format!("{request_id}:sub:{index}:probe"), &pane_id, api_tx)
+                    .map_err(|response| with_request_id(response, request_id))?;
                 let last_status = probe.agent_status;
                 let last_presentation = PanePresentationSnapshot::from(&probe);
                 let initial_event = agent_status
@@ -296,12 +308,14 @@ impl ActiveSubscription {
                         last_presentation: Some(last_presentation),
                         last_sequence,
                         initial_event,
+                        request_id: request_id.to_string(),
                         request_prefix: format!("{request_id}:sub:{index}"),
                     },
                 )))
             }
             Subscription::PaneScrollChanged { pane_id } => {
-                let probe = pane_get(format!("{request_id}:sub:{index}:probe"), &pane_id, api_tx)?;
+                let probe = pane_get(format!("{request_id}:sub:{index}:probe"), &pane_id, api_tx)
+                    .map_err(|response| with_request_id(response, request_id))?;
 
                 Ok(Self::ScrollChanged(ActiveScrollChangedSubscription {
                     pane_id: probe.pane_id,
@@ -312,23 +326,37 @@ impl ActiveSubscription {
         }
     }
 
+    pub(super) fn poll_through(
+        &mut self,
+        api_tx: &ApiRequestSender,
+        event_hub: &EventHub,
+        watermark: u64,
+    ) -> Result<Option<StreamEventEnvelope>, ErrorResponse> {
+        match self {
+            Self::Event(subscription) => subscription.poll_through(event_hub, watermark),
+            Self::OutputMatched(subscription) => Ok(subscription
+                .poll(api_tx, event_hub)
+                .map(StreamEventEnvelope::Subscription)),
+            Self::AgentStatusChanged(subscription) => {
+                match subscription.poll_result(api_tx, event_hub, watermark) {
+                    Ok(event) => Ok(event.map(StreamEventEnvelope::Subscription)),
+                    Err(response) if response.error.code == "resync_required" => Err(response),
+                    Err(_) => Ok(None),
+                }
+            }
+            Self::ScrollChanged(subscription) => Ok(subscription
+                .poll(api_tx, event_hub)
+                .map(StreamEventEnvelope::Subscription)),
+        }
+    }
+
+    #[cfg(test)]
     pub(super) fn poll(
         &mut self,
         api_tx: &ApiRequestSender,
         event_hub: &EventHub,
-    ) -> Option<serde_json::Value> {
-        match self {
-            Self::Event(subscription) => subscription.poll(event_hub),
-            Self::OutputMatched(subscription) => {
-                serde_json::to_value(subscription.poll(api_tx)?).ok()
-            }
-            Self::AgentStatusChanged(subscription) => {
-                serde_json::to_value(subscription.poll(api_tx, event_hub)?).ok()
-            }
-            Self::ScrollChanged(subscription) => {
-                serde_json::to_value(subscription.poll(api_tx)?).ok()
-            }
-        }
+    ) -> Result<Option<StreamEventEnvelope>, ErrorResponse> {
+        self.poll_through(api_tx, event_hub, event_hub.current_sequence())
     }
 
     pub(super) fn poll_for_wait(
@@ -338,27 +366,43 @@ impl ActiveSubscription {
     ) -> Result<Option<serde_json::Value>, ErrorResponse> {
         match self {
             Self::AgentStatusChanged(subscription) => Ok(subscription
-                .poll_result(api_tx, event_hub)?
+                .poll_result(api_tx, event_hub, event_hub.current_sequence())?
                 .and_then(|event| serde_json::to_value(event).ok())),
-            _ => Ok(self.poll(api_tx, event_hub)),
+            _ => Ok(self
+                .poll_through(api_tx, event_hub, event_hub.current_sequence())?
+                .and_then(|event| serde_json::to_value(event).ok())),
         }
     }
 }
 
 impl ActiveEventSubscription {
-    fn poll(&mut self, event_hub: &EventHub) -> Option<serde_json::Value> {
-        for (sequence, event) in event_hub.events_after(self.last_sequence) {
+    fn poll_through(
+        &mut self,
+        event_hub: &EventHub,
+        watermark: u64,
+    ) -> Result<Option<StreamEventEnvelope>, ErrorResponse> {
+        let events = event_hub
+            .checked_events_after_through(self.last_sequence, watermark)
+            .map_err(|gap| history_gap_error(&self.request_id, gap))?;
+        for (sequence, event) in events {
             self.last_sequence = sequence;
             if event.event == self.event_kind {
-                return serde_json::to_value(event).ok();
+                return Ok(Some(StreamEventEnvelope::Event(Box::new(
+                    SequencedEventEnvelope { sequence, event },
+                ))));
             }
         }
-        None
+        self.last_sequence = self.last_sequence.max(watermark);
+        Ok(None)
     }
 }
 
 impl ActiveOutputMatchedSubscription {
-    fn poll(&mut self, api_tx: &ApiRequestSender) -> Option<SubscriptionEventEnvelope> {
+    fn poll(
+        &mut self,
+        api_tx: &ApiRequestSender,
+        _event_hub: &EventHub,
+    ) -> Option<SubscriptionEventEnvelope> {
         let read = pane_read(
             format!("{}:read", self.request_prefix),
             &self.pane_id,
@@ -369,46 +413,67 @@ impl ActiveOutputMatchedSubscription {
         )
         .ok()?;
 
-        let matched_line = match_output(&read.text, &self.matcher, self.regex.as_ref());
-        match matched_line {
-            Some(matched_line) => {
-                if self.currently_matching {
-                    return None;
-                }
-                self.currently_matching = true;
-                Some(SubscriptionEventEnvelope {
-                    event: SubscriptionEventKind::PaneOutputMatched,
-                    data: SubscriptionEventData::PaneOutputMatched(PaneOutputMatchedEvent {
-                        pane_id: read.pane_id.clone(),
-                        matched_line,
-                        read,
-                    }),
-                })
-            }
-            None => {
-                self.currently_matching = false;
-                None
-            }
+        let matched = match_output(&read.text, &self.matcher, self.regex.as_ref()).is_some();
+        if !matched {
+            self.currently_matching = false;
+            return None;
         }
+        if self.currently_matching {
+            return None;
+        }
+
+        // Confirm the transition and reserve its sequence in the same app-thread
+        // turn, so snapshots cannot interleave between the observation and cursor.
+        let (read, sequence) = pane_read_observation(
+            format!("{}:read:observation", self.request_prefix),
+            &self.pane_id,
+            output_match_read_source(&self.source),
+            self.lines,
+            self.strip_ansi,
+            api_tx,
+        )
+        .ok()?;
+        let Some(matched_line) = match_output(&read.text, &self.matcher, self.regex.as_ref())
+        else {
+            self.currently_matching = false;
+            return None;
+        };
+        self.currently_matching = true;
+        Some(SubscriptionEventEnvelope {
+            sequence,
+            event: SubscriptionEventKind::PaneOutputMatched,
+            data: SubscriptionEventData::PaneOutputMatched(PaneOutputMatchedEvent {
+                pane_id: read.pane_id.clone(),
+                matched_line,
+                read,
+            }),
+        })
     }
 }
 
 impl ActiveAgentStatusChangedSubscription {
+    #[cfg(test)]
     fn poll(
         &mut self,
         api_tx: &ApiRequestSender,
         event_hub: &EventHub,
     ) -> Option<SubscriptionEventEnvelope> {
-        self.poll_result(api_tx, event_hub).ok().flatten()
+        self.poll_result(api_tx, event_hub, event_hub.current_sequence())
+            .ok()
+            .flatten()
     }
 
     fn poll_result(
         &mut self,
         api_tx: &ApiRequestSender,
         event_hub: &EventHub,
+        watermark: u64,
     ) -> Result<Option<SubscriptionEventEnvelope>, ErrorResponse> {
         let mut saw_status_event = false;
-        for (sequence, event) in event_hub.events_after(self.last_sequence) {
+        let events = event_hub
+            .checked_events_after_through(self.last_sequence, watermark)
+            .map_err(|gap| history_gap_error(&self.request_id, gap))?;
+        for (sequence, event) in events {
             self.last_sequence = sequence;
             let crate::api::schema::EventData::PaneAgentStatusChanged {
                 pane_id,
@@ -443,6 +508,7 @@ impl ActiveAgentStatusChangedSubscription {
 
             self.initial_event = None;
             return Ok(Some(SubscriptionEventEnvelope {
+                sequence,
                 event: SubscriptionEventKind::PaneAgentStatusChanged,
                 data: SubscriptionEventData::PaneAgentStatusChanged(PaneAgentStatusChangedEvent {
                     pane_id,
@@ -456,59 +522,100 @@ impl ActiveAgentStatusChangedSubscription {
             }));
         }
 
+        self.last_sequence = self.last_sequence.max(watermark);
         if saw_status_event {
             self.initial_event = None;
-        } else if event_hub.current_sequence() != self.last_sequence {
-            return Ok(None);
-        } else if let Some(event) = self.initial_event.take() {
-            return Ok(Some(SubscriptionEventEnvelope {
-                event: SubscriptionEventKind::PaneAgentStatusChanged,
-                data: SubscriptionEventData::PaneAgentStatusChanged(event),
-            }));
+        } else if self.initial_event.is_some() {
+            let (pane, sequence) = pane_get_observation(
+                format!("{}:pane:initial", self.request_prefix),
+                &self.pane_id,
+                api_tx,
+            )
+            .map_err(|response| with_request_id(response, &self.request_id))?;
+            if self.has_relevant_status_event_through(event_hub, sequence)? {
+                return Ok(None);
+            }
+            self.initial_event = None;
+            self.last_status = Some(pane.agent_status);
+            self.last_presentation = Some(PanePresentationSnapshot::from(&pane));
+            if self
+                .status_filter
+                .is_some_and(|wanted| wanted == pane.agent_status)
+            {
+                return Ok(Some(agent_status_observation(pane, sequence)));
+            }
         }
 
-        let before_snapshot_sequence = self.last_sequence;
         let pane = pane_get(
             format!("{}:pane", self.request_prefix),
             &self.pane_id,
             api_tx,
-        );
-        let after_snapshot_sequence = event_hub.current_sequence();
-        if after_snapshot_sequence != before_snapshot_sequence {
+        )
+        .map_err(|response| with_request_id(response, &self.request_id))?;
+        if !self.snapshot_changed(&pane) {
             return Ok(None);
         }
-        let pane = pane?;
 
-        let event = self.event_from_snapshot(pane);
-        if event.is_some() {
-            self.last_sequence = after_snapshot_sequence;
+        let (pane, sequence) = pane_get_observation(
+            format!("{}:pane:observation", self.request_prefix),
+            &self.pane_id,
+            api_tx,
+        )
+        .map_err(|response| with_request_id(response, &self.request_id))?;
+        if self.has_relevant_status_event_through(event_hub, sequence)? {
+            return Ok(None);
         }
-        Ok(event)
+        Ok(self.event_from_snapshot(pane, sequence))
+    }
+
+    fn has_relevant_status_event_through(
+        &self,
+        event_hub: &EventHub,
+        sequence: u64,
+    ) -> Result<bool, ErrorResponse> {
+        let events = event_hub
+            .checked_events_after_through(self.last_sequence, sequence)
+            .map_err(|gap| history_gap_error(&self.request_id, gap))?;
+        Ok(events.into_iter().any(|(_, event)| {
+            event.event == crate::api::schema::EventKind::PaneAgentStatusChanged
+                && matches!(
+                    event.data,
+                    crate::api::schema::EventData::PaneAgentStatusChanged { pane_id, .. }
+                        if pane_id == self.pane_id
+                )
+        }))
+    }
+
+    fn snapshot_changed(&self, pane: &crate::api::schema::PaneInfo) -> bool {
+        let current_presentation = PanePresentationSnapshot::from(pane);
+        self.last_status
+            .is_some_and(|previous| previous != pane.agent_status)
+            || self
+                .last_presentation
+                .as_ref()
+                .is_some_and(|previous| previous != &current_presentation)
     }
 
     fn event_from_snapshot(
         &mut self,
         pane: crate::api::schema::PaneInfo,
+        sequence: u64,
     ) -> Option<SubscriptionEventEnvelope> {
         let current_status = pane.agent_status;
         let current_presentation = PanePresentationSnapshot::from(&pane);
-        let previous_status = self.last_status.replace(current_status);
-        let previous_presentation = self.last_presentation.replace(current_presentation.clone());
-        let presentation_changed = previous_presentation
-            .as_ref()
-            .is_some_and(|previous| previous != &current_presentation);
-        let status_changed = previous_status.is_some_and(|previous| previous != current_status);
-        if !(status_changed || presentation_changed) {
-            return None;
-        }
-        if self
-            .status_filter
-            .is_some_and(|wanted| wanted != current_status)
+        let changed = self.snapshot_changed(&pane);
+        self.last_status = Some(current_status);
+        self.last_presentation = Some(current_presentation);
+        if !changed
+            || self
+                .status_filter
+                .is_some_and(|wanted| wanted != current_status)
         {
             return None;
         }
 
         Some(SubscriptionEventEnvelope {
+            sequence,
             event: SubscriptionEventKind::PaneAgentStatusChanged,
             data: SubscriptionEventData::PaneAgentStatusChanged(PaneAgentStatusChangedEvent {
                 pane_id: pane.pane_id,
@@ -523,20 +630,53 @@ impl ActiveAgentStatusChangedSubscription {
     }
 }
 
+fn agent_status_observation(
+    pane: crate::api::schema::PaneInfo,
+    sequence: u64,
+) -> SubscriptionEventEnvelope {
+    SubscriptionEventEnvelope {
+        sequence,
+        event: SubscriptionEventKind::PaneAgentStatusChanged,
+        data: SubscriptionEventData::PaneAgentStatusChanged(PaneAgentStatusChangedEvent {
+            pane_id: pane.pane_id,
+            workspace_id: pane.workspace_id,
+            agent_status: pane.agent_status,
+            agent: pane.agent,
+            title: pane.title,
+            display_agent: pane.display_agent,
+            state_labels: pane.state_labels,
+        }),
+    }
+}
+
 impl ActiveScrollChangedSubscription {
-    fn poll(&mut self, api_tx: &ApiRequestSender) -> Option<SubscriptionEventEnvelope> {
+    fn poll(
+        &mut self,
+        api_tx: &ApiRequestSender,
+        _event_hub: &EventHub,
+    ) -> Option<SubscriptionEventEnvelope> {
         let pane = pane_get(
             format!("{}:pane", self.request_prefix),
             &self.pane_id,
             api_tx,
         )
         .ok()?;
-        self.event_from_snapshot(pane)
+        if self.last_scroll == pane.scroll {
+            return None;
+        }
+        let (pane, sequence) = pane_get_observation(
+            format!("{}:pane:observation", self.request_prefix),
+            &self.pane_id,
+            api_tx,
+        )
+        .ok()?;
+        self.event_from_snapshot(pane, sequence)
     }
 
     fn event_from_snapshot(
         &mut self,
         pane: crate::api::schema::PaneInfo,
+        sequence: u64,
     ) -> Option<SubscriptionEventEnvelope> {
         let scroll = pane.scroll;
         if self.last_scroll == scroll {
@@ -546,6 +686,7 @@ impl ActiveScrollChangedSubscription {
         let scroll = scroll?;
 
         Some(SubscriptionEventEnvelope {
+            sequence,
             event: SubscriptionEventKind::ScrollChanged,
             data: SubscriptionEventData::ScrollChanged(PaneScrollChangedEvent {
                 pane_id: pane.pane_id,
@@ -553,6 +694,27 @@ impl ActiveScrollChangedSubscription {
                 scroll,
             }),
         })
+    }
+}
+
+fn with_request_id(mut response: ErrorResponse, request_id: &str) -> ErrorResponse {
+    response.id = request_id.to_string();
+    response
+}
+
+fn history_gap_error(
+    request_id: &str,
+    gap: crate::api::event_hub::EventHistoryGap,
+) -> ErrorResponse {
+    ErrorResponse {
+        id: request_id.to_string(),
+        error: ErrorBody {
+            code: "resync_required".into(),
+            message: format!(
+                "event history after sequence {} is unavailable; oldest available is {} (current {})",
+                gap.requested_sequence, gap.oldest_available_sequence, gap.current_sequence
+            ),
+        },
     }
 }
 
@@ -564,21 +726,66 @@ fn pane_read(
     strip_ansi: bool,
     api_tx: &ApiRequestSender,
 ) -> Result<crate::api::schema::PaneReadResult, ErrorResponse> {
-    let response = dispatch_to_app_with_timeout(
-        Request {
-            id: request_id.clone(),
-            method: Method::PaneRead(crate::api::schema::PaneReadParams {
-                pane_id: pane_id.to_string(),
-                source,
-                lines,
-                format: crate::api::schema::ReadFormat::Text,
-                strip_ansi,
-                intent: crate::api::schema::ReadIntent::Passive,
-            }),
-        },
+    pane_read_response(
+        request_id, pane_id, source, lines, strip_ansi, api_tx, false,
+    )
+    .map(|(read, _)| read)
+}
+
+fn pane_read_observation(
+    request_id: String,
+    pane_id: &str,
+    source: crate::api::schema::ReadSource,
+    lines: Option<u32>,
+    strip_ansi: bool,
+    api_tx: &ApiRequestSender,
+) -> Result<(crate::api::schema::PaneReadResult, u64), ErrorResponse> {
+    let (read, sequence) = pane_read_response(
+        request_id.clone(),
+        pane_id,
+        source,
+        lines,
+        strip_ansi,
         api_tx,
-        Some(APP_RESPONSE_TIMEOUT),
-    );
+        true,
+    )?;
+    sequence
+        .map(|sequence| (read, sequence))
+        .ok_or(ErrorResponse {
+            id: request_id,
+            error: ErrorBody {
+                code: "internal_error".into(),
+                message: "pane read observation omitted sequence".into(),
+            },
+        })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn pane_read_response(
+    request_id: String,
+    pane_id: &str,
+    source: crate::api::schema::ReadSource,
+    lines: Option<u32>,
+    strip_ansi: bool,
+    api_tx: &ApiRequestSender,
+    observation: bool,
+) -> Result<(crate::api::schema::PaneReadResult, Option<u64>), ErrorResponse> {
+    let request = Request {
+        id: request_id.clone(),
+        method: Method::PaneRead(crate::api::schema::PaneReadParams {
+            pane_id: pane_id.to_string(),
+            source,
+            lines,
+            format: crate::api::schema::ReadFormat::Text,
+            strip_ansi,
+            intent: crate::api::schema::ReadIntent::Passive,
+        }),
+    };
+    let response = if observation {
+        dispatch_observation_to_app_with_timeout(request, api_tx, Some(APP_RESPONSE_TIMEOUT))
+    } else {
+        dispatch_to_app_with_timeout(request, api_tx, Some(APP_RESPONSE_TIMEOUT))
+    };
     let value: serde_json::Value = serde_json::from_str(&response).map_err(|_| ErrorResponse {
         id: request_id.clone(),
         error: ErrorBody {
@@ -595,13 +802,18 @@ fn pane_read(
             },
         });
     }
-    serde_json::from_value(value["result"]["read"].clone()).map_err(|_| ErrorResponse {
-        id: request_id,
-        error: ErrorBody {
-            code: "internal_error".into(),
-            message: "failed to decode pane read result".into(),
-        },
-    })
+    let sequence = value
+        .get("observation_sequence")
+        .and_then(|value| value.as_u64());
+    let read =
+        serde_json::from_value(value["result"]["read"].clone()).map_err(|_| ErrorResponse {
+            id: request_id,
+            error: ErrorBody {
+                code: "internal_error".into(),
+                message: "failed to decode pane read result".into(),
+            },
+        })?;
+    Ok((read, sequence))
 }
 
 fn pane_get(
@@ -609,16 +821,43 @@ fn pane_get(
     pane_id: &str,
     api_tx: &ApiRequestSender,
 ) -> Result<crate::api::schema::PaneInfo, ErrorResponse> {
-    let response = dispatch_to_app_with_timeout(
-        Request {
-            id: request_id.clone(),
-            method: Method::PaneGet(crate::api::schema::PaneTarget {
-                pane_id: pane_id.to_string(),
-            }),
-        },
-        api_tx,
-        Some(APP_RESPONSE_TIMEOUT),
-    );
+    pane_get_response(request_id, pane_id, api_tx, false).map(|(pane, _)| pane)
+}
+
+fn pane_get_observation(
+    request_id: String,
+    pane_id: &str,
+    api_tx: &ApiRequestSender,
+) -> Result<(crate::api::schema::PaneInfo, u64), ErrorResponse> {
+    let (pane, sequence) = pane_get_response(request_id.clone(), pane_id, api_tx, true)?;
+    sequence
+        .map(|sequence| (pane, sequence))
+        .ok_or(ErrorResponse {
+            id: request_id,
+            error: ErrorBody {
+                code: "internal_error".into(),
+                message: "pane get observation omitted sequence".into(),
+            },
+        })
+}
+
+fn pane_get_response(
+    request_id: String,
+    pane_id: &str,
+    api_tx: &ApiRequestSender,
+    observation: bool,
+) -> Result<(crate::api::schema::PaneInfo, Option<u64>), ErrorResponse> {
+    let request = Request {
+        id: request_id.clone(),
+        method: Method::PaneGet(crate::api::schema::PaneTarget {
+            pane_id: pane_id.to_string(),
+        }),
+    };
+    let response = if observation {
+        dispatch_observation_to_app_with_timeout(request, api_tx, Some(APP_RESPONSE_TIMEOUT))
+    } else {
+        dispatch_to_app_with_timeout(request, api_tx, Some(APP_RESPONSE_TIMEOUT))
+    };
     let value: serde_json::Value = serde_json::from_str(&response).map_err(|_| ErrorResponse {
         id: request_id.clone(),
         error: ErrorBody {
@@ -637,13 +876,18 @@ fn pane_get(
             })?;
         return Err(response);
     }
-    serde_json::from_value(value["result"]["pane"].clone()).map_err(|_| ErrorResponse {
-        id: request_id,
-        error: ErrorBody {
-            code: "internal_error".into(),
-            message: "failed to decode pane get result".into(),
-        },
-    })
+    let sequence = value
+        .get("observation_sequence")
+        .and_then(|value| value.as_u64());
+    let pane =
+        serde_json::from_value(value["result"]["pane"].clone()).map_err(|_| ErrorResponse {
+            id: request_id,
+            error: ErrorBody {
+                code: "internal_error".into(),
+                message: "failed to decode pane get result".into(),
+            },
+        })?;
+    Ok((pane, sequence))
 }
 
 #[cfg(test)]
@@ -722,13 +966,78 @@ mod tests {
 
         let setup_event = subscription
             .poll(&api_tx, &event_hub)
+            .expect("setup poll")
             .expect("setup-window event");
+        let setup_event = serde_json::to_value(setup_event).unwrap();
+        assert_eq!(setup_event["sequence"], 2);
         assert_eq!(setup_event["data"]["workspace_id"], "during_setup");
-        assert!(subscription.poll(&api_tx, &event_hub).is_none());
+        assert!(subscription
+            .poll(&api_tx, &event_hub)
+            .expect("empty poll")
+            .is_none());
 
         event_hub.push(workspace_focused_event("after_setup"));
-        let live_event = subscription.poll(&api_tx, &event_hub).expect("live event");
+        let live_event = subscription
+            .poll(&api_tx, &event_hub)
+            .expect("live poll")
+            .expect("live event");
+        let live_event = serde_json::to_value(live_event).unwrap();
+        assert_eq!(live_event["sequence"], 3);
         assert_eq!(live_event["data"]["workspace_id"], "after_setup");
+    }
+
+    #[test]
+    fn lifecycle_subscription_surfaces_history_overflow_as_resync_required() {
+        let event_hub = EventHub::default();
+        let (api_tx, _api_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut subscription = ActiveSubscription::new(
+            Subscription::WorkspaceFocused {},
+            "overflow",
+            0,
+            &api_tx,
+            &event_hub,
+            0,
+        )
+        .expect("workspace focus subscription");
+
+        for index in 0..513 {
+            event_hub.push(workspace_focused_event(&format!("workspace_{index}")));
+        }
+
+        let error = subscription
+            .poll(&api_tx, &event_hub)
+            .expect_err("truncated history must not look empty");
+        assert_eq!(error.id, "overflow");
+        assert_eq!(error.error.code, "resync_required");
+        assert!(error.error.message.contains("oldest available is 2"));
+    }
+
+    #[test]
+    fn history_gap_error_preserves_request_ids_containing_internal_delimiter() {
+        let event_hub = EventHub::default();
+        let mut subscription = ActiveAgentStatusChangedSubscription {
+            pane_id: "pane_1".into(),
+            status_filter: None,
+            last_status: Some(AgentStatus::Working),
+            last_presentation: None,
+            last_sequence: 0,
+            initial_event: None,
+            request_id: "job:sub:retry".into(),
+            request_prefix: "job:sub:retry:sub:0".into(),
+        };
+        for index in 0..513 {
+            event_hub.push(workspace_focused_event(&format!("workspace_{index}")));
+        }
+
+        let error = subscription
+            .poll_result(
+                &tokio::sync::mpsc::unbounded_channel().0,
+                &event_hub,
+                event_hub.current_sequence(),
+            )
+            .expect_err("overflow must preserve the public request id");
+        assert_eq!(error.id, "job:sub:retry");
+        assert_eq!(error.error.code, "resync_required");
     }
 
     #[test]
@@ -755,7 +1064,7 @@ mod tests {
     }
 
     #[test]
-    fn scroll_subscription_emits_when_scroll_snapshot_changes() {
+    fn post_snapshot_scroll_observation_reserves_new_sequence() {
         let at_bottom = PaneScrollInfo {
             offset_from_bottom: 0,
             max_offset_from_bottom: 40,
@@ -766,6 +1075,7 @@ mod tests {
             max_offset_from_bottom: 40,
             viewport_rows: 20,
         };
+        let event_hub = EventHub::default();
         let mut subscription = ActiveScrollChangedSubscription {
             pane_id: "pane_1".into(),
             last_scroll: Some(at_bottom),
@@ -773,12 +1083,20 @@ mod tests {
         };
 
         assert!(subscription
-            .event_from_snapshot(pane_info_with_scroll(Some(at_bottom)))
+            .event_from_snapshot(
+                pane_info_with_scroll(Some(at_bottom)),
+                event_hub.current_sequence(),
+            )
             .is_none());
 
+        let snapshot_watermark = event_hub.current_sequence();
         let event = subscription
-            .event_from_snapshot(pane_info_with_scroll(Some(scrolled_back)))
+            .event_from_snapshot(
+                pane_info_with_scroll(Some(scrolled_back)),
+                event_hub.reserve_sequence(),
+            )
             .expect("scroll event");
+        assert!(event.sequence > snapshot_watermark);
         assert_eq!(event.event, SubscriptionEventKind::ScrollChanged);
         let SubscriptionEventData::ScrollChanged(data) = event.data else {
             panic!("wrong event data");
@@ -786,6 +1104,113 @@ mod tests {
         assert_eq!(data.pane_id, "pane_1");
         assert_eq!(data.workspace_id, "workspace_1");
         assert_eq!(data.scroll, scrolled_back);
+    }
+
+    #[test]
+    fn stream_ignores_transient_live_pane_probe_errors() {
+        let event_hub = EventHub::default();
+        let (api_tx, mut api_rx) =
+            tokio::sync::mpsc::unbounded_channel::<crate::api::ApiRequestMessage>();
+        let responder = std::thread::spawn(move || {
+            let setup = api_rx.blocking_recv().expect("setup probe");
+            setup
+                .respond_to
+                .send(
+                    serde_json::json!({
+                        "id": setup.request.id,
+                        "result": {
+                            "type": "pane_info",
+                            "pane": pane_info_with_scroll(None)
+                        }
+                    })
+                    .to_string(),
+                )
+                .unwrap();
+            let live = api_rx.blocking_recv().expect("live probe");
+            live.respond_to
+                .send(
+                    serde_json::json!({
+                        "id": live.request.id,
+                        "error": {"code": "pane_not_found", "message": "transient"}
+                    })
+                    .to_string(),
+                )
+                .unwrap();
+        });
+        let mut subscription = ActiveSubscription::new(
+            Subscription::PaneAgentStatusChanged {
+                pane_id: "pane_1".into(),
+                agent_status: None,
+            },
+            "probe:sub:id",
+            0,
+            &api_tx,
+            &event_hub,
+            0,
+        )
+        .unwrap();
+
+        assert!(subscription
+            .poll_through(&api_tx, &event_hub, 0)
+            .expect("transient stream probe errors are ignored")
+            .is_none());
+        responder.join().unwrap();
+    }
+
+    #[test]
+    fn agent_status_setup_replays_transient_changes_from_common_acceptance_cursor() {
+        let event_hub = EventHub::default();
+        let responder_hub = event_hub.clone();
+        let (api_tx, mut api_rx) =
+            tokio::sync::mpsc::unbounded_channel::<crate::api::ApiRequestMessage>();
+        let responder = std::thread::spawn(move || {
+            let request = api_rx.blocking_recv().expect("pane probe request");
+            assert!(matches!(request.request.method, Method::PaneGet(_)));
+            responder_hub.push(presentation_event(Some("transient")));
+            responder_hub.push(presentation_event(None));
+            let mut pane = pane_info_with_scroll(None);
+            pane.agent = Some("pi".into());
+            pane.agent_status = AgentStatus::Working;
+            request
+                .respond_to
+                .send(
+                    serde_json::json!({
+                        "id": request.request.id,
+                        "result": {"type": "pane_info", "pane": pane}
+                    })
+                    .to_string(),
+                )
+                .unwrap();
+        });
+
+        let mut subscription = ActiveSubscription::new(
+            Subscription::PaneAgentStatusChanged {
+                pane_id: "pane_1".into(),
+                agent_status: None,
+            },
+            "setup",
+            0,
+            &api_tx,
+            &event_hub,
+            0,
+        )
+        .expect("agent status subscription");
+
+        let first = subscription
+            .poll(&api_tx, &event_hub)
+            .unwrap()
+            .expect("transient set");
+        let second = subscription
+            .poll(&api_tx, &event_hub)
+            .unwrap()
+            .expect("transient revert");
+        assert_eq!(first.sequence(), 1);
+        assert_eq!(second.sequence(), 2);
+        let first = serde_json::to_value(first).unwrap();
+        let second = serde_json::to_value(second).unwrap();
+        assert_eq!(first["data"]["title"], "transient");
+        assert!(second["data"].get("title").is_none());
+        responder.join().unwrap();
     }
 
     #[test]
@@ -802,6 +1227,7 @@ mod tests {
             }),
             last_sequence: event_hub.current_sequence(),
             initial_event: None,
+            request_id: "test".into(),
             request_prefix: "test".into(),
         };
 
@@ -847,6 +1273,7 @@ mod tests {
                 display_agent: None,
                 state_labels: HashMap::new(),
             }),
+            request_id: "test".into(),
             request_prefix: "test".into(),
         };
 
@@ -892,6 +1319,7 @@ mod tests {
                 display_agent: None,
                 state_labels: HashMap::new(),
             }),
+            request_id: "test".into(),
             request_prefix: "test".into(),
         };
 

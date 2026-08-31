@@ -66,6 +66,7 @@ impl App {
             _ => None,
         };
         let stream_active = msg.stream_active.clone();
+        let observation_sequence = msg.observation_sequence;
         let mut changed = self.expire_due_metadata(Instant::now());
         changed |= crate::api::request_changes_ui(&msg.request);
         let skip_default_workspace = matches!(
@@ -87,7 +88,10 @@ impl App {
             self.sync_prefix_input_source(previous_mode);
             return changed | deferred_changed;
         }
-        let response = self.handle_api_request(msg.request);
+        let mut response = self.handle_api_request(msg.request);
+        if observation_sequence {
+            crate::api::attach_observation_sequence(&mut response, &self.event_hub);
+        }
         if let (Some(params), Some(active)) = (stream_open.as_ref(), stream_active) {
             self.attach_pane_graphics_stream_active(params, active, &response);
         }
