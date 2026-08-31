@@ -241,10 +241,10 @@ pub(crate) fn handle_navigator_key(
             state.navigator.state_filter = Some(NavigatorStateFilter::Done);
             state.select_first_navigator_match_from(terminal_runtimes);
         }
-        KeyCode::Char('j') | KeyCode::Down => {
+        KeyCode::Char('j') | KeyCode::Down if key.modifiers.is_empty() => {
             state.move_navigator_selection_from(terminal_runtimes, 1)
         }
-        KeyCode::Char('k') | KeyCode::Up => {
+        KeyCode::Char('k') | KeyCode::Up if key.modifiers.is_empty() => {
             state.move_navigator_selection_from(terminal_runtimes, -1)
         }
         KeyCode::Char('d') if key.modifiers == KeyModifiers::CONTROL => state
@@ -764,14 +764,15 @@ pub(crate) fn handle_resize_key(state: &mut AppState, raw_key: TerminalKey) {
 }
 
 pub(super) fn open_confirm_close(state: &mut AppState) {
-    state.mode = Mode::ConfirmClose;
+    state.begin_workspace_close_confirmation(state.selected);
 }
 
 #[cfg(test)]
 pub(super) fn confirm_close_accept(state: &mut AppState) {
     if let Some(repository_id) = state.confirm_repository_close_target.take() {
         state.close_repository(&repository_id);
-    } else {
+    } else if let Some(ws_idx) = state.take_confirmed_workspace_close_index() {
+        state.selected = ws_idx;
         state.close_selected_workspace();
     }
     if state.workspaces.is_empty() {
@@ -783,6 +784,7 @@ pub(super) fn confirm_close_accept(state: &mut AppState) {
 
 pub(super) fn confirm_close_cancel(state: &mut AppState) {
     state.confirm_repository_close_target = None;
+    state.confirm_close_workspace_id = None;
     state.mode = Mode::Navigate;
 }
 
@@ -1246,11 +1248,8 @@ impl App {
                     repository_id,
                 }),
             );
-        } else {
-            let ws_idx = self.state.selected;
-            if ws_idx < self.state.workspaces.len() {
-                self.close_workspace_idx_via_api(ws_idx);
-            }
+        } else if let Some(ws_idx) = self.state.take_confirmed_workspace_close_index() {
+            self.close_workspace_idx_via_api(ws_idx);
         }
         self.state.mode = if self.state.active.is_some() {
             Mode::Terminal
@@ -1369,7 +1368,52 @@ impl App {
                 })
                 .then_some(ContextMenuKind::Collection { collection_id });
         }
-        let target = &menu.plugin.as_ref()?.target;
+        let Some(plugin) = menu.plugin.as_ref() else {
+            return match &menu.kind {
+                ContextMenuKind::Workspace { ws_idx }
+                | ContextMenuKind::WorkspaceResource { ws_idx, .. }
+                | ContextMenuKind::GitWorkspace { ws_idx, .. } => self
+                    .state
+                    .workspaces
+                    .get(*ws_idx)
+                    .map(|_| menu.kind.clone()),
+                ContextMenuKind::Tab { ws_idx, tab_idx } => self
+                    .state
+                    .workspaces
+                    .get(*ws_idx)
+                    .and_then(|workspace| workspace.tabs.get(*tab_idx))
+                    .map(|_| menu.kind.clone()),
+                ContextMenuKind::Pane {
+                    ws_idx, pane_id, ..
+                } => self
+                    .state
+                    .workspaces
+                    .get(*ws_idx)
+                    .and_then(|workspace| workspace.pane_state(*pane_id))
+                    .map(|_| menu.kind.clone()),
+                ContextMenuKind::CollectionMember {
+                    ws_idx,
+                    collection_id,
+                    pane_id,
+                    ..
+                } => self
+                    .state
+                    .workspaces
+                    .get(*ws_idx)
+                    .and_then(|workspace| {
+                        workspace
+                            .tabs
+                            .iter()
+                            .find_map(|tab| tab.collection(*collection_id))
+                    })
+                    .filter(|collection| collection.members().contains(pane_id))
+                    .map(|_| menu.kind.clone()),
+                ContextMenuKind::Repository { .. } | ContextMenuKind::Collection { .. } => {
+                    unreachable!("aggregate menu targets are resolved above")
+                }
+            };
+        };
+        let target = &plugin.target;
         match (&menu.kind, target) {
             (
                 ContextMenuKind::Workspace { .. },
@@ -1459,6 +1503,7 @@ impl App {
                 ContextMenuKind::Pane {
                     source_pane_id,
                     has_manual_label,
+                    right_click_passthrough,
                     ..
                 },
                 crate::app::state::ContextMenuTarget::Pane(id),
@@ -1470,6 +1515,7 @@ impl App {
                     pane_id,
                     source_pane_id: *source_pane_id,
                     has_manual_label: *has_manual_label,
+                    right_click_passthrough: *right_click_passthrough,
                 })
             }),
             (
@@ -1669,7 +1715,7 @@ impl App {
             (
                 ContextMenuKind::Workspace { ws_idx }
                 | ContextMenuKind::GitWorkspace { ws_idx, .. },
-                Some("Close" | "Close group" | "Close checkout"),
+                Some("Close" | "Close checkout"),
             ) => {
                 self.state.selected = ws_idx;
                 if self.state.confirm_close {
@@ -1678,6 +1724,19 @@ impl App {
                     self.close_workspace_idx_via_api(ws_idx);
                     self.state.mode = Mode::Navigate;
                 }
+            }
+            (
+                ContextMenuKind::Workspace { ws_idx }
+                | ContextMenuKind::GitWorkspace { ws_idx, .. },
+                Some("Close group"),
+            ) => {
+                self.state.selected = ws_idx;
+                self.close_workspace_idx_with_group_via_api(ws_idx);
+                self.state.mode = if self.state.active.is_some() {
+                    Mode::Terminal
+                } else {
+                    Mode::Navigate
+                };
             }
             (ContextMenuKind::Tab { ws_idx, tab_idx }, Some("New tab")) => {
                 self.focus_workspace_idx_via_api(ws_idx);
@@ -1761,6 +1820,27 @@ impl App {
                         crate::api::schema::PaneRenameParams {
                             pane_id,
                             label: None,
+                        },
+                    );
+                }
+                self.state.mode = Mode::Terminal;
+            }
+            (
+                ContextMenuKind::Pane {
+                    ws_idx, pane_id, ..
+                },
+                Some(action @ ("Send right-clicks to pane" | "Use Herdr right-click menu")),
+            ) => {
+                if let Some(pane_id) = self.public_pane_id(ws_idx, pane_id) {
+                    self.runtime_pane_input_set(
+                        "tui.pane.input.set",
+                        crate::api::schema::PaneInputSetParams {
+                            pane_id,
+                            right_click: if action == "Send right-clicks to pane" {
+                                crate::api::schema::PaneRightClickTarget::Pane
+                            } else {
+                                crate::api::schema::PaneRightClickTarget::Herdr
+                            },
                         },
                     );
                 }
@@ -2463,6 +2543,30 @@ mod tests {
     }
 
     #[test]
+    fn navigator_ignores_modified_j_and_k() {
+        let mut state = state_with_workspaces(&["alpha", "beta"]);
+        let terminal_runtimes = crate::terminal::TerminalRuntimeRegistry::new();
+        state.mode = Mode::Navigator;
+        state.navigator.selected = 1;
+
+        handle_navigator_key(
+            &mut state,
+            &terminal_runtimes,
+            KeyEvent::new(KeyCode::Char('k'), KeyModifiers::CONTROL),
+        );
+
+        assert_eq!(state.navigator.selected, 1);
+
+        handle_navigator_key(
+            &mut state,
+            &terminal_runtimes,
+            KeyEvent::new(KeyCode::Char('j'), KeyModifiers::CONTROL),
+        );
+
+        assert_eq!(state.navigator.selected, 1);
+    }
+
+    #[test]
     fn open_rename_active_tab_can_prefill_default_new_tab_name() {
         let mut state = state_with_workspaces(&["test"]);
         state.workspaces[0].test_add_tab(None);
@@ -2575,8 +2679,8 @@ mod tests {
     #[test]
     fn confirm_close_keyboard_actions_are_direct_not_focused() {
         let mut state = state_with_workspaces(&["a", "b"]);
-        state.mode = Mode::ConfirmClose;
         state.selected = 1;
+        open_confirm_close(&mut state);
 
         handle_confirm_close_key(
             &mut state,
@@ -2585,7 +2689,7 @@ mod tests {
         assert_eq!(state.mode, Mode::Navigate);
         assert_eq!(state.workspaces.len(), 2);
 
-        state.mode = Mode::ConfirmClose;
+        open_confirm_close(&mut state);
         handle_confirm_close_key(
             &mut state,
             KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()),
@@ -2596,7 +2700,6 @@ mod tests {
     #[test]
     fn confirm_close_for_linked_worktree_closes_workspace_only() {
         let mut state = state_with_workspaces(&["main", "issue"]);
-        state.mode = Mode::ConfirmClose;
         state.selected = 1;
         state.workspaces[1].worktree_space = Some(crate::workspace::WorktreeSpaceMembership {
             key: "repo-key".into(),
@@ -2606,6 +2709,7 @@ mod tests {
             is_linked_worktree: true,
         });
 
+        open_confirm_close(&mut state);
         handle_confirm_close_key(
             &mut state,
             KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()),
@@ -2691,7 +2795,41 @@ mod tests {
     }
 
     #[test]
-    fn context_menu_close_pane_last_parent_group_pane_keeps_confirmation_mode() {
+    fn context_menu_toggles_pane_right_click_passthrough() {
+        let mut app = app_with_test_workspaces(&["main"]);
+        app.state.active = Some(0);
+        let pane_id = app.state.workspaces[0].tabs[0]
+            .root_pane
+            .expect("test tab has root pane");
+        let menu = ContextMenuState::new(
+            ContextMenuKind::Pane {
+                ws_idx: 0,
+                tab_idx: 0,
+                pane_id,
+                source_pane_id: None,
+                has_manual_label: false,
+                right_click_passthrough: false,
+            },
+            0,
+            0,
+        );
+        let idx = menu
+            .items()
+            .iter()
+            .position(|item| *item == "Send right-clicks to pane")
+            .unwrap();
+        app.apply_context_menu_action_via_api(menu, idx);
+
+        assert!(
+            app.state.workspaces[0]
+                .pane_state(pane_id)
+                .unwrap()
+                .right_click_passthrough
+        );
+    }
+
+    #[test]
+    fn context_menu_close_pane_last_parent_group_pane_closes_only_checkout() {
         let mut state = state_with_workspaces(&["main", "issue"]);
         state.active = Some(0);
         state.selected = 1;
@@ -2719,6 +2857,7 @@ mod tests {
                 pane_id,
                 source_pane_id: None,
                 has_manual_label: false,
+                right_click_passthrough: false,
             },
             x: 0,
             y: 0,
@@ -2738,6 +2877,62 @@ mod tests {
         assert_eq!(state.selected, 0);
         assert_eq!(state.mode, Mode::Terminal);
         assert_eq!(state.workspaces.len(), 1);
+    }
+
+    #[test]
+    fn api_confirm_close_accept_closes_only_the_confirmed_checkout() {
+        let mut app = app_with_test_workspaces(&["main", "issue"]);
+        mark_worktree_space_member(&mut app.state, 0, "repo-key");
+        mark_worktree_space_member(&mut app.state, 1, "repo-key");
+        app.state.selected = 0;
+        open_confirm_close(&mut app.state);
+
+        app.handle_confirm_close_key_via_api(KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()));
+
+        assert_eq!(app.state.workspaces.len(), 1);
+        assert_eq!(app.state.workspaces[0].display_name(), "issue");
+        assert_eq!(app.state.mode, Mode::Terminal);
+        assert_eq!(
+            app.event_hub
+                .events_after(0)
+                .iter()
+                .filter(|(_, event)| matches!(
+                    event.event,
+                    crate::api::schema::EventKind::WorkspaceClosed
+                ))
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn api_confirm_close_accept_keeps_the_original_workspace_target() {
+        let mut app = app_with_test_workspaces(&["main", "issue", "other"]);
+        mark_worktree_space_member(&mut app.state, 0, "repo-key");
+        mark_worktree_space_member(&mut app.state, 1, "repo-key");
+        app.state.selected = 0;
+        open_confirm_close(&mut app.state);
+
+        app.focus_workspace_idx_via_api(2);
+        assert_eq!(app.state.selected, 2);
+        assert_eq!(app.state.mode, Mode::ConfirmClose);
+
+        app.handle_confirm_close_key_via_api(KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()));
+
+        assert_eq!(app.state.workspaces.len(), 2);
+        assert_eq!(app.state.workspaces[0].display_name(), "issue");
+        assert_eq!(app.state.workspaces[1].display_name(), "other");
+        assert_eq!(
+            app.event_hub
+                .events_after(0)
+                .iter()
+                .filter(|(_, event)| matches!(
+                    event.event,
+                    crate::api::schema::EventKind::WorkspaceClosed
+                ))
+                .count(),
+            1
+        );
     }
 
     #[test]
@@ -2776,7 +2971,7 @@ mod tests {
     }
 
     #[test]
-    fn api_context_menu_enter_close_pane_last_parent_group_pane_keeps_confirmation_mode() {
+    fn api_context_menu_enter_close_pane_last_parent_group_pane_closes_only_checkout() {
         let mut app = app_with_test_workspaces(&["main", "issue"]);
         mark_worktree_space_member(&mut app.state, 0, "repo-key");
         mark_worktree_space_member(&mut app.state, 1, "repo-key");
@@ -2793,6 +2988,7 @@ mod tests {
                 pane_id,
                 source_pane_id: None,
                 has_manual_label: false,
+                right_click_passthrough: false,
             },
             x: 0,
             y: 0,

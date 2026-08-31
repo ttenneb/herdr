@@ -56,11 +56,18 @@ impl App {
                 Ok(workspace_id) => workspace_id,
                 Err(err) => return encode_error(id, err.code, err.message),
             };
-        let source = match self.resolve_worktree_list_source(workspace_id, params.cwd) {
+        let source = match self.resolve_worktree_list_source(
+            workspace_id,
+            params.cwd,
+            params.trust_repository,
+        ) {
             Ok(source) => source,
             Err(err) => return encode_error(id, err.code, err.message),
         };
-        let entries = match crate::worktree::list_existing_worktrees(&source.source_repo_root) {
+        let entries = match crate::worktree::list_existing_worktrees(
+            &source.source_repo_root,
+            params.trust_repository,
+        ) {
             Ok(entries) => entries,
             Err(err) => return encode_error(id, "worktree_list_failed", err),
         };
@@ -99,7 +106,12 @@ impl App {
             Ok(source) => source,
             Err(err) => return encode_error(id, err.code, err.message),
         };
-        let entry = match self.find_worktree_entry(&source, params.path, params.branch) {
+        let entry = match self.find_worktree_entry(
+            &source,
+            params.path,
+            params.branch,
+            params.trust_repository,
+        ) {
             Ok(entry) => entry,
             Err(err) => return encode_error(id, err.code, err.message),
         };
@@ -243,7 +255,12 @@ impl App {
                     .git_space()
                     .is_some_and(|open| open.checkout_key == space.checkout_key)
             });
-            return Ok(worktree_source_from_space(space, workspace_idx, false));
+            return Ok(worktree_source_from_space(
+                space,
+                workspace_idx,
+                false,
+                false,
+            ));
         }
 
         let Some(ws_idx) = self.state.active.or_else(|| {
@@ -264,6 +281,7 @@ impl App {
         &mut self,
         workspace_id: Option<String>,
         cwd: Option<String>,
+        trust_repository: bool,
     ) -> Result<WorktreeSource, ApiFailure> {
         if workspace_id.is_some() && cwd.is_some() {
             return Err(ApiFailure::new(
@@ -279,7 +297,7 @@ impl App {
                     format!("workspace {workspace_id} not found"),
                 ));
             };
-            return self.worktree_list_source_from_workspace(ws_idx);
+            return self.worktree_list_source_from_workspace(ws_idx, trust_repository);
         }
 
         if let Some(cwd) = cwd {
@@ -290,8 +308,13 @@ impl App {
                     "Herdr worktree actions require a path inside a Git work tree",
                 )
             })?;
-            let workspace_idx = self.list_source_workspace_idx_for_space(&space);
-            return Ok(worktree_source_from_space(space, workspace_idx, true));
+            let workspace_idx = self.list_source_workspace_idx_for_space(&space, trust_repository);
+            return Ok(worktree_source_from_space(
+                space,
+                workspace_idx,
+                true,
+                trust_repository,
+            ));
         }
 
         let Some(ws_idx) = self.state.active.or_else(|| {
@@ -305,7 +328,7 @@ impl App {
                 "workspace_id or cwd is required when no workspace is active",
             ));
         };
-        self.worktree_list_source_from_workspace(ws_idx)
+        self.worktree_list_source_from_workspace(ws_idx, trust_repository)
     }
 
     fn worktree_source_from_workspace(&self, ws_idx: usize) -> Result<WorktreeSource, ApiFailure> {
@@ -318,7 +341,12 @@ impl App {
         if let Some(space) =
             ws.resolved_git_space_from(&self.state.terminals, &self.terminal_runtimes)
         {
-            return Ok(worktree_source_from_space(space, Some(ws_idx), false));
+            return Ok(worktree_source_from_space(
+                space,
+                Some(ws_idx),
+                false,
+                false,
+            ));
         }
         if let Some(membership) = ws.worktree_space() {
             return Ok(WorktreeSource {
@@ -338,6 +366,7 @@ impl App {
     fn worktree_list_source_from_workspace(
         &self,
         ws_idx: usize,
+        trust_repository: bool,
     ) -> Result<WorktreeSource, ApiFailure> {
         let Some(ws) = self.state.workspaces.get(ws_idx) else {
             return Err(ApiFailure::new(
@@ -349,11 +378,16 @@ impl App {
             ws.resolved_git_space_from(&self.state.terminals, &self.terminal_runtimes)
         {
             let workspace_idx = if space.is_linked_worktree {
-                self.list_source_workspace_idx_for_space(&space)
+                self.list_source_workspace_idx_for_space(&space, trust_repository)
             } else {
                 Some(ws_idx)
             };
-            return Ok(worktree_source_from_space(space, workspace_idx, true));
+            return Ok(worktree_source_from_space(
+                space,
+                workspace_idx,
+                true,
+                trust_repository,
+            ));
         }
         if let Some(membership) = ws.worktree_space() {
             let source_checkout_path = if membership.is_linked_worktree {
@@ -374,9 +408,27 @@ impl App {
                 repo_name: membership.label.clone(),
             });
         }
-        Err(ApiFailure::new(
-            "not_git_worktree",
-            "Herdr worktree actions require a workspace inside a Git work tree",
+        let git_space = ws.git_space().cloned().or_else(|| {
+            ws.resolved_identity_cwd_from(&self.state.terminals, &self.terminal_runtimes)
+                .as_deref()
+                .and_then(crate::workspace::git_space_metadata)
+        });
+        let Some(space) = git_space else {
+            return Err(ApiFailure::new(
+                "not_git_worktree",
+                "Herdr worktree actions require a workspace inside a Git work tree",
+            ));
+        };
+        let workspace_idx = if space.is_linked_worktree {
+            self.list_source_workspace_idx_for_space(&space, trust_repository)
+        } else {
+            Some(ws_idx)
+        };
+        Ok(worktree_source_from_space(
+            space,
+            workspace_idx,
+            true,
+            trust_repository,
         ))
     }
 
@@ -420,9 +472,10 @@ impl App {
     fn list_source_workspace_idx_for_space(
         &self,
         space: &crate::workspace::GitSpaceMetadata,
+        trust_repository: bool,
     ) -> Option<usize> {
         if space.is_linked_worktree {
-            let parent_checkout = parent_checkout_path_for_space(space);
+            let parent_checkout = parent_checkout_path_for_space(space, trust_repository);
             self.open_workspace_idx_for_checkout(&parent_checkout)
         } else {
             self.find_parent_workspace_for_space(space)
@@ -480,9 +533,11 @@ impl App {
         source: &WorktreeSource,
         path: Option<String>,
         branch: Option<String>,
+        trust_repository: bool,
     ) -> Result<crate::worktree::ExistingWorktree, ApiFailure> {
-        let entries = crate::worktree::list_existing_worktrees(&source.source_repo_root)
-            .map_err(|err| ApiFailure::new("worktree_list_failed", err))?;
+        let entries =
+            crate::worktree::list_existing_worktrees(&source.source_repo_root, trust_repository)
+                .map_err(|err| ApiFailure::new("worktree_list_failed", err))?;
         if let Some(path) = path {
             let expected = absolute_user_path(&path)?;
             let expected = crate::worktree::canonical_or_original(&expected);
@@ -683,8 +738,9 @@ fn worktree_source_from_space(
     space: crate::workspace::GitSpaceMetadata,
     workspace_idx: Option<usize>,
     use_primary_checkout: bool,
+    trust_repository: bool,
 ) -> WorktreeSource {
-    let primary_checkout = parent_checkout_path_for_space(&space);
+    let primary_checkout = parent_checkout_path_for_space(&space, trust_repository);
     let source_checkout_path = if use_primary_checkout {
         primary_checkout.clone()
     } else {
@@ -699,12 +755,15 @@ fn worktree_source_from_space(
     }
 }
 
-fn parent_checkout_path_for_space(space: &crate::workspace::GitSpaceMetadata) -> PathBuf {
+fn parent_checkout_path_for_space(
+    space: &crate::workspace::GitSpaceMetadata,
+    trust_repository: bool,
+) -> PathBuf {
     if !space.is_linked_worktree {
         return space.repo_root.clone();
     }
 
-    crate::worktree::list_existing_worktrees(&space.repo_root)
+    crate::worktree::list_existing_worktrees(&space.repo_root, trust_repository)
         .ok()
         .and_then(|entries| {
             entries.into_iter().find_map(|entry| {
@@ -1038,8 +1097,12 @@ mod tests {
         for (_, runtime) in app.terminal_runtimes.drain() {
             runtime.shutdown();
         }
-        let remove =
-            crate::worktree::build_worktree_remove_command(&repo, Path::new(&worktree.path), false);
+        let remove = crate::worktree::build_worktree_remove_command(
+            &repo,
+            Path::new(&worktree.path),
+            false,
+            false,
+        );
         crate::worktree::run_worktree_command(&remove).unwrap();
         let _ = std::fs::remove_dir_all(worktree_root);
         let _ = std::fs::remove_dir_all(repo);
@@ -1084,7 +1147,7 @@ mod tests {
         for (_, runtime) in app.terminal_runtimes.drain() {
             runtime.shutdown();
         }
-        let remove = crate::worktree::build_worktree_remove_command(&repo, &checkout, true);
+        let remove = crate::worktree::build_worktree_remove_command(&repo, &checkout, true, false);
         crate::worktree::run_worktree_command(&remove).unwrap();
         let _ = std::fs::remove_dir_all(repo);
     }
@@ -1129,7 +1192,7 @@ mod tests {
         for (_, runtime) in app.terminal_runtimes.drain() {
             runtime.shutdown();
         }
-        let remove = crate::worktree::build_worktree_remove_command(&repo, &checkout, true);
+        let remove = crate::worktree::build_worktree_remove_command(&repo, &checkout, true, false);
         crate::worktree::run_worktree_command(&remove).unwrap();
         let _ = std::fs::remove_dir_all(repo);
     }
@@ -1446,8 +1509,12 @@ mod tests {
         for (_, runtime) in app.terminal_runtimes.drain() {
             runtime.shutdown();
         }
-        let remove =
-            crate::worktree::build_worktree_remove_command(&repo, Path::new(&worktree.path), false);
+        let remove = crate::worktree::build_worktree_remove_command(
+            &repo,
+            Path::new(&worktree.path),
+            false,
+            false,
+        );
         crate::worktree::run_worktree_command(&remove).unwrap();
         let _ = std::fs::remove_dir_all(worktree_root);
         let _ = std::fs::remove_dir_all(repo);
@@ -1617,7 +1684,7 @@ mod tests {
             )
         }));
 
-        let remove = crate::worktree::build_worktree_remove_command(&repo, &checkout, false);
+        let remove = crate::worktree::build_worktree_remove_command(&repo, &checkout, false, false);
         crate::worktree::run_worktree_command(&remove).unwrap();
         let _ = std::fs::remove_dir_all(repo);
     }
@@ -1696,7 +1763,7 @@ mod tests {
             )
         }));
 
-        let remove = crate::worktree::build_worktree_remove_command(&repo, &checkout, false);
+        let remove = crate::worktree::build_worktree_remove_command(&repo, &checkout, false, false);
         crate::worktree::run_worktree_command(&remove).unwrap();
         let _ = std::fs::remove_dir_all(repo);
     }
@@ -1782,6 +1849,7 @@ mod tests {
                 repository_id: None,
                 workspace_id: Some(app.state.workspaces[0].id.clone()),
                 cwd: None,
+                trust_repository: false,
             }),
         });
 
@@ -1799,7 +1867,7 @@ mod tests {
         );
         assert!(entry.is_linked_worktree);
 
-        let remove = crate::worktree::build_worktree_remove_command(&repo, &checkout, false);
+        let remove = crate::worktree::build_worktree_remove_command(&repo, &checkout, false, false);
         crate::worktree::run_worktree_command(&remove).unwrap();
         let _ = std::fs::remove_dir_all(repo);
     }
@@ -1833,11 +1901,13 @@ mod tests {
                 repository_id: None,
                 workspace_id: Some(child_id),
                 cwd: None,
+                trust_repository: false,
             }),
             crate::api::schema::Method::WorktreeList(WorktreeListParams {
                 repository_id: None,
                 workspace_id: None,
                 cwd: Some(checkout.display().to_string()),
+                trust_repository: false,
             }),
         ] {
             let response = app.handle_api_request(Request {
@@ -1862,7 +1932,7 @@ mod tests {
             }));
         }
 
-        let remove = crate::worktree::build_worktree_remove_command(&repo, &checkout, false);
+        let remove = crate::worktree::build_worktree_remove_command(&repo, &checkout, false, false);
         crate::worktree::run_worktree_command(&remove).unwrap();
         let _ = std::fs::remove_dir_all(repo);
     }
@@ -1892,6 +1962,7 @@ mod tests {
                 repository_id: None,
                 workspace_id: Some(app.state.workspaces[0].id.clone()),
                 cwd: None,
+                trust_repository: false,
             }),
         });
 
@@ -1951,6 +2022,7 @@ mod tests {
                 method: crate::api::schema::Method::WorktreeRemove(WorktreeRemoveParams {
                     workspace_id: "2".into(),
                     force: true,
+                    trust_repository: false,
                 }),
             },
         );
@@ -1965,6 +2037,7 @@ mod tests {
                 method: crate::api::schema::Method::WorktreeRemove(WorktreeRemoveParams {
                     workspace_id: child_id.clone(),
                     force: false,
+                    trust_repository: false,
                 }),
             },
         );
@@ -1980,6 +2053,7 @@ mod tests {
                 method: crate::api::schema::Method::WorktreeRemove(WorktreeRemoveParams {
                     workspace_id: child_id,
                     force: true,
+                    trust_repository: false,
                 }),
             },
         );
@@ -2036,6 +2110,7 @@ mod tests {
                 method: crate::api::schema::Method::WorktreeRemove(WorktreeRemoveParams {
                     workspace_id: child_id.clone(),
                     force: false,
+                    trust_repository: false,
                 }),
             },
         );
@@ -2121,6 +2196,7 @@ mod tests {
                 method: crate::api::schema::Method::WorktreeRemove(WorktreeRemoveParams {
                     workspace_id: child_id.clone(),
                     force: false,
+                    trust_repository: false,
                 }),
             },
             respond_to,
@@ -2194,6 +2270,7 @@ mod tests {
                 method: crate::api::schema::Method::WorktreeRemove(WorktreeRemoveParams {
                     workspace_id: child_id.clone(),
                     force: false,
+                    trust_repository: false,
                 }),
             },
             first_tx,
@@ -2204,6 +2281,7 @@ mod tests {
                 method: crate::api::schema::Method::WorktreeRemove(WorktreeRemoveParams {
                     workspace_id: child_id,
                     force: false,
+                    trust_repository: false,
                 }),
             },
             second_tx,
@@ -2263,6 +2341,7 @@ mod tests {
                 method: crate::api::schema::Method::WorktreeRemove(WorktreeRemoveParams {
                     workspace_id: first_id,
                     force: true,
+                    trust_repository: false,
                 }),
             },
             first_tx,
@@ -2273,6 +2352,7 @@ mod tests {
                 method: crate::api::schema::Method::WorktreeRemove(WorktreeRemoveParams {
                     workspace_id: second_id,
                     force: true,
+                    trust_repository: false,
                 }),
             },
             second_tx,
@@ -2309,6 +2389,7 @@ mod tests {
                     path: Some(checkout.display().to_string()),
                     label: None,
                     focus: false,
+                    trust_repository: false,
                 }),
             },
             respond_to,
@@ -2363,6 +2444,7 @@ mod tests {
                 method: crate::api::schema::Method::WorktreeRemove(WorktreeRemoveParams {
                     workspace_id: child_id,
                     force: false,
+                    trust_repository: false,
                 }),
             },
             respond_to,
@@ -2374,9 +2456,72 @@ mod tests {
         let error: ErrorResponse = serde_json::from_str(&response).unwrap();
         assert_eq!(error.error.code, "worktree_operation_in_progress");
         assert!(app.event_rx.try_recv().is_err());
-        let remove = crate::worktree::build_worktree_remove_command(&repo, &checkout, true);
+        let remove = crate::worktree::build_worktree_remove_command(&repo, &checkout, true, false);
         let _ = crate::worktree::run_worktree_command(&remove);
         let _ = std::fs::remove_dir_all(repo);
+    }
+
+    #[test]
+    fn deferred_api_background_worktree_remove_preserves_focused_workspace() {
+        let mut app = test_app();
+        let checkout = PathBuf::from("/repo/herdr-issue");
+        let membership = crate::workspace::WorktreeSpaceMembership {
+            key: "repo-key".into(),
+            label: "herdr".into(),
+            repo_root: "/repo/herdr".into(),
+            checkout_path: checkout.clone(),
+            is_linked_worktree: true,
+        };
+        let mut parent = Workspace::test_new("parent");
+        parent.worktree_space = Some(crate::workspace::WorktreeSpaceMembership {
+            is_linked_worktree: false,
+            checkout_path: "/repo/herdr".into(),
+            ..membership.clone()
+        });
+        let mut child = Workspace::test_new("child");
+        child.worktree_space = Some(membership.clone());
+        let foreground = Workspace::test_new("foreground");
+        let child_id = child.id.clone();
+        let foreground_id = foreground.id.clone();
+        app.state.workspaces = vec![parent, child, foreground];
+        app.state.active = Some(2);
+        app.state.selected = 2;
+        let workspace_snapshot = app.workspace_info(1);
+        let worktree_snapshot = app.worktree_info_for_membership(&membership, None);
+        app.pending_api_worktree_removes.insert(child_id.clone(), 7);
+        app.pending_api_worktree_remove_paths
+            .insert(crate::worktree::canonical_or_original(&checkout), 7);
+        let (respond_to, response_rx) = response_channel();
+
+        app.handle_api_worktree_remove_finished(WorktreeRemoveResult {
+            workspace_id: child_id,
+            path: checkout.clone(),
+            workspace: Some(Box::new(workspace_snapshot)),
+            worktree: Some(Box::new(worktree_snapshot)),
+            forced: false,
+            api_request: Some(ApiWorktreeRemoveRequest {
+                id: "req".into(),
+                operation_id: 7,
+                checkout_key: crate::worktree::canonical_or_original(&checkout),
+                respond_to,
+            }),
+            result: Ok(()),
+        });
+
+        let response = response_rx
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .expect("background worktree remove completion should respond");
+        let success: SuccessResponse = serde_json::from_str(&response).unwrap();
+        assert!(matches!(
+            success.result,
+            ResponseResult::WorktreeRemoved { .. }
+        ));
+        assert_eq!(app.state.workspaces.len(), 2);
+        assert_eq!(
+            app.state.active.map(|idx| &app.state.workspaces[idx].id),
+            Some(&foreground_id)
+        );
+        assert_eq!(app.state.workspaces[app.state.selected].id, foreground_id);
     }
 
     #[test]

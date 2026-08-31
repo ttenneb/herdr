@@ -313,7 +313,7 @@ mod tests {
     use super::*;
     use crate::api::schema::{
         CollectionCreateMemberParams, CollectionCreateParams, SplitDirection, SuccessResponse,
-        WorkspaceTarget,
+        WorkspaceTarget as CheckoutCloseTarget,
     };
     use crate::config::Config;
     use crate::repository::{CheckoutKind, CheckoutProvenance, Repository, SpaceRef};
@@ -483,13 +483,13 @@ mod tests {
     }
 
     #[test]
-    fn compatibility_workspace_close_never_closes_sibling_checkout() {
+    fn checkout_close_never_closes_sibling_checkout() {
         let mut app = app_with_repository();
         let first = app.state.workspaces[0].id.clone();
         let second = app.state.workspaces[1].id.clone();
         let response = app.handle_workspace_close(
             "req".into(),
-            WorkspaceTarget {
+            CheckoutCloseTarget {
                 workspace_id: first,
             },
         );
@@ -576,7 +576,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn workspace_close_preserves_peer_checkouts_with_nested_lifecycle_state() {
+    async fn checkout_close_preserves_peer_checkouts_with_nested_lifecycle_state() {
         let mut app = app_with_repository();
         let third = add_linked_checkout(&mut app, "third");
         let first = app.state.workspaces[0].id.clone();
@@ -588,7 +588,7 @@ mod tests {
 
         let _: SuccessResponse = serde_json::from_str(&app.handle_workspace_close(
             "close".into(),
-            WorkspaceTarget {
+            CheckoutCloseTarget {
                 workspace_id: target.clone(),
             },
         ))

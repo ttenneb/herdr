@@ -64,7 +64,7 @@ fn legacy_pane_layout_response_deserializes_without_collection_fields() {
 #[test]
 fn collection_schema_uses_bumped_compatibility_versions() {
     assert_eq!(protocol_schema_document()["schema_version"], 2);
-    assert_eq!(crate::protocol::PROTOCOL_VERSION, 19);
+    assert_eq!(crate::protocol::PROTOCOL_VERSION, 21);
 }
 
 #[test]
@@ -81,6 +81,64 @@ fn request_uses_dot_method_names() {
 
     let json = serde_json::to_value(&request).unwrap();
     assert_eq!(json["method"], "workspace.create");
+}
+
+#[test]
+fn workspace_close_group_intent_defaults_false_and_round_trips() {
+    let request: Request = serde_json::from_value(serde_json::json!({
+        "id": "close",
+        "method": "workspace.close",
+        "params": { "workspace_id": "w1" }
+    }))
+    .unwrap();
+    assert!(matches!(
+        request.method,
+        Method::WorkspaceClose(WorkspaceCloseParams {
+            close_group: false,
+            ..
+        })
+    ));
+
+    let explicit = Request {
+        id: "close-group".into(),
+        method: Method::WorkspaceClose(WorkspaceCloseParams {
+            workspace_id: "w1".into(),
+            close_group: true,
+        }),
+    };
+    let json = serde_json::to_value(&explicit).unwrap();
+    assert_eq!(json["params"]["close_group"], true);
+    assert_eq!(serde_json::from_value::<Request>(json).unwrap(), explicit);
+}
+
+#[test]
+fn omitted_boolean_request_flags_expose_false_schema_defaults() {
+    let cases = [
+        (
+            protocol_schema_entry::<WorkspaceCloseParams>("workspace_close"),
+            "close_group",
+        ),
+        (
+            protocol_schema_entry::<WorktreeListParams>("worktree_list"),
+            "trust_repository",
+        ),
+        (
+            protocol_schema_entry::<WorktreeCreateParams>("worktree_create"),
+            "trust_repository",
+        ),
+        (
+            protocol_schema_entry::<WorktreeOpenParams>("worktree_open"),
+            "trust_repository",
+        ),
+        (
+            protocol_schema_entry::<WorktreeRemoveParams>("worktree_remove"),
+            "trust_repository",
+        ),
+    ];
+
+    for (schema, property) in cases {
+        assert_eq!(schema["properties"][property]["default"], false);
+    }
 }
 
 #[test]
@@ -721,10 +779,12 @@ fn worktree_request_and_response_round_trip() {
             branch: Some("worktree/api".into()),
             base: Some("HEAD".into()),
             focus: true,
+            trust_repository: true,
             ..WorktreeCreateParams::default()
         }),
     };
     let json = serde_json::to_string(&request).unwrap();
+    assert!(json.contains("\"trust_repository\":true"));
     let restored: Request = serde_json::from_str(&json).unwrap();
     assert_eq!(restored, request);
 

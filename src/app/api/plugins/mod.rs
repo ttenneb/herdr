@@ -1457,8 +1457,10 @@ fn manifest_actions(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
+    use crate::api::schema::PaneListParams;
     use crate::api::schema::{
-        Method, PaneListParams, PluginSourceInfo, PluginSourceKind, Request, SuccessResponse,
+        Method, PluginSourceInfo, PluginSourceKind, Request, SuccessResponse,
     };
     use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -1553,6 +1555,58 @@ mod tests {
         serde_json::from_str::<SuccessResponse>(response)
             .expect("success response")
             .result
+    }
+
+    #[test]
+    fn plugin_internal_final_pane_close_keeps_linked_checkout_open() {
+        let mut app = test_app();
+        let mut primary = crate::workspace::Workspace::test_new("primary");
+        let primary_pane = primary.tabs[0].root_pane.expect("primary pane");
+        let mut linked = crate::workspace::Workspace::test_new("linked");
+        let linked_pane = linked.tabs[0].root_pane.expect("linked pane");
+        let membership = |linked| crate::workspace::WorktreeSpaceMembership {
+            key: "repo-key".into(),
+            label: "repo".into(),
+            repo_root: "/repo".into(),
+            checkout_path: if linked {
+                "/repo-linked".into()
+            } else {
+                "/repo".into()
+            },
+            is_linked_worktree: linked,
+        };
+        primary.worktree_space = Some(membership(false));
+        linked.worktree_space = Some(membership(true));
+        app.state.workspaces = vec![primary, linked];
+        app.state.active = Some(0);
+        app.state.selected = 0;
+        app.state.ensure_test_terminals();
+        app.state.plugin_panes.insert(
+            primary_pane,
+            crate::app::state::PluginPaneRecord {
+                plugin_id: "example.plugin".into(),
+                entrypoint: "board".into(),
+            },
+        );
+        let pane_id = app
+            .public_pane_id(0, primary_pane)
+            .expect("public plugin pane");
+
+        let response = app.handle_plugin_pane_close(
+            "close".into(),
+            PluginPaneCloseParams {
+                pane_id: pane_id.clone(),
+            },
+        );
+
+        assert_eq!(
+            response_result(&response),
+            ResponseResult::PluginPaneClosed { pane_id }
+        );
+        assert_eq!(app.state.workspaces.len(), 1);
+        assert_eq!(app.state.workspaces[0].display_name(), "linked");
+        assert!(app.state.workspaces[0].pane_state(linked_pane).is_some());
+        assert!(!app.state.plugin_panes.contains_key(&primary_pane));
     }
 
     fn unique_temp_path(name: &str) -> std::path::PathBuf {

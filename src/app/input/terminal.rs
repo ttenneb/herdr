@@ -183,8 +183,8 @@ impl App {
         if matches!(key_event.code, KeyCode::PageUp | KeyCode::PageDown)
             && key_event.modifiers.is_empty()
         {
-            if let Some(input_state) = rt.input_state() {
-                if input_state.plain_page_keys_use_host_scrollback() {
+            if let Some(host_scroll) = rt.plain_page_keys_use_host_scrollback() {
+                if host_scroll {
                     if key_event.kind == crossterm::event::KeyEventKind::Release {
                         return None;
                     }
@@ -311,14 +311,7 @@ impl App {
             None
         };
 
-        runtime.is_some_and(|runtime| {
-            let protocol = runtime.keyboard_protocol();
-            protocol.reports_all_keys()
-                || (protocol.reports_event_types()
-                    && runtime
-                        .input_state()
-                        .is_some_and(|state| state.modify_other_keys))
-        })
+        runtime.is_some_and(crate::terminal::TerminalRuntime::keyboard_report_all_requested)
     }
 
     fn terminal_input_runtime(
@@ -436,6 +429,7 @@ impl App {
 
     pub(crate) fn release_input_source_headless(&mut self, source_id: crate::app::InputSourceId) {
         // Pending URL clicks survive this call; see clear_input_source.
+        self.state.clear_chrome_gesture(source_id);
         for pressed in self.take_pressed_keys_for_source(source_id) {
             let release = pressed
                 .key
@@ -451,6 +445,7 @@ impl App {
 
     pub(crate) async fn release_input_source(&mut self, source_id: crate::app::InputSourceId) {
         // Pending URL clicks survive this call; see clear_input_source.
+        self.state.clear_chrome_gesture(source_id);
         for pressed in self.take_pressed_keys_for_source(source_id) {
             let release = pressed
                 .key
@@ -496,6 +491,8 @@ mod tests {
     use crossterm::event::{KeyCode, KeyEventKind, KeyModifiers, MouseButton, MouseEventKind};
     use ratatui::layout::Rect;
 
+    #[cfg(target_os = "linux")]
+    use super::super::wait_for_detached_process_reap;
     use super::super::{app_for_mouse_test, mouse, numbered_lines_bytes};
     #[cfg(unix)]
     use super::super::{unique_temp_path, wait_for_file};
@@ -971,6 +968,65 @@ mod tests {
         assert!(app.selection_highlight_clear_deadline.is_none());
     }
 
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn ctrl_click_url_reaps_failed_opener() {
+        let opener_dir = unique_temp_path("url-opener");
+        let record_path = opener_dir.join("record");
+        let opener_path = opener_dir.join("xdg-open");
+        std::fs::create_dir_all(&opener_dir).expect("fake opener directory");
+        std::fs::write(
+            &opener_path,
+            "#!/bin/sh\nprintf '%s\\n%s\\n' \"$$\" \"$1\" > \"$2\"\nexit 3\n",
+        )
+        .expect("fake opener script");
+
+        let url = "https://example.com/akbash-2903";
+        let line = format!("see {url}");
+        let (mut app, info) = app_with_screen_bytes(line.as_bytes());
+        let col = info.inner_rect.x + line.find("example").expect("url host") as u16;
+        let handled = app.handle_modified_url_click_with(
+            41,
+            modified_mouse(
+                MouseEventKind::Down(MouseButton::Left),
+                col,
+                info.inner_rect.y,
+                KeyModifiers::CONTROL,
+            ),
+            |clicked_url| {
+                std::process::Command::new("/bin/sh")
+                    .arg(&opener_path)
+                    .arg(clicked_url)
+                    .arg(&record_path)
+                    .stdin(std::process::Stdio::null())
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null())
+                    .spawn()
+                    .map(Some)
+            },
+        );
+        assert!(handled);
+
+        let record = wait_for_file(&record_path);
+        let mut lines = record.lines();
+        let pid = lines
+            .next()
+            .expect("opener pid")
+            .parse::<u32>()
+            .expect("numeric opener pid");
+        assert_eq!(lines.next(), Some(url));
+
+        let reaped = wait_for_detached_process_reap(&mut app, pid).await;
+        if !reaped {
+            unsafe {
+                libc::waitpid(pid as libc::pid_t, std::ptr::null_mut(), 0);
+            }
+        }
+
+        let _ = std::fs::remove_dir_all(&opener_dir);
+        assert!(reaped, "failed URL opener child {pid} was not reaped");
+    }
+
     #[cfg(unix)]
     #[tokio::test]
     async fn ctrl_click_url_does_not_forward_release_to_mouse_reporting_pane() {
@@ -1076,6 +1132,57 @@ mod tests {
             input_rx.try_recv().is_err(),
             "focus loss must not clear a pending URL click, so its release must stay out of the pane"
         );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn ctrl_click_osc8_file_url_invokes_plugin_link_handler() {
+        let uri = "file:///tmp/herdr-file-repro.txt";
+        let screen = format!("\x1b]8;;{uri}\x1b\\FILE\x1b]8;;\x1b\\");
+        let (mut app, info) = app_with_screen_bytes(screen.as_bytes());
+        install_test_link_handler(&mut app);
+        app.state
+            .installed_plugins
+            .get_mut("example.links")
+            .expect("test plugin")
+            .link_handlers[0]
+            .pattern = r"^file:///tmp/herdr-file-repro\.txt$".into();
+
+        let handled = app.handle_modified_url_click_with(
+            41,
+            modified_mouse(
+                MouseEventKind::Down(MouseButton::Left),
+                info.inner_rect.x + 1,
+                info.inner_rect.y,
+                KeyModifiers::CONTROL,
+            ),
+            |_| panic!("matched file link should not use the system URL opener"),
+        );
+
+        assert!(handled);
+        let log = app
+            .state
+            .plugin_command_logs
+            .last()
+            .expect("ctrl-click should start plugin link handler");
+        assert_eq!(log.plugin_id, "example.links");
+        assert_eq!(log.action_id.as_deref(), Some("open"));
+
+        let (mut unmatched_app, unmatched_info) = app_with_screen_bytes(screen.as_bytes());
+        install_test_link_handler(&mut unmatched_app);
+        let unmatched_handled = unmatched_app.handle_modified_url_click_with(
+            42,
+            modified_mouse(
+                MouseEventKind::Down(MouseButton::Left),
+                unmatched_info.inner_rect.x + 1,
+                unmatched_info.inner_rect.y,
+                KeyModifiers::CONTROL,
+            ),
+            |_| panic!("unmatched file link should not use the system URL opener"),
+        );
+
+        assert!(!unmatched_handled);
+        assert!(unmatched_app.state.plugin_command_logs.is_empty());
     }
 
     #[cfg(unix)]

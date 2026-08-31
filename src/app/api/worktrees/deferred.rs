@@ -249,6 +249,7 @@ impl App {
                     &path,
                     &branch,
                     &base,
+                    params.trust_repository,
                 )
             });
             let _ = event_tx.blocking_send(AppEvent::WorktreeAddFinished(Box::new(
@@ -317,7 +318,11 @@ impl App {
         #[cfg(windows)]
         {
             if !params.force
-                && crate::worktree::checkout_has_dirty_files(&space.checkout_path).unwrap_or(false)
+                && crate::worktree::checkout_has_dirty_files(
+                    &space.checkout_path,
+                    params.trust_repository,
+                )
+                .unwrap_or(false)
             {
                 Self::send_api_response(
                     respond_to,
@@ -369,6 +374,7 @@ impl App {
             &space.repo_root,
             &space.checkout_path,
             params.force,
+            params.trust_repository,
         );
         let api_request = ApiWorktreeRemoveRequest {
             id,
@@ -379,10 +385,15 @@ impl App {
         let repo_root = space.repo_root;
         let path = space.checkout_path;
         let force = params.force;
+        let trust_repository = params.trust_repository;
         let event_tx = self.event_tx.clone();
         std::thread::spawn(move || {
             let result = crate::worktree::run_worktree_remove_command_with_recovery(
-                &command, &repo_root, &path, force,
+                &command,
+                &repo_root,
+                &path,
+                force,
+                trust_repository,
             );
             let _ = event_tx.blocking_send(AppEvent::WorktreeRemoveFinished(Box::new(
                 crate::events::WorktreeRemoveResult {
