@@ -5,6 +5,7 @@ use crate::api::schema::{
     CollectionMemberTarget, CollectionMoveParams, CollectionPromoteParams, CollectionReorderParams,
     CollectionSelectParams, CollectionTarget, EventData, EventEnvelope, EventKind, LayoutFocusInfo,
     PaneMoveDestination, PaneMoveParams, PanePlacementInfo, PaneTarget, ResponseResult,
+    WorkspaceTarget,
 };
 use crate::app::App;
 use crate::delegation::{DelegationId, Delegations, SiblingPosition};
@@ -591,12 +592,13 @@ impl App {
         let requests_cascade = members.is_empty()
             || params.disposition == Some(CollectionCloseDisposition::CascadeClose);
         if closes_workspace && requests_cascade {
-            // Collection close has a one-workspace policy. A final collection is workspace
-            // closure regardless of worktree-group confirmation settings; keep
-            // all group, collection, pane, runtime, delegation, and event cleanup centralized.
+            // Collection close has a one-workspace policy. Use the checkout-close target
+            // deliberately: WorkspaceCloseParams carries group-close intent, while closing a
+            // final collection must close only its owning workspace/checkout. Keep collection,
+            // pane, runtime, delegation, and event cleanup centralized.
             return self.handle_workspace_close(
                 id,
-                crate::api::schema::WorkspaceTarget {
+                WorkspaceTarget {
                     workspace_id: closed_workspace_id,
                 },
             );

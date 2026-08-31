@@ -29,6 +29,7 @@ fn worktree_list(args: &[String]) -> std::io::Result<i32> {
     let mut repository_id = None;
     let mut workspace_id = None;
     let mut cwd = None;
+    let mut trust_repository = false;
 
     let mut index = 0;
     while index < args.len() {
@@ -57,6 +58,10 @@ fn worktree_list(args: &[String]) -> std::io::Result<i32> {
                 cwd = Some(normalize_path_arg(value)?);
                 index += 2;
             }
+            "--trust-repository" => {
+                trust_repository = true;
+                index += 1;
+            }
             "--json" => index += 1,
             other => {
                 eprintln!("unknown option: {other}");
@@ -69,7 +74,9 @@ fn worktree_list(args: &[String]) -> std::io::Result<i32> {
         + usize::from(cwd.is_some())
         > 1
     {
-        eprintln!("usage: herdr worktree list [--repository ID | --workspace ID | --cwd PATH]");
+        eprintln!(
+            "usage: herdr worktree list [--repository ID | --workspace ID | --cwd PATH] [--trust-repository]"
+        );
         return Ok(2);
     }
 
@@ -77,6 +84,7 @@ fn worktree_list(args: &[String]) -> std::io::Result<i32> {
         repository_id,
         workspace_id,
         cwd,
+        trust_repository,
     })
 }
 
@@ -89,6 +97,7 @@ fn worktree_create(args: &[String]) -> std::io::Result<i32> {
     let mut path = None;
     let mut label = None;
     let mut focus = false;
+    let mut trust_repository = false;
 
     let mut index = 0;
     while index < args.len() {
@@ -157,6 +166,10 @@ fn worktree_create(args: &[String]) -> std::io::Result<i32> {
                 focus = false;
                 index += 1;
             }
+            "--trust-repository" => {
+                trust_repository = true;
+                index += 1;
+            }
             "--json" => index += 1,
             other => {
                 eprintln!("unknown option: {other}");
@@ -170,7 +183,7 @@ fn worktree_create(args: &[String]) -> std::io::Result<i32> {
         > 1
     {
         eprintln!(
-            "usage: herdr worktree create [--repository ID | --workspace ID | --cwd PATH] [--branch NAME] [--base REF] [--path PATH] [--label TEXT] [--focus] [--no-focus]"
+            "usage: herdr worktree create [--repository ID | --workspace ID | --cwd PATH] [--branch NAME] [--base REF] [--path PATH] [--label TEXT] [--focus] [--no-focus] [--trust-repository]"
         );
         return Ok(2);
     }
@@ -184,6 +197,7 @@ fn worktree_create(args: &[String]) -> std::io::Result<i32> {
         path,
         label,
         focus,
+        trust_repository,
     })
 }
 
@@ -195,6 +209,7 @@ fn worktree_open(args: &[String]) -> std::io::Result<i32> {
     let mut branch = None;
     let mut label = None;
     let mut focus = false;
+    let mut trust_repository = false;
 
     let mut index = 0;
     while index < args.len() {
@@ -255,6 +270,10 @@ fn worktree_open(args: &[String]) -> std::io::Result<i32> {
                 focus = false;
                 index += 1;
             }
+            "--trust-repository" => {
+                trust_repository = true;
+                index += 1;
+            }
             "--json" => index += 1,
             other => {
                 eprintln!("unknown option: {other}");
@@ -268,13 +287,13 @@ fn worktree_open(args: &[String]) -> std::io::Result<i32> {
         > 1
     {
         eprintln!(
-            "usage: herdr worktree open [--repository ID | --workspace ID | --cwd PATH] (--path PATH | --branch NAME) [--label TEXT] [--focus] [--no-focus]"
+            "usage: herdr worktree open [--repository ID | --workspace ID | --cwd PATH] (--path PATH | --branch NAME) [--label TEXT] [--focus] [--no-focus] [--trust-repository]"
         );
         return Ok(2);
     }
     if path.is_some() == branch.is_some() {
         eprintln!(
-            "usage: herdr worktree open [--repository ID | --workspace ID | --cwd PATH] (--path PATH | --branch NAME) [--label TEXT] [--focus] [--no-focus]"
+            "usage: herdr worktree open [--repository ID | --workspace ID | --cwd PATH] (--path PATH | --branch NAME) [--label TEXT] [--focus] [--no-focus] [--trust-repository]"
         );
         return Ok(2);
     }
@@ -287,12 +306,14 @@ fn worktree_open(args: &[String]) -> std::io::Result<i32> {
         branch,
         label,
         focus,
+        trust_repository,
     })
 }
 
 fn worktree_remove(args: &[String]) -> std::io::Result<i32> {
     let mut workspace_id = None;
     let mut force = false;
+    let mut trust_repository = false;
 
     let mut index = 0;
     while index < args.len() {
@@ -309,6 +330,10 @@ fn worktree_remove(args: &[String]) -> std::io::Result<i32> {
                 force = true;
                 index += 1;
             }
+            "--trust-repository" => {
+                trust_repository = true;
+                index += 1;
+            }
             "--json" => index += 1,
             other => {
                 eprintln!("unknown option: {other}");
@@ -318,26 +343,29 @@ fn worktree_remove(args: &[String]) -> std::io::Result<i32> {
     }
 
     let Some(workspace_id) = workspace_id else {
-        eprintln!("usage: herdr worktree remove --workspace ID [--force]");
+        eprintln!("usage: herdr worktree remove --workspace ID [--force] [--trust-repository]");
         return Ok(2);
     };
 
     super::runtime::worktree_remove(WorktreeRemoveParams {
         workspace_id,
         force,
+        trust_repository,
     })
 }
 
 fn print_worktree_help() {
     eprintln!("herdr worktree commands:");
-    eprintln!("  herdr worktree list [--repository ID | --workspace ID | --cwd PATH]");
     eprintln!(
-        "  herdr worktree create [--repository ID | --workspace ID | --cwd PATH] [--branch NAME] [--base REF] [--path PATH] [--label TEXT] [--focus] [--no-focus]"
+        "  herdr worktree list [--repository ID | --workspace ID | --cwd PATH] [--trust-repository]"
     );
     eprintln!(
-        "  herdr worktree open [--repository ID | --workspace ID | --cwd PATH] (--path PATH | --branch NAME) [--label TEXT] [--focus] [--no-focus]"
+        "  herdr worktree create [--repository ID | --workspace ID | --cwd PATH] [--branch NAME] [--base REF] [--path PATH] [--label TEXT] [--focus] [--no-focus] [--trust-repository]"
     );
-    eprintln!("  herdr worktree remove --workspace ID [--force]");
+    eprintln!(
+        "  herdr worktree open [--repository ID | --workspace ID | --cwd PATH] (--path PATH | --branch NAME) [--label TEXT] [--focus] [--no-focus] [--trust-repository]"
+    );
+    eprintln!("  herdr worktree remove --workspace ID [--force] [--trust-repository]");
 }
 
 fn normalize_path_arg(value: &str) -> std::io::Result<String> {

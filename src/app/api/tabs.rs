@@ -263,14 +263,9 @@ impl App {
             .collect::<Vec<_>>();
 
         if closes_workspace {
-            if self.state.confirm_implicit_worktree_group_close(ws_idx) {
-                return encode_error(
-                    id,
-                    "confirmation_required",
-                    "closing this tab would close a worktree group",
-                );
-            }
-            self.close_workspace_group_with_lifecycle(ws_idx);
+            // Closing the last tab is still a single-checkout operation. Repository-wide
+            // closure is reserved for workspace.close with explicit close_group=true.
+            self.close_workspace_with_lifecycle(ws_idx, true);
             return encode_success(id, ResponseResult::Ok {});
         }
 
@@ -421,13 +416,13 @@ mod tests {
     }
 
     #[test]
-    fn closing_parent_last_tab_uses_group_lifecycle_for_linked_worktree() {
+    fn closing_primary_checkout_last_tab_keeps_linked_checkout_open() {
         let event_hub = crate::api::EventHub::default();
         let (_api_tx, api_rx) = tokio::sync::mpsc::unbounded_channel();
         let mut app = App::new(&Config::default(), true, None, api_rx, event_hub.clone());
-        let mut parent = Workspace::test_new("parent");
-        let pane = parent.tabs[0].root_pane.expect("root pane");
-        parent.worktree_space = Some(crate::workspace::WorktreeSpaceMembership {
+        let mut primary = Workspace::test_new("primary");
+        let pane = primary.tabs[0].root_pane.expect("root pane");
+        primary.worktree_space = Some(crate::workspace::WorktreeSpaceMembership {
             key: "repo".into(),
             label: "repo".into(),
             repo_root: "/repo".into(),
@@ -442,7 +437,7 @@ mod tests {
             checkout_path: "/repo/linked".into(),
             is_linked_worktree: true,
         });
-        app.state.workspaces = vec![parent, linked];
+        app.state.workspaces = vec![primary, linked];
         app.state.active = Some(0);
         app.state.selected = 0;
         app.state.ensure_test_terminals();
@@ -451,14 +446,14 @@ mod tests {
             .create(Some(pane), None, Some("child".into()))
             .unwrap();
         let tab_id = app.public_tab_id(0, 0).unwrap();
-        // Confirmation remains the API default; this test exercises the accepted close.
-        app.state.confirm_close = false;
-        let parent_id = app.public_workspace_id(0);
+        let primary_id = app.public_workspace_id(0);
         let linked_id = app.public_workspace_id(1);
 
         let response = app.handle_tab_close("close".into(), TabTarget { tab_id });
-        assert!(serde_json::from_str::<SuccessResponse>(&response).is_ok());
-        assert!(app.state.workspaces.is_empty());
+
+        let _: SuccessResponse = serde_json::from_str(&response).expect("success");
+        assert_eq!(app.state.workspaces.len(), 1);
+        assert_eq!(app.state.workspaces[0].display_name(), "linked");
         let events = event_hub.events_after(0);
         for kind in [
             EventKind::PaneClosed,
@@ -479,15 +474,9 @@ mod tests {
                 _ => None,
             })
             .collect::<std::collections::HashSet<_>>();
-        assert!(closed_workspaces.contains(&parent_id));
-        assert!(closed_workspaces.contains(&linked_id));
-        let first_workspace = events
-            .iter()
-            .position(|(_, event)| event.event == EventKind::WorkspaceClosed)
-            .unwrap();
-        assert!(events[..first_workspace]
-            .iter()
-            .any(|(_, event)| event.event == EventKind::TabClosed));
+        assert_eq!(closed_workspaces.len(), 1);
+        assert!(closed_workspaces.contains(&primary_id));
+        assert!(!closed_workspaces.contains(&linked_id));
     }
 
     #[test]

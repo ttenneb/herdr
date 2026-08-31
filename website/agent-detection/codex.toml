@@ -1,7 +1,7 @@
 id = "codex"
-version = "2026.07.18.1"
-min_engine_version = 2
-updated_at = "2026-07-18T00:00:00Z"
+version = "2026.08.28.1"
+min_engine_version = 3
+updated_at = "2026-08-28T00:00:00Z"
 
 [[rules]]
 id = "osc_title_blocked"
@@ -32,6 +32,17 @@ any = [
 ]
 
 [[rules]]
+id = "trust_directory"
+state = "blocked"
+priority = 950
+region = "top_non_empty_lines(20)"
+visible_blocker = true
+all = [
+  { regex = ['\A> You are in [^\r\n]+(?:\r?\n|$)'] },
+  { regex = ['(?s)Do\s+you\s+trust\s+the\s+contents\s+of\s+this\s+directory\?'] },
+]
+
+[[rules]]
 id = "live_strong_blocker"
 state = "blocked"
 priority = 900
@@ -48,7 +59,7 @@ any = [
 id = "weak_blocker"
 state = "blocked"
 priority = 600
-region = "whole_recent"
+region = "whole_recent_without_current_prompt_marker"
 any = [
   { contains = ["[y/n]"] },
   { contains = ["yes (y)"] },

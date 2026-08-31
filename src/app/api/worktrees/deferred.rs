@@ -9,7 +9,33 @@ use crate::app::App;
 use crate::events::{ApiWorktreeAddRequest, ApiWorktreeRemoveRequest, AppEvent};
 
 use super::super::responses::{encode_error, encode_success};
-use super::{absolute_user_path, WorktreeSource};
+use super::{
+    absolute_user_path, validate_repository_identity, ApiFailure, SelectedRepositoryIdentity,
+    WorktreeSource,
+};
+
+pub(super) fn prepare_deferred_worktree_add(
+    selected_repository: Option<&SelectedRepositoryIdentity>,
+    source_checkout_path: &Path,
+    source_repo_key: &str,
+    parent_dir: Option<&Path>,
+) -> Result<(), ApiFailure> {
+    if let Some(expected) = selected_repository {
+        validate_repository_identity(expected, source_checkout_path, source_repo_key)?;
+    }
+    if let Some(parent_dir) = parent_dir {
+        std::fs::create_dir_all(parent_dir).map_err(|err| {
+            ApiFailure::new(
+                "worktree_create_failed",
+                format!(
+                    "failed to create worktree parent directory {}: {err}",
+                    parent_dir.display()
+                ),
+            )
+        })?;
+    }
+    Ok(())
+}
 
 impl App {
     pub(crate) fn handle_deferred_worktree_api_request(
@@ -112,36 +138,66 @@ impl App {
             );
             return;
         }
-        let workspace_id = match self
+        let selection = match self
             .worktree_workspace_source(params.repository_id.clone(), params.workspace_id)
         {
-            Ok(workspace_id) => workspace_id,
+            Ok(selection) => selection,
             Err(err) => {
                 Self::send_api_response(respond_to, encode_error(id, err.code, err.message));
                 return;
             }
         };
-        let source = match self.resolve_worktree_source(workspace_id, params.cwd) {
+        if selection.repository.is_some() {
+            let probe = match self
+                .resolve_worktree_identity_probe(selection.workspace_id.clone(), params.cwd.clone())
+            {
+                Ok(source) => source,
+                Err(err) => {
+                    Self::send_api_response(respond_to, encode_error(id, err.code, err.message));
+                    return;
+                }
+            };
+            if let Err(err) = self.validate_selected_repository(&selection, &probe) {
+                Self::send_api_response(respond_to, encode_error(id, err.code, err.message));
+                return;
+            }
+        }
+        let source = match self.resolve_worktree_source(
+            selection.workspace_id.clone(),
+            params.cwd,
+            params.trust_repository,
+        ) {
             Ok(source) => source,
             Err(err) => {
                 Self::send_api_response(respond_to, encode_error(id, err.code, err.message));
                 return;
             }
         };
+        if let Err(err) = self.validate_selected_repository(&selection, &source) {
+            Self::send_api_response(respond_to, encode_error(id, err.code, err.message));
+            return;
+        }
+        let selected_repository = selection.repository.clone();
         let preferred_base = params.repository_id.as_deref().and_then(|repository_id| {
             self.state
                 .repository(repository_id)
                 .and_then(|repository| repository.preferred_base.as_deref())
         });
-        let branch_exists = crate::worktree::local_branch_exists(&source.source_repo_root, &branch)
-            .unwrap_or(false);
+        let branch_exists = crate::worktree::local_branch_exists_with_trust(
+            &source.source_repo_root,
+            &branch,
+            params.trust_repository,
+        )
+        .unwrap_or(false);
         let base = if branch_exists {
             // Git ignores the base when checking out an existing local branch.
             params.base.unwrap_or_else(|| "HEAD".into())
         } else if let Some(requested) = params.base {
-            let Some(resolved) =
-                crate::worktree::resolve_worktree_base(&source.source_repo_root, &requested)
-            else {
+            let Some(resolved) = crate::worktree::resolve_worktree_base_with_trust(
+                &source.source_repo_root,
+                &requested,
+                params.trust_repository,
+            ) else {
                 Self::send_api_response(
                     respond_to,
                     encode_error(
@@ -154,9 +210,13 @@ impl App {
             };
             resolved.reference
         } else {
-            crate::worktree::resolve_repository_base(&source.source_repo_root, preferred_base)
-                .map(|base| base.reference)
-                .unwrap_or_else(|| "HEAD".into())
+            crate::worktree::resolve_repository_base_with_trust(
+                &source.source_repo_root,
+                preferred_base,
+                params.trust_repository,
+            )
+            .map(|base| base.reference)
+            .unwrap_or_else(|| "HEAD".into())
         };
         if !branch_exists {
             if let (Some(repository_id), Some(requested_base)) =
@@ -232,23 +292,35 @@ impl App {
             repo_name: source.repo_name,
             label: params.label,
             focus: params.focus,
+            failure_code: None,
             respond_to,
         };
         let path = checkout_path;
         let source_checkout_path = api_request.source_checkout_path.clone();
         let event_tx = self.event_tx.clone();
         std::thread::spawn(move || {
-            let result = if let Some(parent_dir) = parent_dir {
-                std::fs::create_dir_all(&parent_dir).map_err(|err| err.to_string())
-            } else {
-                Ok(())
-            }
+            let mut api_request = api_request;
+            let operation_source_checkout_path = selected_repository
+                .as_ref()
+                .map(|_| crate::worktree::canonical_or_original(&source_checkout_path))
+                .unwrap_or_else(|| source_checkout_path.clone());
+            let result = prepare_deferred_worktree_add(
+                selected_repository.as_ref(),
+                &operation_source_checkout_path,
+                &api_request.repo_key,
+                parent_dir.as_deref(),
+            )
+            .map_err(|err| {
+                api_request.failure_code = Some(err.code);
+                err.message
+            })
             .and_then(|()| {
                 crate::worktree::run_worktree_add_command(
-                    &source_checkout_path,
+                    &operation_source_checkout_path,
                     &path,
                     &branch,
                     &base,
+                    params.trust_repository,
                 )
             });
             let _ = event_tx.blocking_send(AppEvent::WorktreeAddFinished(Box::new(
@@ -317,7 +389,11 @@ impl App {
         #[cfg(windows)]
         {
             if !params.force
-                && crate::worktree::checkout_has_dirty_files(&space.checkout_path).unwrap_or(false)
+                && crate::worktree::checkout_has_dirty_files(
+                    &space.checkout_path,
+                    params.trust_repository,
+                )
+                .unwrap_or(false)
             {
                 Self::send_api_response(
                     respond_to,
@@ -369,6 +445,7 @@ impl App {
             &space.repo_root,
             &space.checkout_path,
             params.force,
+            params.trust_repository,
         );
         let api_request = ApiWorktreeRemoveRequest {
             id,
@@ -379,10 +456,15 @@ impl App {
         let repo_root = space.repo_root;
         let path = space.checkout_path;
         let force = params.force;
+        let trust_repository = params.trust_repository;
         let event_tx = self.event_tx.clone();
         std::thread::spawn(move || {
             let result = crate::worktree::run_worktree_remove_command_with_recovery(
-                &command, &repo_root, &path, force,
+                &command,
+                &repo_root,
+                &path,
+                force,
+                trust_repository,
             );
             let _ = event_tx.blocking_send(AppEvent::WorktreeRemoveFinished(Box::new(
                 crate::events::WorktreeRemoveResult {
@@ -432,7 +514,11 @@ impl App {
             }
             Self::send_api_response(
                 api.respond_to,
-                encode_error(api.id, "worktree_create_failed", err),
+                encode_error(
+                    api.id,
+                    api.failure_code.unwrap_or("worktree_create_failed"),
+                    err,
+                ),
             );
             return;
         }

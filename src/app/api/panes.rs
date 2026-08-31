@@ -3,11 +3,12 @@ use bytes::Bytes;
 use crate::api::schema::{
     EventData, EventEnvelope, EventKind, PaneClearAgentAuthorityParams, PaneCurrentParams,
     PaneDirection, PaneEdgesParams, PaneEdgesResult, PaneFocusDirectionParams,
-    PaneFocusDirectionReason, PaneFocusDirectionResult, PaneInfo, PaneLayoutPane, PaneLayoutParams,
-    PaneLayoutRect, PaneLayoutSnapshot, PaneLayoutSplit, PaneListParams, PaneMoveDestination,
-    PaneMoveParams, PaneMoveReason, PaneMoveResult, PaneNeighborParams, PaneNeighborResult,
-    PaneProcessInfo, PaneProcessInfoParams, PaneProcessInfoProcess, PaneReadParams, PaneReadResult,
-    PaneReleaseAgentParams, PaneRenameParams, PaneReportAgentParams, PaneReportAgentSessionParams,
+    PaneFocusDirectionReason, PaneFocusDirectionResult, PaneInfo, PaneInputSetParams,
+    PaneLayoutPane, PaneLayoutParams, PaneLayoutRect, PaneLayoutSnapshot, PaneLayoutSplit,
+    PaneListParams, PaneMoveDestination, PaneMoveParams, PaneMoveReason, PaneMoveResult,
+    PaneNeighborParams, PaneNeighborResult, PaneProcessInfo, PaneProcessInfoParams,
+    PaneProcessInfoProcess, PaneReadParams, PaneReadResult, PaneReleaseAgentParams,
+    PaneRenameParams, PaneReportAgentParams, PaneReportAgentSessionParams,
     PaneReportMetadataParams, PaneResizeParams, PaneResizeReason, PaneResizeResult,
     PaneSendInputParams, PaneSendKeysParams, PaneSendTextParams, PaneSplitParams, PaneSwapParams,
     PaneSwapReason, PaneSwapResult, PaneTarget, PaneZoomMode, PaneZoomParams, PaneZoomReason,
@@ -101,6 +102,12 @@ impl App {
             Some(Err(err)) => return encode_error(id, "pane_split_failed", err.to_string()),
             None => return encode_error(id, "pane_not_found", "pane not found"),
         };
+        if let Some(pane) = self.state.workspaces[ws_idx].pane_state_mut(new_pane.pane_id) {
+            pane.right_click_passthrough = matches!(
+                params.right_click,
+                crate::api::schema::PaneRightClickTarget::Pane
+            );
+        }
         if params.focus {
             self.state.switch_workspace_tab(ws_idx, target_tab_idx);
             self.state
@@ -1297,6 +1304,29 @@ impl App {
         )
     }
 
+    pub(super) fn handle_pane_input_set(
+        &mut self,
+        id: String,
+        params: PaneInputSetParams,
+    ) -> String {
+        let Some((ws_idx, pane_id)) = self.parse_pane_id(&params.pane_id) else {
+            return pane_not_found(id, &params.pane_id);
+        };
+        let Some(pane) = self
+            .state
+            .workspaces
+            .get_mut(ws_idx)
+            .and_then(|workspace| workspace.pane_state_mut(pane_id))
+        else {
+            return pane_not_found(id, &params.pane_id);
+        };
+        pane.right_click_passthrough = matches!(
+            params.right_click,
+            crate::api::schema::PaneRightClickTarget::Pane
+        );
+        encode_success(id, ResponseResult::Ok {})
+    }
+
     pub(super) fn handle_pane_rename(&mut self, id: String, params: PaneRenameParams) -> String {
         let Some((ws_idx, pane_id)) = self.parse_pane_id(&params.pane_id) else {
             return pane_not_found(id, &params.pane_id);
@@ -1736,15 +1766,10 @@ impl App {
         let workspace_id = self.public_workspace_id(ws_idx);
         let layout_update_target = self.layout_update_target_after_pane_removal(ws_idx, pane_id);
         let closes_workspace = self.state.close_pane_would_close_workspace(ws_idx, pane_id);
-        if closes_workspace && self.state.confirm_implicit_worktree_group_close(ws_idx) {
-            return Err(encode_error(
-                id,
-                "confirmation_required",
-                "closing this pane would close a worktree group",
-            ));
-        }
         if closes_workspace {
-            self.close_workspace_group_with_lifecycle(ws_idx);
+            // All pane-close callers, including internal plugin closes, target one checkout.
+            // Repository-wide closure requires workspace.close with close_group=true.
+            self.close_workspace_with_lifecycle(ws_idx, true);
             return Ok(());
         }
         let workspace_snapshot = self.workspace_info(ws_idx);
@@ -2015,6 +2040,7 @@ impl App {
             tab.layout.panes(area),
             self.state.pane_borders,
             self.state.pane_gaps,
+            self.state.pane_outer_borders,
         )
         .into_iter()
         .filter_map(|pane| {
@@ -2229,6 +2255,38 @@ mod tests {
             .expect("test tab has root pane");
         let public_pane_id = app.public_pane_id(0, pane_id).unwrap();
         (app, public_pane_id)
+    }
+
+    #[test]
+    fn pane_input_set_changes_only_the_target_pane() {
+        let (mut app, public_pane_id) = app_with_test_workspace();
+        let target = app.state.workspaces[0].tabs[0]
+            .root_pane
+            .expect("test tab has root pane");
+        let other = app.state.workspaces[0].test_split(ratatui::layout::Direction::Horizontal);
+
+        let response = app.handle_pane_input_set(
+            "req".into(),
+            PaneInputSetParams {
+                pane_id: public_pane_id,
+                right_click: crate::api::schema::PaneRightClickTarget::Pane,
+            },
+        );
+
+        let response: SuccessResponse = serde_json::from_str(&response).unwrap();
+        assert!(matches!(response.result, ResponseResult::Ok {}));
+        assert!(
+            app.state.workspaces[0]
+                .pane_state(target)
+                .unwrap()
+                .right_click_passthrough
+        );
+        assert!(
+            !app.state.workspaces[0]
+                .pane_state(other)
+                .unwrap()
+                .right_click_passthrough
+        );
     }
 
     fn app_with_send_key_runtime(
@@ -2905,29 +2963,14 @@ mod tests {
     }
 
     #[test]
-    fn final_pane_close_emits_complete_worktree_group_lifecycle_in_order() {
+    fn final_primary_checkout_pane_close_keeps_linked_checkout_open() {
         let event_hub = crate::api::EventHub::default();
         let (_api_tx, api_rx) = tokio::sync::mpsc::unbounded_channel();
         let mut app = App::new(&Config::default(), true, None, api_rx, event_hub.clone());
-        let mut root_workspace = Workspace::test_new("root");
-        let root_pane = root_workspace.tabs[0].root_pane.expect("root pane");
-        let mut peer_workspace = Workspace::test_new("peer");
-        let peer_tiled = peer_workspace.tabs[0].root_pane.expect("peer root");
-        let peer_collected = peer_workspace.test_split(ratatui::layout::Direction::Horizontal);
-        let collection = peer_workspace
-            .create_collection_near(
-                0,
-                crate::layout::LayoutLeaf::Pane(peer_tiled),
-                ratatui::layout::Direction::Vertical,
-                0.5,
-                None,
-            )
-            .expect("collection");
-        peer_workspace
-            .collect_pane(peer_collected, collection)
-            .expect("collect peer pane");
-        peer_workspace.test_add_tab(Some("peer second tab"));
-        let peer_second_tab = peer_workspace.tabs[1].root_pane.expect("second tab pane");
+        let mut primary = Workspace::test_new("primary");
+        let primary_pane = primary.tabs[0].root_pane.expect("primary pane");
+        let mut linked = Workspace::test_new("linked");
+        let linked_pane = linked.tabs[0].root_pane.expect("linked pane");
         let membership = |linked| crate::workspace::WorktreeSpaceMembership {
             key: "repo-key".into(),
             label: "repo".into(),
@@ -2939,72 +2982,56 @@ mod tests {
             },
             is_linked_worktree: linked,
         };
-        root_workspace.worktree_space = Some(membership(false));
-        peer_workspace.worktree_space = Some(membership(true));
-        app.state.workspaces = vec![root_workspace, peer_workspace];
+        primary.worktree_space = Some(membership(false));
+        linked.worktree_space = Some(membership(true));
+        app.state.workspaces = vec![primary, linked];
         app.state.active = Some(0);
         app.state.selected = 0;
-        app.state.confirm_close = false;
         app.state.ensure_test_terminals();
-        let pane_ids = [root_pane, peer_tiled, peer_collected, peer_second_tab];
-        for pane_id in pane_ids {
-            app.state
-                .delegations
-                .create(Some(pane_id), None, Some("lifecycle".into()))
-                .expect("delegation");
-        }
-        let expected_public_panes = pane_ids
-            .into_iter()
-            .enumerate()
-            .map(|(position, pane)| {
-                app.public_pane_id(usize::from(position != 0), pane)
-                    .expect("public pane")
-            })
-            .collect::<std::collections::HashSet<_>>();
-        let target = app.public_pane_id(0, root_pane).expect("target pane");
+        app.state
+            .delegations
+            .create(Some(primary_pane), None, Some("primary".into()))
+            .expect("primary delegation");
+        app.state
+            .delegations
+            .create(Some(linked_pane), None, Some("linked".into()))
+            .expect("linked delegation");
+        let primary_id = app.public_workspace_id(0);
+        let linked_id = app.public_workspace_id(1);
+        let target = app
+            .public_pane_id(0, primary_pane)
+            .expect("primary public pane");
 
         let response = app.handle_pane_close("close".into(), PaneTarget { pane_id: target });
 
         let _: SuccessResponse = serde_json::from_str(&response).expect("success");
-        assert!(app.state.workspaces.is_empty());
+        assert_eq!(app.state.workspaces.len(), 1);
+        assert_eq!(app.state.workspaces[0].display_name(), "linked");
+        assert!(app.state.workspaces[0].pane_state(linked_pane).is_some());
         let events = event_hub.events_after(0);
-        let positions = |kind| {
-            events
-                .iter()
-                .enumerate()
-                .filter_map(|(position, (_, event))| (event.event == kind).then_some(position))
-                .collect::<Vec<_>>()
-        };
-        let pane_positions = positions(EventKind::PaneClosed);
-        let tombstone_positions = positions(EventKind::DelegationTombstoned);
-        let tab_positions = positions(EventKind::TabClosed);
-        let workspace_positions = positions(EventKind::WorkspaceClosed);
-        assert_eq!(pane_positions.len(), 4);
-        assert_eq!(tombstone_positions.len(), 4);
-        assert_eq!(positions(EventKind::DelegationGarbageCollected).len(), 4);
-        assert_eq!(tab_positions.len(), 3);
-        assert_eq!(workspace_positions.len(), 2);
-        assert_eq!(positions(EventKind::CollectionMemberRemoved).len(), 1);
-        assert_eq!(positions(EventKind::CollectionClosed).len(), 1);
-        assert!(pane_positions
-            .iter()
-            .all(|position| *position < tab_positions[0]));
-        assert!(tombstone_positions
-            .iter()
-            .all(|position| *position < tab_positions[0]));
-        assert!(tab_positions
-            .iter()
-            .all(|position| *position < workspace_positions[0]));
         assert_eq!(
             events
                 .iter()
-                .filter_map(|(_, event)| match &event.data {
-                    EventData::PaneClosed { pane_id, .. } => Some(pane_id.clone()),
-                    _ => None,
-                })
-                .collect::<std::collections::HashSet<_>>(),
-            expected_public_panes
+                .filter(|(_, event)| event.event == EventKind::PaneClosed)
+                .count(),
+            1
         );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|(_, event)| event.event == EventKind::DelegationTombstoned)
+                .count(),
+            1
+        );
+        let closed_workspaces = events
+            .iter()
+            .filter_map(|(_, event)| match &event.data {
+                EventData::WorkspaceClosed { workspace_id, .. } => Some(workspace_id),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(closed_workspaces, [&primary_id]);
+        assert!(!closed_workspaces.contains(&&linked_id));
     }
 
     #[test]

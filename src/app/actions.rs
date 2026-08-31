@@ -177,7 +177,10 @@ pub fn notification_toast_for_pane_state_update(
     suppress_active_tab_notifications: bool,
     update: &PaneStateUpdate,
 ) -> Option<ToastKind> {
-    if suppress_active_tab_notifications || update.state == update.previous_state {
+    if update.suppress_completion
+        || suppress_active_tab_notifications
+        || update.state == update.previous_state
+    {
         return None;
     }
 
@@ -249,6 +252,7 @@ pub struct PaneStateUpdate {
     pub agent_name_changed: bool,
     pub agent_released: bool,
     pub agent_release_status: Option<crate::api::schema::AgentStatus>,
+    pub suppress_completion: bool,
 }
 
 #[derive(Default)]
@@ -1321,7 +1325,7 @@ impl AppState {
                     .get_mut(&terminal_id)?
                     .expire_agent_metadata_at(scheduled_deadline, now)?;
                 let change = mutation.effective_state_change?;
-                let seen = self.apply_pane_state_change(ws_idx, pane_id, &change)?;
+                let seen = self.apply_pane_state_change(ws_idx, pane_id, &change, false)?;
                 if seen != previous_seen {
                     self.mark_session_dirty();
                 }
@@ -1341,6 +1345,7 @@ impl AppState {
                     agent_name_changed: false,
                     agent_released: false,
                     agent_release_status: None,
+                    suppress_completion: false,
                 };
                 Some(update)
             })
@@ -2313,8 +2318,6 @@ impl AppState {
             self.public_pane_id_aliases
                 .retain(|_, alias| *alias != pane_id);
             self.plugin_panes.remove(&pane_id);
-            self.pane_graphics_layers.remove(&pane_id);
-            self.pane_graphics_streams.remove(&pane_id);
             if let Some(delegation_id) = self.delegations.tombstone_pane(pane_id) {
                 tombstoned_delegations.push((delegation_id, pane_id));
             }
@@ -2435,7 +2438,7 @@ impl AppState {
 
         let layout = crate::ui::compute_tab_bar_view(
             ws,
-            area,
+            crate::ui::tab_bar_content_area(self, area),
             self.tab_scroll,
             self.tab_scroll_follow_active,
             self.mouse_capture,
@@ -2666,18 +2669,57 @@ impl AppState {
         self.apply_pane_zoom(ws_idx, pane_id, PaneZoomCommand::Toggle);
     }
 
-    pub(crate) fn workspace_close_would_close_worktree_group(&self, _ws_idx: usize) -> bool {
-        false
+    #[cfg(test)]
+    pub(crate) fn workspace_close_would_close_worktree_group(&self, ws_idx: usize) -> bool {
+        self.workspace_close_indices(ws_idx).len() >= 2
     }
 
-    pub(crate) fn confirm_implicit_worktree_group_close(&mut self, ws_idx: usize) -> bool {
-        if self.confirm_close && self.workspace_close_would_close_worktree_group(ws_idx) {
-            self.selected = ws_idx;
-            self.mode = Mode::ConfirmClose;
-            true
-        } else {
-            false
-        }
+    pub(crate) fn workspace_close_indices(&self, ws_idx: usize) -> Vec<usize> {
+        self.workspaces
+            .get(ws_idx)
+            .and_then(|ws| ws.worktree_space())
+            .filter(|space| !space.is_linked_worktree)
+            .map(|space| {
+                self.workspaces
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(idx, ws)| {
+                        ws.worktree_space()
+                            .is_some_and(|member| member.key == space.key)
+                            .then_some(idx)
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .filter(|indices| indices.len() >= 2)
+            .unwrap_or_else(|| vec![ws_idx])
+    }
+
+    pub(crate) fn begin_workspace_close_confirmation(&mut self, ws_idx: usize) -> bool {
+        let Some(workspace_id) = self
+            .workspaces
+            .get(ws_idx)
+            .map(|workspace| workspace.id.clone())
+        else {
+            return false;
+        };
+        self.selected = ws_idx;
+        self.confirm_close_workspace_id = Some(workspace_id);
+        self.mode = Mode::ConfirmClose;
+        true
+    }
+
+    pub(crate) fn take_confirmed_workspace_close_index(&mut self) -> Option<usize> {
+        let workspace_id = self.confirm_close_workspace_id.take()?;
+        self.workspaces
+            .iter()
+            .position(|workspace| workspace.id == workspace_id)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn confirm_implicit_worktree_group_close(&mut self, _ws_idx: usize) -> bool {
+        // Test-only legacy UI helpers now target one checkout. Repository-wide closure is
+        // reserved for explicit workspace close with close_group=true.
+        false
     }
 
     #[cfg(test)]
@@ -2844,10 +2886,7 @@ impl AppState {
         else {
             return false;
         };
-        if rt
-            .input_state()
-            .is_some_and(crate::pane::InputState::mouse_reporting_enabled)
-        {
+        if rt.mouse_reporting_enabled() {
             return false;
         }
 
@@ -2937,7 +2976,7 @@ impl AppState {
             .into_iter()
             .find(|((x, y), _, _)| *x == logical_col && *y == logical_row)
         {
-            return safe_web_url(&uri).map(str::to_owned);
+            return Some(uri);
         }
 
         let metrics = self.pane_scroll_metrics(terminal_runtimes, pane_id);
@@ -3439,7 +3478,9 @@ impl AppState {
                 }
                 Vec::new()
             }
-            AppEvent::AgentDetectionManifestsUpdated { updated, status } => {
+            AppEvent::AgentDetectionManifestsUpdated {
+                updated, status, ..
+            } => {
                 self.agent_manifest_update_status = status;
                 self.refresh_agent_manifest_summaries();
                 if !updated.is_empty()
@@ -3469,6 +3510,16 @@ impl AppState {
                 }
                 Vec::new()
             }
+            AppEvent::AgentProcessDetected {
+                pane_id,
+                agent,
+                observed_at,
+            } => self
+                .update_terminal_state(pane_id, |terminal| {
+                    Some(terminal.set_detected_agent_process_at(agent, observed_at))
+                })
+                .into_iter()
+                .collect(),
             AppEvent::StateChanged {
                 pane_id,
                 agent,
@@ -3598,9 +3649,10 @@ impl AppState {
                     .collect()
                 }
             }
-            // Both intercepted before this dispatch — in App::handle_internal_event (monolithic)
+            // Intercepted before this dispatch — in App::handle_internal_event (monolithic)
             // or via HeadlessServer forwarding to the foreground client (server); never touch
             // AppState. Kept for AppEvent exhaustiveness.
+            AppEvent::TerminalBell { .. } => Vec::new(),
             AppEvent::ClipboardWrite { .. } => Vec::new(),
             AppEvent::PrefixInputSource { .. } => Vec::new(),
             AppEvent::TerminalCwdReported { pane_id, cwd } => {
@@ -3632,7 +3684,8 @@ impl AppState {
             }
             AppEvent::WorktreeAddFinished(_) => Vec::new(),
             AppEvent::WorktreeRemoveFinished(_) => Vec::new(),
-            AppEvent::PluginCommandFinished { .. }
+            AppEvent::TabBarCommandFinished { .. }
+            | AppEvent::PluginCommandFinished { .. }
             | AppEvent::PluginActionChoicesFinished { .. }
             | AppEvent::PluginActionChoicesCleanupFinished { .. } => Vec::new(),
         }
@@ -3652,11 +3705,20 @@ impl AppState {
             .clone();
         let previous_seen = self.workspaces[ws_idx].pane_state(pane_id)?.seen;
         let now = Instant::now();
-        let (mutation, managed_changed, agent_name_changed, unchanged_change) = {
+        let (
+            mutation,
+            managed_changed,
+            agent_name_changed,
+            unchanged_change,
+            managed_launch_pending,
+            suppress_acquisition_completion,
+        ) = {
             let terminal = self.terminals.get_mut(&terminal_id)?;
             let previous_agent_name = terminal.agent_name.clone();
+            let managed_launch_pending = terminal.managed_agent_launch_pending();
             let mutation = update(terminal)?;
             let managed_changed = terminal.reconcile_managed_agent_at(now, false);
+            let suppress_acquisition_completion = terminal.finish_agent_process_acquisition();
             let agent_name_changed = terminal.agent_name != previous_agent_name;
             let unchanged_change = (mutation.agent_released || agent_name_changed)
                 .then(|| terminal.unchanged_effective_state_change_at(now));
@@ -3665,6 +3727,8 @@ impl AppState {
                 managed_changed,
                 agent_name_changed,
                 unchanged_change,
+                managed_launch_pending,
+                suppress_acquisition_completion,
             )
         };
         if mutation.session_ref_changed || managed_changed || agent_name_changed {
@@ -3672,13 +3736,15 @@ impl AppState {
         }
         let agent_released = mutation.agent_released;
         let change = mutation.effective_state_change.or(unchanged_change)?;
+        let suppress_completion = change.state == AgentState::Idle
+            && (managed_launch_pending || suppress_acquisition_completion);
         if change.previous_state != change.state {
             self.next_agent_state_change_seq += 1;
             if let Some(terminal) = self.terminals.get_mut(&terminal_id) {
                 terminal.last_agent_state_change_seq = Some(self.next_agent_state_change_seq);
             }
         }
-        let seen = self.apply_pane_state_change(ws_idx, pane_id, &change)?;
+        let seen = self.apply_pane_state_change(ws_idx, pane_id, &change, suppress_completion)?;
         if seen != previous_seen {
             self.mark_session_dirty();
         }
@@ -3706,6 +3772,7 @@ impl AppState {
             agent_name_changed,
             agent_released,
             agent_release_status: agent_released.then(|| pane_agent_status(change.state, seen)),
+            suppress_completion,
         };
         Some(update)
     }
@@ -3772,6 +3839,7 @@ impl AppState {
         ws_idx: usize,
         pane_id: PaneId,
         change: &EffectiveStateChange,
+        suppress_completion: bool,
     ) -> Option<bool> {
         let suppress_active_tab_notifications = self.pane_suppresses_notifications(ws_idx, pane_id);
         let pane = self.workspaces[ws_idx]
@@ -3781,13 +3849,17 @@ impl AppState {
 
         if change.state != AgentState::Idle {
             pane.seen = true;
-        } else if is_completion_transition(change) {
+        } else if !suppress_completion && is_completion_transition(change) {
             pane.seen = suppress_active_tab_notifications;
         }
         let seen = pane.seen;
 
-        if let Some(delivery) = self.record_or_deliver_agent_notification(ws_idx, pane_id, change) {
-            self.apply_agent_notification_delivery(&delivery);
+        if !suppress_completion {
+            if let Some(delivery) =
+                self.record_or_deliver_agent_notification(ws_idx, pane_id, change)
+            {
+                self.apply_agent_notification_delivery(&delivery);
+            }
         }
 
         Some(seen)
@@ -4121,26 +4193,6 @@ mod tests {
                 std::time::Instant::now(),
             )
             .unwrap();
-    }
-
-    fn insert_test_pane_graphics_layer(state: &mut AppState, pane_id: PaneId) {
-        state.pane_graphics_layers.insert(
-            pane_id,
-            crate::app::state::PaneGraphicsLayer::new(
-                crate::api::schema::PaneGraphicsFormat::Rgba,
-                1,
-                1,
-                vec![1, 2, 3, 4],
-                crate::api::schema::PaneGraphicsPlacementParams::default(),
-            ),
-        );
-    }
-
-    fn insert_test_pane_graphics_state(state: &mut AppState, pane_id: PaneId) {
-        insert_test_pane_graphics_layer(state, pane_id);
-        state
-            .pane_graphics_streams
-            .insert(pane_id, "test-stream".into());
     }
 
     fn mark_linked_worktree(state: &mut AppState, ws_idx: usize) {
@@ -6299,6 +6351,97 @@ mod tests {
     }
 
     #[test]
+    fn first_idle_after_process_detection_is_not_completion() {
+        let mut state = app_with_workspaces(&["active", "background"]);
+        state.toast_config.delivery = crate::config::ToastDelivery::Herdr;
+        state.active = Some(0);
+        let pane_id = *state.workspaces[1].panes.keys().next().unwrap();
+
+        state.handle_app_event(AppEvent::AgentProcessDetected {
+            pane_id,
+            agent: Agent::Pi,
+            observed_at: Instant::now(),
+        });
+        let direct_idle = state
+            .handle_app_event(AppEvent::StateChanged {
+                pane_id,
+                agent: Some(Agent::Pi),
+                state: AgentState::Idle,
+                visible_blocker: false,
+                visible_working: false,
+                process_exited: false,
+                observed_at: Instant::now(),
+            })
+            .pop()
+            .expect("direct idle state update");
+        assert!(direct_idle.suppress_completion);
+
+        state.handle_app_event(AppEvent::AgentProcessDetected {
+            pane_id,
+            agent: Agent::Pi,
+            observed_at: Instant::now(),
+        });
+        for agent_state in [AgentState::Working, AgentState::Blocked] {
+            state.handle_app_event(AppEvent::StateChanged {
+                pane_id,
+                agent: Some(Agent::Pi),
+                state: agent_state,
+                visible_blocker: agent_state == AgentState::Blocked,
+                visible_working: agent_state == AgentState::Working,
+                process_exited: false,
+                observed_at: Instant::now(),
+            });
+        }
+        let update = state
+            .handle_app_event(AppEvent::StateChanged {
+                pane_id,
+                agent: Some(Agent::Pi),
+                state: AgentState::Idle,
+                visible_blocker: false,
+                visible_working: false,
+                process_exited: false,
+                observed_at: Instant::now(),
+            })
+            .pop()
+            .expect("idle state update");
+
+        assert!(update.suppress_completion);
+        assert!(state.workspaces[1].panes[&pane_id].seen);
+        assert!(!matches!(
+            state.toast.as_ref().map(|toast| toast.kind),
+            Some(ToastKind::Finished)
+        ));
+
+        state.handle_app_event(AppEvent::AgentProcessDetected {
+            pane_id,
+            agent: Agent::Codex,
+            observed_at: Instant::now(),
+        });
+        state.handle_app_event(AppEvent::StateChanged {
+            pane_id,
+            agent: Some(Agent::Codex),
+            state: AgentState::Working,
+            visible_blocker: false,
+            visible_working: true,
+            process_exited: false,
+            observed_at: Instant::now(),
+        });
+        let exit_update = state
+            .handle_app_event(AppEvent::StateChanged {
+                pane_id,
+                agent: Some(Agent::Codex),
+                state: AgentState::Idle,
+                visible_blocker: false,
+                visible_working: false,
+                process_exited: true,
+                observed_at: Instant::now(),
+            })
+            .pop()
+            .expect("process exit update");
+        assert!(!exit_update.suppress_completion);
+    }
+
+    #[test]
     fn waiting_sound_plays_even_in_active_workspace() {
         assert_eq!(
             notification_sound_for_state_change(true, AgentState::Working, AgentState::Blocked),
@@ -6998,6 +7141,7 @@ mod tests {
                 version: crate::detect::manifest_update::ManifestVersion::parse("2026.06.10.1")
                     .unwrap(),
             }],
+            activated: Vec::new(),
             status,
         });
 
@@ -7157,16 +7301,12 @@ mod tests {
                 entrypoint: "board".into(),
             },
         );
-        insert_test_pane_graphics_state(&mut state, closed);
         state
             .collection_archive_times
             .insert(closed, std::time::SystemTime::now());
-
         state.close_pane();
         assert_eq!(state.workspaces[0].panes.len(), 1);
         assert!(!state.plugin_panes.contains_key(&closed));
-        assert!(!state.pane_graphics_layers.contains_key(&closed));
-        assert!(!state.pane_graphics_streams.contains_key(&closed));
         assert!(!state.collection_archive_times.contains_key(&closed));
         state.assert_invariants_for_test();
     }
@@ -7241,14 +7381,10 @@ mod tests {
                 entrypoint: "board".into(),
             },
         );
-        insert_test_pane_graphics_state(&mut state, pane_id);
-
         state.close_tab();
 
         assert!(!state.terminals.contains_key(&terminal_id));
         assert!(!state.plugin_panes.contains_key(&pane_id));
-        assert!(!state.pane_graphics_layers.contains_key(&pane_id));
-        assert!(!state.pane_graphics_streams.contains_key(&pane_id));
         state.assert_invariants_for_test();
     }
 
@@ -7266,14 +7402,10 @@ mod tests {
                 entrypoint: "board".into(),
             },
         );
-        insert_test_pane_graphics_state(&mut state, pane_id);
-
         state.close_selected_workspace();
 
         assert!(!state.terminals.contains_key(&terminal_id));
         assert!(!state.plugin_panes.contains_key(&pane_id));
-        assert!(!state.pane_graphics_layers.contains_key(&pane_id));
-        assert!(!state.pane_graphics_streams.contains_key(&pane_id));
         state.assert_invariants_for_test();
     }
 

@@ -1,14 +1,40 @@
 use std::path::PathBuf;
 
 use crate::api::schema::{
-    EventData, EventEnvelope, EventKind, ResponseResult, WorkspaceCreateParams,
-    WorkspaceMoveBlockParams, WorkspaceMoveParams, WorkspaceRenameParams,
+    EventData, EventEnvelope, EventKind, ResponseResult, WorkspaceCloseParams,
+    WorkspaceCreateParams, WorkspaceMoveBlockParams, WorkspaceMoveParams, WorkspaceRenameParams,
     WorkspaceReportMetadataParams, WorkspaceReportResourcesParams, WorkspaceTarget,
 };
 use crate::app::App;
 
 use super::super::api_helpers::{normalize_metadata_source, normalize_metadata_ttl};
 use super::responses::{encode_error, encode_success};
+
+pub(super) struct WorkspaceCloseRequest {
+    workspace_id: String,
+    close_group: bool,
+    require_group_intent: bool,
+}
+
+impl From<WorkspaceCloseParams> for WorkspaceCloseRequest {
+    fn from(params: WorkspaceCloseParams) -> Self {
+        Self {
+            workspace_id: params.workspace_id,
+            close_group: params.close_group,
+            require_group_intent: true,
+        }
+    }
+}
+
+impl From<WorkspaceTarget> for WorkspaceCloseRequest {
+    fn from(target: WorkspaceTarget) -> Self {
+        Self {
+            workspace_id: target.workspace_id,
+            close_group: false,
+            require_group_intent: false,
+        }
+    }
+}
 
 impl App {
     pub(super) fn handle_workspace_list(&mut self, id: String) -> String {
@@ -395,14 +421,31 @@ impl App {
         }
     }
 
-    pub(super) fn handle_workspace_close(&mut self, id: String, target: WorkspaceTarget) -> String {
-        let Some(index) = self.parse_workspace_id(&target.workspace_id) else {
-            return workspace_not_found(id, &target.workspace_id);
+    pub(super) fn handle_workspace_close(
+        &mut self,
+        id: String,
+        params: impl Into<WorkspaceCloseRequest>,
+    ) -> String {
+        let params = params.into();
+        let Some(index) = self.parse_workspace_id(&params.workspace_id) else {
+            return workspace_not_found(id, &params.workspace_id);
         };
         if self.state.workspaces.get(index).is_none() {
-            return workspace_not_found(id, &target.workspace_id);
+            return workspace_not_found(id, &params.workspace_id);
         }
-        self.close_workspace_with_lifecycle(index, true);
+        let closes_group = self.state.workspace_close_indices(index).len() >= 2;
+        if closes_group && params.require_group_intent && !params.close_group {
+            return encode_error(
+                id,
+                "workspace_group_close_required",
+                "workspace has linked worktree workspaces; use --group (close_group=true in the API) to close the group",
+            );
+        }
+        if closes_group && params.close_group {
+            self.close_workspace_group_with_lifecycle(index);
+        } else {
+            self.close_workspace_with_lifecycle(index, true);
+        }
         encode_success(id, ResponseResult::Ok {})
     }
 
@@ -439,7 +482,6 @@ impl App {
                 }
             }
         }
-
         self.state.selected = index;
         let destruction = self.state.close_selected_workspace();
         self.shutdown_detached_terminal_runtimes();
@@ -513,37 +555,10 @@ impl App {
         self.emit_workspace_attention_updates(affected);
     }
 
-    /// Close a worktree group for the tab/pane implicit-close paths. Workspace/Checkout close
-    /// deliberately does not use this path.
+    /// Close a complete worktree group while emitting nested pane, collection, tab,
+    /// workspace, repository, and delegated-attention lifecycle events.
     pub(super) fn close_workspace_group_with_lifecycle(&mut self, index: usize) {
-        let has_nested_lifecycle = self.state.workspaces[index].tabs.iter().any(|tab| {
-            !tab.layout.collection_ids().is_empty()
-                || tab.layout.pane_ids().into_iter().any(|pane_id| {
-                    self.state
-                        .delegations
-                        .delegation_for_pane(pane_id)
-                        .is_some()
-                })
-        });
-        let close_indices = has_nested_lifecycle
-            .then(|| self.state.workspaces[index].worktree_space())
-            .flatten()
-            .filter(|space| !space.is_linked_worktree)
-            .map(|space| {
-                self.state
-                    .workspaces
-                    .iter()
-                    .enumerate()
-                    .filter_map(|(idx, workspace)| {
-                        workspace
-                            .worktree_space()
-                            .is_some_and(|member| member.key == space.key)
-                            .then_some(idx)
-                    })
-                    .collect::<Vec<_>>()
-            })
-            .filter(|indices| indices.len() >= 2)
-            .unwrap_or_else(|| vec![index]);
+        let close_indices = self.state.workspace_close_indices(index);
         let workspace_snapshots = close_indices
             .iter()
             .map(|idx| (self.public_workspace_id(*idx), self.workspace_info(*idx)))
@@ -784,6 +799,144 @@ mod tests {
         app
     }
 
+    fn app_with_worktree_group() -> App {
+        let mut app = app_with_linked_worktree();
+        let mut parent = Workspace::test_new("parent");
+        parent.worktree_space = Some(crate::workspace::WorktreeSpaceMembership {
+            key: "repo-key".into(),
+            label: "herdr".into(),
+            repo_root: "/repo/herdr".into(),
+            checkout_path: "/repo/herdr".into(),
+            is_linked_worktree: false,
+        });
+        app.state.workspaces.insert(0, parent);
+        app.state.active = Some(1);
+        app.state.selected = 1;
+        app.state.mode = crate::app::Mode::Terminal;
+        app
+    }
+
+    #[test]
+    fn api_workspace_close_parent_group_requires_explicit_group_intent() {
+        for confirm_close in [true, false] {
+            let mut app = app_with_worktree_group();
+            app.state.confirm_close = confirm_close;
+            let parent_id = app.public_workspace_id(0);
+            let workspace_ids = app
+                .state
+                .workspaces
+                .iter()
+                .map(|workspace| workspace.id.clone())
+                .collect::<Vec<_>>();
+
+            let request: crate::api::schema::Request = serde_json::from_value(serde_json::json!({
+                "id": "req",
+                "method": "workspace.close",
+                "params": { "workspace_id": parent_id }
+            }))
+            .unwrap();
+            let response = app.handle_api_request(request);
+
+            let response: serde_json::Value = serde_json::from_str(&response).unwrap();
+            assert_eq!(response["error"]["code"], "workspace_group_close_required");
+            assert!(app.event_hub.events_after(0).is_empty());
+            assert_eq!(app.state.mode, crate::app::Mode::Terminal);
+            assert_eq!(app.state.active, Some(1));
+            assert_eq!(app.state.selected, 1);
+            assert_eq!(
+                app.state
+                    .workspaces
+                    .iter()
+                    .map(|workspace| workspace.id.clone())
+                    .collect::<Vec<_>>(),
+                workspace_ids
+            );
+        }
+    }
+
+    #[test]
+    fn api_workspace_close_noncontiguous_group_preserves_adversarial_identity_state() {
+        let mut app = app_with_worktree_group();
+        let parent = app.state.workspaces.remove(0);
+        let linked = app.state.workspaces.remove(0);
+        app.state = crate::app::state::AppState::test_with_adversarial_identity_state();
+        let survivor_id = app.state.workspaces[0].id.clone();
+        app.state.workspaces.insert(0, parent);
+        app.state.workspaces.push(linked);
+        app.state.active = Some(1);
+        app.state.selected = 1;
+        app.state.mode = crate::app::Mode::Terminal;
+        app.state.ensure_test_terminals();
+        let closed_pane_ids = [0, 2].map(|index| {
+            app.state.workspaces[index].tabs[0]
+                .root_pane
+                .expect("test tab has root pane")
+        });
+        let closed_terminal_ids = [0, 2].map(|index| {
+            app.state
+                .terminal_id_for_pane(index, closed_pane_ids[index / 2])
+                .expect("closed workspace pane has a terminal")
+        });
+        for pane_id in closed_pane_ids {
+            app.state.plugin_panes.insert(
+                pane_id,
+                crate::app::state::PluginPaneRecord {
+                    plugin_id: "example.pane".into(),
+                    entrypoint: "board".into(),
+                },
+            );
+        }
+        app.state.assert_invariants_for_test();
+
+        let parent_id = app.public_workspace_id(0);
+        let closed = [0, 2]
+            .into_iter()
+            .map(|index| (app.public_workspace_id(index), app.workspace_info(index)))
+            .collect::<Vec<_>>();
+
+        let response = app.handle_workspace_close(
+            "req".into(),
+            WorkspaceCloseParams {
+                workspace_id: parent_id,
+                close_group: true,
+            },
+        );
+
+        let success: SuccessResponse = serde_json::from_str(&response).unwrap();
+        assert_eq!(success.id, "req");
+        assert_eq!(app.state.workspaces.len(), 1);
+        assert_eq!(app.state.workspaces[0].id, survivor_id);
+        for terminal_id in closed_terminal_ids {
+            assert!(!app.state.terminals.contains_key(&terminal_id));
+        }
+        for pane_id in closed_pane_ids {
+            assert!(!app.state.plugin_panes.contains_key(&pane_id));
+        }
+        assert!(app.state.terminal_runtime_shutdowns.is_empty());
+        app.state.assert_invariants_for_test();
+        let events = app.event_hub.events_after(0);
+        let workspace_closed = events
+            .iter()
+            .filter(|(_, event)| event.event == EventKind::WorkspaceClosed)
+            .collect::<Vec<_>>();
+        assert_eq!(workspace_closed.len(), closed.len());
+        for ((_, event), (workspace_id, workspace)) in workspace_closed.into_iter().zip(closed) {
+            assert!(matches!(
+                &event.data,
+                EventData::WorkspaceClosed {
+                    workspace_id: closed_id,
+                    workspace: Some(closed_workspace),
+                } if closed_id == &workspace_id && closed_workspace == &workspace
+            ));
+        }
+        assert!(!events.iter().any(|(_, event)| {
+            matches!(
+                &event.data,
+                EventData::WorkspaceClosed { workspace_id, .. } if workspace_id == &survivor_id
+            )
+        }));
+    }
+
     #[test]
     fn opening_nested_path_reuses_existing_checkout() {
         let root =
@@ -831,19 +984,22 @@ mod tests {
 
     #[test]
     fn api_workspace_close_closes_linked_worktree_workspace_only() {
-        let mut app = app_with_linked_worktree();
+        let mut app = app_with_worktree_group();
+        let linked_id = app.public_workspace_id(1);
 
         let response = app.handle_workspace_close(
             "req".into(),
-            WorkspaceTarget {
-                workspace_id: app.state.workspaces[0].id.clone(),
+            WorkspaceCloseParams {
+                workspace_id: linked_id,
+                close_group: true,
             },
         );
 
         let success: SuccessResponse = serde_json::from_str(&response).unwrap();
         assert_eq!(success.id, "req");
         assert_eq!(app.state.request_remove_linked_worktree, None);
-        assert!(app.state.workspaces.is_empty());
+        assert_eq!(app.state.workspaces.len(), 1);
+        assert_eq!(app.state.workspaces[0].display_name(), "parent");
     }
 
     #[test]
@@ -856,8 +1012,9 @@ mod tests {
 
         let response = app.handle_workspace_close(
             "req".into(),
-            WorkspaceTarget {
+            WorkspaceCloseParams {
                 workspace_id: workspace_id.clone(),
+                close_group: false,
             },
         );
 

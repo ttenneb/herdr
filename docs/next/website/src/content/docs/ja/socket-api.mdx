@@ -96,24 +96,26 @@ herdr pane read w1:p2 --source recent --lines 50
 | 通知 | `notification.show` |
 | クライアント | `client.window_title.set`、`client.window_title.clear` |
 | セッション | `session.snapshot` |
-| ワークスペース | `workspace.create`、`workspace.list`、`workspace.get`、`workspace.focus`、`workspace.rename`、`workspace.move`、`workspace.move_block`、`workspace.report_metadata`、`workspace.close` |
+| リポジトリ | `repository.list`、`repository.get`、`repository.focus`、`repository.rename`、`repository.move`、`repository.close` |
+| チェックアウト | `checkout.open`、`checkout.focus`、`checkout.rename`、`checkout.move`、`checkout.close` |
+| ワークスペース互換 | `workspace.create`、`workspace.list`、`workspace.get`、`workspace.focus`、`workspace.rename`、`workspace.move`、`workspace.move_block`、`workspace.report_metadata`、`workspace.resources.report`、`workspace.close` |
 | Worktree | `worktree.list`、`worktree.create`、`worktree.open`、`worktree.remove` |
 | タブ | `tab.create`、`tab.list`、`tab.get`、`tab.focus`、`tab.rename`、`tab.move`、`tab.close` |
-| ペイン | `pane.split`、`pane.swap`、`pane.move`、`pane.zoom`、`pane.layout`、`pane.process_info`、`pane.neighbor`、`pane.edges`、`pane.focus_direction`、`pane.resize`、`pane.list`、`pane.current`、`pane.get`、`pane.rename`、`pane.send_text`、`pane.send_keys`、`pane.send_input`、`pane.read`、`pane.graphics.info`、`pane.graphics.set`、`pane.graphics.clear`、`pane.graphics.stream`、`pane.report_agent`、`pane.report_agent_session`、`pane.report_metadata`、`pane.clear_agent_authority`、`pane.release_agent`、`pane.close`、`pane.wait_for_output` |
+| ペイン | `pane.split`、`pane.swap`、`pane.move`、`pane.zoom`、`pane.layout`、`pane.process_info`、`pane.neighbor`、`pane.edges`、`pane.focus_direction`、`pane.resize`、`pane.list`、`pane.current`、`pane.get`、`pane.rename`、`pane.send_text`、`pane.send_keys`、`pane.send_input`、`pane.input.set`、`pane.read`、`pane.graphics.info`、`pane.graphics.set`、`pane.graphics.clear`、`pane.graphics.stream`、`pane.report_agent`、`pane.report_agent_session`、`pane.report_metadata`、`pane.clear_agent_authority`、`pane.release_agent`、`pane.close`、`pane.wait_for_output` |
 | コレクション | `collection.list`、`collection.get`、`collection.create`、`collection.add`、`collection.move`、`collection.promote`、`collection.select`、`collection.reorder`、`collection.archive`、`collection.restore`、`collection.member_create`、`collection.close` |
 | 委譲 | `delegation.create`、`delegation.get`、`delegation.tree`、`delegation.root`、`delegation.descendants`、`delegation.reparent`、`delegation.reorder` |
 | ポップアップ | `popup.close` |
 | レイアウト | `layout.export`、`layout.apply`、`layout.set_split_ratio` |
-| エージェント | `agent.list`、`agent.get`、`agent.read`、`agent.explain`、`agent.send_keys`、`agent.prompt`、`agent.wait`、`agent.rename`、`agent.focus`、`agent.start` |
+| エージェント | `agent.list`、`agent.get`、`agent.read`、`agent.explain`、`agent.send_keys`、`agent.prompt`、`agent.wait`、`agent.rename`、`agent.focus`、`agent.start`、`agent.view.set`、`agent.view.clear` |
 | イベント | `events.subscribe`、`events.wait` |
 | インテグレーション | `integration.install`、`integration.uninstall` |
 | プラグイン | `plugin.link`、`plugin.list`、`plugin.unlink`、`plugin.enable`、`plugin.disable`、`plugin.action.list`、`plugin.action.invoke`、`plugin.log.list`、`plugin.pane.open`、`plugin.pane.focus`、`plugin.pane.close` |
 
-`agent.wait` はサーバー所有でイベント駆動です。解決したペイン占有者に固定されるため、置換されたエージェントが待機を満たすことはありません。`agent.prompt` は `until` と `timeout_ms` を持つ省略可能な `wait` オブジェクトを受け付けます。これにより、プロンプト送信と待機開始を 1 つのリクエストで行い、別々の呼び出し間の競合を避けられます。成功した `agent.prompt` は、現在の端末ランタイムが直列化された text → delay → Enter トランザクションを受理したことを意味し、PTY への最終的な配信を保証するものではありません。各端末は、アクティブ分を含め最大 8 件、合計 64 KiB のプロンプトトランザクションを受理します。`agent_prompt_queue_full` の場合はランタイムの処理完了後に再試行してください。`agent_prompt_payload_too_large` は単一のトランザクションが 64 KiB を超えることを示します。ランタイムの終了または置換は保留中のトランザクションを取り消し、置換先へは書き込みません。
+`agent.wait` はサーバー所有でイベント駆動です。解決したペイン占有者に固定されるため、置換されたエージェントが待機を満たすことはありません。`agent.prompt` は `until` と `timeout_ms` を持つ省略可能な `wait` オブジェクトを受け付けます。これにより、プロンプト送信と待機開始を 1 つのリクエストで行い、別々の呼び出し間の競合を避けられます。解決したエージェントがすでに `blocked` の場合、`agent.prompt` は入力を送信せず、待機も開始せずに `agent_blocked` を返します。成功した `agent.prompt` は、現在の端末ランタイムが直列化された text → delay → Enter トランザクションを受理したことを意味し、PTY への最終的な配信を保証するものではありません。各端末は、アクティブ分を含め最大 8 件、合計 64 KiB のプロンプトトランザクションを受理します。`agent_prompt_queue_full` の場合はランタイムの処理完了後に再試行してください。`agent_prompt_payload_too_large` は単一のトランザクションが 64 KiB を超えることを示します。ランタイムの終了または置換は保留中のトランザクションを取り消し、置換先へは書き込みません。
 
 `workspace.move_block` は、順序付きの `workspace_ids` を `before_workspace_id` の前へアトミックに移動します。アンカーを省略するとブロックを末尾へ移動します。id は一意である必要があり、アンカーをブロックに含めることはできません。レスポンスにはサーバーが確定した順序付きワークスペース一覧が含まれます。
 
-`session.snapshot` は、独自のローカルランタイムキャッシュを持つクライアント向けに、一度限りのブートストラップスナップショットを返します。レスポンスには、バージョン/プロトコルメタデータ、フォーカス中のワークスペース/タブ/ペイン id、ワークスペース、タブ、ペイン、タブレイアウト、エージェントの各レコードが含まれます。これは購読ではありません。取得後はリソースイベントを購読し、そのイベントでローカルキャッシュを更新してください。再接続後やキャッシュが古い可能性がある場合は、`session.snapshot` を再度呼び出します。ワークスペースレコードには、関連付けられた worktree の出自情報も含まれます。リポジトリ全体の worktree 検出には引き続き `worktree.list` を使います。
+`session.snapshot` は、独自のローカルランタイムキャッシュを持つクライアント向けに、一度限りのブートストラップスナップショットを返します。レスポンスには、バージョン/プロトコルメタデータ、`result.snapshot.sequence` のウォーターマーク、フォーカス中のワークスペース/タブ/ペイン id、ワークスペース、タブ、ペイン、タブレイアウト、エージェントの各レコードが含まれます。これは購読ではありません。ブートストラップ中のイベントを取りこぼさないよう、まず別の接続で `events.subscribe` を開き、`subscription_started` の確認応答を待ちます。その `result.sequence` は、リクエスト内のすべての購読に共通して受理されたセッション全体のカーソルです。そのストリームをバッファしながら `session.snapshot` を呼び出してスナップショットを適用し、トップレベルの `sequence` がスナップショットのウォーターマーク以下であるバッファ済み行を破棄してから、残りを受信順に適用し、そのままストリーミングを続けます。カスタム観測ごとに新しいグローバル値が予約されますが、重複するライフサイクル購読では同じイベント値が繰り返されることがあります。`sequence` を購読ごとのカウンターとして扱ったり、すべてのストリーム行が一意であると仮定したりしないでください。再接続後やキャッシュが古い可能性がある場合は、`session.snapshot` を再度呼び出します。ワークスペースレコードには `repository_id` と `checkout` の出自情報が追加され、従来の `worktree` の出自情報も維持されます。リポジトリレコードは、チェックアウトの順序、優先ベース、MRU フォーカスを保持します。リポジトリ全体の worktree 検出には引き続き `worktree.list` を使います。
 
 CLI の `herdr api snapshot` は、クライアントやエージェントが簡単にブートストラップできるよう、現在の `session.snapshot` レスポンスを JSON で出力します。
 
@@ -139,11 +141,14 @@ CLI の `herdr api snapshot` は、クライアントやエージェントが簡
 {"id":"req_focus","method":"pane.focus_direction","params":{"direction":"right"}}
 {"id":"req_resize","method":"pane.resize","params":{"pane_id":"w1:p1","direction":"right","amount":0.1}}
 {"id":"req_zoom","method":"pane.zoom","params":{"pane_id":"w1:p1","mode":"toggle"}}
-{"id":"req_split","method":"pane.split","params":{"direction":"right","ratio":0.333,"env":{"HERDR_ROLE":"tests"}}}
+{"id":"req_input","method":"pane.input.set","params":{"pane_id":"w1:p1","right_click":"pane"}}
+{"id":"req_split","method":"pane.split","params":{"direction":"right","ratio":0.333,"right_click":"pane","env":{"HERDR_ROLE":"tests"}}}
 {"id":"req_process","method":"pane.process_info","params":{"pane_id":"w1:p1"}}
 ```
 
 `pane.current` は単一の `PaneInfo` を返します。`caller_pane_id` があるときはそのペインを返します。省略時はアクティブなフォーカス中ペインを返します。
+
+`pane.input.set` は、1 つのペインの `right_click` を `herdr` または `pane` に設定します。デフォルトは `herdr` です。`pane` を指定すると、アプリケーションがターミナルのマウスレポーティングを要求している間、修飾キーなしの右クリック、ホールド、ドラッグを転送します。それ以外の場合は Herdr のペインメニューにフォールバックします。ペイン枠の右クリックは常に Herdr のメニューを開きます。`pane.split` は、新しく作成するペインに同じ省略可能な `right_click` 値を受け付けます。
 
 ターミナルのスクロール情報を取得できる場合、`PaneInfo` には `scroll` が含まれます:
 
@@ -159,7 +164,9 @@ CLI の `herdr api snapshot` は、クライアントやエージェントが簡
 
 ### 実験的なペイングラフィックス
 
-ペイングラフィックスを使うと、プラグインがペイン上に画像データを配置できます。`[experimental].kitty_graphics = true` の場合にのみ利用でき、それ以外ではすべてのペイングラフィックスメソッドが `feature_disabled` を返します。`pane.graphics.info` はグラフィックスレイヤーを作成せず、接続中クライアントのセルの幅と高さをピクセル単位で返します。`pane.graphics.set` は `data_base64` の `png`、`rgb`、`rgba` データを受け取り、`pane.graphics.clear` はレイヤーを削除します。
+ペイングラフィックスを使うと、プラグインがペイン上に画像データを配置できます。`[experimental].kitty_graphics = true` の場合にのみ利用でき、それ以外ではすべてのペイングラフィックスメソッドが `feature_disabled` を返します。`pane.graphics.info` を明示的に呼ぶと機能検出が有効になり、接続中クライアントのセルサイズ、ファイルフレームのオプション、ピクセル単位のマウス対応、最大 16 レイヤー、`pane_visible` が返されます。`pane_visible` は対象がアクティブなワークスペースとタブにあり、ズームで隠されていない場合だけ true です。短時間の UI モードでは変わりません。
+
+`pane.graphics.set`、`pane.graphics.clear`、`pane.graphics.stream` は省略可能な `layer_id`（デフォルトは `primary`）を受け付けます。set と stream は `z_index` も受け付け、レイヤーは安定した `(z_index, layer_id)` 順に配置されます。各ストリームはそのレイヤーを排他的に所有し、閉じるとレイヤーも削除されます。インラインフレームの形式は `png`、`rgb`、`rgba`、`bgra` で、BGRA は一度だけ所有 RGBA に正規化されます。Herdr はレンダーパスごとに 1 つの画像トランザクションをホストキャッシュへ進めるため、任意のレイヤー集合が集約フレームなしで進行します。ヘッドレス転送では各トランザクションを 32 MiB のワイヤ上限内に保ちますが、ローカルのモノリシック描画にはこの上限を適用しません。
 
 ```json
 {"id":"graphics_info","method":"pane.graphics.info","params":{"pane_id":"w1:p1"}}
@@ -167,12 +174,16 @@ CLI の `herdr api snapshot` は、クライアントやエージェントが簡
 {"id":"graphics_clear","method":"pane.graphics.clear","params":{"pane_id":"w1:p1"}}
 ```
 
-フレームを繰り返し送る場合は、`pane.graphics.stream` で専用ソケットを開きます。Herdr が `ok` を返した後、フレームごとに 1 つの JSON ヘッダーと正確に `data_length` バイトの生データを送ります。ソケットが閉じるまでストリームがそのペインのグラフィックスレイヤーを所有し、同時に set、clear、stream を要求すると `stream_conflict` を返します。
+フレームを繰り返し送る場合は、`pane.graphics.stream` で専用ソケットを開きます。Herdr が `ok` を返した後、インラインフレームごとに 1 つの JSON ヘッダーと正確に `data_length` バイトの生データを送ります。そのレイヤーへの同時操作は `stream_conflict` を返します。
 
 ```json
-{"id":"graphics_stream","method":"pane.graphics.stream","params":{"pane_id":"w1:p1"}}
+{"id":"graphics_stream","method":"pane.graphics.stream","params":{"pane_id":"w1:p1","z_index":0}}
 {"format":"png","image_width":800,"image_height":600,"data_length":12345,"placement":{"viewport_col":0,"viewport_row":0,"grid_cols":80,"grid_rows":30}}
 ```
+
+`pane.graphics.info` が `file_frame_transport: "direct-kitty"` を通知した場合、対象となるローカルの Ghostty、kitty、WezTerm クライアントは、不変で非公開の `rgba` または `bgra` ファイルを `file.path`、`sequence`、`revision` とともに送信できます。Direct Kitty ファイル転送はデフォルトの `primary` ページレイヤー専用です。名前付きのセカンダリレイヤーは所有インライン RGBA を使い、BGRA は常にコピー、スウィズルされてインライン描画されます。Herdr はターミナルがファイルを受理した後、または安全な所有インラインフォールバックを導入した後にだけ `pane_graphics_frame_ack` を返します。ファイル転送の失敗が確認されると、そのクライアント接続では direct file が無効になりますが、正確なピクセルマウスは無効になりません。タイムアウトまたはクライアント切断時は、送信元の再利用を確認応答せずストリームを閉じます。モノリシックな `--no-session` モードは高速ファイル転送も正確なピクセルマウスも通知せず、所有インラインフォールバックを使います。
+
+Direct file は常に完全な正規 `width * height * 4` RGBA フレームです。`file_frame_max_bytes` は所有インラインフォールバックの対象にできる上限です。`file_frame_transport` が利用可能な場合、primary レイヤーの RGBA ファイルはより大きい `file_frame_direct_max_bytes` 上限を使えます。フォールバック上限を超えるフレームは、ターミナルが direct 転送を受理した場合にのみ確認応答され、拒否されるとストリームが閉じます。所有インラインフォールバックを使えないフレームのペインが一時的に非表示、または再描画中に配置不能な場合、Herdr は画像を表示せずアップロードし、ペインが再表示されたときに配置を再生します。`file_frame_damage: true` はプロデューサ側の正規リング効率化に省略可能な damage メタデータを受け付けることを示しますが、完全なファイルをコピーまたは表示します。リサイズと完全再描画ではピクセルを再送せず配置を再生します。
 
 `pane.layout` は、`workspace_id`、`tab_id`、`zoomed`、外側の `area`、`focused_pane_id`、ペインの矩形、分割の矩形/比率を含むタブレイアウトのスナップショットを返します。`pane.neighbor` と `pane.edges` は同じレイアウトスナップショットを含むので、クライアントは非公開のレイアウト状態なしに次の判断を下せます。
 
@@ -285,7 +296,7 @@ reason の候補は `shown`、`disabled`、`rate_limited`、`no_foreground_clien
 {"id":"req_title_clear","method":"client.window_title.clear","params":{}}
 ```
 
-`client.window_title.clear` は Herdr のデフォルトタイトルを復元します。レスポンスは `type: "client_window_title"` で、`changed` と、`set`、`cleared`、`no_foreground_client` のいずれかの reason を含みます。
+`client.window_title.clear` はタイトルを `ui.window_title` に戻します。レスポンスは `type: "client_window_title"` で、`changed` と、`set`、`cleared`、`no_foreground_client` のいずれかの reason を含みます。
 
 Worktree メソッドは Git チェックアウトを Herdr ワークスペースとして管理します。`worktree.create` はチェックアウトを作成し、新しい `workspace`、`tab`、`root_pane`、`worktree` のレコードを返します。要求されたブランチがローカルに既存ならそれをチェックアウトし、なければ要求されたベースまたは `HEAD` からブランチを作成します。`worktree.open` は既存のチェックアウトを開くか、すでに開いているワークスペースを返します。`worktree.remove` はリンクされた子ワークスペースに対して `git worktree remove` を実行し、ブランチは決して削除しません。
 
@@ -307,9 +318,13 @@ Worktree メソッドは Git チェックアウトを Herdr ワークスペー�
 {"id":"req_3","method":"worktree.remove","params":{"workspace_id":"2","force":false}}
 ```
 
+4 つの raw worktree メソッドはすべて `trust_repository` を受け付け、省略時のデフォルトは `false` です。Git が選択されたリポジトリを所有権が安全でない、または疑わしいとして拒否した場合を除き、`false` のままにしてください。解決されたリポジトリパスを独立して確認した後、同じリクエストを `"trust_repository": true` で再試行します。信頼はリクエスト単位です。Herdr はそのリクエストの Git サブプロセスだけに `git -c safe.directory=<resolved-repository>` を追加します。信頼を永続化せず、Git 設定を変更せず、他のパスを信頼しません。後続の各リクエストは再び `false` がデフォルトとなり、必要な場合は個別に明示する必要があります。
+
 `worktree.list`、`worktree.create`、`worktree.open` では `workspace_id` と `cwd` は最大どちらか一方だけを使い、両方省略するとアクティブなワークスペースを使います。`worktree.open` では `path` と `branch` のちょうど一方を使います。生のソケットの `cwd` と `path` の値は絶対パスでなければなりません。CLI は相対の `--cwd` と `--path` の値をリクエスト送信前に展開します。ワークスペースが Herdr の worktree グループに属している場合、ワークスペースのレスポンスには任意の `worktree` 出自情報が含まれます。既存のワークスペースが worktree の出自情報を獲得または変更したとき、worktree コマンドは `workspace.updated` を発行することがあります。
 
 worktree コマンドはライフサイクルイベントも発行します。`worktree.create` は `workspace.created`、`tab.created`、`pane.created`、`worktree.created` を発行します。`worktree.open` は `worktree.opened` を発行し、新しい Herdr ワークスペースを開いた場合はワークスペース/タブ/ペインの作成イベントも発行します。`worktree.remove` は `worktree.removed` を発行し、リンクされたワークスペースがまだ開いている場合は `workspace.closed` も発行します。
+
+リンクされた worktree ワークスペースが開いている親ワークスペースを `workspace.close` で閉じるには、params に `"close_group": true` が必要です。明示的なグループクローズ指定がない場合は `workspace_group_close_required` を返します。明示的なグループクローズは、閉じた各ワークスペースについて `workspace.closed` イベントを 1 件ずつ発行します。
 
 ## エージェントビューのクエリ
 
@@ -667,7 +682,9 @@ workspace の get/list 応答は結果の `tokens` マップを公開し、ス�
 }
 ```
 
-最初のレスポンスは購読の確認応答です。以降の行はプッシュされるイベントです。
+最初のレスポンスは、`result` 内の `{"type":"subscription_started","sequence":N}` として購読を確認します。`N` は、リクエストされたすべての購読に共通するセッション全体の受理カーソルです。以降のライフサイクルイベントとカスタムイベントの行は、トップレベルにセッション全体の `sequence` を持ち、カーソル順にマージされます。同じ値の場合はリクエスト順が優先されます。プローブに基づくカスタム観測はそれぞれ次のグローバルシーケンスを予約するため、スナップショットのウォーターマークはこれらの観測にも順序を与えます。ライフサイクルイベントの購読は受理カーソルから始まり、それ以前に保持されていたイベントは再生しません。
+
+Herdr はストリームの追いつき用に最新 512 件のライフサイクルイベントを保持します。購読側が遅れ、次に必要なカーソルが利用できなくなった場合、サーバーはコード `resync_required` のエラーレスポンスを書き込み、そのソケットを閉じます。部分的なキャッシュから続行せず、新しい購読を開き、新しい `session.snapshot` を取得して、上記のウォーターマークに基づくブートストラップ手順を繰り返してください。
 
 ワークスペースのイベント購読には `workspace.created`、`workspace.updated`、`workspace.metadata_updated`、`workspace.renamed`、`workspace.moved`、`workspace.reordered`、`workspace.closed`、`workspace.focused` があります。`workspace.metadata_updated` はプラグインイベントフックを実行せずにトークン変更と TTL 失効を報告します。その他のワークスペースイベントは Herdr の UI/ランタイムのライフサイクルを記述します。ワークスペースが worktree グループに属している場合、`workspace.created` は任意の `workspace.worktree` 出自情報を含みます。`workspace.moved` は、移動した `workspace_id`、要求された `insert_index`、更新済みの順序付き `workspaces` リストを含みます。`workspace.reordered` は、アトミックに移動した `workspace_ids`、省略可能な `before_workspace_id`、サーバーが確定した順序付き `workspaces` リストを含みます。削除前に Herdr がまだ識別できる場合、`workspace.closed` は最終的な `workspace` スナップショットを含みます。
 タブのイベント購読には `tab.created`、`tab.closed`、`tab.focused`、`tab.renamed`、`tab.moved` があります。`tab.moved` は、移動した `tab_id`、`workspace_id`、要求された `insert_index`、そのワークスペースの更新済みの順序付き `tabs` リストを含みます。

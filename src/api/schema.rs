@@ -88,7 +88,7 @@ pub enum Method {
     #[serde(rename = "workspace.resources.report")]
     WorkspaceReportResources(WorkspaceReportResourcesParams),
     #[serde(rename = "workspace.close")]
-    WorkspaceClose(WorkspaceTarget),
+    WorkspaceClose(WorkspaceCloseParams),
     #[serde(rename = "repository.list")]
     RepositoryList(EmptyParams),
     #[serde(rename = "repository.get")]
@@ -229,6 +229,8 @@ pub enum Method {
     PaneGet(PaneTarget),
     #[serde(rename = "pane.focus")]
     PaneFocus(PaneTarget),
+    #[serde(rename = "pane.input.set")]
+    PaneInputSet(PaneInputSetParams),
     #[serde(rename = "pane.rename")]
     PaneRename(PaneRenameParams),
     #[serde(rename = "pane.send_text")]
@@ -251,6 +253,9 @@ pub enum Method {
     #[serde(skip)]
     #[schemars(skip)]
     PaneGraphicsStreamSet(PaneGraphicsSetParams),
+    #[serde(skip)]
+    #[schemars(skip)]
+    PaneGraphicsStreamDirect(PaneGraphicsDirectParams),
     #[serde(skip)]
     #[schemars(skip)]
     PaneGraphicsStreamOpen(PaneGraphicsStreamParams),

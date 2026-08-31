@@ -96,24 +96,26 @@ herdr pane read w1:p2 --source recent --lines 50
 | 通知 | `notification.show` |
 | 客户端 | `client.window_title.set`、`client.window_title.clear` |
 | 会话 | `session.snapshot` |
-| 工作区 | `workspace.create`、`workspace.list`、`workspace.get`、`workspace.focus`、`workspace.rename`、`workspace.move`、`workspace.move_block`、`workspace.report_metadata`、`workspace.close` |
+| 仓库 | `repository.list`、`repository.get`、`repository.focus`、`repository.rename`、`repository.move`、`repository.close` |
+| 检出 | `checkout.open`、`checkout.focus`、`checkout.rename`、`checkout.move`、`checkout.close` |
+| 工作区兼容 | `workspace.create`、`workspace.list`、`workspace.get`、`workspace.focus`、`workspace.rename`、`workspace.move`、`workspace.move_block`、`workspace.report_metadata`、`workspace.resources.report`、`workspace.close` |
 | Worktree | `worktree.list`、`worktree.create`、`worktree.open`、`worktree.remove` |
 | 标签页 | `tab.create`、`tab.list`、`tab.get`、`tab.focus`、`tab.rename`、`tab.move`、`tab.close` |
-| 窗格 | `pane.split`、`pane.swap`、`pane.move`、`pane.zoom`、`pane.layout`、`pane.process_info`、`pane.neighbor`、`pane.edges`、`pane.focus_direction`、`pane.resize`、`pane.list`、`pane.current`、`pane.get`、`pane.rename`、`pane.send_text`、`pane.send_keys`、`pane.send_input`、`pane.read`、`pane.graphics.info`、`pane.graphics.set`、`pane.graphics.clear`、`pane.graphics.stream`、`pane.report_agent`、`pane.report_agent_session`、`pane.report_metadata`、`pane.clear_agent_authority`、`pane.release_agent`、`pane.close`、`pane.wait_for_output` |
+| 窗格 | `pane.split`、`pane.swap`、`pane.move`、`pane.zoom`、`pane.layout`、`pane.process_info`、`pane.neighbor`、`pane.edges`、`pane.focus_direction`、`pane.resize`、`pane.list`、`pane.current`、`pane.get`、`pane.rename`、`pane.send_text`、`pane.send_keys`、`pane.send_input`、`pane.input.set`、`pane.read`、`pane.graphics.info`、`pane.graphics.set`、`pane.graphics.clear`、`pane.graphics.stream`、`pane.report_agent`、`pane.report_agent_session`、`pane.report_metadata`、`pane.clear_agent_authority`、`pane.release_agent`、`pane.close`、`pane.wait_for_output` |
 | 集合 | `collection.list`、`collection.get`、`collection.create`、`collection.add`、`collection.move`、`collection.promote`、`collection.select`、`collection.reorder`、`collection.archive`、`collection.restore`、`collection.member_create`、`collection.close` |
 | 委派 | `delegation.create`、`delegation.get`、`delegation.tree`、`delegation.root`、`delegation.descendants`、`delegation.reparent`、`delegation.reorder` |
 | 弹窗 | `popup.close` |
 | 布局 | `layout.export`、`layout.apply`、`layout.set_split_ratio` |
-| 智能体 | `agent.list`、`agent.get`、`agent.read`、`agent.explain`、`agent.send_keys`、`agent.prompt`、`agent.wait`、`agent.rename`、`agent.focus`、`agent.start` |
+| 智能体 | `agent.list`、`agent.get`、`agent.read`、`agent.explain`、`agent.send_keys`、`agent.prompt`、`agent.wait`、`agent.rename`、`agent.focus`、`agent.start`、`agent.view.set`、`agent.view.clear` |
 | 事件 | `events.subscribe`、`events.wait` |
 | 集成 | `integration.install`、`integration.uninstall` |
 | 插件 | `plugin.link`、`plugin.list`、`plugin.unlink`、`plugin.enable`、`plugin.disable`、`plugin.action.list`、`plugin.action.invoke`、`plugin.log.list`、`plugin.pane.open`、`plugin.pane.focus`、`plugin.pane.close` |
 
-`agent.wait` 由服务器拥有并由事件驱动。它会固定到已解析的窗格占用者,因此替换后的智能体不能满足该等待。`agent.prompt` 接受可选的 `wait` 对象,其中包含 `until` 和 `timeout_ms`;这样可在一个请求中提交提示并开始等待,避免两个独立调用之间的竞态。成功的 `agent.prompt` 仅表示当前终端运行时已接纳串行的 text → delay → Enter 事务,并不保证最终会写入 PTY。每个终端最多接纳 8 个（包括活动和排队）提示事务及其合计 64 KiB 负载；收到 `agent_prompt_queue_full` 后应在运行时排空后重试；`agent_prompt_payload_too_large` 表示单个事务超过 64 KiB。运行时关闭或被替换会取消待处理事务，绝不会将其写入替换后的运行时。
+`agent.wait` 由服务器拥有并由事件驱动。它会固定到已解析的窗格占用者,因此替换后的智能体不能满足该等待。`agent.prompt` 接受可选的 `wait` 对象,其中包含 `until` 和 `timeout_ms`;这样可在一个请求中提交提示并开始等待,避免两个独立调用之间的竞态。如果解析出的智能体已经是 `blocked`,`agent.prompt` 不会发送输入或开始等待,而是返回 `agent_blocked`。成功的 `agent.prompt` 仅表示当前终端运行时已接纳串行的 text → delay → Enter 事务,并不保证最终会写入 PTY。每个终端最多接纳 8 个（包括活动和排队）提示事务及其合计 64 KiB 负载；收到 `agent_prompt_queue_full` 后应在运行时排空后重试；`agent_prompt_payload_too_large` 表示单个事务超过 64 KiB。运行时关闭或被替换会取消待处理事务，绝不会将其写入替换后的运行时。
 
 `workspace.move_block` 会将有序的 `workspace_ids` 原子地移动到 `before_workspace_id` 之前;省略锚点则将该块移动到末尾。id 必须唯一,且锚点不能属于被移动的块。响应包含服务器确认的有序工作区列表。
 
-`session.snapshot` 为维护本地运行时缓存的客户端返回一次性引导快照。响应包含版本/协议元数据、当前聚焦的工作区/标签页/窗格 id、工作区记录、标签页记录、窗格记录、标签页布局快照和智能体记录。它不是订阅;读取后应订阅资源事件,并根据事件更新本地缓存。重新连接后或本地缓存可能已过期时,再次调用 `session.snapshot`。工作区记录也包含关联 worktree 的来源信息。完整的仓库 worktree 发现仍使用 `worktree.list`。
+`session.snapshot` 为维护本地运行时缓存的客户端返回一次性引导快照。响应包含版本/协议元数据、`result.snapshot.sequence` 水位线、当前聚焦的工作区/标签页/窗格 id、工作区记录、标签页记录、窗格记录、标签页布局快照和智能体记录。它不是订阅。为避免引导期间漏掉事件，应先在另一个连接上打开 `events.subscribe`，并等待 `subscription_started` 确认；其中的 `result.sequence` 是该请求中所有订阅共同接受的会话全局游标。在调用 `session.snapshot` 时缓冲事件流，安装快照，丢弃顶层 `sequence` 小于或等于快照水位线的已缓冲行，再按接收顺序应用其余行并继续接收事件。每个自定义观测都会预留一个新的全局值，而重复的生命周期订阅可能重复同一生命周期事件的值。不要把 `sequence` 当作每个订阅各自的计数器，也不要要求每条事件流记录都唯一。重新连接后或本地缓存可能已过期时，再次调用 `session.snapshot`。工作区记录会新增 `repository_id` 和 `checkout` 来源信息，同时保留旧版 `worktree` 来源信息。仓库记录负责检出顺序、首选基准和 MRU 焦点。完整的仓库 worktree 发现仍使用 `worktree.list`。
 
 CLI 的 `herdr api snapshot` 会把当前 `session.snapshot` 响应输出为 JSON,让客户端和智能体可以简单地完成引导。
 
@@ -139,11 +141,14 @@ Shell 集成可使用 `herdr workspace report-resources w1 --plugin hs.jail --fi
 {"id":"req_focus","method":"pane.focus_direction","params":{"direction":"right"}}
 {"id":"req_resize","method":"pane.resize","params":{"pane_id":"w1:p1","direction":"right","amount":0.1}}
 {"id":"req_zoom","method":"pane.zoom","params":{"pane_id":"w1:p1","mode":"toggle"}}
-{"id":"req_split","method":"pane.split","params":{"direction":"right","ratio":0.333,"env":{"HERDR_ROLE":"tests"}}}
+{"id":"req_input","method":"pane.input.set","params":{"pane_id":"w1:p1","right_click":"pane"}}
+{"id":"req_split","method":"pane.split","params":{"direction":"right","ratio":0.333,"right_click":"pane","env":{"HERDR_ROLE":"tests"}}}
 {"id":"req_process","method":"pane.process_info","params":{"pane_id":"w1:p1"}}
 ```
 
 `pane.current` 返回单个 `PaneInfo`。带有 `caller_pane_id` 时,Herdr 返回那个窗格。省略时,Herdr 返回当前聚焦的活动窗格。
+
+`pane.input.set` 为单个窗格把 `right_click` 设置为 `herdr` 或 `pane`，默认值为 `herdr`。当应用请求终端鼠标上报时，`pane` 会转发无修饰键的右键点击、按住和拖动手势；否则 Herdr 会回退到窗格菜单。右键点击窗格边框始终会打开 Herdr 菜单。`pane.split` 接受相同的可选 `right_click` 值，用于新建的窗格。
 
 终端滚动指标可用时,`PaneInfo` 包含 `scroll`:
 
@@ -159,7 +164,9 @@ Shell 集成可使用 `herdr workspace report-resources w1 --plugin hs.jail --fi
 
 ### 实验性窗格图形
 
-窗格图形允许插件在窗格上放置图像数据。它们只在 `[experimental].kitty_graphics = true` 时可用;否则所有窗格图形方法都返回 `feature_disabled`。调用 `pane.graphics.info` 会返回所连接客户端的单元格像素宽度和高度,但不会创建图形层。`pane.graphics.set` 接受 `data_base64` 中的 `png`、`rgb` 或 `rgba` 数据,`pane.graphics.clear` 删除该图层。
+窗格图形允许插件在窗格上放置图像数据。它们只在 `[experimental].kitty_graphics = true` 时可用；否则所有窗格图形方法都返回 `feature_disabled`。显式调用 `pane.graphics.info` 会启用能力发现，并返回所连接客户端的单元格尺寸、文件帧选项、像素级鼠标支持、最多 16 个图层以及 `pane_visible`。只有目标位于活动工作区和标签页中且未被缩放隐藏时，`pane_visible` 才为 true；短暂的 UI 模式不会改变它。
+
+`pane.graphics.set`、`pane.graphics.clear` 和 `pane.graphics.stream` 接受可选的 `layer_id`（默认为 `primary`）。set 和 stream 还接受 `z_index`；图层按稳定的 `(z_index, layer_id)` 顺序放置。每个流独占其图层，关闭流时会删除该图层。内联帧支持 `png`、`rgb`、`rgba` 或 `bgra`；BGRA 会一次性规范化为自有 RGBA。Herdr 每个渲染过程向主机缓存推进一个图像事务，因此任意图层集合无需聚合帧也能推进。无头传输会让每个事务保持在 32 MiB 的线路限制内；本地单体渲染不应用该传输限制。
 
 ```json
 {"id":"graphics_info","method":"pane.graphics.info","params":{"pane_id":"w1:p1"}}
@@ -167,12 +174,16 @@ Shell 集成可使用 `herdr workspace report-resources w1 --plugin hs.jail --fi
 {"id":"graphics_clear","method":"pane.graphics.clear","params":{"pane_id":"w1:p1"}}
 ```
 
-要重复发送帧,用 `pane.graphics.stream` 打开专用 socket。Herdr 回复 `ok` 后,每一帧发送一个 JSON 头,再发送恰好 `data_length` 字节的原始数据。socket 关闭前,该流拥有对应窗格的图形层;并发 set、clear 或 stream 请求返回 `stream_conflict`。
+要重复发送帧，请用 `pane.graphics.stream` 打开专用 socket。Herdr 回复 `ok` 后，每个内联帧发送一个 JSON 头，再发送恰好 `data_length` 字节的原始数据。对该图层的并发操作会返回 `stream_conflict`。
 
 ```json
-{"id":"graphics_stream","method":"pane.graphics.stream","params":{"pane_id":"w1:p1"}}
+{"id":"graphics_stream","method":"pane.graphics.stream","params":{"pane_id":"w1:p1","z_index":0}}
 {"format":"png","image_width":800,"image_height":600,"data_length":12345,"placement":{"viewport_col":0,"viewport_row":0,"grid_cols":80,"grid_rows":30}}
 ```
+
+当 `pane.graphics.info` 公告 `file_frame_transport: "direct-kitty"` 时，符合条件的本地 Ghostty、kitty 或 WezTerm 客户端可以提交不可变的私有 `rgba` 或 `bgra` 文件，并附带 `file.path`、`sequence` 和 `revision`。Direct Kitty 文件传输仅用于默认的 `primary` 页面图层；命名的次级图层使用自有内联 RGBA。BGRA 始终会被复制、通道重排并以内联方式渲染。只有终端接受文件，或已安装安全的自有内联回退之后，Herdr 才回复 `pane_graphics_frame_ack`。确认文件传输失败后，该客户端连接会禁用直接文件，但不会禁用精确像素鼠标。超时或客户端丢失会关闭流，且不会确认源可复用。单体 `--no-session` 模式既不公告快速文件传输，也不公告精确像素鼠标，始终使用自有内联回退。
+
+直接文件始终是完整的规范 `width * height * 4` RGBA 帧。`file_frame_max_bytes` 是仍可使用自有内联回退的大小上限。`file_frame_transport` 可用时，主图层 RGBA 文件可使用更大的 `file_frame_direct_max_bytes` 上限。超过回退上限的帧只有在终端接受直接传输时才会获得确认；拒绝会关闭流。如果帧无法使用自有内联回退，而其窗格暂时隐藏或重绘时无法放置，Herdr 会上传图像但不显示，并在窗格再次可见时重放其放置。`file_frame_damage: true` 表示 Herdr 接受可选的 damage 元数据，以提高生产者侧规范环形缓冲区的效率；它仍会复制或呈现完整文件。调整大小和完整重绘会重放放置，而无需重新传输像素。
 
 `pane.layout` 返回标签页布局快照,包含 `workspace_id`、`tab_id`、`zoomed`、外层 `area`、`focused_pane_id`、窗格矩形和分割矩形/比例。`pane.neighbor` 和 `pane.edges` 也包含同一份布局快照,让客户端不需要私有布局状态就能做出下一步决策。
 
@@ -285,7 +296,7 @@ herdr notification show "build failed" --body "api workspace" --position top-lef
 {"id":"req_title_clear","method":"client.window_title.clear","params":{}}
 ```
 
-`client.window_title.clear` 恢复 Herdr 的默认标题。响应是 `type: "client_window_title"`,带 `changed` 和 `set`、`cleared` 或 `no_foreground_client` 之一的 reason。
+`client.window_title.clear` 把标题交还给 `ui.window_title`。响应是 `type: "client_window_title"`,带 `changed` 和 `set`、`cleared` 或 `no_foreground_client` 之一的 reason。
 
 Worktree 方法把 Git 检出作为 Herdr 工作区管理。`worktree.create` 创建检出,并返回新的 `workspace`、`tab`、`root_pane` 和 `worktree` 记录。请求的分支已在本地存在时检出它;否则从请求的 base 或 `HEAD` 创建分支。`worktree.open` 打开已有检出,或返回已打开的工作区。`worktree.remove` 对关联的子工作区运行 `git worktree remove`,从不删除分支。
 
@@ -307,9 +318,13 @@ Worktree 方法把 Git 检出作为 Herdr 工作区管理。`worktree.create` �
 {"id":"req_3","method":"worktree.remove","params":{"workspace_id":"2","force":false}}
 ```
 
+四个原始 worktree 方法都接受 `trust_repository`，省略时默认为 `false`。除非 Git 因所有权不安全或可疑而拒绝所选仓库，否则应保持为 `false`。独立验证解析后的仓库路径后，可用 `"trust_repository": true` 重试同一请求。信任仅对该次请求有效：Herdr 只会为该请求的 Git 子进程添加 `git -c safe.directory=<resolved-repository>`。它不会持久化信任、修改 Git 配置或信任其他路径。之后的每个请求都会再次默认使用 `false`，需要时必须分别明确启用。
+
 `worktree.list`、`worktree.create` 和 `worktree.open` 中,`workspace_id` 和 `cwd` 最多用一个;两个都省略则使用活动工作区。`worktree.open` 中,`path` 和 `branch` 恰好用一个。原始 socket 的 `cwd` 和 `path` 值必须是绝对路径;CLI 在发送请求前会展开相对的 `--cwd` 和 `--path` 值。当工作区属于某个 Herdr worktree 组时,工作区响应包含可选的 `worktree` 来源信息。当已有工作区获得或改变 worktree 来源信息时,worktree 命令可能发出 `workspace.updated`。
 
 Worktree 命令也发出生命周期事件。`worktree.create` 发出 `workspace.created`、`tab.created`、`pane.created` 和 `worktree.created`。`worktree.open` 发出 `worktree.opened`,并在打开新的 Herdr 工作区时同时发出工作区/标签页/窗格创建事件。`worktree.remove` 发出 `worktree.removed`;如果关联的工作区仍然打开,还会发出 `workspace.closed`。
+
+当关联的 worktree 工作区仍然打开时，父工作区只有在 `workspace.close` 的 params 中包含 `"close_group": true` 时才会被关闭；缺少显式关闭组意图时会返回 `workspace_group_close_required`。显式关闭组时，每个被关闭的工作区都会发出一个 `workspace.closed` 事件。
 
 ## 智能体视图查询
 
@@ -661,7 +676,9 @@ workspace 的 get/list 响应会公开生成的 `tokens` 映射,空间侧边栏�
 }
 ```
 
-第一个响应确认订阅。之后的行是推送的事件。
+第一个响应通过 `result` 中的 `{"type":"subscription_started","sequence":N}` 确认订阅。`N` 是请求中所有订阅共同使用的会话全局接受游标。之后的生命周期和自定义事件行在顶层携带会话全局 `sequence`，并按游标顺序合并；游标相同时以请求顺序打破平局。每个基于探测的自定义观测都会预留下一个全局序列，因此快照水位线也能对这些观测排序。生命周期事件订阅从接受游标开始，不会重放此前保留的事件。
+
+Herdr 保留最新 512 个生命周期事件，供事件流追赶。如果订阅方落后过多，导致下一个所需游标已不可用，服务器会写入错误码为 `resync_required` 的响应并关闭该 socket。不要从不完整缓存继续：应打开新订阅，获取新的 `session.snapshot`，并重复上述基于水位线的引导流程。
 
 工作区事件订阅包括 `workspace.created`、`workspace.updated`、`workspace.metadata_updated`、`workspace.renamed`、`workspace.moved`、`workspace.reordered`、`workspace.closed` 和 `workspace.focused`。`workspace.metadata_updated` 报告令牌变更和 TTL 到期,但不会调用插件事件钩子。其他工作区事件描述 Herdr UI/运行时的生命周期。当工作区属于 worktree 组时,`workspace.created` 包含可选的 `workspace.worktree` 来源信息。`workspace.moved` 包含被移动的 `workspace_id`、请求的 `insert_index` 和更新后的有序 `workspaces` 列表。`workspace.reordered` 包含原子移动的 `workspace_ids`、可选的 `before_workspace_id` 和服务器确认的有序 `workspaces` 列表。在移除前 Herdr 仍能识别时,`workspace.closed` 包含最终的 `workspace` 快照。
 标签页事件订阅包括 `tab.created`、`tab.closed`、`tab.focused`、`tab.renamed` 和 `tab.moved`。`tab.moved` 包含被移动的 `tab_id`、`workspace_id`、请求的 `insert_index` 和该工作区更新后的有序 `tabs` 列表。
