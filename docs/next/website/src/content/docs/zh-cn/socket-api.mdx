@@ -738,7 +738,7 @@ herdr agent wait w1:p1 --until blocked
 }
 ```
 
-`TabInfo`、`WorkspaceInfo` 和 `RepositoryInfo` 包含 `descendant_attention_count`。其中 `agent_status` 跟随顶层智能体；该计数表示在顶层父终端成功接收输入之前仍未确认的已完成委派后代。若委派子项的父窗格仍然存在，向该子项输入不会清除计数。父窗格关闭后，存活的子项会成为确认语义上的有效根。被阻塞的后代仍会使聚合状态显示为 `blocked`。
+`TabInfo`、`WorkspaceInfo` 和 `RepositoryInfo` 包含 `descendant_attention_count`。其中 `agent_status` 跟随顶层智能体；该计数表示在顶层父终端成功接收输入之前仍未确认、且位于窗格集合之外的已完成委派后代。当窗格仍是集合成员时，未查看的完成状态只显示在该集合内，并从上层状态和注意力计数中排除；将其提升回平铺窗格后会恢复正常的向上汇总。若委派子项的父窗格仍然存在，向该子项输入不会清除计数。父窗格关闭后，存活的子项会成为确认语义上的有效根。无论是否位于集合中，被阻塞的后代仍会使聚合状态显示为 `blocked`。
 
 `server.agent_manifests` 返回生效的智能体检测清单来源和远程更新诊断信息,不重载规则:
 

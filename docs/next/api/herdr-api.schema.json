@@ -1866,7 +1866,7 @@
             },
             "descendant_attention_count": {
               "default": 0,
-              "description": "Completed delegated descendants that have not been explicitly acknowledged.",
+              "description": "Completed delegated descendants outside collections that have not been explicitly acknowledged.",
               "format": "uint",
               "minimum": 0,
               "type": "integer"
@@ -1927,7 +1927,7 @@
             },
             "descendant_attention_count": {
               "default": 0,
-              "description": "Completed delegated descendants that have not been explicitly acknowledged.",
+              "description": "Completed delegated descendants outside collections that have not been explicitly acknowledged.",
               "format": "uint",
               "minimum": 0,
               "type": "integer"
@@ -1986,7 +1986,7 @@
             },
             "descendant_attention_count": {
               "default": 0,
-              "description": "Completed delegated descendants that have not been explicitly acknowledged.",
+              "description": "Completed delegated descendants outside collections that have not been explicitly acknowledged.",
               "format": "uint",
               "minimum": 0,
               "type": "integer"
@@ -10275,7 +10275,7 @@
             },
             "descendant_attention_count": {
               "default": 0,
-              "description": "Completed delegated descendants that have not been explicitly acknowledged.",
+              "description": "Completed delegated descendants outside collections that have not been explicitly acknowledged.",
               "format": "uint",
               "minimum": 0,
               "type": "integer"
@@ -10401,7 +10401,7 @@
             },
             "descendant_attention_count": {
               "default": 0,
-              "description": "Completed delegated descendants that have not been explicitly acknowledged.",
+              "description": "Completed delegated descendants outside collections that have not been explicitly acknowledged.",
               "format": "uint",
               "minimum": 0,
               "type": "integer"
@@ -10460,7 +10460,7 @@
             },
             "descendant_attention_count": {
               "default": 0,
-              "description": "Completed delegated descendants that have not been explicitly acknowledged.",
+              "description": "Completed delegated descendants outside collections that have not been explicitly acknowledged.",
               "format": "uint",
               "minimum": 0,
               "type": "integer"
@@ -14131,7 +14131,7 @@
             },
             "descendant_attention_count": {
               "default": 0,
-              "description": "Completed delegated descendants that have not been explicitly acknowledged.",
+              "description": "Completed delegated descendants outside collections that have not been explicitly acknowledged.",
               "format": "uint",
               "minimum": 0,
               "type": "integer"
@@ -15613,7 +15613,7 @@
             },
             "descendant_attention_count": {
               "default": 0,
-              "description": "Completed delegated descendants that have not been explicitly acknowledged.",
+              "description": "Completed delegated descendants outside collections that have not been explicitly acknowledged.",
               "format": "uint",
               "minimum": 0,
               "type": "integer"
@@ -15672,7 +15672,7 @@
             },
             "descendant_attention_count": {
               "default": 0,
-              "description": "Completed delegated descendants that have not been explicitly acknowledged.",
+              "description": "Completed delegated descendants outside collections that have not been explicitly acknowledged.",
               "format": "uint",
               "minimum": 0,
               "type": "integer"

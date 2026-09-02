@@ -639,16 +639,12 @@ fn render_mobile_switcher_content(
             };
             let selected = app.selected_repository_id.as_ref() == Some(repository_id);
             let bg = mobile_item_bg(selected, false, p);
-            let attention = AttentionSummary::for_panes(
+            let attention = AttentionSummary::for_tabs(
                 repository
                     .checkout_workspace_ids
                     .iter()
                     .filter_map(|id| app.workspaces.iter().find(|workspace| &workspace.id == id))
-                    .flat_map(|workspace| {
-                        workspace.tabs.iter().flat_map(|tab| {
-                            tab.panes.iter().map(|(&pane_id, pane)| (pane_id, pane))
-                        })
-                    }),
+                    .flat_map(|workspace| workspace.tabs.iter()),
                 &app.terminals,
                 &app.delegations,
             );

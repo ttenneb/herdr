@@ -421,16 +421,11 @@ fn workspace_attention_summary(
 }
 
 fn space_attention_summary(app: &AppState, key: &str) -> AttentionSummary {
-    AttentionSummary::for_panes(
+    AttentionSummary::for_tabs(
         app.workspaces
             .iter()
             .filter(|workspace| workspace_repository_key(workspace) == Some(key))
-            .flat_map(|workspace| {
-                workspace
-                    .tabs
-                    .iter()
-                    .flat_map(|tab| tab.panes.iter().map(|(&pane_id, pane)| (pane_id, pane)))
-            }),
+            .flat_map(|workspace| workspace.tabs.iter()),
         &app.terminals,
         &app.delegations,
     )
@@ -2289,7 +2284,11 @@ fn render_sidebar_toggle(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{detect::Agent, layout::PaneId, workspace::Workspace};
+    use crate::{
+        detect::Agent,
+        layout::{LayoutLeaf, PaneId},
+        workspace::Workspace,
+    };
     use ratatui::{backend::TestBackend, layout::Direction, Terminal};
 
     fn row_text(buffer: &ratatui::buffer::Buffer, row: u16, width: u16) -> String {
@@ -2498,6 +2497,68 @@ rows = [[{ token = "workspace", bold = false }, { token = "agent", dim = false }
         assert_eq!(buffer[(dot_x, row)].style().fg, Some(app.palette.yellow));
         assert_eq!(buffer[(badge_x, row)].style().fg, Some(app.palette.teal));
         assert!(badge_x > dot_x);
+    }
+
+    #[test]
+    fn collection_completion_stays_off_space_badge_but_blocked_propagates() {
+        let mut app = crate::app::state::AppState::test_new();
+        let mut workspace = Workspace::test_new("one");
+        let root = workspace.tabs[0].root_pane.expect("root");
+        let child = workspace.test_split(Direction::Horizontal);
+        let collection = workspace
+            .create_collection_near(
+                0,
+                LayoutLeaf::Pane(root),
+                Direction::Vertical,
+                0.5,
+                Some("helpers".into()),
+            )
+            .expect("collection");
+        workspace
+            .collect_pane(child, collection)
+            .expect("collect child");
+        app.workspaces = vec![workspace];
+        app.ensure_test_terminals();
+        let root_terminal = app.workspaces[0].tabs[0].panes[&root]
+            .attached_terminal_id
+            .clone();
+        app.terminals.get_mut(&root_terminal).unwrap().state = AgentState::Working;
+        let child_terminal = app.workspaces[0].tabs[0].panes[&child]
+            .attached_terminal_id
+            .clone();
+        app.terminals.get_mut(&child_terminal).unwrap().state = AgentState::Idle;
+        app.workspaces[0].tabs[0]
+            .panes
+            .get_mut(&child)
+            .unwrap()
+            .seen = false;
+        let delegation_root = app.delegations.create(Some(root), None, None).unwrap();
+        app.delegations
+            .create(Some(child), Some(delegation_root), Some("review".into()))
+            .unwrap();
+        app.active = Some(0);
+        app.mode = Mode::Terminal;
+
+        let area = Rect::new(0, 0, 26, 20);
+        app.view.workspace_card_areas = compute_workspace_card_areas(&app, area);
+        let row = app.view.workspace_card_areas[0].rect.y;
+        let mut terminal = Terminal::new(TestBackend::new(26, 20)).unwrap();
+        terminal
+            .draw(|frame| render_sidebar(&app, &TerminalRuntimeRegistry::new(), frame, area))
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+        let dot_x = find_symbol_x(buffer, row, 25, "●");
+        assert_eq!(buffer[(dot_x, row)].style().fg, Some(app.palette.yellow));
+        assert!(!row_text(buffer, row, 25).contains('•'));
+
+        app.terminals.get_mut(&child_terminal).unwrap().state = AgentState::Blocked;
+        let mut blocked = Terminal::new(TestBackend::new(26, 20)).unwrap();
+        blocked
+            .draw(|frame| render_sidebar(&app, &TerminalRuntimeRegistry::new(), frame, area))
+            .unwrap();
+        let buffer = blocked.backend().buffer();
+        let dot_x = find_symbol_x(buffer, row, 25, "●");
+        assert_eq!(buffer[(dot_x, row)].style().fg, Some(app.palette.red));
     }
 
     #[test]

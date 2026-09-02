@@ -509,6 +509,25 @@ pub(crate) fn render_collections(
                         .count()
                 })
                 .unwrap_or_default();
+            let unseen_done = collection
+                .map(|collection| {
+                    collection
+                        .active_members()
+                        .filter(|pane_id| {
+                            tab.panes
+                                .get(pane_id)
+                                .and_then(|pane| {
+                                    app.terminals
+                                        .get(&pane.attached_terminal_id)
+                                        .map(|terminal| (terminal.state, pane.seen))
+                                })
+                                .is_some_and(|(state, seen)| {
+                                    state == crate::detect::AgentState::Idle && !seen
+                                })
+                        })
+                        .count()
+                })
+                .unwrap_or_default();
             let concurrency_warning = app.collection_lifecycle.concurrency > 0
                 && concurrent > app.collection_lifecycle.concurrency;
             let label = if !layout
@@ -517,8 +536,14 @@ pub(crate) fn render_collections(
                 .any(|row| row.section == CollectionSection::Active)
             {
                 "Active · empty".to_owned()
+            } else if concurrency_warning && unseen_done > 0 {
+                format!(
+                    "{unseen_done} done · Active · {concurrent} working/blocked ⚠ advisory limit"
+                )
             } else if concurrency_warning {
                 format!("Active · {concurrent} working/blocked ⚠ advisory limit")
+            } else if unseen_done > 0 {
+                format!("{unseen_done} done · Active")
             } else {
                 "Active".to_owned()
             };
@@ -535,6 +560,25 @@ pub(crate) fn render_collections(
             let archived = collection
                 .map(|collection| collection.archived_members().count())
                 .unwrap_or_default();
+            let unseen_done = collection
+                .map(|collection| {
+                    collection
+                        .archived_members()
+                        .filter(|pane_id| {
+                            tab.panes
+                                .get(pane_id)
+                                .and_then(|pane| {
+                                    app.terminals
+                                        .get(&pane.attached_terminal_id)
+                                        .map(|terminal| (terminal.state, pane.seen))
+                                })
+                                .is_some_and(|(state, seen)| {
+                                    state == crate::detect::AgentState::Idle && !seen
+                                })
+                        })
+                        .count()
+                })
+                .unwrap_or_default();
             let policy = app.collection_lifecycle;
             let age_warning = policy.archive_age_days > 0
                 && collection.is_some_and(|collection| {
@@ -550,8 +594,12 @@ pub(crate) fn render_collections(
                 });
             let warning =
                 age_warning || (policy.archive_count > 0 && archived > policy.archive_count);
-            let label = if warning {
+            let label = if warning && unseen_done > 0 {
+                format!("{unseen_done} done · Archived · {archived} total ⚠ advisory limit")
+            } else if warning {
                 format!("Archived · {archived} ⚠ advisory limit")
+            } else if unseen_done > 0 {
+                format!("{unseen_done} done · Archived · {archived} total")
             } else {
                 format!("Archived · {archived}")
             };
@@ -982,6 +1030,119 @@ mod tests {
             .collect::<String>();
         assert!(rendered.contains("Helpers"));
         assert!(rendered.contains("Active · empty"));
+    }
+
+    #[test]
+    fn collection_header_keeps_unseen_completion_local() {
+        let mut ws = Workspace::test_new("collection");
+        let root = ws.tabs[0].root_pane.expect("root");
+        let child = ws.test_split(Direction::Horizontal);
+        let id = ws
+            .create_collection_near(
+                0,
+                LayoutLeaf::Pane(root),
+                Direction::Vertical,
+                0.5,
+                Some("Helpers".into()),
+            )
+            .expect("collection");
+        ws.collect_pane(child, id).expect("collect");
+        let mut app = AppState::test_new();
+        app.workspaces = vec![ws];
+        app.ensure_test_terminals();
+        let terminal_id = app.workspaces[0].tabs[0].panes[&child]
+            .attached_terminal_id
+            .clone();
+        app.terminals.get_mut(&terminal_id).unwrap().state = crate::detect::AgentState::Idle;
+        app.workspaces[0].tabs[0]
+            .panes
+            .get_mut(&child)
+            .unwrap()
+            .seen = false;
+        app.active = Some(0);
+        let layouts = compute_collection_layouts(
+            &mut app,
+            &TerminalRuntimeRegistry::new(),
+            Rect::new(0, 0, 80, 20),
+            false,
+            Default::default(),
+        );
+        let mut terminal = Terminal::new(TestBackend::new(80, 20)).expect("terminal");
+        terminal
+            .draw(|frame| {
+                render_collections(&app, &TerminalRuntimeRegistry::new(), &layouts, frame)
+            })
+            .expect("render");
+        let rendered = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+
+        assert!(rendered.contains("1 done · Active"));
+        assert_eq!(
+            app.workspaces[0]
+                .attention_summary(&app.terminals, &app.delegations)
+                .descendant_attention_count(),
+            0
+        );
+        assert!(!app.workspaces[0].tabs[0].panes[&child].seen);
+
+        let narrow_layouts = compute_collection_layouts(
+            &mut app,
+            &TerminalRuntimeRegistry::new(),
+            Rect::new(0, 0, 30, 20),
+            false,
+            Default::default(),
+        );
+        let mut narrow = Terminal::new(TestBackend::new(30, 20)).expect("terminal");
+        narrow
+            .draw(|frame| {
+                render_collections(
+                    &app,
+                    &TerminalRuntimeRegistry::new(),
+                    &narrow_layouts,
+                    frame,
+                )
+            })
+            .expect("render");
+        let rendered = narrow
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(rendered.contains("1 done"));
+
+        app.workspaces[0]
+            .set_collection_member_archived(child, id, true)
+            .expect("archive child");
+        let archived_layouts = compute_collection_layouts(
+            &mut app,
+            &TerminalRuntimeRegistry::new(),
+            Rect::new(0, 0, 30, 20),
+            false,
+            Default::default(),
+        );
+        let archive_header = archived_layouts[0].archive_header.expect("archive header");
+        let mut archived = Terminal::new(TestBackend::new(30, 20)).expect("terminal");
+        archived
+            .draw(|frame| {
+                render_collections(
+                    &app,
+                    &TerminalRuntimeRegistry::new(),
+                    &archived_layouts,
+                    frame,
+                )
+            })
+            .expect("render");
+        let archived_header = (archive_header.x..archive_header.right())
+            .map(|x| archived.backend().buffer()[(x, archive_header.y)].symbol())
+            .collect::<String>();
+        assert!(archived_header.starts_with("1 done"));
     }
 
     #[test]
