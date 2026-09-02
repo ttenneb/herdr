@@ -658,6 +658,18 @@ impl App {
             Some(PanePlacement::Collection(collection_id)) => Some(collection_id),
             _ => None,
         };
+        let source_was_unseen_completion = self.state.workspaces[source_ws_idx].tabs
+            [source_tab_idx]
+            .panes
+            .get(&source_pane_id)
+            .is_some_and(|pane| {
+                !pane.seen
+                    && self
+                        .state
+                        .terminals
+                        .get(&pane.attached_terminal_id)
+                        .is_some_and(|terminal| terminal.state == crate::detect::AgentState::Idle)
+            });
         let recovery_context = PaneMoveRecoveryContext {
             source_ws_idx,
             previous_workspace_id: previous_workspace_id.clone(),
@@ -1198,7 +1210,7 @@ impl App {
             event: EventKind::PaneMoved,
             data: EventData::PaneMoved {
                 previous_pane_id,
-                previous_workspace_id,
+                previous_workspace_id: previous_workspace_id.clone(),
                 previous_tab_id,
                 pane: Box::new(pane),
                 created_workspace,
@@ -1211,6 +1223,17 @@ impl App {
             self.emit_layout_updated_snapshot(source_layout);
         }
         self.emit_layout_updated_snapshot((*move_result.target_layout).clone());
+        if source_was_unseen_completion
+            && source_collection_id.is_some() != target_collection_id.is_some()
+        {
+            let mut attention_workspaces = vec![target_ws_idx];
+            if let Some(source_ws_idx) = self.parse_workspace_id(&previous_workspace_id) {
+                attention_workspaces.push(source_ws_idx);
+            }
+            attention_workspaces.sort_unstable();
+            attention_workspaces.dedup();
+            self.emit_workspace_attention_updates(attention_workspaces);
+        }
 
         encode_success(id, ResponseResult::PaneMove { move_result })
     }

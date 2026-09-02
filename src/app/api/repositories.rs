@@ -19,13 +19,8 @@ impl App {
                     .find(|workspace| &workspace.id == id)
             })
             .collect::<Vec<_>>();
-        let attention = crate::workspace::AttentionSummary::for_panes(
-            members.iter().flat_map(|workspace| {
-                workspace
-                    .tabs
-                    .iter()
-                    .flat_map(|tab| tab.panes.iter().map(|(&pane_id, pane)| (pane_id, pane)))
-            }),
+        let attention = crate::workspace::AttentionSummary::for_tabs(
+            members.iter().flat_map(|workspace| workspace.tabs.iter()),
             &self.state.terminals,
             &self.state.delegations,
         );
@@ -312,12 +307,15 @@ impl App {
 mod tests {
     use super::*;
     use crate::api::schema::{
-        CollectionCreateMemberParams, CollectionCreateParams, SplitDirection, SuccessResponse,
-        WorkspaceTarget as CheckoutCloseTarget,
+        AgentStatus, CollectionCreateMemberParams, CollectionCreateParams, SplitDirection,
+        SuccessResponse, WorkspaceTarget as CheckoutCloseTarget,
     };
     use crate::config::Config;
+    use crate::detect::AgentState;
+    use crate::layout::LayoutLeaf;
     use crate::repository::{CheckoutKind, CheckoutProvenance, Repository, SpaceRef};
     use crate::workspace::Workspace;
+    use ratatui::layout::Direction;
 
     fn app_with_repository() -> App {
         let event_hub = crate::api::EventHub::default();
@@ -411,6 +409,49 @@ mod tests {
         ))
         .expect("member response");
         assert!(member.get("error").is_none(), "{member}");
+    }
+
+    #[test]
+    fn repository_rollup_suppresses_collection_completion_but_keeps_blocked_urgent() {
+        let mut app = app_with_repository();
+        let root = app.state.workspaces[0].tabs[0]
+            .root_pane
+            .expect("root pane");
+        let child = app.state.workspaces[0].test_split(Direction::Horizontal);
+        let collection = app.state.workspaces[0]
+            .create_collection_near(
+                0,
+                LayoutLeaf::Pane(root),
+                Direction::Vertical,
+                0.5,
+                Some("helpers".into()),
+            )
+            .expect("collection");
+        app.state.workspaces[0]
+            .collect_pane(child, collection)
+            .expect("collect child");
+        app.state.ensure_test_terminals();
+        let root_terminal = app.state.workspaces[0].tabs[0].panes[&root]
+            .attached_terminal_id
+            .clone();
+        app.state.terminals.get_mut(&root_terminal).unwrap().state = AgentState::Working;
+        let child_terminal = app.state.workspaces[0].tabs[0].panes[&child]
+            .attached_terminal_id
+            .clone();
+        app.state.terminals.get_mut(&child_terminal).unwrap().state = AgentState::Idle;
+        app.state.workspaces[0].tabs[0]
+            .panes
+            .get_mut(&child)
+            .unwrap()
+            .seen = false;
+
+        let repository = app.repository_info("rtest").expect("repository");
+        assert_eq!(repository.agent_status, AgentStatus::Working);
+        assert_eq!(repository.descendant_attention_count, 0);
+
+        app.state.terminals.get_mut(&child_terminal).unwrap().state = AgentState::Blocked;
+        let repository = app.repository_info("rtest").expect("repository");
+        assert_eq!(repository.agent_status, AgentStatus::Blocked);
     }
 
     #[test]

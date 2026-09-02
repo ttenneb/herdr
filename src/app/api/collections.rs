@@ -280,6 +280,17 @@ impl App {
                 "pane is not a collection member",
             );
         };
+        let restores_completion_attention = self.state.workspaces[ws_idx].tabs[tab_idx]
+            .panes
+            .get(&pane_id)
+            .is_some_and(|pane| {
+                !pane.seen
+                    && self
+                        .state
+                        .terminals
+                        .get(&pane.attached_terminal_id)
+                        .is_some_and(|terminal| terminal.state == crate::detect::AgentState::Idle)
+            });
         if let Err(err) = self.state.workspaces[ws_idx].promote_collection_member_near(
             pane_id,
             collection_id,
@@ -306,6 +317,9 @@ impl App {
             },
         );
         self.emit_layout_updated_event(ws_idx, tab_idx);
+        if restores_completion_attention {
+            self.emit_workspace_attention_updates([ws_idx]);
+        }
         encode_success(id, ResponseResult::PaneInfo { pane })
     }
 
@@ -576,10 +590,26 @@ impl App {
         let closed_tab_id = self.public_tab_id(ws_idx, tab_idx).unwrap_or_default();
         let mut layout_update_tab_idx = Some(tab_idx);
         let mut created_layout_tab_indices = Vec::new();
+        let mut promoted_members = false;
         let members = self.state.workspaces[ws_idx].tabs[tab_idx]
             .collection(collection_id)
             .map(|c| c.members().to_vec())
             .unwrap_or_default();
+        let restores_completion_attention = members.iter().any(|pane_id| {
+            self.state.workspaces[ws_idx].tabs[tab_idx]
+                .panes
+                .get(pane_id)
+                .is_some_and(|pane| {
+                    !pane.seen
+                        && self
+                            .state
+                            .terminals
+                            .get(&pane.attached_terminal_id)
+                            .is_some_and(|terminal| {
+                                terminal.state == crate::detect::AgentState::Idle
+                            })
+                })
+        });
         let member_terminal_ids: Vec<_> = members
             .iter()
             .filter_map(|pane_id| self.state.workspaces[ws_idx].terminal_id(*pane_id).cloned())
@@ -765,6 +795,7 @@ impl App {
                             return encode_error(id, "collection_close_failed", format!("{err:?}"))
                         }
                     };
+                    promoted_members = true;
                     layout_update_tab_idx = outcome.source_layout_tab_idx;
                     created_layout_tab_indices = outcome.created_tab_indices.clone();
                     for pane_id in &outcome.members {
@@ -819,7 +850,7 @@ impl App {
             EventKind::CollectionClosed,
             EventData::CollectionClosed {
                 collection_id: params.collection_id,
-                workspace_id: closed_workspace_id,
+                workspace_id: closed_workspace_id.clone(),
                 tab_id: closed_tab_id,
             },
         );
@@ -828,6 +859,11 @@ impl App {
         }
         for tab_idx in created_layout_tab_indices {
             self.emit_layout_updated_event(ws_idx, tab_idx);
+        }
+        if promoted_members && restores_completion_attention {
+            if let Some(ws_idx) = self.parse_workspace_id(&closed_workspace_id) {
+                self.emit_workspace_attention_updates([ws_idx]);
+            }
         }
         encode_success(id, ResponseResult::Ok {})
     }
@@ -1272,7 +1308,7 @@ fn collection_not_found(id: String, collection_id: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::api::schema::{Method, Request};
+    use crate::api::schema::{AgentStatus, Method, Request};
     use crate::{config::Config, detect::AgentState, workspace::Workspace};
 
     fn app_with_panes() -> (
@@ -1327,6 +1363,91 @@ mod tests {
 
     fn create_collection(app: &mut App, target: crate::layout::PaneId) -> String {
         create_collection_in(app, 0, target)
+    }
+
+    #[test]
+    fn collection_completion_stays_local_and_promotion_restores_rollup() {
+        let (mut app, root, child, _) = app_with_panes();
+        let collection_id = create_collection(&mut app, root);
+        let root_terminal = app.state.workspaces[0].tabs[0].panes[&root]
+            .attached_terminal_id
+            .clone();
+        app.state.terminals.get_mut(&root_terminal).unwrap().state = AgentState::Working;
+        let child_terminal = app.state.workspaces[0].tabs[0].panes[&child]
+            .attached_terminal_id
+            .clone();
+        app.state.terminals.get_mut(&child_terminal).unwrap().state = AgentState::Idle;
+        app.state.workspaces[0].tabs[0]
+            .panes
+            .get_mut(&child)
+            .unwrap()
+            .seen = false;
+        let parent = app
+            .state
+            .delegations
+            .create(Some(root), None, None)
+            .unwrap();
+        app.state
+            .delegations
+            .create(Some(child), Some(parent), Some("review".into()))
+            .unwrap();
+        assert_eq!(app.workspace_info(0).descendant_attention_count, 1);
+
+        let child_id = app.public_pane_id(0, child).expect("public child");
+        let root_id = app.public_pane_id(0, root).expect("public root");
+        let sequence = app.event_hub.current_sequence();
+        let added = request(
+            &mut app,
+            Method::CollectionAdd(CollectionAddParams {
+                collection_id: collection_id.clone(),
+                pane_id: child_id.clone(),
+            }),
+        );
+        assert!(added.get("error").is_none(), "{added}");
+        assert_eq!(
+            app.pane_info(0, child).unwrap().agent_status,
+            AgentStatus::Done
+        );
+        assert_eq!(app.tab_info(0, 0).unwrap().descendant_attention_count, 0);
+        assert_eq!(app.workspace_info(0).agent_status, AgentStatus::Working);
+        assert_eq!(app.workspace_info(0).descendant_attention_count, 0);
+        assert!(app
+            .event_hub
+            .events_after(sequence)
+            .iter()
+            .any(|(_, event)| {
+                matches!(
+                    &event.data,
+                    EventData::WorkspaceUpdated { workspace }
+                        if workspace.descendant_attention_count == 0
+                            && workspace.agent_status == AgentStatus::Working
+                )
+            }));
+
+        let sequence = app.event_hub.current_sequence();
+        let promoted = request(
+            &mut app,
+            Method::CollectionPromote(CollectionPromoteParams {
+                pane_id: child_id,
+                target_pane_id: root_id,
+                direction: crate::api::schema::SplitDirection::Right,
+                ratio: Some(0.5),
+                focus: false,
+            }),
+        );
+        assert!(promoted.get("error").is_none(), "{promoted}");
+        assert_eq!(app.workspace_info(0).descendant_attention_count, 1);
+        assert!(app
+            .event_hub
+            .events_after(sequence)
+            .iter()
+            .any(|(_, event)| {
+                matches!(
+                    &event.data,
+                    EventData::WorkspaceUpdated { workspace }
+                        if workspace.descendant_attention_count == 1
+                )
+            }));
     }
 
     #[tokio::test]
@@ -2441,6 +2562,14 @@ mod tests {
             .terminal_id(second)
             .cloned()
             .expect("terminal ID");
+        app.state.terminals.get_mut(&terminal_id).unwrap().state = AgentState::Idle;
+        app.state.workspaces[0].tabs[0]
+            .panes
+            .get_mut(&second)
+            .unwrap()
+            .seen = false;
+        let source_workspace_id = app.public_workspace_id(0);
+        let target_workspace_id = app.public_workspace_id(1);
         let delegation_id = app
             .state
             .delegations
@@ -2464,6 +2593,7 @@ mod tests {
         assert!(app.state.workspaces[1].pane_state(second).is_none());
         assert!(app.state.terminal_runtime_shutdowns.is_empty());
 
+        let sequence = app.event_hub.current_sequence();
         let moved = request(
             &mut app,
             Method::CollectionAdd(CollectionAddParams {
@@ -2472,6 +2602,19 @@ mod tests {
             }),
         );
         assert!(moved.get("error").is_none(), "{moved}");
+        let updated_workspaces = app
+            .event_hub
+            .events_after(sequence)
+            .into_iter()
+            .filter_map(|(_, event)| match event.data {
+                EventData::WorkspaceUpdated { workspace } => Some(workspace.workspace_id),
+                _ => None,
+            })
+            .collect::<std::collections::HashSet<_>>();
+        assert_eq!(
+            updated_workspaces,
+            std::collections::HashSet::from([source_workspace_id, target_workspace_id])
+        );
         let (target_ws, moved_id) = app.parse_pane_id(&source_public).expect("public alias");
         assert_eq!(target_ws, 1);
         assert_eq!(moved_id, second);
@@ -2826,6 +2969,26 @@ mod tests {
             );
             assert!(response.get("error").is_none(), "{response}");
         }
+        let second_terminal = app.state.workspaces[0].tabs[0].panes[&second]
+            .attached_terminal_id
+            .clone();
+        app.state.terminals.get_mut(&second_terminal).unwrap().state = AgentState::Idle;
+        app.state.workspaces[0].tabs[0]
+            .panes
+            .get_mut(&second)
+            .unwrap()
+            .seen = false;
+        let parent = app
+            .state
+            .delegations
+            .create(Some(root), None, None)
+            .unwrap();
+        app.state
+            .delegations
+            .create(Some(second), Some(parent), Some("review".into()))
+            .unwrap();
+        assert_eq!(app.workspace_info(0).descendant_attention_count, 0);
+
         let source_tab_id = app.public_tab_id(0, 0).expect("source tab ID");
         let identities = [second, third, root].map(|pane| {
             (
@@ -2873,9 +3036,15 @@ mod tests {
                 Some(source_tab_id.clone())
             );
         }
-        let relevant_events = app
-            .event_hub
-            .events_after(sequence)
+        let events = app.event_hub.events_after(sequence);
+        assert!(events.iter().any(|(_, event)| {
+            matches!(
+                &event.data,
+                EventData::WorkspaceUpdated { workspace }
+                    if workspace.descendant_attention_count == 1
+            )
+        }));
+        let relevant_events = events
             .into_iter()
             .map(|(_, event)| event.event)
             .filter(|event| {

@@ -49,7 +49,7 @@ pub struct RepositoryInfo {
     pub pane_count: usize,
     pub active_agent_count: usize,
     pub agent_status: AgentStatus,
-    /// Completed delegated descendants that have not been explicitly acknowledged.
+    /// Completed delegated descendants outside collections that have not been explicitly acknowledged.
     #[serde(default)]
     pub descendant_attention_count: usize,
 }

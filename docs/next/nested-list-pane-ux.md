@@ -266,7 +266,7 @@ A hidden or collapsed child changing state does not alter the user's expansion, 
 
 - Blocked and newly completed children are highlighted in their rows.
 - Tab, Workspace, and Repository activity follows top-level or locally promoted agents rather than allowing a completed delegated descendant to impersonate its parent.
-- Unseen completed descendants appear as a separate teal badge/count beside the primary state icon, while a blocked descendant still makes that primary icon red.
+- Unseen completed collection members remain local to their collection rows and section counts; they do not change Tab, Workspace, or Repository status or attention badges. Unseen completed descendants outside collections still appear as a separate teal badge/count beside the primary state icon, while blocked descendants propagate regardless of placement and make that primary icon red.
 - Viewing or focusing the collection does not mark children as seen.
 - Seen remains session-global initially.
 - Input successfully delivered to a top-level agent terminal marks that agent and every surviving pane in its delegated subtree as seen.

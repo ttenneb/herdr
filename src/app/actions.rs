@@ -508,7 +508,7 @@ impl AppState {
                 ws.checkout.as_ref().map_or_else(
                     || workspace_activity_summary(ws, &self.terminals, &self.delegations),
                     |checkout| {
-                        activity_summary_for_panes(
+                        activity_summary_for_tabs(
                             self.workspaces
                                 .iter()
                                 .filter(|workspace| {
@@ -516,11 +516,7 @@ impl AppState {
                                         candidate.repository_id == checkout.repository_id
                                     })
                                 })
-                                .flat_map(|workspace| {
-                                    workspace.tabs.iter().flat_map(|tab| {
-                                        tab.panes.iter().map(|(&pane_id, pane)| (pane_id, pane))
-                                    })
-                                }),
+                                .flat_map(|workspace| workspace.tabs.iter()),
                             &self.terminals,
                             &self.delegations,
                         )
@@ -533,7 +529,7 @@ impl AppState {
                 ws.checkout.as_ref().map_or_else(
                     || ws.attention_summary(&self.terminals, &self.delegations),
                     |checkout| {
-                        crate::workspace::AttentionSummary::for_panes(
+                        crate::workspace::AttentionSummary::for_tabs(
                             self.workspaces
                                 .iter()
                                 .filter(|workspace| {
@@ -541,11 +537,7 @@ impl AppState {
                                         candidate.repository_id == checkout.repository_id
                                     })
                                 })
-                                .flat_map(|workspace| {
-                                    workspace.tabs.iter().flat_map(|tab| {
-                                        tab.panes.iter().map(|(&pane_id, pane)| (pane_id, pane))
-                                    })
-                                }),
+                                .flat_map(|workspace| workspace.tabs.iter()),
                             &self.terminals,
                             &self.delegations,
                         )
@@ -1194,11 +1186,7 @@ fn tab_activity_summary(
     >,
     delegations: &crate::delegation::Delegations,
 ) -> String {
-    activity_summary_for_panes(
-        tab.panes.iter().map(|(&pane_id, pane)| (pane_id, pane)),
-        terminals,
-        delegations,
-    )
+    activity_summary_for_tabs(std::iter::once(tab), terminals, delegations)
 }
 
 fn workspace_activity_summary(
@@ -1209,32 +1197,41 @@ fn workspace_activity_summary(
     >,
     delegations: &crate::delegation::Delegations,
 ) -> String {
-    activity_summary_for_panes(
-        ws.tabs
-            .iter()
-            .flat_map(|tab| tab.panes.iter().map(|(&pane_id, pane)| (pane_id, pane))),
-        terminals,
-        delegations,
-    )
+    activity_summary_for_tabs(ws.tabs.iter(), terminals, delegations)
 }
 
-fn activity_summary_for_panes<'a>(
-    panes: impl Iterator<Item = (PaneId, &'a crate::pane::PaneState)>,
+fn activity_summary_for_tabs<'a>(
+    tabs: impl Iterator<Item = &'a crate::workspace::Tab>,
     terminals: &std::collections::HashMap<
         crate::terminal::TerminalId,
         crate::terminal::TerminalState,
     >,
     delegations: &crate::delegation::Delegations,
 ) -> String {
-    let panes = panes.collect::<Vec<_>>();
+    let panes = tabs
+        .flat_map(|tab| {
+            tab.panes
+                .iter()
+                .map(|(&pane_id, pane)| (pane_id, pane, tab.pane_placement(pane_id)))
+        })
+        .collect::<Vec<_>>();
     let scope_panes = panes
         .iter()
-        .map(|(pane_id, _)| *pane_id)
+        .map(|(pane_id, _, _)| *pane_id)
         .collect::<std::collections::HashSet<_>>();
     let mut blocked = 0usize;
     let mut working = 0usize;
     let mut done = 0usize;
-    for (pane_id, pane) in panes {
+    for (pane_id, pane, placement) in panes {
+        let Some(terminal) = terminals.get(&pane.attached_terminal_id) else {
+            continue;
+        };
+        if matches!(placement, Some(crate::layout::PanePlacement::Collection(_)))
+            && terminal.state == AgentState::Idle
+            && !pane.seen
+        {
+            continue;
+        }
         let delegated_descendant = delegations
             .delegation_for_pane(pane_id)
             .and_then(|record| record.parent_id)
@@ -1244,9 +1241,6 @@ fn activity_summary_for_panes<'a>(
         if delegated_descendant {
             continue;
         }
-        let Some(terminal) = terminals.get(&pane.attached_terminal_id) else {
-            continue;
-        };
         match (terminal.state, pane.seen) {
             (AgentState::Blocked, _) => blocked += 1,
             (AgentState::Working, _) => working += 1,
@@ -4150,6 +4144,7 @@ impl AppState {
 mod tests {
     use super::*;
     use crate::detect::{Agent, AgentState};
+    use crate::layout::LayoutLeaf;
     use crate::workspace::Workspace;
     use ratatui::layout::Direction;
 
@@ -4881,6 +4876,67 @@ mod tests {
                 ..
             } if plugin_id == "plugin-beta" && resource_id == "resource-beta"
         )));
+    }
+
+    #[test]
+    fn navigator_keeps_collection_completion_on_pane_not_ancestors() {
+        let mut state = app_with_workspaces(&["one"]);
+        let root = state.workspaces[0].tabs[0].root_pane.expect("root pane");
+        let child = state.workspaces[0].test_split(Direction::Horizontal);
+        let collection = state.workspaces[0]
+            .create_collection_near(
+                0,
+                LayoutLeaf::Pane(root),
+                Direction::Vertical,
+                0.5,
+                Some("helpers".into()),
+            )
+            .expect("collection");
+        state.workspaces[0]
+            .collect_pane(child, collection)
+            .expect("collect child");
+        state.ensure_test_terminals();
+        let root_terminal = state.workspaces[0].tabs[0].panes[&root]
+            .attached_terminal_id
+            .clone();
+        state.terminals.get_mut(&root_terminal).unwrap().state = AgentState::Working;
+        let child_terminal = state.workspaces[0].tabs[0].panes[&child]
+            .attached_terminal_id
+            .clone();
+        state.terminals.get_mut(&child_terminal).unwrap().state = AgentState::Idle;
+        state.workspaces[0].tabs[0]
+            .panes
+            .get_mut(&child)
+            .unwrap()
+            .seen = false;
+        state.open_navigator();
+
+        let rows = state.navigator_rows();
+        let workspace = rows
+            .iter()
+            .find(|row| matches!(row.target, NavigatorTarget::Workspace { ws_idx: 0 }))
+            .expect("workspace row");
+        assert_eq!(workspace.status, AgentState::Working);
+        assert_eq!(workspace.descendant_attention_count, 0);
+        assert!(!workspace.meta.contains("done"));
+        let pane = rows
+            .iter()
+            .find(|row| {
+                matches!(row.target, NavigatorTarget::Pane { pane_id, .. } if pane_id == child)
+            })
+            .expect("collection member pane row");
+        assert_eq!(pane.status, AgentState::Idle);
+        assert!(!pane.seen);
+
+        state.navigator.state_filter = Some(NavigatorStateFilter::Done);
+        let rows = state.navigator_rows();
+        assert!(rows.iter().any(|row| {
+            matches!(row.target, NavigatorTarget::Pane { pane_id, .. } if pane_id == child)
+                && row.matched
+        }));
+        assert!(rows.iter().any(|row| {
+            matches!(row.target, NavigatorTarget::Workspace { ws_idx: 0 }) && !row.matched
+        }));
     }
 
     #[test]

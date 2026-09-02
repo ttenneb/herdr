@@ -2,8 +2,7 @@ use std::collections::{HashMap, HashSet};
 
 use crate::delegation::Delegations;
 use crate::detect::{Agent, AgentState};
-use crate::layout::PaneId;
-use crate::pane::PaneState;
+use crate::layout::{PaneId, PanePlacement};
 use crate::terminal::{TerminalId, TerminalState};
 
 use super::{Tab, Workspace};
@@ -29,27 +28,35 @@ impl AttentionSummary {
         }
     }
 
-    pub(crate) fn for_panes<'a, I>(
-        panes: I,
+    pub(crate) fn for_tabs<'a, I>(
+        tabs: I,
         terminals: &HashMap<TerminalId, TerminalState>,
         delegations: &Delegations,
     ) -> Self
     where
-        I: IntoIterator<Item = (PaneId, &'a PaneState)>,
+        I: IntoIterator<Item = &'a Tab>,
     {
-        let panes = panes.into_iter().collect::<Vec<_>>();
+        let panes = tabs
+            .into_iter()
+            .flat_map(|tab| {
+                tab.panes
+                    .iter()
+                    .map(|(&pane_id, pane)| (pane_id, pane, tab.pane_placement(pane_id)))
+            })
+            .collect::<Vec<_>>();
         let scope_panes = panes
             .iter()
-            .map(|(pane_id, _)| *pane_id)
+            .map(|(pane_id, _, _)| *pane_id)
             .collect::<HashSet<_>>();
         panes
             .into_iter()
-            .fold(Self::empty(), |mut summary, (pane_id, pane)| {
+            .fold(Self::empty(), |mut summary, (pane_id, pane, placement)| {
                 if let Some(terminal) = terminals.get(&pane.attached_terminal_id) {
                     summary.include_pane(
                         pane_id,
                         terminal.state,
                         pane.seen,
+                        placement,
                         delegations,
                         &scope_panes,
                     );
@@ -72,9 +79,21 @@ impl AttentionSummary {
         pane_id: PaneId,
         state: AgentState,
         seen: bool,
+        placement: Option<PanePlacement>,
         delegations: &Delegations,
         scope_panes: &HashSet<PaneId>,
     ) {
+        // A collection is the notification boundary for completed members.
+        // Keep the pane's unseen completion local to the collection without
+        // changing its underlying state or seen flag. Other states, especially
+        // blocked, continue to participate in ancestor rollups.
+        if matches!(placement, Some(PanePlacement::Collection(_)))
+            && state == AgentState::Idle
+            && !seen
+        {
+            return;
+        }
+
         let delegated_descendant = delegations
             .delegation_for_pane(pane_id)
             .and_then(|record| record.parent_id)
@@ -158,11 +177,7 @@ impl Tab {
         terminals: &HashMap<TerminalId, TerminalState>,
         delegations: &Delegations,
     ) -> AttentionSummary {
-        AttentionSummary::for_panes(
-            self.panes.iter().map(|(&pane_id, pane)| (pane_id, pane)),
-            terminals,
-            delegations,
-        )
+        AttentionSummary::for_tabs(std::iter::once(self), terminals, delegations)
     }
 
     fn pane_details(
@@ -227,13 +242,7 @@ impl Workspace {
         terminals: &HashMap<TerminalId, TerminalState>,
         delegations: &Delegations,
     ) -> AttentionSummary {
-        AttentionSummary::for_panes(
-            self.tabs
-                .iter()
-                .flat_map(|tab| tab.panes.iter().map(|(&pane_id, pane)| (pane_id, pane))),
-            terminals,
-            delegations,
-        )
+        AttentionSummary::for_tabs(self.tabs.iter(), terminals, delegations)
     }
 
     #[cfg(test)]
@@ -280,6 +289,7 @@ mod tests {
 
     use super::*;
     use crate::detect::Agent;
+    use crate::layout::LayoutLeaf;
 
     fn terminal_for_pane(ws: &Workspace, pane_id: PaneId) -> TerminalState {
         TerminalState::new(ws.terminal_id(pane_id).unwrap().clone(), "/tmp".into())
@@ -376,6 +386,107 @@ mod tests {
         assert_eq!(summary.display_state(), (AgentState::Working, true));
         assert_eq!(summary.unseen_descendant_done(), 1);
         assert_eq!(summary.blocked_descendants(), 0);
+    }
+
+    #[test]
+    fn delegated_collection_completion_stays_local() {
+        let mut ws = Workspace::test_new("test");
+        let child_id = ws.test_split(Direction::Horizontal);
+        let root_id = ws.tabs[0].root_pane.expect("root");
+        let collection = ws
+            .create_collection_near(
+                0,
+                LayoutLeaf::Pane(root_id),
+                Direction::Vertical,
+                0.5,
+                Some("helpers".into()),
+            )
+            .expect("create collection");
+        ws.collect_pane(child_id, collection)
+            .expect("collect child");
+
+        let mut terminals = HashMap::new();
+        let mut root_terminal = terminal_for_pane(&ws, root_id);
+        root_terminal.state = AgentState::Working;
+        terminals.insert(root_terminal.id.clone(), root_terminal);
+        let mut child_terminal = terminal_for_pane(&ws, child_id);
+        child_terminal.state = AgentState::Idle;
+        terminals.insert(child_terminal.id.clone(), child_terminal);
+        ws.tabs[0].panes.get_mut(&child_id).unwrap().seen = false;
+
+        let mut delegations = Delegations::new();
+        let root = delegations.create(Some(root_id), None, None).unwrap();
+        delegations
+            .create(Some(child_id), Some(root), Some("child".into()))
+            .unwrap();
+
+        let tab_summary = ws.tabs[0].attention_summary(&terminals, &delegations);
+        let workspace_summary = ws.attention_summary(&terminals, &delegations);
+        assert_eq!(tab_summary.display_state(), (AgentState::Working, true));
+        assert_eq!(tab_summary.descendant_attention_count(), 0);
+        assert_eq!(
+            workspace_summary.display_state(),
+            (AgentState::Working, true)
+        );
+        assert_eq!(workspace_summary.descendant_attention_count(), 0);
+        assert!(!ws.tabs[0].panes[&child_id].seen);
+    }
+
+    #[test]
+    fn nondelegated_collection_completion_does_not_replace_tiled_activity() {
+        let mut ws = Workspace::test_new("test");
+        let child_id = ws.test_split(Direction::Horizontal);
+        let root_id = ws.tabs[0].root_pane.expect("root");
+        let collection = ws
+            .create_collection_near(0, LayoutLeaf::Pane(root_id), Direction::Vertical, 0.5, None)
+            .expect("create collection");
+        ws.collect_pane(child_id, collection)
+            .expect("collect child");
+
+        let mut terminals = HashMap::new();
+        let mut root_terminal = terminal_for_pane(&ws, root_id);
+        root_terminal.state = AgentState::Working;
+        terminals.insert(root_terminal.id.clone(), root_terminal);
+        let mut child_terminal = terminal_for_pane(&ws, child_id);
+        child_terminal.state = AgentState::Idle;
+        terminals.insert(child_terminal.id.clone(), child_terminal);
+        ws.tabs[0].panes.get_mut(&child_id).unwrap().seen = false;
+
+        let summary = ws.attention_summary(&terminals, &Delegations::new());
+        assert_eq!(summary.display_state(), (AgentState::Working, true));
+        assert_eq!(summary.descendant_attention_count(), 0);
+    }
+
+    #[test]
+    fn blocked_archived_collection_member_remains_urgent() {
+        let mut ws = Workspace::test_new("test");
+        let child_id = ws.test_split(Direction::Horizontal);
+        let root_id = ws.tabs[0].root_pane.expect("root");
+        let collection = ws
+            .create_collection_near(0, LayoutLeaf::Pane(root_id), Direction::Vertical, 0.5, None)
+            .expect("create collection");
+        ws.collect_pane(child_id, collection)
+            .expect("collect child");
+        ws.set_collection_member_archived(child_id, collection, true)
+            .expect("archive child");
+
+        let mut terminals = HashMap::new();
+        let mut root_terminal = terminal_for_pane(&ws, root_id);
+        root_terminal.state = AgentState::Working;
+        terminals.insert(root_terminal.id.clone(), root_terminal);
+        let mut child_terminal = terminal_for_pane(&ws, child_id);
+        child_terminal.state = AgentState::Blocked;
+        terminals.insert(child_terminal.id.clone(), child_terminal);
+
+        let mut delegations = Delegations::new();
+        let root = delegations.create(Some(root_id), None, None).unwrap();
+        delegations
+            .create(Some(child_id), Some(root), Some("child".into()))
+            .unwrap();
+
+        let summary = ws.attention_summary(&terminals, &delegations);
+        assert_eq!(summary.display_state(), (AgentState::Blocked, false));
+        assert_eq!(summary.blocked_descendants(), 1);
     }
 
     #[test]

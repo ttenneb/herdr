@@ -15,7 +15,7 @@
 - Custom themes can now define separate light and dark color overrides when automatic theme switching is enabled. (#837, thanks @aneym)
 
 ### Changed
-- Space and tab activity now follow top-level agents while completed delegated subagents appear as a separate unread attention badge that clears when terminal input is delivered to their top-level parent; blocked descendants still make the primary status red.
+- Space and tab activity now follow top-level agents while completed delegated subagents outside collections appear as a separate unread attention badge that clears when terminal input is delivered to their top-level parent. Completed collection members remain local to their collection, while blocked descendants still make the primary status red regardless of placement.
 - Newly expanded collection previews now automatically use at least half of the collection height while preserving explicit manual sizes.
 - `close_pane` now closes the focused collection through its promote-or-cascade flow when a collection leaf is focused; promotion preserves every member in its own standalone tab, `Shift+X` remains a collection-close alias, and bare list `x`/`Delete` still closes the selected member.
 - Delegated completion attention now rolls up to the top-level agent: input delivered to that main terminal acknowledges its descendant subtree, while entering or typing in an individual child does not.

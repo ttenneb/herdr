@@ -100,7 +100,7 @@ pub struct WorkspaceInfo {
     pub tab_count: usize,
     pub active_tab_id: String,
     pub agent_status: AgentStatus,
-    /// Completed delegated descendants that have not been explicitly acknowledged.
+    /// Completed delegated descendants outside collections that have not been explicitly acknowledged.
     #[serde(default)]
     pub descendant_attention_count: usize,
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
