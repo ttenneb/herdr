@@ -60,7 +60,8 @@ rustPlatform.buildRustPackage {
   nativeBuildInputs = [
     git
     pkg-config
-  ] ++ darwinToolchain;
+  ]
+  ++ darwinToolchain;
 
   env = {
     LIBGHOSTTY_VT_OPTIMIZE = "ReleaseFast";

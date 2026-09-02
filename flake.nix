@@ -43,11 +43,35 @@
         pkgs:
         let
           rustToolchain = rustToolchainFor pkgs;
+          baseRustPlatform = pkgs.makeRustPlatform {
+            cargo = rustToolchain;
+            rustc = rustToolchain;
+          };
+          # crates.io rejects nixpkgs fetchurl's curl User-Agent on its API
+          # download endpoint. Keep the workaround local to Herdr's Cargo lock
+          # importer and rewrite only complete crate-download URLs.
+          cratesIoFetchurl =
+            args:
+            let
+              match = builtins.match "https://crates\\.io/api/v1/crates/([^/]+)/([^/]+)/download" args.url;
+              rewrittenArgs =
+                if match == null then
+                  args
+                else
+                  args
+                  // {
+                    url = "https://static.crates.io/crates/${builtins.elemAt match 0}/${builtins.elemAt match 1}/download";
+                  };
+            in
+            pkgs.buildPackages.fetchurl rewrittenArgs;
         in
-        pkgs.makeRustPlatform {
-          cargo = rustToolchain;
-          rustc = rustToolchain;
-        };
+        baseRustPlatform.overrideScope (
+          _final: prev: {
+            importCargoLock = prev.importCargoLock.override {
+              fetchurl = cratesIoFetchurl;
+            };
+          }
+        );
     in
     {
       packages = forAllSystems (
