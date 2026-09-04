@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+### Fixed
+- Interactive New Workspace actions now open a chooser for an existing Git worktree or a named standalone workspace rooted at the user's home, instead of silently reusing the active checkout.
+
 ## [0.8.2] - 2026-08-19
 
 ### Added

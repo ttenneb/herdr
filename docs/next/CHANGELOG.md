@@ -22,6 +22,7 @@
 - Repository rows are aggregate native targets: their menus do not expose Checkout or plugin actions, while Checkout menus retain workspace plugin choices.
 
 ### Fixed
+- Interactive New Workspace actions now open a chooser for an existing Git worktree or a named standalone workspace rooted at the user's home, instead of silently reusing the active checkout.
 - Pi panes now report `ask_user_question` as blocked while waiting for a human response instead of remaining working.
 - Delegated-attention acknowledgement now requires input delivered to the top-level parent terminal, persists across restart, and emits ordered pane/workspace projections for the acknowledged subtree; API focus and passive host focus do not clear child attention, and clipped custom Space layouts retain the unread badge.
 - Pane split-resize drags now continue smoothly when the pointer crosses collection content instead of stopping at the collection boundary.

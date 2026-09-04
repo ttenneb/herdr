@@ -1,10 +1,16 @@
 use std::path::PathBuf;
 
+use crossterm::event::{KeyCode, KeyEvent};
+
 use crate::api::schema::{EventData, EventEnvelope, EventKind};
 #[cfg(test)]
 use tracing::error;
 
-use super::{api_helpers::pane_agent_status, App, Mode};
+use super::{
+    api_helpers::pane_agent_status,
+    state::{NewWorkspaceKind, NewWorkspaceState},
+    App, Mode,
+};
 use crate::{config::NewTerminalCwdConfig, workspace::Workspace};
 
 pub(crate) fn resolve_new_terminal_cwd(
@@ -93,31 +99,101 @@ impl App {
         })
     }
 
-    pub(super) fn begin_tui_workspace_create(&mut self, request_id: &'static str) {
-        if self.state.prompt_new_workspace_name {
-            let follow_cwd = self.workspace_creation_source().and_then(|ws_idx| {
-                self.focused_pane_cwd_in_workspace(ws_idx)
-                    .or_else(|| self.seed_cwd_from_workspace(ws_idx))
-            });
-            let cwd = self.resolve_new_terminal_cwd(follow_cwd);
-            super::input::open_new_workspace_dialog(&mut self.state, cwd);
+    pub(super) fn begin_tui_workspace_create(&mut self) {
+        let source_idx = self.workspace_creation_source();
+        let worktree_source =
+            source_idx.and_then(|ws_idx| self.worktree_source_metadata(ws_idx).ok());
+        self.state.new_workspace = Some(NewWorkspaceState {
+            selected: if worktree_source.is_some() {
+                NewWorkspaceKind::ExistingWorktree
+            } else {
+                NewWorkspaceKind::Standalone
+            },
+            worktree_source,
+            error: None,
+        });
+        self.state.mode = Mode::NewWorkspace;
+    }
+
+    pub(super) fn select_new_workspace_kind(&mut self, kind: NewWorkspaceKind) {
+        let Some(chooser) = self.state.new_workspace.as_mut() else {
+            return;
+        };
+        if kind == NewWorkspaceKind::ExistingWorktree && !chooser.existing_worktree_available() {
             return;
         }
+        chooser.selected = kind;
+        chooser.error = None;
+    }
 
-        self.runtime_workspace_create(
-            request_id,
-            crate::api::schema::WorkspaceCreateParams {
-                cwd: None,
-                focus: true,
-                label: None,
-                env: Default::default(),
+    pub(super) fn accept_new_workspace_kind(&mut self) {
+        let Some(chooser) = self.state.new_workspace.as_ref() else {
+            return;
+        };
+        match chooser.selected {
+            NewWorkspaceKind::Standalone => match crate::worktree::home_dir() {
+                Ok(home) => {
+                    self.state.new_workspace = None;
+                    super::input::open_new_workspace_dialog(&mut self.state, home);
+                }
+                Err(error) => {
+                    if let Some(chooser) = self.state.new_workspace.as_mut() {
+                        chooser.error = Some(error);
+                    }
+                }
             },
-        );
+            NewWorkspaceKind::ExistingWorktree if chooser.existing_worktree_available() => {
+                let source = chooser
+                    .worktree_source
+                    .clone()
+                    .expect("available worktree source should be captured");
+                match self.open_existing_worktree_dialog_from_source(source) {
+                    Ok(()) => {
+                        if let Some(chooser) = self.state.new_workspace.as_mut() {
+                            chooser.error = None;
+                        }
+                    }
+                    Err(error) => {
+                        if let Some(chooser) = self.state.new_workspace.as_mut() {
+                            chooser.error = Some(error);
+                        }
+                        self.state.mode = Mode::NewWorkspace;
+                    }
+                }
+            }
+            NewWorkspaceKind::ExistingWorktree => {}
+        }
+    }
+
+    pub(super) fn cancel_new_workspace_create(&mut self) {
+        self.state.new_workspace = None;
         self.state.mode = if self.state.active.is_some() {
             Mode::Terminal
         } else {
             Mode::Navigate
         };
+    }
+
+    pub(super) fn handle_new_workspace_key(&mut self, key: KeyEvent) {
+        match key.code {
+            KeyCode::Esc => self.cancel_new_workspace_create(),
+            KeyCode::Enter => self.accept_new_workspace_kind(),
+            KeyCode::Up | KeyCode::Down | KeyCode::Tab | KeyCode::BackTab => {
+                let Some(chooser) = self.state.new_workspace.as_ref() else {
+                    return;
+                };
+                let kind = if chooser.existing_worktree_available() {
+                    match chooser.selected {
+                        NewWorkspaceKind::ExistingWorktree => NewWorkspaceKind::Standalone,
+                        NewWorkspaceKind::Standalone => NewWorkspaceKind::ExistingWorktree,
+                    }
+                } else {
+                    NewWorkspaceKind::Standalone
+                };
+                self.select_new_workspace_kind(kind);
+            }
+            _ => {}
+        }
     }
 
     /// Create a workspace with a real PTY (needs event_tx).

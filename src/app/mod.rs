@@ -652,6 +652,7 @@ impl App {
             creating_new_tab: false,
             requested_new_tab_name: None,
             pending_workspace_create_cwd: None,
+            new_workspace: None,
             rename_repository_target: None,
             confirm_repository_close_target: None,
             rename_pane_target: None,
@@ -1364,6 +1365,7 @@ impl App {
         if !self.state.workspaces.is_empty()
             || self.state.mode == Mode::Onboarding
             || self.state.pending_workspace_create_cwd.is_some()
+            || self.state.new_workspace.is_some()
         {
             return false;
         }
@@ -2069,6 +2071,9 @@ impl App {
             }
             Mode::RenameWorkspace | Mode::RenameTab | Mode::RenamePane => {
                 self.handle_rename_key_via_api(key_event);
+            }
+            Mode::NewWorkspace => {
+                self.handle_new_workspace_key(key_event);
             }
             Mode::NewLinkedWorktree => {
                 self.handle_worktree_create_key(key_event);
@@ -2943,20 +2948,40 @@ mod tests {
     }
 
     #[test]
-    fn workspace_name_prompt_suppresses_default_creation_while_pending() {
-        let mut app = test_app();
-        app.state.prompt_new_workspace_name = true;
+    fn interactive_workspace_create_always_opens_chooser_and_suppresses_default_creation() {
+        for prompt_new_workspace_name in [false, true] {
+            let mut app = test_app();
+            app.state.prompt_new_workspace_name = prompt_new_workspace_name;
 
-        app.begin_tui_workspace_create("test.workspace.create");
+            app.begin_tui_workspace_create();
+
+            assert_eq!(app.state.mode, Mode::NewWorkspace);
+            let chooser = app.state.new_workspace.as_ref().unwrap();
+            assert!(!chooser.existing_worktree_available());
+            assert_eq!(chooser.selected, state::NewWorkspaceKind::Standalone);
+            assert!(!app.ensure_default_workspace());
+            assert!(app.state.workspaces.is_empty());
+
+            app.handle_new_workspace_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::empty()));
+            assert!(app.state.workspaces.is_empty());
+            assert!(app.state.new_workspace.is_none());
+        }
+    }
+
+    #[test]
+    fn standalone_workspace_prompt_uses_exact_home_directory() {
+        let mut app = test_app();
+        app.begin_tui_workspace_create();
+
+        app.handle_new_workspace_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()));
 
         assert_eq!(app.state.mode, Mode::RenameWorkspace);
-        assert!(app.state.pending_workspace_create_cwd.is_some());
-        assert!(!app.ensure_default_workspace());
+        assert_eq!(
+            app.state.pending_workspace_create_cwd.as_deref(),
+            Some(crate::worktree::home_dir().unwrap().as_path())
+        );
+        assert!(app.state.new_workspace.is_none());
         assert!(app.state.workspaces.is_empty());
-
-        app.handle_rename_key_via_api(KeyEvent::new(KeyCode::Esc, KeyModifiers::empty()));
-        assert!(app.state.workspaces.is_empty());
-        assert!(app.state.pending_workspace_create_cwd.is_none());
     }
 
     #[test]

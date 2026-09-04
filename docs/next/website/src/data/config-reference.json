@@ -944,7 +944,7 @@
           "key": "ui.prompt_new_workspace_name",
           "type": "boolean",
           "default": "false",
-          "description": "Ask for a workspace name before interactive TUI creation."
+          "description": "Retired compatibility setting; interactive creation always uses the workspace chooser."
         },
         {
           "key": "ui.pane_borders",

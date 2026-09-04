@@ -896,7 +896,7 @@ pub struct UiConfig {
     pub confirm_close: bool,
     /// Ask for a tab name before creating a new tab. Default: true.
     pub prompt_new_tab_name: bool,
-    /// Ask for a workspace name before interactive creation. Default: false.
+    /// Retired compatibility setting. Interactive creation now always uses the workspace chooser.
     pub prompt_new_workspace_name: bool,
     /// Draw borders around split panes. Default: true.
     pub pane_borders: bool,

@@ -121,6 +121,7 @@ impl App {
                 Mode::RenameWorkspace | Mode::RenameTab | Mode::RenamePane => {
                     self.handle_rename_key_via_api(key_event)
                 }
+                Mode::NewWorkspace => self.handle_new_workspace_key(key_event),
                 Mode::NewLinkedWorktree => self.handle_worktree_create_key(key_event),
                 Mode::OpenExistingWorktree => self.handle_worktree_open_key(key_event),
                 Mode::ConfirmRemoveWorktree => self.handle_worktree_remove_key(key_event),
@@ -514,9 +515,7 @@ impl App {
                     .handle_mouse(&mut self.terminal_runtimes, source_id, mouse)
             {
                 match action {
-                    MouseAction::NewWorkspace => {
-                        self.begin_tui_workspace_create("tui.mouse.workspace.create")
-                    }
+                    MouseAction::NewWorkspace => self.begin_tui_workspace_create(),
                     MouseAction::Settings(action) => match action {
                         SettingsAction::SaveTheme(name) => self.save_theme(&name),
                         SettingsAction::SaveStatusIndicators(style) => {

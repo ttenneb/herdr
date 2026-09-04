@@ -3,7 +3,10 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 use super::{
-    state::{WorktreeCreateState, WorktreeOpenEntry, WorktreeOpenState, WorktreeRemoveState},
+    state::{
+        WorktreeCreateState, WorktreeOpenEntry, WorktreeOpenState, WorktreeRemoveState,
+        WorktreeSourceMetadata,
+    },
     App, Mode,
 };
 #[cfg(test)]
@@ -11,18 +14,10 @@ use crate::events::AppEvent;
 use crate::events::{WorktreeAddResult, WorktreeRemoveResult};
 
 impl App {
-    fn worktree_source_metadata(
+    pub(super) fn worktree_source_metadata(
         &self,
         ws_idx: usize,
-    ) -> Result<
-        (
-            Option<crate::workspace::WorktreeSpaceMembership>,
-            crate::workspace::GitSpaceMetadata,
-            std::path::PathBuf,
-            String,
-        ),
-        String,
-    > {
+    ) -> Result<WorktreeSourceMetadata, String> {
         let Some(ws) = self.state.workspaces.get(ws_idx) else {
             return Err("Workspace not found.".into());
         };
@@ -54,12 +49,12 @@ impl App {
             })
             .unwrap_or_else(|| space.repo_root.clone());
         let source_workspace_id = self.state.workspaces[ws_idx].id.clone();
-        Ok((
+        Ok(WorktreeSourceMetadata {
             existing_membership,
             space,
-            source_checkout_path,
-            source_workspace_id,
-        ))
+            checkout_path: source_checkout_path,
+            workspace_id: source_workspace_id,
+        })
     }
 
     pub(crate) fn open_new_linked_worktree_dialog(&mut self, ws_idx: usize) {
@@ -75,14 +70,19 @@ impl App {
     }
 
     fn open_new_worktree_dialog(&mut self, ws_idx: usize, repository_scope: Option<&str>) {
-        let (existing_membership, space, source_checkout_path, source_workspace_id) =
-            match self.worktree_source_metadata(ws_idx) {
-                Ok(metadata) => metadata,
-                Err(err) => {
-                    self.state.config_diagnostic = Some(err);
-                    return;
-                }
-            };
+        let source = match self.worktree_source_metadata(ws_idx) {
+            Ok(metadata) => metadata,
+            Err(err) => {
+                self.state.config_diagnostic = Some(err);
+                return;
+            }
+        };
+        let WorktreeSourceMetadata {
+            existing_membership,
+            space,
+            checkout_path: source_checkout_path,
+            workspace_id: source_workspace_id,
+        } = source;
 
         let repo_name = space.repo_name.clone();
         let seed = SystemTime::now()
@@ -167,22 +167,25 @@ impl App {
     }
 
     pub(crate) fn open_existing_worktree_dialog(&mut self, ws_idx: usize) {
-        let (existing_membership, space, source_checkout_path, source_workspace_id) =
-            match self.worktree_source_metadata(ws_idx) {
-                Ok(metadata) => metadata,
-                Err(err) => {
-                    self.state.config_diagnostic = Some(err);
-                    return;
-                }
-            };
+        let result = self
+            .worktree_source_metadata(ws_idx)
+            .and_then(|source| self.open_existing_worktree_dialog_from_source(source));
+        if let Err(err) = result {
+            self.state.config_diagnostic = Some(err);
+        }
+    }
 
-        let list = match crate::worktree::list_existing_worktrees(&space.repo_root, false) {
-            Ok(list) => list,
-            Err(err) => {
-                self.state.config_diagnostic = Some(err);
-                return;
-            }
-        };
+    pub(super) fn open_existing_worktree_dialog_from_source(
+        &mut self,
+        source: WorktreeSourceMetadata,
+    ) -> Result<(), String> {
+        let WorktreeSourceMetadata {
+            existing_membership,
+            space,
+            checkout_path: source_checkout_path,
+            workspace_id: source_workspace_id,
+        } = source;
+        let list = crate::worktree::list_existing_worktrees(&space.repo_root, false)?;
         let entries = list
             .into_iter()
             .filter(|entry| !entry.is_bare && !entry.is_prunable)
@@ -221,11 +224,17 @@ impl App {
             .collect::<Vec<_>>();
 
         if entries.is_empty() {
-            self.state.config_diagnostic = Some("No Git worktrees found for this repo.".into());
-            return;
+            return Err("No Git worktrees found for this repo.".into());
         }
 
-        self.state.selected = ws_idx;
+        if let Some(ws_idx) = self
+            .state
+            .workspaces
+            .iter()
+            .position(|workspace| workspace.id == source_workspace_id)
+        {
+            self.state.selected = ws_idx;
+        }
         self.state.worktree_open = Some(WorktreeOpenState {
             source_workspace_id,
             source_existing_membership: existing_membership,
@@ -240,6 +249,7 @@ impl App {
             error: None,
         });
         self.state.mode = Mode::OpenExistingWorktree;
+        Ok(())
     }
 
     pub(crate) fn handle_worktree_create_key(&mut self, key: KeyEvent) {
@@ -355,7 +365,9 @@ impl App {
         match key.code {
             KeyCode::Esc => {
                 self.state.worktree_open = None;
-                self.state.mode = if self.state.active.is_some() {
+                self.state.mode = if self.state.new_workspace.is_some() {
+                    Mode::NewWorkspace
+                } else if self.state.active.is_some() {
                     Mode::Terminal
                 } else {
                     Mode::Navigate
@@ -822,13 +834,33 @@ impl App {
             return;
         };
         let source_workspace_id = open.source_workspace_id.clone();
+        let source_checkout_path = open.source_checkout_path.clone();
+        let chooser_source = self
+            .state
+            .new_workspace
+            .as_ref()
+            .and_then(|chooser| chooser.worktree_source.as_ref())
+            .cloned();
+        let source_workspace_still_matches = chooser_source.as_ref().is_some_and(|captured| {
+            self.state
+                .workspaces
+                .iter()
+                .position(|workspace| workspace.id == captured.workspace_id)
+                .and_then(|ws_idx| self.worktree_source_metadata(ws_idx).ok())
+                .is_some_and(|current| {
+                    current.space.key == captured.space.key
+                        && crate::worktree::canonical_or_original(&current.checkout_path)
+                            == crate::worktree::canonical_or_original(&captured.checkout_path)
+                })
+        });
+        let use_source_workspace = chooser_source.is_none() || source_workspace_still_matches;
 
         let response = self.runtime_worktree_open(
             "tui.worktree.open",
             crate::api::schema::WorktreeOpenParams {
                 repository_id: None,
-                workspace_id: Some(source_workspace_id),
-                cwd: None,
+                workspace_id: use_source_workspace.then_some(source_workspace_id),
+                cwd: (!use_source_workspace).then(|| source_checkout_path.display().to_string()),
                 path: Some(entry.path.display().to_string()),
                 branch: None,
                 focus: true,
@@ -838,6 +870,7 @@ impl App {
         );
         if serde_json::from_str::<crate::api::schema::SuccessResponse>(&response).is_ok() {
             self.state.worktree_open = None;
+            self.state.new_workspace = None;
             self.state.mode = Mode::Terminal;
         } else if let Ok(error) =
             serde_json::from_str::<crate::api::schema::ErrorResponse>(&response)
@@ -1615,6 +1648,95 @@ mod tests {
             .find(|entry| crate::worktree::canonical_or_original(&entry.path) == checkout)
             .unwrap_or_else(|| panic!("missing checkout in entries: {:?}", open.entries));
         assert_eq!(entry.already_open_ws_idx, Some(1));
+    }
+
+    #[tokio::test]
+    async fn new_workspace_existing_choice_reuses_worktree_picker() {
+        let repo = create_committed_repo("new-workspace-existing-choice");
+        let mut app = app_for_worktree_tests();
+        app.state.workspaces = vec![crate::workspace::Workspace::test_new("main")];
+        app.state.workspaces[0].identity_cwd = repo.clone();
+        app.state.ensure_test_terminals();
+        app.state.active = Some(0);
+        app.state.selected = 0;
+        app.state.mode = Mode::Terminal;
+
+        app.begin_tui_workspace_create();
+
+        let chooser = app.state.new_workspace.as_ref().unwrap();
+        assert!(chooser.existing_worktree_available());
+        assert_eq!(
+            chooser.selected,
+            crate::app::state::NewWorkspaceKind::ExistingWorktree
+        );
+        app.state.new_workspace.as_mut().unwrap().error = Some("stale list error".into());
+        app.accept_new_workspace_kind();
+
+        assert_eq!(app.state.mode, Mode::OpenExistingWorktree);
+        assert!(app.state.new_workspace.is_some());
+        assert!(app.state.worktree_open.is_some());
+
+        app.handle_worktree_open_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::empty()));
+        assert_eq!(app.state.mode, Mode::NewWorkspace);
+        assert_eq!(
+            app.state
+                .new_workspace
+                .as_ref()
+                .and_then(|chooser| chooser.error.as_deref()),
+            None
+        );
+        assert!(app.state.worktree_open.is_none());
+
+        app.accept_new_workspace_kind();
+        app.submit_worktree_open_via_api();
+        assert_eq!(app.state.mode, Mode::Terminal);
+        assert!(app.state.new_workspace.is_none());
+        assert!(app.state.worktree_open.is_none());
+        assert_eq!(app.state.workspaces.len(), 1);
+        let _ = std::fs::remove_dir_all(repo);
+    }
+
+    #[tokio::test]
+    async fn new_workspace_chooser_keeps_captured_repository_when_source_cwd_changes() {
+        let original_repo = create_committed_repo("new-workspace-stable-source-original");
+        let changed_repo = create_committed_repo("new-workspace-stable-source-changed");
+        let mut app = app_for_worktree_tests();
+        app.state.workspaces = vec![crate::workspace::Workspace::test_new("main")];
+        app.state.workspaces[0].identity_cwd = original_repo.clone();
+        app.state.active = Some(0);
+        app.state.selected = 0;
+        app.state.mode = Mode::Terminal;
+        app.begin_tui_workspace_create();
+
+        app.state.workspaces[0].identity_cwd = changed_repo.clone();
+        app.accept_new_workspace_kind();
+
+        let open = app.state.worktree_open.as_ref().unwrap();
+        assert_eq!(app.state.mode, Mode::OpenExistingWorktree);
+        assert_eq!(
+            crate::worktree::canonical_or_original(&open.source_repo_root),
+            crate::worktree::canonical_or_original(&original_repo)
+        );
+        assert!(open.entries.iter().any(|entry| {
+            crate::worktree::canonical_or_original(&entry.path)
+                == crate::worktree::canonical_or_original(&original_repo)
+        }));
+        assert!(!open.entries.iter().any(|entry| {
+            crate::worktree::canonical_or_original(&entry.path)
+                == crate::worktree::canonical_or_original(&changed_repo)
+        }));
+
+        app.submit_worktree_open_via_api();
+        assert_eq!(app.state.mode, Mode::Terminal);
+        assert!(app.state.new_workspace.is_none());
+        assert!(app.state.worktree_open.is_none());
+        assert!(app.state.workspaces.iter().any(|workspace| {
+            crate::worktree::canonical_or_original(&workspace.identity_cwd)
+                == crate::worktree::canonical_or_original(&original_repo)
+        }));
+        crate::app::api::test_support::shutdown_test_runtimes(&mut app);
+        let _ = std::fs::remove_dir_all(original_repo);
+        let _ = std::fs::remove_dir_all(changed_repo);
     }
 
     #[test]
