@@ -5,7 +5,7 @@ use ratatui::{
 };
 
 use crate::app::{
-    state::{AppState, DragState, DragTarget, Mode, NavigatorTarget},
+    state::{AppState, DragState, DragTarget, Mode, NavigatorTarget, NewWorkspaceKind},
     App,
 };
 
@@ -20,6 +20,44 @@ fn rect_contains(rect: Rect, col: u16, row: u16) -> bool {
 
 impl App {
     pub(super) fn handle_overlay_mouse(&mut self, mouse: MouseEvent) -> bool {
+        if self.state.mode == Mode::NewWorkspace {
+            if let MouseEventKind::Down(MouseButton::Left) = mouse.kind {
+                let Some(inner) = self.state.new_workspace_modal_inner() else {
+                    return true;
+                };
+                if rect_contains(
+                    crate::ui::new_workspace_cancel_rect(inner),
+                    mouse.column,
+                    mouse.row,
+                ) || !rect_contains(inner, mouse.column, mouse.row)
+                {
+                    self.cancel_new_workspace_create();
+                    return true;
+                }
+                if let Some((idx, _)) = crate::ui::new_workspace_choice_rects(inner)
+                    .into_iter()
+                    .enumerate()
+                    .find(|(_, rect)| rect_contains(*rect, mouse.column, mouse.row))
+                {
+                    let kind = if idx == 0 {
+                        NewWorkspaceKind::ExistingWorktree
+                    } else {
+                        NewWorkspaceKind::Standalone
+                    };
+                    self.select_new_workspace_kind(kind);
+                    if self
+                        .state
+                        .new_workspace
+                        .as_ref()
+                        .is_some_and(|chooser| chooser.selected == kind)
+                    {
+                        self.accept_new_workspace_kind();
+                    }
+                }
+            }
+            return true;
+        }
+
         if self.state.mode == Mode::ReleaseNotes {
             match mouse.kind {
                 MouseEventKind::Down(MouseButton::Left)
@@ -408,6 +446,10 @@ impl AppState {
 
     pub(super) fn rename_modal_inner(&self) -> Option<Rect> {
         self.onboarding_modal_inner(56, 7)
+    }
+
+    pub(super) fn new_workspace_modal_inner(&self) -> Option<Rect> {
+        crate::ui::new_workspace_inner_rect(self.onboarding_full_area())
     }
 
     fn release_notes_body_rect(&self) -> Option<Rect> {

@@ -45,6 +45,13 @@ pub struct WorktreeSpaceMembership {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum CurrentGitIdentity {
+    Git(GitSpaceMetadata),
+    NonGit,
+    Unavailable,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WorkspaceGitStatus {
     pub workspace_id: String,
     pub resolved_identity_cwd: PathBuf,
@@ -1581,17 +1588,21 @@ impl Workspace {
         self.cached_git_space.as_ref()
     }
 
-    /// Resolve Git identity from the live checkout first. The refresh cache is
-    /// only a continuity fallback when Git discovery cannot currently run.
-    pub(crate) fn resolved_git_space_from(
+    pub(crate) fn current_git_identity_from(
         &self,
         terminals: &HashMap<TerminalId, TerminalState>,
         terminal_runtimes: &TerminalRuntimeRegistry,
-    ) -> Option<GitSpaceMetadata> {
-        self.resolved_identity_cwd_from(terminals, terminal_runtimes)
-            .as_deref()
-            .and_then(git_space_metadata)
-            .or_else(|| self.cached_git_space.clone())
+    ) -> CurrentGitIdentity {
+        let Some(cwd) = self.resolved_identity_cwd_from(terminals, terminal_runtimes) else {
+            return CurrentGitIdentity::Unavailable;
+        };
+        if let Some(space) = git_space_metadata(&cwd) {
+            CurrentGitIdentity::Git(space)
+        } else if cwd.try_exists().unwrap_or(false) {
+            CurrentGitIdentity::NonGit
+        } else {
+            CurrentGitIdentity::Unavailable
+        }
     }
 
     pub fn worktree_space(&self) -> Option<&WorktreeSpaceMembership> {

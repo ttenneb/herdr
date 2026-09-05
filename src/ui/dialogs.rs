@@ -2,23 +2,188 @@ use ratatui::{
     layout::{Constraint, Layout, Rect},
     style::{Modifier, Style},
     text::{Line, Span},
-    widgets::{Clear, Paragraph, Wrap},
+    widgets::{Block, Clear, Paragraph, Wrap},
     Frame,
 };
 
 use super::text::{display_width_u16, truncate_end};
 use super::widgets::{
-    action_button_row_rects, centered_popup_rect, panel_contrast_fg, render_action_button,
-    render_modal_header, render_modal_shell, render_panel_shell, ActionButtonSpec,
+    action_button_row_rects, centered_popup_rect, modal_choice_rows, panel_contrast_fg,
+    render_action_button, render_modal_description, render_modal_header, render_modal_shell,
+    render_panel_shell, ActionButtonSpec,
 };
-use crate::app::{state::WorktreeOpenState, AppState, Mode};
+use crate::app::{
+    state::{NewWorkspaceKind, WorktreeOpenState},
+    AppState, Mode,
+};
 use crate::terminal::TerminalRuntimeRegistry;
+
+const NEW_WORKSPACE_POPUP_WIDTH: u16 = 64;
+const NEW_WORKSPACE_POPUP_HEIGHT: u16 = 15;
 
 const NEW_LINKED_WORKTREE_POPUP_WIDTH: u16 = 68;
 const NEW_LINKED_WORKTREE_POPUP_HEIGHT: u16 = 15;
 
 const COLLECTION_CLOSE_POPUP_WIDTH: u16 = 76;
 const COLLECTION_CLOSE_POPUP_HEIGHT: u16 = 12;
+
+pub(crate) fn new_workspace_inner_rect(area: Rect) -> Option<Rect> {
+    let popup = centered_popup_rect(area, NEW_WORKSPACE_POPUP_WIDTH, NEW_WORKSPACE_POPUP_HEIGHT)?;
+    Some(
+        Block::default()
+            .borders(ratatui::widgets::Borders::ALL)
+            .inner(popup),
+    )
+}
+
+pub(crate) fn new_workspace_choice_rects(inner: Rect) -> Vec<Rect> {
+    if inner.height >= 11 {
+        return modal_choice_rows(
+            Rect::new(
+                inner.x,
+                inner.y.saturating_add(4),
+                inner.width,
+                inner.height.saturating_sub(7),
+            ),
+            2,
+            3,
+        );
+    }
+
+    let reserve_header_and_cancel = inner.height >= 4;
+    let top = u16::from(reserve_header_and_cancel);
+    let bottom = u16::from(reserve_header_and_cancel);
+    modal_choice_rows(
+        Rect::new(
+            inner.x,
+            inner.y.saturating_add(top),
+            inner.width,
+            inner.height.saturating_sub(top.saturating_add(bottom)),
+        ),
+        2,
+        1,
+    )
+}
+
+pub(crate) fn new_workspace_cancel_rect(inner: Rect) -> Rect {
+    if inner.height < 4 {
+        return Rect::default();
+    }
+    action_button_row_rects(
+        inner,
+        &[ActionButtonSpec {
+            hint: Some("esc"),
+            label: "cancel",
+        }],
+        0,
+        inner.height.saturating_sub(1),
+    )[0]
+}
+
+pub(super) fn render_new_workspace_overlay(app: &AppState, frame: &mut Frame, area: Rect) {
+    let Some(chooser) = app.new_workspace.as_ref() else {
+        return;
+    };
+    super::dim_background(frame, area);
+    let Some(inner) = render_modal_shell(
+        frame,
+        area,
+        NEW_WORKSPACE_POPUP_WIDTH,
+        NEW_WORKSPACE_POPUP_HEIGHT,
+        &app.palette,
+    ) else {
+        return;
+    };
+
+    let rows = new_workspace_choice_rects(inner);
+    let choices_start = rows.first().map(|row| row.y).unwrap_or(inner.y);
+    if choices_start > inner.y {
+        render_modal_header(
+            frame,
+            Rect::new(inner.x, inner.y, inner.width, 1),
+            "new workspace",
+            &app.palette,
+        );
+    }
+    if choices_start >= inner.y.saturating_add(4) {
+        render_modal_description(
+            frame,
+            Rect::new(inner.x, inner.y.saturating_add(2), inner.width, 1),
+            "Choose how this workspace should start.",
+            Style::default().fg(app.palette.overlay1),
+        );
+    }
+    let choices = [
+        (
+            NewWorkspaceKind::ExistingWorktree,
+            "Existing Git worktree",
+            if chooser.existing_worktree_available() {
+                "Open a checkout from the current repository"
+            } else {
+                "Requires an active workspace inside a Git worktree"
+            },
+        ),
+        (
+            NewWorkspaceKind::Standalone,
+            "Standalone",
+            "Create a named workspace in your home directory",
+        ),
+    ];
+    for ((kind, label, description), row) in choices.into_iter().zip(rows) {
+        let enabled =
+            kind != NewWorkspaceKind::ExistingWorktree || chooser.existing_worktree_available();
+        let selected = chooser.selected == kind;
+        let style = if selected {
+            Style::default()
+                .fg(app.palette.text)
+                .bg(app.palette.surface0)
+                .add_modifier(Modifier::BOLD)
+        } else if enabled {
+            Style::default().fg(app.palette.subtext0)
+        } else {
+            Style::default().fg(app.palette.overlay0)
+        };
+        let marker = if selected { ">" } else { " " };
+        let lines = if row.height >= 2 {
+            vec![
+                Line::from(format!(" {marker} {label}")),
+                Line::from(vec![Span::raw("    "), Span::styled(description, style)]),
+            ]
+        } else {
+            vec![Line::from(format!(" {marker} {label}"))]
+        };
+        frame.render_widget(Paragraph::new(lines).style(style), row);
+    }
+
+    if let Some(error) = chooser.error.as_deref() {
+        let error_row = if inner.height >= 10 {
+            Some(inner.bottom().saturating_sub(3))
+        } else if inner.height >= 5 {
+            Some(inner.bottom().saturating_sub(2))
+        } else {
+            None
+        };
+        if let Some(error_row) = error_row {
+            frame.render_widget(
+                Paragraph::new(error).style(Style::default().fg(app.palette.red)),
+                Rect::new(inner.x, error_row, inner.width, 1),
+            );
+        }
+    }
+    let cancel = new_workspace_cancel_rect(inner);
+    if cancel.width > 0 && cancel.height > 0 {
+        render_action_button(
+            frame,
+            cancel,
+            Some("esc"),
+            "cancel",
+            Style::default()
+                .fg(app.palette.text)
+                .bg(app.palette.surface0)
+                .add_modifier(Modifier::BOLD),
+        );
+    }
+}
 
 pub(crate) fn collection_close_popup_rect(area: Rect) -> Option<Rect> {
     centered_popup_rect(
@@ -1007,7 +1172,10 @@ pub(crate) fn confirm_close_button_rects(inner: Rect) -> (Rect, Rect) {
 #[cfg(test)]
 mod tests {
     use crate::{
-        app::{state::WorktreeCreateState, AppState, Mode},
+        app::{
+            state::{NewWorkspaceKind, NewWorkspaceState, WorktreeCreateState},
+            AppState, Mode,
+        },
         workspace::Workspace,
     };
     use ratatui::{
@@ -1018,9 +1186,79 @@ mod tests {
     };
 
     use super::{
-        confirm_close_overlay_text, render_collection_close_overlay,
-        render_new_linked_worktree_overlay, render_rename_overlay,
+        confirm_close_overlay_text, new_workspace_choice_rects, new_workspace_inner_rect,
+        render_collection_close_overlay, render_new_linked_worktree_overlay,
+        render_new_workspace_overlay, render_rename_overlay,
     };
+
+    #[test]
+    fn new_workspace_dialog_renders_both_choices_and_disabled_repository_help() {
+        let mut app = AppState::test_new();
+        app.mode = Mode::NewWorkspace;
+        app.new_workspace = Some(NewWorkspaceState {
+            worktree_source: None,
+            selected: NewWorkspaceKind::Standalone,
+            error: None,
+        });
+        let backend = TestBackend::new(100, 24);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+
+        terminal
+            .draw(|frame| render_new_workspace_overlay(&app, frame, frame.area()))
+            .expect("draw");
+
+        let text = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(text.contains("Existing Git worktree"));
+        assert!(text.contains("Requires an active workspace inside a Git worktree"));
+        assert!(text.contains("Standalone"));
+        assert!(text.contains("home directory"));
+    }
+
+    #[test]
+    fn short_new_workspace_dialog_renders_two_mouse_addressable_choices() {
+        let mut app = AppState::test_new();
+        app.mode = Mode::NewWorkspace;
+        app.new_workspace = Some(NewWorkspaceState {
+            worktree_source: None,
+            selected: NewWorkspaceKind::Standalone,
+            error: None,
+        });
+
+        for height in [8, 14] {
+            let area = Rect::new(0, 0, 50, height);
+            let backend = TestBackend::new(area.width, area.height);
+            let mut terminal = Terminal::new(backend).expect("terminal");
+
+            terminal
+                .draw(|frame| render_new_workspace_overlay(&app, frame, frame.area()))
+                .expect("draw");
+
+            let text = terminal
+                .backend()
+                .buffer()
+                .content()
+                .iter()
+                .map(|cell| cell.symbol())
+                .collect::<String>();
+            assert!(text.contains("Existing Git worktree"), "height={height}");
+            assert!(text.contains("Standalone"), "height={height}");
+
+            let inner = new_workspace_inner_rect(area).expect("compact modal");
+            let choices = new_workspace_choice_rects(inner);
+            assert_eq!(choices.len(), 2, "height={height}");
+            assert!(
+                choices.iter().all(|rect| rect.width > 0 && rect.height > 0),
+                "height={height}"
+            );
+            assert_ne!(choices[0], choices[1], "height={height}");
+        }
+    }
 
     #[test]
     fn collection_close_dialog_shows_disposition_counts_and_state_warning() {

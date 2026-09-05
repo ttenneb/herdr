@@ -466,7 +466,11 @@ impl AppState {
                                 }
                                 Some(ModalAction::Cancel) => {
                                     self.worktree_open = None;
-                                    leave_modal(self);
+                                    if self.new_workspace.is_some() {
+                                        self.mode = Mode::NewWorkspace;
+                                    } else {
+                                        leave_modal(self);
+                                    }
                                 }
                                 _ => {}
                             }
@@ -4311,6 +4315,28 @@ mod tests {
 
         assert!(app.state.worktree_open.is_none());
         assert_eq!(app.state.mode, Mode::Navigate);
+
+        let mut app = app_for_mouse_test();
+        app.state.mode = Mode::OpenExistingWorktree;
+        app.state.worktree_open = Some(sample_worktree_open_state());
+        app.state.new_workspace = Some(crate::app::state::NewWorkspaceState {
+            worktree_source: None,
+            selected: crate::app::state::NewWorkspaceKind::Standalone,
+            error: None,
+        });
+        let inner =
+            crate::ui::open_existing_worktree_inner_rect(app.state.screen_rect(), 2).unwrap();
+        let (_, cancel) = crate::ui::open_existing_worktree_button_rects(inner);
+
+        app.handle_mouse(mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            cancel.x,
+            cancel.y,
+        ));
+
+        assert!(app.state.worktree_open.is_none());
+        assert!(app.state.new_workspace.is_some());
+        assert_eq!(app.state.mode, Mode::NewWorkspace);
     }
 
     #[test]
@@ -5337,13 +5363,12 @@ mod tests {
     }
 
     #[test]
-    fn mobile_switcher_new_workspace_opens_prompt_when_enabled() {
+    fn mobile_switcher_new_workspace_opens_chooser() {
         let mut app = app_for_mouse_test();
         app.state.workspaces = vec![Workspace::test_new("one")];
         app.state.active = Some(0);
         app.state.selected = 0;
         app.state.mode = Mode::Terminal;
-        app.state.prompt_new_workspace_name = true;
 
         crate::ui::compute_view(&mut app.state, Rect::new(0, 0, 44, 20));
         let switch = app.state.view.mobile_menu_hit_area;
@@ -5359,56 +5384,83 @@ mod tests {
             viewport.y + 1,
         ));
 
-        assert_eq!(app.state.mode, Mode::RenameWorkspace);
-        assert!(app.state.pending_workspace_create_cwd.is_some());
-        assert!(app.state.name_input_replace_on_type);
+        assert_eq!(app.state.mode, Mode::NewWorkspace);
+        assert!(app.state.new_workspace.is_some());
+        assert!(app.state.pending_workspace_create_cwd.is_none());
         assert_eq!(app.state.workspaces.len(), 1);
     }
 
     #[test]
-    fn desktop_new_workspace_opens_prompt_when_enabled() {
+    fn desktop_new_workspace_always_opens_chooser() {
+        for prompt_new_workspace_name in [false, true] {
+            let mut app = app_for_mouse_test();
+            app.state.workspaces = vec![Workspace::test_new("one")];
+            app.state.active = Some(0);
+            app.state.selected = 0;
+            app.state.mode = Mode::Terminal;
+            app.state.prompt_new_workspace_name = prompt_new_workspace_name;
+
+            crate::ui::compute_view(&mut app.state, Rect::new(0, 0, 120, 40));
+            let new_workspace = app.state.sidebar_new_button_rect();
+            app.handle_mouse(mouse(
+                MouseEventKind::Down(MouseButton::Left),
+                new_workspace.x + 1,
+                new_workspace.y,
+            ));
+
+            assert_eq!(app.state.mode, Mode::NewWorkspace);
+            assert!(app.state.new_workspace.is_some());
+            assert!(app.state.pending_workspace_create_cwd.is_none());
+            assert_eq!(app.state.workspaces.len(), 1);
+        }
+    }
+
+    #[test]
+    fn chooser_outside_click_cancels_without_creating() {
         let mut app = app_for_mouse_test();
         app.state.workspaces = vec![Workspace::test_new("one")];
         app.state.active = Some(0);
         app.state.selected = 0;
         app.state.mode = Mode::Terminal;
-        app.state.prompt_new_workspace_name = true;
-
         crate::ui::compute_view(&mut app.state, Rect::new(0, 0, 120, 40));
-        let new_workspace = app.state.sidebar_new_button_rect();
-        app.handle_mouse(mouse(
-            MouseEventKind::Down(MouseButton::Left),
-            new_workspace.x + 1,
-            new_workspace.y,
-        ));
+        app.begin_tui_workspace_create();
 
-        assert_eq!(app.state.mode, Mode::RenameWorkspace);
-        assert!(app.state.pending_workspace_create_cwd.is_some());
-        assert!(app.state.name_input_replace_on_type);
+        app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), 0, 0));
+
+        assert_eq!(app.state.mode, Mode::Terminal);
+        assert!(app.state.new_workspace.is_none());
         assert_eq!(app.state.workspaces.len(), 1);
     }
 
-    #[tokio::test]
-    async fn desktop_new_workspace_creates_immediately_by_default() {
+    #[test]
+    fn chooser_mouse_selects_standalone_home_prompt_and_contains_other_mouse() {
         let mut app = app_for_mouse_test();
         app.state.workspaces = vec![Workspace::test_new("one")];
-        app.state.ensure_test_terminals();
         app.state.active = Some(0);
         app.state.selected = 0;
         app.state.mode = Mode::Terminal;
-
         crate::ui::compute_view(&mut app.state, Rect::new(0, 0, 120, 40));
-        let new_workspace = app.state.sidebar_new_button_rect();
+        app.begin_tui_workspace_create();
+
+        app.handle_mouse(mouse(MouseEventKind::ScrollDown, 1, 1));
+        app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Right), 1, 1));
+        assert_eq!(app.state.mode, Mode::NewWorkspace);
+        assert!(app.state.context_menu.is_none());
+
+        let inner = app.state.new_workspace_modal_inner().unwrap();
+        let standalone = crate::ui::new_workspace_choice_rects(inner)[1];
         app.handle_mouse(mouse(
             MouseEventKind::Down(MouseButton::Left),
-            new_workspace.x + 1,
-            new_workspace.y,
+            standalone.x + 1,
+            standalone.y,
         ));
 
-        assert_eq!(app.state.workspaces.len(), 2);
-        assert_eq!(app.state.mode, Mode::Terminal);
-        assert!(app.state.pending_workspace_create_cwd.is_none());
-        crate::app::api::test_support::shutdown_test_runtimes(&mut app);
+        assert_eq!(app.state.mode, Mode::RenameWorkspace);
+        assert_eq!(
+            app.state.pending_workspace_create_cwd,
+            Some(crate::worktree::home_dir().unwrap())
+        );
+        assert_eq!(app.state.workspaces.len(), 1);
     }
 
     #[test]

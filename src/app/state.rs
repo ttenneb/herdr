@@ -941,6 +941,7 @@ pub enum Mode {
     RenameWorkspace,
     RenameTab,
     RenamePane,
+    NewWorkspace,
     NewLinkedWorktree,
     OpenExistingWorktree,
     ConfirmRemoveWorktree,
@@ -980,6 +981,7 @@ impl Mode {
                 | Mode::ConfirmClose
                 | Mode::CollectionClose
                 | Mode::ConfirmRemoveWorktree
+                | Mode::NewWorkspace
                 | Mode::ContextMenu
                 | Mode::GlobalMenu
                 | Mode::KeybindHelp
@@ -1200,6 +1202,33 @@ impl MenuListState {
         if let Some(idx) = idx {
             self.highlighted = idx;
         }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum NewWorkspaceKind {
+    ExistingWorktree,
+    Standalone,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct WorktreeSourceMetadata {
+    pub existing_membership: Option<crate::workspace::WorktreeSpaceMembership>,
+    pub space: crate::workspace::GitSpaceMetadata,
+    pub checkout_path: std::path::PathBuf,
+    pub workspace_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct NewWorkspaceState {
+    pub worktree_source: Option<WorktreeSourceMetadata>,
+    pub selected: NewWorkspaceKind,
+    pub error: Option<String>,
+}
+
+impl NewWorkspaceState {
+    pub(crate) fn existing_worktree_available(&self) -> bool {
+        self.worktree_source.is_some()
     }
 }
 
@@ -1930,6 +1959,7 @@ pub struct AppState {
     pub creating_new_tab: bool,
     pub requested_new_tab_name: Option<String>,
     pub pending_workspace_create_cwd: Option<std::path::PathBuf>,
+    pub(crate) new_workspace: Option<NewWorkspaceState>,
     pub rename_repository_target: Option<String>,
     pub confirm_repository_close_target: Option<String>,
     pub rename_pane_target: Option<PaneId>,
@@ -2453,6 +2483,7 @@ impl AppState {
             creating_new_tab: false,
             requested_new_tab_name: None,
             pending_workspace_create_cwd: None,
+            new_workspace: None,
             rename_repository_target: None,
             confirm_repository_close_target: None,
             rename_pane_target: None,

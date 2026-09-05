@@ -57,6 +57,11 @@ pub(crate) fn expand_tilde_path(path: &str) -> PathBuf {
     expand_tilde_path_from_env(path, cfg!(windows), |key| std::env::var_os(key))
 }
 
+pub(crate) fn home_dir() -> Result<PathBuf, String> {
+    home_dir_from_env(cfg!(windows), |key| std::env::var_os(key))
+        .map_err(|()| "Unable to determine the home directory.".to_string())
+}
+
 fn expand_tilde_path_from_env(
     path: &str,
     is_windows: bool,
@@ -97,27 +102,69 @@ fn home_dir_from_env(
     env: impl Fn(&str) -> Option<OsString>,
 ) -> Result<PathBuf, ()> {
     if !is_windows {
-        return env("HOME").map(PathBuf::from).ok_or(());
+        return usable_home_path(env("HOME"))
+            .filter(|path| path.is_absolute())
+            .ok_or(());
     }
 
-    if let Some(path) = usable_home_path(env("USERPROFILE")) {
+    if let Some(path) = usable_windows_absolute_home(env("USERPROFILE")) {
         return Ok(path);
     }
     if let (Some(drive), Some(path)) = (
         usable_home_component(env("HOMEDRIVE")),
         usable_home_component(env("HOMEPATH")),
     ) {
+        let drive = drive.to_string_lossy();
         let path = path.to_string_lossy();
-        if !path.starts_with(['\\', '/']) {
-            return usable_home_path(env("HOME")).ok_or(());
-        }
-        let combined = format!("{}{}", drive.to_string_lossy(), path);
-        if let Some(path) = usable_home_path(Some(OsString::from(combined))) {
-            return Ok(path);
+        let valid_drive = drive.len() == 2
+            && drive.as_bytes()[0].is_ascii_alphabetic()
+            && drive.as_bytes()[1] == b':';
+        let path_bytes = path.as_bytes();
+        let valid_path = path_bytes
+            .first()
+            .is_some_and(|byte| matches!(byte, b'\\' | b'/'))
+            && !path_bytes
+                .get(1)
+                .is_some_and(|byte| matches!(byte, b'\\' | b'/'))
+            && !path.contains(':');
+        if valid_drive && valid_path {
+            let combined = OsString::from(format!("{drive}{path}"));
+            if let Some(path) = usable_windows_absolute_home(Some(combined)) {
+                return Ok(path);
+            }
         }
     }
 
-    usable_home_path(env("HOME")).ok_or(())
+    usable_windows_absolute_home(env("HOME")).ok_or(())
+}
+
+fn usable_windows_absolute_home(value: Option<OsString>) -> Option<PathBuf> {
+    let path = usable_home_path(value)?;
+    is_windows_absolute_path(&path).then_some(path)
+}
+
+fn is_windows_absolute_path(path: &Path) -> bool {
+    let value = path.as_os_str().to_string_lossy();
+    let bytes = value.as_bytes();
+    if bytes.len() >= 3
+        && bytes[0].is_ascii_alphabetic()
+        && bytes[1] == b':'
+        && matches!(bytes[2], b'\\' | b'/')
+    {
+        return true;
+    }
+
+    if !(value.starts_with("\\\\") || value.starts_with("//")) {
+        return false;
+    }
+    let rest = &value[2..];
+    if rest.starts_with(['\\', '/']) {
+        return false;
+    }
+    let mut components = rest.split(['\\', '/']);
+    let valid_component =
+        |part: &str| !part.is_empty() && part != "." && part != "?" && !part.contains(':');
+    components.next().is_some_and(valid_component) && components.next().is_some_and(valid_component)
 }
 
 fn usable_home_path(value: Option<OsString>) -> Option<PathBuf> {
@@ -756,6 +803,23 @@ prunable stale
     }
 
     #[test]
+    fn home_dir_rejects_missing_or_unusable_unix_home() {
+        assert_eq!(home_dir_from_env(false, |_| None), Err(()));
+        assert_eq!(
+            home_dir_from_env(false, |_| Some(OsString::from(""))),
+            Err(())
+        );
+        assert_eq!(
+            home_dir_from_env(false, |_| Some(OsString::from("~"))),
+            Err(())
+        );
+        assert_eq!(
+            home_dir_from_env(false, |_| Some(OsString::from("relative/home"))),
+            Err(())
+        );
+    }
+
+    #[test]
     fn home_dir_uses_windows_profile_before_literal_home() {
         assert_eq!(
             home_dir_from_env(true, |key| match key {
@@ -796,6 +860,101 @@ prunable stale
                 _ => None,
             }),
             Err(())
+        );
+    }
+
+    #[test]
+    fn home_dir_rejects_relative_and_drive_relative_windows_profile_and_home() {
+        for value in [
+            "relative/home",
+            r"C:Users\herdr",
+            r"\Users\herdr",
+            "/Users/herdr",
+            r"\\server",
+            r"\\?\UNC\server",
+            r"\\.\pipe\foo",
+        ] {
+            assert_eq!(
+                home_dir_from_env(true, |key| match key {
+                    "USERPROFILE" => Some(OsString::from(value)),
+                    _ => None,
+                }),
+                Err(()),
+                "USERPROFILE={value}"
+            );
+            assert_eq!(
+                home_dir_from_env(true, |key| match key {
+                    "HOME" => Some(OsString::from(value)),
+                    _ => None,
+                }),
+                Err(()),
+                "HOME={value}"
+            );
+        }
+    }
+
+    #[test]
+    fn home_dir_rejects_malformed_windows_drive_and_path() {
+        for drive in ["C", "CC:", "1:", r"C:\", "relative", r"\\server"] {
+            assert_eq!(
+                home_dir_from_env(true, |key| match key {
+                    "HOMEDRIVE" => Some(OsString::from(drive)),
+                    "HOMEPATH" => Some(OsString::from(r"\Users\herdr")),
+                    _ => None,
+                }),
+                Err(()),
+                "HOMEDRIVE={drive}"
+            );
+        }
+        for path in [
+            r"Users\herdr",
+            r"C:\Users\herdr",
+            r"\\server\share",
+            "//server/share",
+            r"\/Users\herdr",
+            r"/\Users\herdr",
+        ] {
+            assert_eq!(
+                home_dir_from_env(true, |key| match key {
+                    "HOMEDRIVE" => Some(OsString::from("C:")),
+                    "HOMEPATH" => Some(OsString::from(path)),
+                    _ => None,
+                }),
+                Err(()),
+                "HOMEPATH={path}"
+            );
+        }
+    }
+
+    #[test]
+    fn home_dir_accepts_absolute_windows_profile_unc_and_fallback_home() {
+        for value in [r"C:\Users\herdr", "C:/Users/herdr", r"\\server\share\herdr"] {
+            assert_eq!(
+                home_dir_from_env(true, |key| match key {
+                    "USERPROFILE" => Some(OsString::from(value)),
+                    _ => None,
+                }),
+                Ok(PathBuf::from(value))
+            );
+            assert_eq!(
+                home_dir_from_env(true, |key| match key {
+                    "HOME" => Some(OsString::from(value)),
+                    _ => None,
+                }),
+                Ok(PathBuf::from(value))
+            );
+        }
+    }
+
+    #[test]
+    fn invalid_windows_profile_falls_back_to_valid_home() {
+        assert_eq!(
+            home_dir_from_env(true, |key| match key {
+                "USERPROFILE" => Some(OsString::from(r"C:relative")),
+                "HOME" => Some(OsString::from(r"D:\Users\fallback")),
+                _ => None,
+            }),
+            Ok(PathBuf::from(r"D:\Users\fallback"))
         );
     }
 

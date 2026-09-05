@@ -178,7 +178,7 @@ impl App {
         let previous_mode = self.state.mode;
         match action {
             NavigateAction::NewWorkspace => {
-                self.begin_tui_workspace_create("tui.key.workspace.create");
+                self.begin_tui_workspace_create();
             }
             NavigateAction::NewWorktree => {
                 if let Some(ws_idx) = workspace_action_target(&self.state, context).filter(|idx| {
@@ -2183,6 +2183,8 @@ mod tests {
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, ModifierKeyCode};
     use ratatui::layout::Direction;
 
+    #[cfg(target_os = "linux")]
+    use super::super::capture_snapshot;
     use super::super::{state_with_workspaces, unique_temp_path};
     #[cfg(unix)]
     use super::super::{wait_for_detached_process_reap, wait_for_file};
@@ -2373,70 +2375,126 @@ mod tests {
         assert_eq!(state.mode, Mode::Terminal);
     }
 
-    #[tokio::test]
-    async fn new_workspace_key_opens_prefilled_prompt_and_preserves_captured_cwd() {
-        let cwd = unique_temp_path("workspace-name-suggestion");
-        std::fs::create_dir_all(&cwd).unwrap();
-        let suggested_name = crate::workspace::derive_label_from_cwd(&cwd);
+    #[test]
+    fn new_workspace_key_opens_chooser_then_home_rooted_name_prompt() {
+        let home = crate::worktree::home_dir().unwrap();
+        let suggested_name = crate::workspace::derive_label_from_cwd(&home);
         let mut app = app_with_test_workspaces(&["test"]);
         app.state.new_terminal_cwd =
-            crate::config::NewTerminalCwdConfig::Path(cwd.display().to_string());
-        app.state.prompt_new_workspace_name = true;
+            crate::config::NewTerminalCwdConfig::Path("/tmp/not-the-standalone-home".into());
         app.state.mode = Mode::Navigate;
         app.state.keybinds.new_workspace = crate::config::ActionKeybinds::prefix("g");
 
         app.handle_navigate_key(TerminalKey::new(KeyCode::Char('g'), KeyModifiers::empty()));
 
+        assert_eq!(app.state.mode, Mode::NewWorkspace);
+        assert!(app.state.pending_workspace_create_cwd.is_none());
+        assert_eq!(app.state.workspaces.len(), 1);
+
+        app.handle_new_workspace_key(KeyEvent::new(KeyCode::Down, KeyModifiers::empty()));
+        app.handle_new_workspace_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()));
+
         assert_eq!(app.state.mode, Mode::RenameWorkspace);
         assert_eq!(app.state.name_input, suggested_name);
         assert!(app.state.name_input_replace_on_type);
-        assert_eq!(app.state.pending_workspace_create_cwd.as_ref(), Some(&cwd));
-        assert_eq!(app.state.workspaces.len(), 1);
-
-        app.state.new_terminal_cwd =
-            crate::config::NewTerminalCwdConfig::Path("/tmp/changed-after-prompt".into());
-        app.handle_rename_key_via_api(KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()));
-
-        assert_eq!(app.state.workspaces.len(), 2);
-        assert_eq!(app.state.workspaces[1].identity_cwd, cwd);
-        assert!(app.state.workspaces[1].custom_name.is_none());
-        assert!(app.state.pending_workspace_create_cwd.is_none());
-        assert_eq!(app.state.mode, Mode::Terminal);
-        crate::app::api::test_support::shutdown_test_runtimes(&mut app);
-        let _ = std::fs::remove_dir_all(&cwd);
+        assert_eq!(app.state.pending_workspace_create_cwd.as_ref(), Some(&home));
     }
 
     #[tokio::test]
-    async fn new_workspace_prompt_saves_custom_name_atomically() {
-        let cwd = unique_temp_path("workspace-custom-name");
-        std::fs::create_dir_all(&cwd).unwrap();
+    async fn standalone_workspace_prompt_saves_custom_name_atomically() {
+        let home = crate::worktree::home_dir().unwrap();
         let mut app = app_with_test_workspaces(&["test"]);
-        app.state.new_terminal_cwd =
-            crate::config::NewTerminalCwdConfig::Path(cwd.display().to_string());
-        app.state.prompt_new_workspace_name = true;
         app.state.mode = Mode::Navigate;
 
         app.execute_tui_navigate_action(NavigateAction::NewWorkspace, ActionContext::Navigate);
+        app.handle_new_workspace_key(KeyEvent::new(KeyCode::Down, KeyModifiers::empty()));
+        app.handle_new_workspace_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()));
         app.state.name_input = "  logs  ".into();
         app.handle_rename_key_via_api(KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()));
 
         assert_eq!(app.state.workspaces.len(), 2);
         assert_eq!(app.state.workspaces[1].custom_name.as_deref(), Some("logs"));
-        assert_eq!(app.state.workspaces[1].identity_cwd, cwd);
+        assert_eq!(app.state.workspaces[1].identity_cwd, home);
         crate::app::api::test_support::shutdown_test_runtimes(&mut app);
-        let _ = std::fs::remove_dir_all(&cwd);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn standalone_workspace_preserves_non_utf8_home_path() {
+        use std::os::unix::ffi::OsStringExt;
+
+        let mut name = b"herdr-standalone-home-".to_vec();
+        name.extend_from_slice(
+            &SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+                .to_string()
+                .into_bytes(),
+        );
+        name.push(0xff);
+        let home = std::env::temp_dir().join(std::ffi::OsString::from_vec(name));
+        std::fs::create_dir_all(&home).unwrap();
+
+        let event_hub = crate::api::EventHub::default();
+        let (_api_tx, api_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = App::new(&Config::default(), true, None, api_rx, event_hub.clone());
+        app.state.workspaces = vec![Workspace::test_new("test")];
+        app.state.ensure_test_terminals();
+        app.state.active = Some(0);
+        app.state.selected = 0;
+
+        crate::app::input::open_new_workspace_dialog(&mut app.state, home.clone());
+        app.state.name_input = "scratch".into();
+        app.handle_rename_key_via_api(KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()));
+
+        assert_eq!(app.state.workspaces.len(), 2);
+        assert_eq!(app.state.workspaces[1].identity_cwd, home);
+        assert_eq!(
+            app.state.workspaces[1].custom_name.as_deref(),
+            Some("scratch")
+        );
+        let events = event_hub.events_after(0);
+        assert_eq!(
+            events
+                .iter()
+                .map(|(_, event)| event.event)
+                .collect::<Vec<_>>(),
+            vec![
+                crate::api::schema::EventKind::WorkspaceCreated,
+                crate::api::schema::EventKind::TabCreated,
+                crate::api::schema::EventKind::PaneCreated,
+                crate::api::schema::EventKind::LayoutUpdated,
+            ]
+        );
+        let workspace_created = events
+            .iter()
+            .find_map(|(_, event)| match &event.data {
+                crate::api::schema::EventData::WorkspaceCreated { workspace } => Some(workspace),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(workspace_created.label, "scratch");
+        let snapshot = capture_snapshot(&app.state);
+        assert_eq!(
+            snapshot.workspaces[1].custom_name.as_deref(),
+            Some("scratch")
+        );
+
+        crate::app::api::test_support::shutdown_test_runtimes(&mut app);
+        let _ = std::fs::remove_dir_all(&app.state.workspaces[1].identity_cwd);
     }
 
     #[test]
-    fn cancelling_new_workspace_prompt_creates_nothing() {
+    fn cancelling_new_workspace_chooser_creates_nothing() {
         let mut app = app_with_test_workspaces(&["test"]);
-        app.state.prompt_new_workspace_name = true;
         app.state.mode = Mode::Navigate;
 
         app.execute_tui_navigate_action(NavigateAction::NewWorkspace, ActionContext::Navigate);
-        app.handle_rename_key_via_api(KeyEvent::new(KeyCode::Esc, KeyModifiers::empty()));
+        app.handle_new_workspace_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::empty()));
 
         assert_eq!(app.state.workspaces.len(), 1);
+        assert!(app.state.new_workspace.is_none());
         assert!(app.state.pending_workspace_create_cwd.is_none());
         assert_eq!(app.state.mode, Mode::Terminal);
     }
@@ -3306,8 +3364,8 @@ command = "printf literal > '{}'"
 
         app.handle_navigate_key(TerminalKey::new(KeyCode::Char('n'), KeyModifiers::SHIFT));
 
-        assert_eq!(app.state.workspaces.len(), 2);
-        assert_eq!(app.state.mode, Mode::Terminal);
+        assert_eq!(app.state.workspaces.len(), 1);
+        assert_eq!(app.state.mode, Mode::NewWorkspace);
     }
 
     #[tokio::test]
@@ -3327,8 +3385,8 @@ command = "printf literal > '{}'"
 
         app.handle_navigate_key(TerminalKey::new(KeyCode::Char('N'), KeyModifiers::empty()));
 
-        assert_eq!(app.state.workspaces.len(), 2);
-        assert_eq!(app.state.mode, Mode::Terminal);
+        assert_eq!(app.state.workspaces.len(), 1);
+        assert_eq!(app.state.mode, Mode::NewWorkspace);
     }
 
     #[tokio::test]
