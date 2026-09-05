@@ -2183,9 +2183,11 @@ mod tests {
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, ModifierKeyCode};
     use ratatui::layout::Direction;
 
-    #[cfg(unix)]
-    use super::super::{capture_snapshot, wait_for_detached_process_reap, wait_for_file};
+    #[cfg(target_os = "linux")]
+    use super::super::capture_snapshot;
     use super::super::{state_with_workspaces, unique_temp_path};
+    #[cfg(unix)]
+    use super::super::{wait_for_detached_process_reap, wait_for_file};
     use super::*;
     use crate::{
         app::App,
@@ -2416,7 +2418,7 @@ mod tests {
         crate::app::api::test_support::shutdown_test_runtimes(&mut app);
     }
 
-    #[cfg(unix)]
+    #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn standalone_workspace_preserves_non_utf8_home_path() {
         use std::os::unix::ffi::OsStringExt;
