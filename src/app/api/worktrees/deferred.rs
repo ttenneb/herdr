@@ -79,15 +79,19 @@ impl App {
             return self.find_parent_workspace_by_key(&api.repo_key);
         };
         let workspace = &self.state.workspaces[ws_idx];
-        if let Some(space) =
-            workspace.resolved_git_space_from(&self.state.terminals, &self.terminal_runtimes)
-        {
-            return (!space.is_linked_worktree
-                && space.key == api.repo_key
-                && crate::worktree::canonical_or_original(&space.repo_root)
-                    == crate::worktree::canonical_or_original(&api.source_repo_root))
-            .then_some(ws_idx)
-            .or_else(|| self.find_parent_workspace_by_key(&api.repo_key));
+        match workspace.current_git_identity_from(&self.state.terminals, &self.terminal_runtimes) {
+            crate::workspace::CurrentGitIdentity::Git(space) => {
+                return (!space.is_linked_worktree
+                    && space.key == api.repo_key
+                    && crate::worktree::canonical_or_original(&space.repo_root)
+                        == crate::worktree::canonical_or_original(&api.source_repo_root))
+                .then_some(ws_idx)
+                .or_else(|| self.find_parent_workspace_by_key(&api.repo_key));
+            }
+            crate::workspace::CurrentGitIdentity::NonGit => {
+                return self.find_parent_workspace_by_key(&api.repo_key);
+            }
+            crate::workspace::CurrentGitIdentity::Unavailable => {}
         }
 
         if let Some(expected) = api.source_existing_membership.as_ref() {

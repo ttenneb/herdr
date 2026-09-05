@@ -458,9 +458,19 @@ impl App {
                 "workspace not found",
             ));
         };
-        if let Some(space) =
-            ws.resolved_git_space_from(&self.state.terminals, &self.terminal_runtimes)
-        {
+        match ws.current_git_identity_from(&self.state.terminals, &self.terminal_runtimes) {
+            crate::workspace::CurrentGitIdentity::Git(space) => {
+                return Ok(worktree_identity_probe_from_space(space, Some(ws_idx)));
+            }
+            crate::workspace::CurrentGitIdentity::NonGit => {
+                return Err(ApiFailure::new(
+                    "not_git_worktree",
+                    "Herdr worktree actions require a workspace inside a Git work tree",
+                ));
+            }
+            crate::workspace::CurrentGitIdentity::Unavailable => {}
+        }
+        if let Some(space) = ws.cached_git_space.clone() {
             return Ok(worktree_identity_probe_from_space(space, Some(ws_idx)));
         }
         if let Some(membership) = ws.worktree_space() {
@@ -489,9 +499,24 @@ impl App {
                 "workspace not found",
             ));
         };
-        if let Some(space) =
-            ws.resolved_git_space_from(&self.state.terminals, &self.terminal_runtimes)
-        {
+        match ws.current_git_identity_from(&self.state.terminals, &self.terminal_runtimes) {
+            crate::workspace::CurrentGitIdentity::Git(space) => {
+                return Ok(worktree_source_from_space(
+                    space,
+                    Some(ws_idx),
+                    false,
+                    trust_repository,
+                ));
+            }
+            crate::workspace::CurrentGitIdentity::NonGit => {
+                return Err(ApiFailure::new(
+                    "not_git_worktree",
+                    "Herdr worktree actions require a workspace inside a Git work tree",
+                ));
+            }
+            crate::workspace::CurrentGitIdentity::Unavailable => {}
+        }
+        if let Some(space) = ws.cached_git_space.clone() {
             return Ok(worktree_source_from_space(
                 space,
                 Some(ws_idx),
@@ -525,9 +550,29 @@ impl App {
                 "workspace not found",
             ));
         };
-        if let Some(space) =
-            ws.resolved_git_space_from(&self.state.terminals, &self.terminal_runtimes)
-        {
+        match ws.current_git_identity_from(&self.state.terminals, &self.terminal_runtimes) {
+            crate::workspace::CurrentGitIdentity::Git(space) => {
+                let workspace_idx = if space.is_linked_worktree {
+                    self.list_source_workspace_idx_for_space(&space, trust_repository)
+                } else {
+                    Some(ws_idx)
+                };
+                return Ok(worktree_source_from_space(
+                    space,
+                    workspace_idx,
+                    true,
+                    trust_repository,
+                ));
+            }
+            crate::workspace::CurrentGitIdentity::NonGit => {
+                return Err(ApiFailure::new(
+                    "not_git_worktree",
+                    "Herdr worktree actions require a workspace inside a Git work tree",
+                ));
+            }
+            crate::workspace::CurrentGitIdentity::Unavailable => {}
+        }
+        if let Some(space) = ws.cached_git_space.clone() {
             let workspace_idx = if space.is_linked_worktree {
                 self.list_source_workspace_idx_for_space(&space, trust_repository)
             } else {
@@ -635,14 +680,20 @@ impl App {
 
     fn find_parent_workspace_by_key(&self, repo_key: &str) -> Option<usize> {
         self.state.workspaces.iter().position(|ws| {
-            if let Some(space) =
-                ws.resolved_git_space_from(&self.state.terminals, &self.terminal_runtimes)
-            {
-                return space.key == repo_key && !space.is_linked_worktree;
+            match ws.current_git_identity_from(&self.state.terminals, &self.terminal_runtimes) {
+                crate::workspace::CurrentGitIdentity::Git(space) => {
+                    space.key == repo_key && !space.is_linked_worktree
+                }
+                crate::workspace::CurrentGitIdentity::NonGit => false,
+                crate::workspace::CurrentGitIdentity::Unavailable => {
+                    ws.cached_git_space
+                        .as_ref()
+                        .is_some_and(|space| space.key == repo_key && !space.is_linked_worktree)
+                        || ws
+                            .worktree_space()
+                            .is_some_and(|space| space.key == repo_key && !space.is_linked_worktree)
+                }
             }
-
-            ws.worktree_space()
-                .is_some_and(|space| space.key == repo_key && !space.is_linked_worktree)
         })
     }
 
@@ -798,23 +849,33 @@ impl App {
         let canonical_checkout = crate::worktree::canonical_or_original(checkout_path);
         let checkout_key = canonical_checkout.display().to_string();
         self.state.workspaces.iter().position(|ws| {
-            let git_space =
-                ws.resolved_git_space_from(&self.state.terminals, &self.terminal_runtimes);
-            if let Some(metadata) = git_space {
-                return metadata.checkout_key == checkout_key;
+            match ws.current_git_identity_from(&self.state.terminals, &self.terminal_runtimes) {
+                crate::workspace::CurrentGitIdentity::Git(metadata) => {
+                    metadata.checkout_key == checkout_key
+                }
+                crate::workspace::CurrentGitIdentity::NonGit => ws
+                    .resolved_identity_cwd_from(&self.state.terminals, &self.terminal_runtimes)
+                    .is_some_and(|cwd| {
+                        crate::worktree::canonical_or_original(&cwd) == canonical_checkout
+                    }),
+                crate::workspace::CurrentGitIdentity::Unavailable => {
+                    ws.cached_git_space
+                        .as_ref()
+                        .is_some_and(|metadata| metadata.checkout_key == checkout_key)
+                        || ws.worktree_space().is_some_and(|space| {
+                            crate::worktree::canonical_or_original(&space.checkout_path)
+                                == canonical_checkout
+                        })
+                        || ws
+                            .resolved_identity_cwd_from(
+                                &self.state.terminals,
+                                &self.terminal_runtimes,
+                            )
+                            .is_some_and(|cwd| {
+                                crate::worktree::canonical_or_original(&cwd) == canonical_checkout
+                            })
+                }
             }
-
-            if ws.worktree_space().is_some_and(|space| {
-                crate::worktree::canonical_or_original(&space.checkout_path) == canonical_checkout
-            }) {
-                return true;
-            }
-
-            ws.resolved_identity_cwd_from(&self.state.terminals, &self.terminal_runtimes)
-                .as_deref()
-                .is_some_and(|cwd| {
-                    crate::worktree::canonical_or_original(cwd) == canonical_checkout
-                })
         })
     }
 
@@ -1256,6 +1317,13 @@ mod tests {
             repo_root: missing.clone(),
             is_linked_worktree: false,
         });
+        workspace.worktree_space = Some(crate::workspace::WorktreeSpaceMembership {
+            key: "/stale/app/.git".into(),
+            label: "stale-app".into(),
+            repo_root: "/stale/app".into(),
+            checkout_path: "/stale/app".into(),
+            is_linked_worktree: false,
+        });
         app.state.workspaces = vec![workspace];
         app.state.ensure_test_terminals();
         let terminal_id = app.state.workspaces[0].tabs[0].panes[&app.state.workspaces[0].tabs[0]
@@ -1265,6 +1333,10 @@ mod tests {
             .clone();
         app.state.terminals.get_mut(&terminal_id).unwrap().cwd = missing.clone();
 
+        let tui_source = app.worktree_source_metadata(0).unwrap();
+        assert_eq!(tui_source.space.key, "/cached/app/.git");
+        assert_eq!(tui_source.checkout_path, missing);
+
         let source = app.worktree_source_from_workspace(0, false).unwrap();
         assert_eq!(source.repo_key, "/cached/app/.git");
         assert_eq!(source.repo_name, "cached-app");
@@ -1273,6 +1345,43 @@ mod tests {
         for (_, runtime) in app.terminal_runtimes.drain() {
             runtime.shutdown();
         }
+    }
+
+    #[test]
+    fn live_non_git_cwd_rejects_stale_repository_identity() {
+        let non_git = unique_temp_path("api-worktree-live-non-git");
+        std::fs::create_dir_all(&non_git).unwrap();
+        let mut app = test_app();
+        let mut workspace = Workspace::test_new("source");
+        workspace.identity_cwd = non_git.clone();
+        workspace.cached_git_space = Some(crate::workspace::GitSpaceMetadata {
+            key: "/cached/app/.git".into(),
+            checkout_key: "/cached/app".into(),
+            repo_name: "cached-app".into(),
+            repo_root: "/cached/app".into(),
+            is_linked_worktree: false,
+        });
+        workspace.worktree_space = Some(crate::workspace::WorktreeSpaceMembership {
+            key: "/cached/app/.git".into(),
+            label: "cached-app".into(),
+            repo_root: "/cached/app".into(),
+            checkout_path: "/cached/app".into(),
+            is_linked_worktree: false,
+        });
+        app.state.workspaces = vec![workspace];
+
+        assert!(app.worktree_source_metadata(0).is_err());
+        assert!(app.worktree_identity_probe_from_workspace(0).is_err());
+        assert!(app.worktree_source_from_workspace(0, false).is_err());
+        assert!(app.worktree_list_source_from_workspace(0, false).is_err());
+        assert!(app
+            .open_workspace_idx_for_checkout(Path::new("/cached/app"))
+            .is_none());
+        assert!(app
+            .find_parent_workspace_by_key("/cached/app/.git")
+            .is_none());
+
+        let _ = std::fs::remove_dir_all(non_git);
     }
 
     #[tokio::test]
@@ -1739,24 +1848,27 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn deferred_api_worktree_create_completes_after_source_workspace_changes() {
+    async fn deferred_api_worktree_create_does_not_reuse_source_moved_outside_git() {
         let event_hub = crate::api::EventHub::default();
         let mut app = test_app_with_event_hub(event_hub.clone());
         let repo = create_committed_repo("api-worktree-create-changed-source-repo");
+        let non_git = unique_temp_path("api-worktree-create-changed-source-non-git");
+        std::fs::create_dir_all(&non_git).unwrap();
         let checkout = unique_temp_path("api-worktree-create-changed-source-checkout");
         std::fs::create_dir_all(&checkout).unwrap();
         let checkout_key = crate::worktree::canonical_or_original(&checkout);
         let mut source = Workspace::test_new("source");
-        source.identity_cwd = repo.clone();
+        source.identity_cwd = non_git.clone();
+        source.cached_git_space = crate::workspace::git_space_metadata(&repo);
         let source_id = source.id.clone();
         app.state.workspaces = vec![source];
         app.pending_api_worktree_creates
             .insert(checkout_key.clone(), 9);
         app.state.workspaces[0].worktree_space = Some(crate::workspace::WorktreeSpaceMembership {
-            key: "other-key".into(),
-            label: "other".into(),
-            repo_root: "/repo/other".into(),
-            checkout_path: "/repo/other".into(),
+            key: "repo-key".into(),
+            label: "herdr".into(),
+            repo_root: repo.clone(),
+            checkout_path: repo.clone(),
             is_linked_worktree: false,
         });
         let (respond_to, response_rx) = response_channel();
@@ -1794,18 +1906,13 @@ mod tests {
             .into_iter()
             .any(|(_, event)| event.event == EventKind::WorktreeCreated));
         assert_eq!(app.state.workspaces.len(), 3);
-        assert_ne!(
-            app.state.workspaces[0]
-                .worktree_space()
-                .map(|membership| membership.label.as_str()),
-            Some("other"),
-            "live source Git identity supersedes stale compatibility membership"
-        );
+        assert_eq!(app.state.workspaces[0].identity_cwd, non_git);
 
         for (_, runtime) in app.terminal_runtimes.drain() {
             runtime.shutdown();
         }
         let _ = std::fs::remove_dir_all(checkout);
+        let _ = std::fs::remove_dir_all(non_git);
         let _ = std::fs::remove_dir_all(repo);
     }
 

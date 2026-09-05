@@ -22,10 +22,21 @@ impl App {
             return Err("Workspace not found.".into());
         };
         let existing_membership = ws.worktree_space().cloned();
+        let cached_space = ws.cached_git_space.clone();
 
-        let live_space = ws.resolved_git_space_from(&self.state.terminals, &self.terminal_runtimes);
+        let live_space =
+            match ws.current_git_identity_from(&self.state.terminals, &self.terminal_runtimes) {
+                crate::workspace::CurrentGitIdentity::Git(space) => Some(space),
+                crate::workspace::CurrentGitIdentity::NonGit => {
+                    return Err(
+                        "Herdr worktree actions require a workspace inside a Git work tree.".into(),
+                    );
+                }
+                crate::workspace::CurrentGitIdentity::Unavailable => None,
+            };
         let space = live_space
             .clone()
+            .or_else(|| cached_space.clone())
             .or_else(|| {
                 existing_membership
                     .as_ref()
@@ -42,6 +53,7 @@ impl App {
             })?;
         let source_checkout_path = live_space
             .map(|space| space.repo_root)
+            .or_else(|| cached_space.map(|space| space.repo_root))
             .or_else(|| {
                 existing_membership
                     .as_ref()
