@@ -191,29 +191,9 @@ impl App {
             .filter(|entry| !entry.is_bare && !entry.is_prunable)
             .map(|entry| {
                 let entry_checkout_path = crate::worktree::canonical_or_original(&entry.path);
-                let entry_checkout_key = entry_checkout_path.display().to_string();
                 let repo_checkout_path = crate::worktree::canonical_or_original(&space.repo_root);
-                let already_open_ws_idx = self.state.workspaces.iter().position(|ws| {
-                    if let Some(membership) = ws.worktree_space() {
-                        return crate::worktree::canonical_or_original(&membership.checkout_path)
-                            == entry_checkout_path;
-                    }
-
-                    let git_space =
-                        ws.resolved_git_space_from(&self.state.terminals, &self.terminal_runtimes);
-                    if git_space
-                        .as_ref()
-                        .is_some_and(|metadata| metadata.checkout_key == entry_checkout_key)
-                    {
-                        return true;
-                    }
-
-                    ws.resolved_identity_cwd_from(&self.state.terminals, &self.terminal_runtimes)
-                        .as_deref()
-                        .is_some_and(|cwd| {
-                            crate::worktree::canonical_or_original(cwd) == entry_checkout_path
-                        })
-                });
+                let already_open_ws_idx =
+                    self.open_workspace_idx_for_checkout(&entry_checkout_path);
                 WorktreeOpenEntry {
                     is_linked_worktree: entry_checkout_path != repo_checkout_path,
                     path: entry.path,
@@ -1703,6 +1683,14 @@ mod tests {
         let mut app = app_for_worktree_tests();
         app.state.workspaces = vec![crate::workspace::Workspace::test_new("main")];
         app.state.workspaces[0].identity_cwd = original_repo.clone();
+        let original_space = crate::workspace::git_space_metadata(&original_repo).unwrap();
+        app.state.workspaces[0].worktree_space = Some(crate::workspace::WorktreeSpaceMembership {
+            key: original_space.key.clone(),
+            label: original_space.repo_name.clone(),
+            repo_root: original_space.repo_root.clone(),
+            checkout_path: original_space.repo_root.clone(),
+            is_linked_worktree: false,
+        });
         app.state.active = Some(0);
         app.state.selected = 0;
         app.state.mode = Mode::Terminal;
@@ -1730,10 +1718,16 @@ mod tests {
         assert_eq!(app.state.mode, Mode::Terminal);
         assert!(app.state.new_workspace.is_none());
         assert!(app.state.worktree_open.is_none());
-        assert!(app.state.workspaces.iter().any(|workspace| {
-            crate::worktree::canonical_or_original(&workspace.identity_cwd)
-                == crate::worktree::canonical_or_original(&original_repo)
-        }));
+        assert_eq!(app.state.workspaces.len(), 2);
+        assert_eq!(
+            crate::worktree::canonical_or_original(&app.state.workspaces[0].identity_cwd),
+            crate::worktree::canonical_or_original(&changed_repo),
+            "the stale source workspace must not be reused for the captured checkout"
+        );
+        assert_eq!(
+            crate::worktree::canonical_or_original(&app.state.workspaces[1].identity_cwd),
+            crate::worktree::canonical_or_original(&original_repo)
+        );
         crate::app::api::test_support::shutdown_test_runtimes(&mut app);
         let _ = std::fs::remove_dir_all(original_repo);
         let _ = std::fs::remove_dir_all(changed_repo);

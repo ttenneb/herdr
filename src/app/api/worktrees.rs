@@ -371,11 +371,7 @@ impl App {
                     "Herdr worktree actions require a path inside a Git work tree",
                 )
             })?;
-            let workspace_idx = self.state.workspaces.iter().position(|workspace| {
-                workspace
-                    .git_space()
-                    .is_some_and(|open| open.checkout_key == space.checkout_key)
-            });
+            let workspace_idx = self.open_workspace_idx_for_checkout(&space.repo_root);
             return Ok(worktree_source_from_space(
                 space,
                 workspace_idx,
@@ -639,11 +635,14 @@ impl App {
 
     fn find_parent_workspace_by_key(&self, repo_key: &str) -> Option<usize> {
         self.state.workspaces.iter().position(|ws| {
+            if let Some(space) =
+                ws.resolved_git_space_from(&self.state.terminals, &self.terminal_runtimes)
+            {
+                return space.key == repo_key && !space.is_linked_worktree;
+            }
+
             ws.worktree_space()
                 .is_some_and(|space| space.key == repo_key && !space.is_linked_worktree)
-                || ws
-                    .git_space()
-                    .is_some_and(|space| space.key == repo_key && !space.is_linked_worktree)
         })
     }
 
@@ -799,18 +798,15 @@ impl App {
         let canonical_checkout = crate::worktree::canonical_or_original(checkout_path);
         let checkout_key = canonical_checkout.display().to_string();
         self.state.workspaces.iter().position(|ws| {
+            let git_space =
+                ws.resolved_git_space_from(&self.state.terminals, &self.terminal_runtimes);
+            if let Some(metadata) = git_space {
+                return metadata.checkout_key == checkout_key;
+            }
+
             if ws.worktree_space().is_some_and(|space| {
                 crate::worktree::canonical_or_original(&space.checkout_path) == canonical_checkout
             }) {
-                return true;
-            }
-
-            let git_space =
-                ws.resolved_git_space_from(&self.state.terminals, &self.terminal_runtimes);
-            if git_space
-                .as_ref()
-                .is_some_and(|metadata| metadata.checkout_key == checkout_key)
-            {
                 return true;
             }
 

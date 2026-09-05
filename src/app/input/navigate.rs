@@ -2183,9 +2183,9 @@ mod tests {
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, ModifierKeyCode};
     use ratatui::layout::Direction;
 
-    use super::super::{state_with_workspaces, unique_temp_path};
     #[cfg(unix)]
-    use super::super::{wait_for_detached_process_reap, wait_for_file};
+    use super::super::{capture_snapshot, wait_for_detached_process_reap, wait_for_file};
+    use super::super::{state_with_workspaces, unique_temp_path};
     use super::*;
     use crate::{
         app::App,
@@ -2414,6 +2414,73 @@ mod tests {
         assert_eq!(app.state.workspaces[1].custom_name.as_deref(), Some("logs"));
         assert_eq!(app.state.workspaces[1].identity_cwd, home);
         crate::app::api::test_support::shutdown_test_runtimes(&mut app);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn standalone_workspace_preserves_non_utf8_home_path() {
+        use std::os::unix::ffi::OsStringExt;
+
+        let mut name = b"herdr-standalone-home-".to_vec();
+        name.extend_from_slice(
+            &SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+                .to_string()
+                .into_bytes(),
+        );
+        name.push(0xff);
+        let home = std::env::temp_dir().join(std::ffi::OsString::from_vec(name));
+        std::fs::create_dir_all(&home).unwrap();
+
+        let event_hub = crate::api::EventHub::default();
+        let (_api_tx, api_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = App::new(&Config::default(), true, None, api_rx, event_hub.clone());
+        app.state.workspaces = vec![Workspace::test_new("test")];
+        app.state.ensure_test_terminals();
+        app.state.active = Some(0);
+        app.state.selected = 0;
+
+        crate::app::input::open_new_workspace_dialog(&mut app.state, home.clone());
+        app.state.name_input = "scratch".into();
+        app.handle_rename_key_via_api(KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()));
+
+        assert_eq!(app.state.workspaces.len(), 2);
+        assert_eq!(app.state.workspaces[1].identity_cwd, home);
+        assert_eq!(
+            app.state.workspaces[1].custom_name.as_deref(),
+            Some("scratch")
+        );
+        let events = event_hub.events_after(0);
+        assert_eq!(
+            events
+                .iter()
+                .map(|(_, event)| event.event)
+                .collect::<Vec<_>>(),
+            vec![
+                crate::api::schema::EventKind::WorkspaceCreated,
+                crate::api::schema::EventKind::TabCreated,
+                crate::api::schema::EventKind::PaneCreated,
+                crate::api::schema::EventKind::LayoutUpdated,
+            ]
+        );
+        let workspace_created = events
+            .iter()
+            .find_map(|(_, event)| match &event.data {
+                crate::api::schema::EventData::WorkspaceCreated { workspace } => Some(workspace),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(workspace_created.label, "scratch");
+        let snapshot = capture_snapshot(&app.state);
+        assert_eq!(
+            snapshot.workspaces[1].custom_name.as_deref(),
+            Some("scratch")
+        );
+
+        crate::app::api::test_support::shutdown_test_runtimes(&mut app);
+        let _ = std::fs::remove_dir_all(&app.state.workspaces[1].identity_cwd);
     }
 
     #[test]

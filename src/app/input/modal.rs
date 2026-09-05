@@ -1144,15 +1144,10 @@ impl App {
                 } else if let Some(cwd) = self.state.pending_workspace_create_cwd.take() {
                     let suggested_name = crate::workspace::derive_label_from_cwd(&cwd);
                     let label = workspace_create_label(&new_name, &suggested_name);
-                    self.runtime_workspace_create(
-                        "tui.workspace.create_named",
-                        crate::api::schema::WorkspaceCreateParams {
-                            cwd: Some(cwd.display().to_string()),
-                            focus: true,
-                            label,
-                            env: Default::default(),
-                        },
-                    );
+                    if let Err(error) = self.create_named_standalone_workspace(cwd, label) {
+                        self.state.config_diagnostic =
+                            Some(format!("Unable to create standalone Workspace: {error}"));
+                    }
                 } else if !self.state.workspaces.is_empty() && !new_name.is_empty() {
                     let workspace_id = self.public_workspace_id(self.state.selected);
                     self.runtime_workspace_rename(

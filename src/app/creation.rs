@@ -301,6 +301,22 @@ impl App {
         self.create_workspace_with_launch_env(initial_cwd, focus, Vec::new())
     }
 
+    pub(crate) fn create_named_standalone_workspace(
+        &mut self,
+        initial_cwd: PathBuf,
+        label: Option<String>,
+    ) -> std::io::Result<usize> {
+        let ws_idx = self.create_workspace_with_options(initial_cwd, true)?;
+        if let Some(label) = label {
+            if let Some(workspace) = self.state.workspaces.get_mut(ws_idx) {
+                workspace.set_custom_name(label);
+                crate::logging::workspace_renamed(&workspace.id);
+            }
+        }
+        self.emit_workspace_open_events(ws_idx);
+        Ok(ws_idx)
+    }
+
     #[cfg(test)]
     pub(crate) fn create_workspace_with_events(
         &mut self,
