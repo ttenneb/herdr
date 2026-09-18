@@ -61,6 +61,7 @@ struct RunReceipt {
     repository: Option<RunRepository>,
     workspace_id: Option<String>,
     pane_id: Option<String>,
+    terminal_id: Option<String>,
     agent_session: Option<AgentSessionInfo>,
     role_profile: Option<String>,
     provider: Option<String>,
@@ -97,6 +98,7 @@ impl RunReceipt {
             repository: None,
             workspace_id: None,
             pane_id: None,
+            terminal_id: None,
             agent_session: None,
             role_profile: args.role.clone(),
             provider: args.provider.clone(),
@@ -145,6 +147,16 @@ pub(super) fn run_run_command(args: &[String]) -> std::io::Result<i32> {
 }
 
 fn execute(args: &RunArgs, receipt: &mut RunReceipt) -> i32 {
+    let Some(profile_helper) = args
+        .profile_helper
+        .clone()
+        .or_else(|| std::env::var_os("HERDR_PANE_PROFILE_HELPER").map(PathBuf::from))
+    else {
+        return receipt.fail(
+            "validate_inputs",
+            "external profile interface unavailable; set --profile-helper or HERDR_PANE_PROFILE_HELPER (see docs/handoff-and-run.md)",
+        );
+    };
     let parent = match read_json_arg::<CanonicalHerdrIdentity>(
         args.parent.as_deref().expect("validated args"),
     ) {
@@ -462,6 +474,7 @@ fn execute(args: &RunArgs, receipt: &mut RunReceipt) -> i32 {
             "agent start did not establish a canonical agent_session".into(),
         );
     };
+    receipt.terminal_id = Some(agent.terminal_id.clone());
     receipt.agent_session = Some(session.clone());
     receipt.stage(
         "start_agent",
@@ -478,15 +491,8 @@ fn execute(args: &RunArgs, receipt: &mut RunReceipt) -> i32 {
         );
     }
 
-    let helper = args
-        .profile_helper
-        .clone()
-        .or_else(|| std::env::var_os("HERDR_PANE_PROFILE_HELPER").map(PathBuf::from));
-    let Some(helper) = helper else {
-        return finish_failure_with_cleanup(args, receipt, "apply_profile", "external profile interface unavailable; set --profile-helper or HERDR_PANE_PROFILE_HELPER (see docs/handoff-and-run.md)".into());
-    };
     match apply_profile(
-        &helper,
+        &profile_helper,
         &child_identity,
         args.role.as_deref().expect("validated args"),
         Duration::from_secs(10),
@@ -812,6 +818,16 @@ fn canonical_existing_checkout(repo: &Path, checkout: &Path) -> Result<PathBuf, 
     let checkout = checkout
         .canonicalize()
         .map_err(|err| format!("cannot resolve checkout: {err}"))?;
+    let checkout_root = PathBuf::from(git_output(&checkout, &["rev-parse", "--show-toplevel"])?)
+        .canonicalize()
+        .map_err(|err| format!("cannot resolve checkout root: {err}"))?;
+    if checkout != checkout_root {
+        return Err(format!(
+            "existing checkout path must be exact root {}; got {}",
+            checkout_root.display(),
+            checkout.display()
+        ));
+    }
     let common = git_output(&checkout, &["rev-parse", "--git-common-dir"])?;
     let repo_common = git_output(repo, &["rev-parse", "--git-common-dir"])?;
     let normalize = |base: &Path, value: String| {
@@ -833,6 +849,7 @@ fn canonical_existing_checkout(repo: &Path, checkout: &Path) -> Result<PathBuf, 
 fn conventional_worktree_path(repo: &Path, branch: &str) -> Result<PathBuf, String> {
     if branch.is_empty()
         || branch.starts_with('/')
+        || branch.contains('\\')
         || branch
             .split('/')
             .any(|part| part.is_empty() || part == "." || part == "..")
@@ -1007,6 +1024,47 @@ mod tests {
         let pos = args.iter().position(|v| v == "low").unwrap();
         args[pos] = "high".into();
         assert!(parse_args(&args).is_err());
+    }
+
+    #[test]
+    fn worktree_convention_rejects_windows_separator_escape() {
+        assert!(
+            conventional_worktree_path(Path::new("/tmp/repository"), "feature\\outside").is_err()
+        );
+    }
+
+    #[test]
+    fn existing_checkout_requires_the_checkout_root() {
+        let root = std::env::temp_dir().join(format!(
+            "herdr-run-checkout-root-{}-{}",
+            std::process::id(),
+            unix_seconds()
+        ));
+        std::fs::create_dir_all(root.join("nested")).unwrap();
+        let git = |args: &[&str]| {
+            assert!(Command::new("git")
+                .current_dir(&root)
+                .args(args)
+                .output()
+                .unwrap()
+                .status
+                .success());
+        };
+        git(&["init", "--quiet"]);
+        assert_eq!(canonical_existing_checkout(&root, &root).unwrap(), root);
+        assert!(canonical_existing_checkout(&root, &root.join("nested"))
+            .unwrap_err()
+            .contains("must be exact root"));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn receipt_exposes_the_pinned_terminal_identity() {
+        let args = RunArgs::default();
+        let mut receipt = RunReceipt::new("run-test".into(), &args);
+        receipt.terminal_id = Some("terminal-1".into());
+        let encoded = serde_json::to_value(receipt).unwrap();
+        assert_eq!(encoded["terminalId"], "terminal-1");
     }
 
     #[test]

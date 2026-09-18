@@ -11,7 +11,7 @@ use crate::app::App;
 use super::responses::{encode_error, encode_success};
 
 const PROMPT_SUBMIT_DELAY: Duration = Duration::from_millis(300);
-const ATTEMPTED_PATH: &str = "pi_prompt_via_pty";
+const ATTEMPTED_PATH: &str = "agent_prompt_via_pty";
 
 impl App {
     pub(super) fn handle_handoff_validate(
