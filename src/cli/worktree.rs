@@ -1,5 +1,6 @@
 use crate::api::schema::{
-    WorktreeCreateParams, WorktreeListParams, WorktreeOpenParams, WorktreeRemoveParams,
+    WorktreeBranchMode, WorktreeCreateParams, WorktreeListParams, WorktreeOpenParams,
+    WorktreeRemoveParams,
 };
 
 // Worktree output is always JSON. The parsers retain `--json` as a hidden compatibility no-op.
@@ -96,6 +97,7 @@ fn worktree_create(args: &[String]) -> std::io::Result<i32> {
     let mut base = None;
     let mut path = None;
     let mut label = None;
+    let mut new_branch_only = false;
     let mut focus = false;
     let mut trust_repository = false;
 
@@ -142,6 +144,10 @@ fn worktree_create(args: &[String]) -> std::io::Result<i32> {
                 base = Some(value.clone());
                 index += 2;
             }
+            "--new-branch-only" => {
+                new_branch_only = true;
+                index += 1;
+            }
             "--path" => {
                 let Some(value) = args.get(index + 1) else {
                     eprintln!("missing value for --path");
@@ -183,7 +189,7 @@ fn worktree_create(args: &[String]) -> std::io::Result<i32> {
         > 1
     {
         eprintln!(
-            "usage: herdr worktree create [--repository ID | --workspace ID | --cwd PATH] [--branch NAME] [--base REF] [--path PATH] [--label TEXT] [--focus] [--no-focus] [--trust-repository]"
+            "usage: herdr worktree create [--repository ID | --workspace ID | --cwd PATH] [--branch NAME] [--new-branch-only] [--base REF] [--path PATH] [--label TEXT] [--focus] [--no-focus] [--trust-repository]"
         );
         return Ok(2);
     }
@@ -193,6 +199,11 @@ fn worktree_create(args: &[String]) -> std::io::Result<i32> {
         workspace_id,
         cwd,
         branch,
+        branch_mode: if new_branch_only {
+            WorktreeBranchMode::NewOnly
+        } else {
+            WorktreeBranchMode::ReuseOrCreate
+        },
         base,
         path,
         label,

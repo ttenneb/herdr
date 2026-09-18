@@ -2838,6 +2838,7 @@ mod tests {
                     workspace_id: None,
                     cwd: Some(repo.display().to_string()),
                     branch: Some("worktree/create-remove-in-flight".into()),
+                    branch_mode: crate::api::schema::WorktreeBranchMode::ReuseOrCreate,
                     base: None,
                     path: Some(checkout.display().to_string()),
                     label: None,

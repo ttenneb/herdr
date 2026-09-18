@@ -2,8 +2,8 @@ use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::api::schema::{
-    EventData, EventEnvelope, EventKind, Request, ResponseResult, WorktreeCreateParams,
-    WorktreeRemoveParams,
+    EventData, EventEnvelope, EventKind, Request, ResponseResult, WorktreeBranchMode,
+    WorktreeCreateParams, WorktreeRemoveParams,
 };
 use crate::app::App;
 use crate::events::{ApiWorktreeAddRequest, ApiWorktreeRemoveRequest, AppEvent};
@@ -124,6 +124,7 @@ impl App {
         respond_to: std::sync::mpsc::Sender<String>,
     ) {
         let requested_base = params.base.clone();
+        let branch_mode = params.branch_mode;
         let branch = params
             .branch
             .unwrap_or_else(|| {
@@ -193,6 +194,17 @@ impl App {
             params.trust_repository,
         )
         .unwrap_or(false);
+        if branch_exists && branch_mode == WorktreeBranchMode::NewOnly {
+            Self::send_api_response(
+                respond_to,
+                encode_error(
+                    id,
+                    "worktree_branch_exists",
+                    format!("branch '{branch}' already exists"),
+                ),
+            );
+            return;
+        }
         let base = if branch_exists {
             // Git ignores the base when checking out an existing local branch.
             params.base.unwrap_or_else(|| "HEAD".into())
@@ -319,13 +331,23 @@ impl App {
                 err.message
             })
             .and_then(|()| {
-                crate::worktree::run_worktree_add_command(
-                    &operation_source_checkout_path,
-                    &path,
-                    &branch,
-                    &base,
-                    params.trust_repository,
-                )
+                if branch_mode == WorktreeBranchMode::NewOnly {
+                    crate::worktree::run_worktree_add_new_branch_command(
+                        &operation_source_checkout_path,
+                        &path,
+                        &branch,
+                        &base,
+                        params.trust_repository,
+                    )
+                } else {
+                    crate::worktree::run_worktree_add_command(
+                        &operation_source_checkout_path,
+                        &path,
+                        &branch,
+                        &base,
+                        params.trust_repository,
+                    )
+                }
             });
             let _ = event_tx.blocking_send(AppEvent::WorktreeAddFinished(Box::new(
                 crate::events::WorktreeAddResult {

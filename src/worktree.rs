@@ -434,6 +434,18 @@ pub(crate) fn local_branch_exists_with_trust(
     }
 }
 
+pub(crate) fn run_worktree_add_new_branch_command(
+    repo_root: &Path,
+    path: &Path,
+    branch: &str,
+    base: &str,
+    trust_repository: bool,
+) -> Result<(), String> {
+    let command =
+        build_worktree_add_new_branch_command(repo_root, path, branch, base, trust_repository);
+    run_worktree_command(&command)
+}
+
 pub(crate) fn run_worktree_add_command(
     repo_root: &Path,
     path: &Path,
@@ -719,6 +731,43 @@ mod tests {
             .output()
             .unwrap();
         assert!(safe_directory.stdout.is_empty());
+        std::fs::remove_dir_all(repo).unwrap();
+    }
+
+    #[test]
+    fn strict_new_branch_create_never_reuses_an_existing_branch() {
+        let repo = create_committed_repo("strict-new-branch-conflict");
+        run_git(&repo, &["branch", "feature/conflict"]);
+        let checkout = unique_temp_path("strict-new-branch-conflict-checkout");
+        let error = run_worktree_add_new_branch_command(
+            &repo,
+            &checkout,
+            "feature/conflict",
+            "HEAD",
+            false,
+        )
+        .unwrap_err();
+        assert!(!checkout.exists());
+        assert!(error.contains("already exists"), "{error}");
+        std::fs::remove_dir_all(repo).unwrap();
+    }
+
+    #[test]
+    fn strict_new_branch_create_is_atomic_against_late_branch_creation() {
+        let repo = create_committed_repo("strict-new-branch-race");
+        assert!(!local_branch_exists_with_trust(&repo, "feature/race", false).unwrap());
+        // Simulate the branch appearing after API preflight but before the worker executes.
+        run_git(&repo, &["branch", "feature/race"]);
+        let checkout = unique_temp_path("strict-new-branch-race-checkout");
+        assert!(run_worktree_add_new_branch_command(
+            &repo,
+            &checkout,
+            "feature/race",
+            "HEAD",
+            false,
+        )
+        .is_err());
+        assert!(!checkout.exists());
         std::fs::remove_dir_all(repo).unwrap();
     }
 

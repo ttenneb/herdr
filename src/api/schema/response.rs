@@ -5,6 +5,7 @@ use super::collections::{CollectionCreateMemberResult, CollectionInfo};
 use super::common::{ClientWindowTitleReason, NotificationShowReason};
 use super::delegations::{DelegationInfo, DelegationTreeEntry};
 use super::events::EventEnvelope;
+use super::handoffs::HandoffTransportReceipt;
 use super::integrations::{
     IntegrationInstallResult, IntegrationTarget, IntegrationUninstallResult,
 };
@@ -112,6 +113,14 @@ pub enum ResponseResult {
     },
     AgentPrompted {
         agent: AgentInfo,
+    },
+    HandoffValidated {
+        version: u8,
+        message_id: String,
+        encoded_bytes: usize,
+    },
+    HandoffTransport {
+        receipt: HandoffTransportReceipt,
     },
     AgentList {
         agents: Vec<AgentInfo>,

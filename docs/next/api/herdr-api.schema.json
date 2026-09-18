@@ -2289,6 +2289,36 @@
           ],
           "type": "object"
         },
+        "AgentSessionInfo": {
+          "properties": {
+            "agent": {
+              "type": "string"
+            },
+            "kind": {
+              "$ref": "#/schemas/request/$defs/AgentSessionRefKind"
+            },
+            "source": {
+              "type": "string"
+            },
+            "value": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "source",
+            "agent",
+            "kind",
+            "value"
+          ],
+          "type": "object"
+        },
+        "AgentSessionRefKind": {
+          "enum": [
+            "id",
+            "path"
+          ],
+          "type": "string"
+        },
         "AgentStartParams": {
           "properties": {
             "args": {
@@ -2643,6 +2673,60 @@
           },
           "required": [
             "target"
+          ],
+          "type": "object"
+        },
+        "ArtifactKind": {
+          "enum": [
+            "commit",
+            "file",
+            "diff",
+            "receipt",
+            "test"
+          ],
+          "type": "string"
+        },
+        "ArtifactRef": {
+          "properties": {
+            "digest": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "kind": {
+              "$ref": "#/schemas/request/$defs/ArtifactKind"
+            },
+            "value": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind",
+            "value"
+          ],
+          "type": "object"
+        },
+        "CanonicalHerdrIdentity": {
+          "properties": {
+            "agentSession": {
+              "$ref": "#/schemas/request/$defs/AgentSessionInfo"
+            },
+            "paneId": {
+              "type": "string"
+            },
+            "terminalId": {
+              "type": "string"
+            },
+            "workspaceId": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "workspaceId",
+            "paneId",
+            "terminalId",
+            "agentSession"
           ],
           "type": "object"
         },
@@ -3469,6 +3553,128 @@
           },
           "required": [
             "match_event"
+          ],
+          "type": "object"
+        },
+        "HandoffKind": {
+          "enum": [
+            "assignment",
+            "blocker",
+            "answer",
+            "report",
+            "cancel",
+            "info"
+          ],
+          "type": "string"
+        },
+        "HandoffSendParams": {
+          "properties": {
+            "envelope": {
+              "$ref": "#/schemas/request/$defs/HerdrHandoff"
+            }
+          },
+          "required": [
+            "envelope"
+          ],
+          "type": "object"
+        },
+        "HandoffTask": {
+          "properties": {
+            "attemptId": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "id": true,
+            "revision": {
+              "format": "uint64",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            }
+          },
+          "required": [
+            "id"
+          ],
+          "type": "object"
+        },
+        "HandoffValidateParams": {
+          "properties": {
+            "envelope": {
+              "$ref": "#/schemas/request/$defs/HerdrHandoff"
+            }
+          },
+          "required": [
+            "envelope"
+          ],
+          "type": "object"
+        },
+        "HerdrHandoff": {
+          "properties": {
+            "artifactRefs": {
+              "items": {
+                "$ref": "#/schemas/request/$defs/ArtifactRef"
+              },
+              "type": "array"
+            },
+            "correlationId": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "createdAt": {
+              "type": "string"
+            },
+            "kind": {
+              "$ref": "#/schemas/request/$defs/HandoffKind"
+            },
+            "messageId": {
+              "type": "string"
+            },
+            "recipient": {
+              "$ref": "#/schemas/request/$defs/CanonicalHerdrIdentity"
+            },
+            "replyToId": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "sender": {
+              "$ref": "#/schemas/request/$defs/CanonicalHerdrIdentity"
+            },
+            "summary": {
+              "type": "string"
+            },
+            "task": {
+              "anyOf": [
+                {
+                  "$ref": "#/schemas/request/$defs/HandoffTask"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "version": {
+              "format": "uint8",
+              "maximum": 255,
+              "minimum": 0,
+              "type": "integer"
+            }
+          },
+          "required": [
+            "version",
+            "messageId",
+            "createdAt",
+            "sender",
+            "recipient",
+            "kind",
+            "summary"
           ],
           "type": "object"
         },
@@ -6191,6 +6397,13 @@
           ],
           "type": "object"
         },
+        "WorktreeBranchMode": {
+          "enum": [
+            "reuse_or_create",
+            "new_only"
+          ],
+          "type": "string"
+        },
         "WorktreeCreateParams": {
           "properties": {
             "base": {
@@ -6204,6 +6417,9 @@
                 "string",
                 "null"
               ]
+            },
+            "branch_mode": {
+              "$ref": "#/schemas/request/$defs/WorktreeBranchMode"
             },
             "cwd": {
               "type": [
@@ -7200,6 +7416,38 @@
             },
             "params": {
               "$ref": "#/schemas/request/$defs/AgentWaitParams"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "method": {
+              "const": "handoff.validate",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/schemas/request/$defs/HandoffValidateParams"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "method": {
+              "const": "handoff.send",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/schemas/request/$defs/HandoffSendParams"
             }
           },
           "required": [
@@ -10875,6 +11123,29 @@
           ],
           "type": "string"
         },
+        "CanonicalHerdrIdentity": {
+          "properties": {
+            "agentSession": {
+              "$ref": "#/schemas/success_response/$defs/AgentSessionInfo"
+            },
+            "paneId": {
+              "type": "string"
+            },
+            "terminalId": {
+              "type": "string"
+            },
+            "workspaceId": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "workspaceId",
+            "paneId",
+            "terminalId",
+            "agentSession"
+          ],
+          "type": "object"
+        },
         "CheckoutInfo": {
           "properties": {
             "checkout_path": {
@@ -12360,6 +12631,72 @@
             "layout_updated"
           ],
           "type": "string"
+        },
+        "HandoffTransportOutcome": {
+          "enum": [
+            "runtime_transaction_admitted",
+            "sender_identity_mismatch",
+            "recipient_identity_mismatch",
+            "recipient_not_ready",
+            "recipient_blocked",
+            "recipient_not_foreground",
+            "queue_full",
+            "payload_too_large",
+            "transport_closed"
+          ],
+          "type": "string"
+        },
+        "HandoffTransportReceipt": {
+          "properties": {
+            "attemptedPath": {
+              "type": "string"
+            },
+            "detail": {
+              "type": "string"
+            },
+            "messageId": {
+              "type": "string"
+            },
+            "outcome": {
+              "$ref": "#/schemas/success_response/$defs/HandoffTransportOutcome"
+            },
+            "recipient": {
+              "$ref": "#/schemas/success_response/$defs/CanonicalHerdrIdentity"
+            },
+            "sender": {
+              "$ref": "#/schemas/success_response/$defs/CanonicalHerdrIdentity"
+            },
+            "targetInteractiveReady": {
+              "type": "boolean"
+            },
+            "targetStateChangeSeq": {
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "targetStatus": {
+              "$ref": "#/schemas/success_response/$defs/AgentStatus"
+            },
+            "version": {
+              "format": "uint8",
+              "maximum": 255,
+              "minimum": 0,
+              "type": "integer"
+            }
+          },
+          "required": [
+            "version",
+            "messageId",
+            "sender",
+            "recipient",
+            "attemptedPath",
+            "targetStatus",
+            "targetInteractiveReady",
+            "targetStateChangeSeq",
+            "outcome",
+            "detail"
+          ],
+          "type": "object"
         },
         "InstalledPluginInfo": {
           "properties": {
@@ -14537,6 +14874,51 @@
               "required": [
                 "type",
                 "agent"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "encoded_bytes": {
+                  "format": "uint",
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                "message_id": {
+                  "type": "string"
+                },
+                "type": {
+                  "const": "handoff_validated",
+                  "type": "string"
+                },
+                "version": {
+                  "format": "uint8",
+                  "maximum": 255,
+                  "minimum": 0,
+                  "type": "integer"
+                }
+              },
+              "required": [
+                "type",
+                "version",
+                "message_id",
+                "encoded_bytes"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "receipt": {
+                  "$ref": "#/schemas/success_response/$defs/HandoffTransportReceipt"
+                },
+                "type": {
+                  "const": "handoff_transport",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type",
+                "receipt"
               ],
               "type": "object"
             },

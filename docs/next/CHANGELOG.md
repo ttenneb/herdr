@@ -3,6 +3,8 @@
 ## Unreleased
 
 ### Added
+- Added bounded exact-session `herdr handoff` validation/submission and staged `herdr run` launch receipts; run profile application remains delegated to a verified Pi-owned helper interface.
+- Added strict `herdr worktree create --new-branch-only` semantics that cannot race into reusing an existing branch.
 - Added first-class Repository and Checkout Spaces, including grouped hierarchy, Repository lifecycle/API commands, and compatibility-preserving workspace projections.
 - Added pane collections: one nested, scrollable list leaf can hold multiple real terminal panes with inline previews, active/archive sections, collection and delegation CLI/socket APIs, and explicit promote-or-cascade close behavior.
 - Added session-wide delegation provenance with stable parent, purpose, sibling order, root, descendants, tombstones, persistence, and restore semantics.

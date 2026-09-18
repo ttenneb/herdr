@@ -34,12 +34,14 @@ pub(super) fn command() -> Command {
         .subcommand(server_command())
         .subcommand(api_command())
         .subcommand(repository_command())
+        .subcommand(run_command())
         .subcommand(checkout_command())
         .subcommand(workspace_command())
         .subcommand(worktree_command())
         .subcommand(tab_command())
         .subcommand(collection_command())
         .subcommand(delegation_command())
+        .subcommand(handoff_command())
         .subcommand(notification_command())
         .subcommand(agent_command())
         .subcommand(pane_command())
@@ -111,6 +113,27 @@ fn write_requested_help(
     selected.write_long_help(&mut *output)?;
     writeln!(output)?;
     Ok(true)
+}
+
+fn handoff_command() -> Command {
+    let source = || {
+        Arg::new("source")
+            .value_name("JSON|PATH|-")
+            .required(true)
+            .help("Bounded handoff envelope as JSON, a file path, or stdin (-)")
+    };
+    Command::new("handoff")
+        .about("Validate or submit a bounded exact-session agent handoff")
+        .subcommand(
+            Command::new("validate")
+                .about("Validate a versioned handoff envelope")
+                .arg(source()),
+        )
+        .subcommand(
+            Command::new("send")
+                .about("Submit a handoff through the normal prompt path")
+                .arg(source()),
+        )
 }
 
 fn completion_command() -> Command {
@@ -297,6 +320,46 @@ fn workspace_command() -> Command {
         .subcommand(id_command("close", "workspace_id", "Close a workspace"))
 }
 
+fn run_command() -> Command {
+    Command::new("run")
+        .about("Launch one reproducible bounded Pi agent run")
+        .arg(path_option("repo", "PATH").required(true))
+        .arg(option("base", "REF").required(true))
+        .arg(option("branch", "NAME"))
+        .arg(path_option("existing", "PATH"))
+        .group(
+            ArgGroup::new("launch_mode")
+                .args(["branch", "existing"])
+                .required(true)
+                .multiple(false),
+        )
+        .arg(option("label", "TEXT"))
+        .arg(option("role", "PROFILE.md").required(true))
+        .arg(option("provider", "PROVIDER"))
+        .arg(option("model", "MODEL").required(true))
+        .arg(
+            option("thinking", "LEVEL")
+                .required(true)
+                .value_parser(["low", "medium", "high"]),
+        )
+        .arg(option("complexity-reason", "TEXT"))
+        .arg(path_option("assignment-file", "PATH").required(true))
+        .arg(option("parent", "JSON|PATH").required(true))
+        .arg(option("name", "NAME").required(true))
+        .arg(option("collection", "ID").help(
+            "Create the agent as a workspace-local member of this collection; requires --existing",
+        ))
+        .arg(
+            path_option("profile-helper", "PATH")
+                .help("Pi-owned profile use/readback helper (see docs/handoff-and-run.md)"),
+        )
+        .arg(option("timeout", "MS"))
+        .arg(
+            flag("cleanup-on-failure")
+                .help("Request conservative identity-safe cleanup; never forces removal"),
+        )
+}
+
 fn worktree_command() -> Command {
     Command::new("worktree")
         .about("Manage Git worktree-backed workspaces")
@@ -315,6 +378,7 @@ fn worktree_command() -> Command {
                 .arg(option("workspace", "ID"))
                 .arg(path_option("cwd", "PATH"))
                 .arg(option("branch", "NAME"))
+                .arg(flag("new-branch-only").help("Refuse to reuse an existing local branch"))
                 .arg(option("base", "REF"))
                 .arg(path_option("path", "PATH"))
                 .arg(option("label", "TEXT"))

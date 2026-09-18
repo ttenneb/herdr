@@ -13,6 +13,16 @@ pub struct WorktreeListParams {
     pub trust_repository: bool,
 }
 
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema, Default,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum WorktreeBranchMode {
+    #[default]
+    ReuseOrCreate,
+    NewOnly,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema, Default)]
 pub struct WorktreeCreateParams {
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -23,6 +33,8 @@ pub struct WorktreeCreateParams {
     pub cwd: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub branch: Option<String>,
+    #[serde(default, skip_serializing_if = "is_default_branch_mode")]
+    pub branch_mode: WorktreeBranchMode,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub base: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -34,6 +46,10 @@ pub struct WorktreeCreateParams {
     #[serde(default, skip_serializing_if = "super::is_false")]
     #[schemars(extend("default" = false))]
     pub trust_repository: bool,
+}
+
+fn is_default_branch_mode(value: &WorktreeBranchMode) -> bool {
+    *value == WorktreeBranchMode::ReuseOrCreate
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema, Default)]

@@ -700,6 +700,7 @@ impl App {
                 workspace_id,
                 cwd: None,
                 branch: Some(branch),
+                branch_mode: crate::api::schema::WorktreeBranchMode::ReuseOrCreate,
                 path: Some(checkout_path),
                 base: Some(base),
                 focus: true,

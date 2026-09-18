@@ -5,6 +5,7 @@ pub mod collections;
 pub mod common;
 pub mod delegations;
 pub mod events;
+pub mod handoffs;
 pub mod integrations;
 pub mod panes;
 pub mod plugins;
@@ -21,6 +22,7 @@ pub use collections::*;
 pub use common::*;
 pub use delegations::*;
 pub use events::*;
+pub use handoffs::*;
 pub use integrations::*;
 pub use panes::*;
 pub use plugins::*;
@@ -157,6 +159,10 @@ pub enum Method {
     AgentPrompt(AgentPromptParams),
     #[serde(rename = "agent.wait")]
     AgentWait(AgentWaitParams),
+    #[serde(rename = "handoff.validate")]
+    HandoffValidate(HandoffValidateParams),
+    #[serde(rename = "handoff.send")]
+    HandoffSend(HandoffSendParams),
     #[serde(rename = "collection.list")]
     CollectionList(CollectionListParams),
     #[serde(rename = "collection.get")]

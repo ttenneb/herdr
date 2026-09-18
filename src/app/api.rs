@@ -5,6 +5,9 @@ mod agents;
 mod collections;
 mod delegations;
 mod env;
+mod handoffs;
+#[cfg(test)]
+mod handoffs_tests;
 mod integrations;
 mod layouts;
 mod pane_graphics;
@@ -1369,6 +1372,10 @@ impl App {
             }
             Method::AgentStart(params) => return self.handle_agent_start(request.id, params),
             Method::AgentPrompt(params) => return self.handle_agent_prompt(request.id, params),
+            Method::HandoffValidate(params) => {
+                return self.handle_handoff_validate(request.id, params)
+            }
+            Method::HandoffSend(params) => return self.handle_handoff_send(request.id, params),
             Method::AgentWait(_) => {
                 return responses::encode_error(
                     request.id,

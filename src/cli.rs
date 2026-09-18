@@ -27,12 +27,14 @@ mod api;
 mod collection;
 mod completion;
 mod delegation;
+mod handoff;
 mod integration;
 mod notification;
 mod pane;
 mod plugin;
 mod protocol_guard;
 mod repository;
+mod run;
 mod runtime;
 mod server;
 mod server_not_running;
@@ -119,10 +121,12 @@ pub fn maybe_run(args: &[String]) -> std::io::Result<CommandOutcome> {
         "workspace" => workspace::run_workspace_command(&args[2..])?,
         "checkout" => workspace::run_checkout_command(&args[2..])?,
         "repository" => repository::run_repository_command(&args[2..])?,
+        "run" => run::run_run_command(&args[2..])?,
         "worktree" => worktree::run_worktree_command(&args[2..])?,
         "tab" => tab::run_tab_command(&args[2..])?,
         "collection" => collection::run_collection_command(&args[2..])?,
         "delegation" => delegation::run_delegation_command(&args[2..])?,
+        "handoff" => handoff::run_handoff_command(&args[2..])?,
         "notification" => notification::run_notification_command(&args[2..])?,
         "agent" => agent::run_agent_command(&args[2..])?,
         "terminal" => run_terminal_command(&args[2..])?,
