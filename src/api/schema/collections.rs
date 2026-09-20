@@ -2,7 +2,7 @@ use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
 
-use super::{PaneInfo, SplitDirection};
+use super::{AgentInfo, PaneInfo, SplitDirection};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema, Default)]
 pub struct CollectionListParams {
@@ -159,4 +159,37 @@ pub struct CollectionCreateMemberResult {
     pub pane: PaneInfo,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub delegation_id: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct CollectionHelperLaunchParams {
+    pub collection_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cwd: Option<String>,
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub env: HashMap<String, String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delegation_parent_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub purpose: Option<String>,
+    pub name: String,
+    pub kind: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub args: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeout_ms: Option<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct CollectionHelperLaunchResult {
+    pub created: CollectionCreateMemberResult,
+    pub agent: AgentInfo,
+    pub argv: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct CollectionHelperAbortParams {
+    pub collection_id: String,
+    pub pane_id: String,
+    pub terminal_id: String,
 }

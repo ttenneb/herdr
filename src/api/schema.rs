@@ -185,6 +185,10 @@ pub enum Method {
     CollectionRestore(CollectionMemberTarget),
     #[serde(rename = "collection.member_create")]
     CollectionCreateMember(CollectionCreateMemberParams),
+    #[serde(rename = "collection.helper_launch")]
+    CollectionHelperLaunch(CollectionHelperLaunchParams),
+    #[serde(rename = "collection.helper_abort")]
+    CollectionHelperAbort(CollectionHelperAbortParams),
     #[serde(rename = "collection.close")]
     CollectionClose(CollectionCloseParams),
     #[serde(rename = "delegation.create")]

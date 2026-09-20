@@ -422,6 +422,7 @@ fn agent_start(args: &[String]) -> std::io::Result<i32> {
         timeout,
         &expected_kind,
         expected_terminal_id,
+        false,
     );
     match waited {
         Ok(Ok(agent)) => {
@@ -559,12 +560,13 @@ fn agent_wait(args: &[String]) -> std::io::Result<i32> {
     })?)
 }
 
-fn wait_for_named_agent(
+pub(super) fn wait_for_named_agent(
     name: &str,
     fallback_pane_id: &str,
     timeout: Duration,
     expected_kind: &str,
     expected_terminal_id: &str,
+    require_agent_session: bool,
 ) -> std::io::Result<Result<serde_json::Value, serde_json::Value>> {
     let deadline = Instant::now().checked_add(timeout);
     let mut first_poll = true;
@@ -611,8 +613,18 @@ fn wait_for_named_agent(
                     format!("agent {name} is blocked during startup and is not ready for prompts"),
                 ))),
                 Some("working" | "unknown") => None,
-                Some("idle" | "done") if agent["interactive_ready"].as_bool() == Some(true) => {
+                Some("idle" | "done")
+                    if agent["interactive_ready"].as_bool() == Some(true)
+                        && (!require_agent_session || agent["agent_session"].is_object()) =>
+                {
                     Some(Ok(agent.clone()))
+                }
+                Some("idle" | "done")
+                    if require_agent_session
+                        && agent["interactive_ready"].as_bool() == Some(true)
+                        && !agent["agent_session"].is_object() =>
+                {
+                    None
                 }
                 Some("idle" | "done") if !agent["launch_pending"].as_bool().unwrap_or(false) => {
                     Some(Err(cli_agent_error(

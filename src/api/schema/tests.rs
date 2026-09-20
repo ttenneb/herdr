@@ -180,6 +180,28 @@ fn omitted_boolean_request_flags_expose_false_schema_defaults() {
 }
 
 #[test]
+fn collection_helper_launch_request_round_trips() {
+    let request = Request {
+        id: "launch".into(),
+        method: Method::CollectionHelperLaunch(CollectionHelperLaunchParams {
+            collection_id: "collection_1".into(),
+            cwd: Some("/tmp".into()),
+            env: [("ROLE".into(), "review".into())].into_iter().collect(),
+            delegation_parent_id: None,
+            purpose: Some("review".into()),
+            name: "reviewer".into(),
+            kind: "pi".into(),
+            args: vec!["--thinking".into(), "low".into()],
+            timeout_ms: Some(30_000),
+        }),
+    };
+    let json = serde_json::to_value(&request).unwrap();
+    assert_eq!(json["method"], "collection.helper_launch");
+    assert_eq!(json["params"]["name"], "reviewer");
+    assert_eq!(serde_json::from_value::<Request>(json).unwrap(), request);
+}
+
+#[test]
 fn agent_start_and_prompt_requests_round_trip() {
     let start = Request {
         id: "start".into(),

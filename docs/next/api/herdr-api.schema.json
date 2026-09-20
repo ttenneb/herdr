@@ -2910,6 +2910,82 @@
           ],
           "type": "object"
         },
+        "CollectionHelperAbortParams": {
+          "properties": {
+            "collection_id": {
+              "type": "string"
+            },
+            "pane_id": {
+              "type": "string"
+            },
+            "terminal_id": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "collection_id",
+            "pane_id",
+            "terminal_id"
+          ],
+          "type": "object"
+        },
+        "CollectionHelperLaunchParams": {
+          "properties": {
+            "args": {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            "collection_id": {
+              "type": "string"
+            },
+            "cwd": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "delegation_parent_id": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "env": {
+              "additionalProperties": {
+                "type": "string"
+              },
+              "type": "object"
+            },
+            "kind": {
+              "type": "string"
+            },
+            "name": {
+              "type": "string"
+            },
+            "purpose": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "timeout_ms": {
+              "format": "uint64",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            }
+          },
+          "required": [
+            "collection_id",
+            "name",
+            "kind"
+          ],
+          "type": "object"
+        },
         "CollectionListParams": {
           "properties": {
             "tab_id": {
@@ -7635,6 +7711,38 @@
         {
           "properties": {
             "method": {
+              "const": "collection.helper_launch",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/schemas/request/$defs/CollectionHelperLaunchParams"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "method": {
+              "const": "collection.helper_abort",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/schemas/request/$defs/CollectionHelperAbortParams"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "method": {
               "const": "collection.close",
               "type": "string"
             },
@@ -11202,6 +11310,28 @@
           "required": [
             "collection",
             "pane"
+          ],
+          "type": "object"
+        },
+        "CollectionHelperLaunchResult": {
+          "properties": {
+            "agent": {
+              "$ref": "#/schemas/success_response/$defs/AgentInfo"
+            },
+            "argv": {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            "created": {
+              "$ref": "#/schemas/success_response/$defs/CollectionCreateMemberResult"
+            }
+          },
+          "required": [
+            "created",
+            "agent",
+            "argv"
           ],
           "type": "object"
         },
@@ -15017,6 +15147,22 @@
               "required": [
                 "type",
                 "created"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "launched": {
+                  "$ref": "#/schemas/success_response/$defs/CollectionHelperLaunchResult"
+                },
+                "type": {
+                  "const": "collection_helper_launched",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type",
+                "launched"
               ],
               "type": "object"
             },

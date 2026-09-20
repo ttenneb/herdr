@@ -913,6 +913,7 @@ impl Workspace {
         host_terminal_appearance: Option<crate::terminal_theme::HostAppearance>,
         shell_config: crate::pane::PaneShellConfig<'_>,
         extra_env: Vec<(String, String)>,
+        argv: Option<&[String]>,
     ) -> Result<crate::workspace::tab::NewPane, crate::workspace::tab::CollectionCreateMemberError>
     {
         let pane_number = self.next_public_pane_number;
@@ -928,6 +929,7 @@ impl Workspace {
             host_terminal_appearance,
             shell_config,
             &launch_env,
+            argv,
         )?;
         self.register_new_pane_with_number(new_pane.pane_id, pane_number);
         Ok(new_pane)

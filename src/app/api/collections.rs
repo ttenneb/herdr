@@ -1,6 +1,7 @@
 use crate::api::schema::{
-    CollectionAddParams, CollectionCloseDisposition, CollectionCloseParams,
+    AgentStartParams, CollectionAddParams, CollectionCloseDisposition, CollectionCloseParams,
     CollectionCreateMemberParams, CollectionCreateMemberResult, CollectionCreateParams,
+    CollectionHelperAbortParams, CollectionHelperLaunchParams, CollectionHelperLaunchResult,
     CollectionInfo, CollectionLifecycleSummary, CollectionListParams, CollectionMemberInfo,
     CollectionMemberTarget, CollectionMoveParams, CollectionPromoteParams, CollectionReorderParams,
     CollectionSelectParams, CollectionTarget, EventData, EventEnvelope, EventKind, LayoutFocusInfo,
@@ -11,7 +12,7 @@ use crate::app::App;
 use crate::delegation::{DelegationId, Delegations, SiblingPosition};
 use crate::layout::{CollectionId, LayoutLeaf, PanePlacement};
 
-use super::responses::{encode_error, encode_success};
+use super::responses::{encode_error, encode_error_body, encode_success};
 
 #[derive(Clone, Copy)]
 pub(crate) struct ArchivedMemberInputRestore {
@@ -937,6 +938,7 @@ impl App {
             self.state.host_terminal_appearance,
             shell_config,
             extra_env,
+            None,
         ) {
             Ok(new_pane) => new_pane,
             Err(err) => {
@@ -1012,6 +1014,239 @@ impl App {
                 }),
             },
         )
+    }
+
+    pub(super) fn handle_collection_helper_launch(
+        &mut self,
+        id: String,
+        params: CollectionHelperLaunchParams,
+    ) -> String {
+        let Some((ws_idx, tab_idx, collection_id)) = self.resolve_collection(&params.collection_id)
+        else {
+            return collection_not_found(id, &params.collection_id);
+        };
+        let agent_params = AgentStartParams {
+            name: params.name,
+            kind: params.kind,
+            pane_id: String::new(),
+            args: params.args,
+            timeout_ms: params.timeout_ms,
+        };
+        // Validate every managed-agent field before allocating a pane or emitting lifecycle
+        // events. The agent process itself becomes the pane's initial process, avoiding the
+        // new-shell readiness race inherent in creating a shell and injecting a command later.
+        let (kind, argv) = match self.prepare_agent_launch(&agent_params) {
+            Ok(prepared) => prepared,
+            Err(err) => return encode_error_body(id, self.agent_start_error_body(err)),
+        };
+        let timeout = match self.agent_start_timeout(&agent_params) {
+            Ok(timeout) => timeout,
+            Err(err) => return encode_error_body(id, self.agent_start_error_body(err)),
+        };
+        let parent = match params
+            .delegation_parent_id
+            .as_deref()
+            .map(str::parse::<DelegationId>)
+            .transpose()
+        {
+            Ok(value) => value,
+            Err(err) => return encode_error(id, "invalid_delegation_id", err.to_string()),
+        };
+        if let Some(parent_id) = parent {
+            if self.state.delegations.get(parent_id).is_none() {
+                return encode_error(
+                    id,
+                    "delegation_create_failed",
+                    format!("parent delegation {parent_id} was not found"),
+                );
+            }
+        }
+        let purpose = params
+            .purpose
+            .map(|value| value.trim().chars().take(200).collect::<String>())
+            .filter(|value| !value.is_empty());
+        let create_delegation = parent.is_some() || purpose.is_some();
+        let extra_env = match super::env::normalize_launch_env(params.env) {
+            Ok(env) => env,
+            Err((code, message)) => return encode_error(id, &code, message),
+        };
+        let (_, estimated_cols) = self.state.estimate_pane_size();
+        let collection_cols = self.state.workspaces[ws_idx].tabs[tab_idx]
+            .layout
+            .leaf_rect(
+                LayoutLeaf::Collection(collection_id),
+                self.state.view.terminal_area,
+            )
+            .map(|rect| rect.width.saturating_sub(2))
+            .filter(|cols| *cols > 0)
+            .unwrap_or(estimated_cols);
+        let follow_cwd = self.state.workspaces[ws_idx].tabs[tab_idx]
+            .collection(collection_id)
+            .and_then(|collection| collection.selected())
+            .and_then(|pane_id| self.launch_cwd_for_pane_in_workspace(ws_idx, pane_id));
+        let cwd = params
+            .cwd
+            .map(std::path::PathBuf::from)
+            .or_else(|| Some(self.resolve_new_terminal_cwd(follow_cwd)));
+        let shell_config =
+            crate::pane::PaneShellConfig::new(&self.state.default_shell, self.state.shell_mode);
+        let mut new_pane = match self.state.workspaces[ws_idx].create_collection_member(
+            tab_idx,
+            collection_id,
+            crate::app::collection_view::DEFAULT_PREVIEW_HEIGHT,
+            collection_cols,
+            cwd,
+            self.state.pane_scrollback_limit_bytes,
+            self.state.host_terminal_theme,
+            self.state.host_terminal_appearance,
+            shell_config,
+            extra_env,
+            Some(&argv),
+        ) {
+            Ok(new_pane) => new_pane,
+            Err(err) => {
+                return encode_error(id, "collection_helper_launch_failed", err.to_string())
+            }
+        };
+        let pane_id = new_pane.pane_id;
+        let terminal_id = new_pane.terminal.id.to_string();
+        new_pane.terminal.begin_managed_agent(
+            agent_params.name,
+            kind,
+            std::time::Instant::now(),
+            crate::app::AGENT_START_SETTLE_DELAY,
+            timeout,
+        );
+        self.terminal_runtimes
+            .insert(new_pane.terminal.id.clone(), new_pane.runtime);
+        self.state.remove_alias_shadowed_by_new_pane(pane_id);
+        self.state
+            .terminals
+            .insert(new_pane.terminal.id.clone(), new_pane.terminal);
+        let delegation_id = if create_delegation {
+            match self
+                .state
+                .delegations
+                .create(Some(pane_id), parent, purpose)
+            {
+                Ok(value) => Some(value),
+                Err(err) => {
+                    let pane_id = self.public_pane_id(ws_idx, pane_id).unwrap_or_default();
+                    let rollback = self.handle_collection_helper_abort(
+                        format!("{id}:rollback"),
+                        CollectionHelperAbortParams {
+                            collection_id: params.collection_id,
+                            pane_id,
+                            terminal_id,
+                        },
+                    );
+                    if serde_json::from_str::<serde_json::Value>(&rollback)
+                        .ok()
+                        .is_some_and(|value| value.get("error").is_some())
+                    {
+                        return encode_error(
+                            id,
+                            "delegation_create_rollback_failed",
+                            format!("{err}; helper rollback failed: {rollback}"),
+                        );
+                    }
+                    return encode_error(id, "delegation_create_failed", err.to_string());
+                }
+            }
+        } else {
+            None
+        };
+        let pane = self
+            .pane_info(ws_idx, pane_id)
+            .expect("created member exists");
+        let agent = self
+            .agent_info(ws_idx, pane_id)
+            .expect("created agent exists");
+        self.emit_event(EventEnvelope {
+            event: EventKind::PaneCreated,
+            data: EventData::PaneCreated { pane: pane.clone() },
+        });
+        if let Some(delegation_id) = delegation_id {
+            let delegation = self.delegation_info(
+                self.state
+                    .delegations
+                    .get(delegation_id)
+                    .expect("created delegation exists"),
+            );
+            self.emit_event(EventEnvelope {
+                event: EventKind::DelegationCreated,
+                data: EventData::DelegationCreated { delegation },
+            });
+        }
+        self.state.mark_session_dirty();
+        self.schedule_session_save();
+        let collection = self
+            .collection_info(ws_idx, tab_idx, collection_id)
+            .expect("collection exists");
+        self.emit_collection_event(
+            EventKind::CollectionMemberAdded,
+            EventData::CollectionMemberAdded {
+                collection: collection.clone(),
+                pane: pane.clone(),
+            },
+        );
+        encode_success(
+            id,
+            ResponseResult::CollectionHelperLaunched {
+                launched: Box::new(CollectionHelperLaunchResult {
+                    created: CollectionCreateMemberResult {
+                        collection,
+                        pane,
+                        delegation_id: delegation_id.map(|value| value.to_string()),
+                    },
+                    agent,
+                    argv,
+                }),
+            },
+        )
+    }
+
+    pub(super) fn handle_collection_helper_abort(
+        &mut self,
+        id: String,
+        params: CollectionHelperAbortParams,
+    ) -> String {
+        let Some((collection_ws_idx, collection_tab_idx, collection_id)) =
+            self.resolve_collection(&params.collection_id)
+        else {
+            return collection_not_found(id, &params.collection_id);
+        };
+        let Some((pane_ws_idx, pane_id)) = self.parse_pane_id(&params.pane_id) else {
+            // Pane IDs are not reused within a session. An already-absent target means process
+            // exit or an earlier retry completed the rollback, so abort remains idempotent.
+            return encode_success(id, ResponseResult::Ok {});
+        };
+        let matches_collection = pane_ws_idx == collection_ws_idx
+            && self.state.workspaces[collection_ws_idx]
+                .find_tab_index_for_pane(pane_id)
+                .is_some_and(|tab_idx| tab_idx == collection_tab_idx)
+            && self.state.workspaces[collection_ws_idx].tabs[collection_tab_idx]
+                .pane_placement(pane_id)
+                == Some(PanePlacement::Collection(collection_id));
+        let matches_terminal = self.state.workspaces[collection_ws_idx]
+            .terminal_id(pane_id)
+            .is_some_and(|terminal_id| terminal_id.to_string() == params.terminal_id);
+        if !matches_collection || !matches_terminal {
+            return encode_error(
+                id,
+                "collection_helper_rollback_mismatch",
+                "helper pane no longer matches the created collection member and terminal",
+            );
+        }
+        match self.close_pane(
+            id.clone(),
+            &PaneTarget {
+                pane_id: params.pane_id,
+            },
+        ) {
+            Ok(()) => encode_success(id, ResponseResult::Ok {}),
+            Err(response) => response,
+        }
     }
 
     fn canonical_collection_member_order(
@@ -1484,20 +1719,60 @@ mod tests {
         assert!(response.get("error").is_none(), "{response}");
         let pane_public = response["result"]["created"]["pane"]["pane_id"]
             .as_str()
-            .expect("pane id");
-        let (_, pane_id) = app.parse_pane_id(pane_public).expect("created pane");
+            .expect("pane id")
+            .to_string();
+        let (_, pane_id) = app.parse_pane_id(&pane_public).expect("created pane");
         assert_eq!(
             app.state.workspaces[0].tabs[0].pane_placement(pane_id),
             Some(PanePlacement::Collection(collection))
         );
         let terminal_id = app.state.workspaces[0]
             .terminal_id(pane_id)
-            .expect("terminal");
-        let runtime = app.terminal_runtimes.get(terminal_id).expect("runtime");
+            .expect("terminal")
+            .clone();
+        let runtime = app.terminal_runtimes.get(&terminal_id).expect("runtime");
         assert_eq!(
             runtime.current_size(),
             (crate::app::collection_view::DEFAULT_PREVIEW_HEIGHT, 98)
         );
+
+        let mismatched = request(
+            &mut app,
+            Method::CollectionHelperAbort(CollectionHelperAbortParams {
+                collection_id: collection_id_string(collection),
+                pane_id: pane_public.clone(),
+                terminal_id: "term_wrong".into(),
+            }),
+        );
+        assert_eq!(
+            mismatched["error"]["code"],
+            "collection_helper_rollback_mismatch"
+        );
+        assert!(app.state.workspaces[0].tabs[0].panes.contains_key(&pane_id));
+
+        let closed = request(
+            &mut app,
+            Method::CollectionHelperAbort(CollectionHelperAbortParams {
+                collection_id: collection_id_string(collection),
+                pane_id: pane_public.clone(),
+                terminal_id: terminal_id.to_string(),
+            }),
+        );
+        assert!(closed.get("error").is_none(), "{closed}");
+        let retried = request(
+            &mut app,
+            Method::CollectionHelperAbort(CollectionHelperAbortParams {
+                collection_id: collection_id_string(collection),
+                pane_id: pane_public,
+                terminal_id: terminal_id.to_string(),
+            }),
+        );
+        assert!(retried.get("error").is_none(), "{retried}");
+        assert_eq!(app.state.workspaces.len(), 1);
+        let retained = app.state.workspaces[0].tabs[0]
+            .collection(collection)
+            .expect("empty collection retained");
+        assert!(retained.members().is_empty());
     }
 
     #[test]
@@ -1519,6 +1794,40 @@ mod tests {
         assert_eq!(response["error"]["code"], "delegation_create_failed");
         assert_eq!(app.state.terminals.len(), panes_before);
         assert_eq!(app.event_hub.current_sequence(), events_before);
+    }
+
+    #[tokio::test]
+    async fn helper_launch_rejects_invalid_agent_before_member_creation() {
+        let (mut app, root, _, _) = app_with_panes();
+        let collection_id = create_collection(&mut app, root);
+        let (_, _, internal_collection_id) = app
+            .resolve_collection(&collection_id)
+            .expect("collection resolves");
+        let terminals_before = app.state.terminals.len();
+        let events_before = app.event_hub.current_sequence();
+
+        let response = request(
+            &mut app,
+            Method::CollectionHelperLaunch(CollectionHelperLaunchParams {
+                collection_id: collection_id.clone(),
+                cwd: None,
+                env: Default::default(),
+                delegation_parent_id: None,
+                purpose: None,
+                name: "reviewer".into(),
+                kind: "not-an-agent".into(),
+                args: Vec::new(),
+                timeout_ms: None,
+            }),
+        );
+
+        assert_eq!(response["error"]["code"], "unsupported_agent_kind");
+        assert_eq!(app.state.terminals.len(), terminals_before);
+        assert_eq!(app.event_hub.current_sequence(), events_before);
+        let collection = app.state.workspaces[0].tabs[0]
+            .collection(internal_collection_id)
+            .expect("collection");
+        assert!(collection.members().is_empty());
     }
 
     #[test]

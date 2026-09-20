@@ -1417,6 +1417,12 @@ impl App {
             Method::CollectionCreateMember(params) => {
                 return self.handle_collection_create_member(request.id, params)
             }
+            Method::CollectionHelperLaunch(params) => {
+                return self.handle_collection_helper_launch(request.id, params)
+            }
+            Method::CollectionHelperAbort(params) => {
+                return self.handle_collection_helper_abort(request.id, params)
+            }
             Method::CollectionClose(params) => {
                 return self.handle_collection_close(request.id, params)
             }

@@ -516,6 +516,26 @@ fn collection_command() -> Command {
                 .arg(option("purpose", "TEXT")),
         )
         .subcommand(
+            Command::new("helper-launch")
+                .about("Create a collection member with readiness-checked managed-agent startup")
+                .long_about("Create a collection member with readiness-checked managed-agent startup. Startup failures remove the exact created member. A transport failure before the initial response is ambiguous; inspect the collection before retrying.")
+                .arg(required("collection_id", "COLLECTION_ID"))
+                .arg(path_option("cwd", "PATH"))
+                .arg(env_option())
+                .arg(option("parent", "DELEGATION_ID"))
+                .arg(option("purpose", "TEXT"))
+                .arg(option("name", "NAME").required(true))
+                .arg(option("kind", "KIND").required(true))
+                .arg(option("timeout", "MS"))
+                .arg(
+                    Arg::new("agent_args")
+                        .num_args(0..)
+                        .last(true)
+                        .allow_hyphen_values(true)
+                        .value_name("AGENT_ARG"),
+                ),
+        )
+        .subcommand(
             Command::new("close")
                 .about("Close a collection with an explicit member disposition")
                 .arg(required("collection_id", "COLLECTION_ID"))

@@ -64,6 +64,7 @@ mod client;
 mod config;
 pub mod delegation;
 mod detect;
+pub mod direct_transport;
 mod events;
 mod ghostty;
 mod handoff_runtime;

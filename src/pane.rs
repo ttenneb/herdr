@@ -2110,10 +2110,7 @@ impl PaneRuntime {
                 "argv must not be empty",
             ));
         };
-        let mut cmd = CommandBuilder::new(program);
-        for arg in args {
-            cmd.arg(arg);
-        }
+        let mut cmd = crate::plugin_command::pty_command_for_argv(program, args);
         cmd.cwd(cwd);
         apply_pane_terminal_env(&mut cmd);
         apply_pane_launch_env(&mut cmd, launch_env);

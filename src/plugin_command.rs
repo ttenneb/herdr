@@ -11,6 +11,39 @@ pub(crate) fn command_for_argv_in_dir(program: &str, args: &[String], cwd: &Path
     command
 }
 
+pub(crate) fn pty_command_for_argv(program: &str, args: &[String]) -> portable_pty::CommandBuilder {
+    #[cfg(not(windows))]
+    let mut command = portable_pty::CommandBuilder::new(program);
+    #[cfg(windows)]
+    let mut command = {
+        let program = OsStr::new(program);
+        let resolved = resolve_windows_program(program);
+        let command_program = resolved.as_ref().map_or_else(
+            || program.to_os_string(),
+            |path| path.as_os_str().to_os_string(),
+        );
+        if is_windows_batch_file_name(program)
+            || resolved
+                .as_ref()
+                .is_some_and(|path| is_windows_batch_path(path))
+        {
+            let shell = std::env::var_os("ComSpec")
+                .unwrap_or_else(|| r"C:\Windows\System32\cmd.exe".into());
+            let mut command = portable_pty::CommandBuilder::new(shell);
+            command.arg("/d");
+            command.arg("/c");
+            command.arg(command_program);
+            command
+        } else {
+            portable_pty::CommandBuilder::new(command_program)
+        }
+    };
+    for arg in args {
+        command.arg(arg);
+    }
+    command
+}
+
 fn program_for_cwd(program: &str, cwd: &Path) -> OsString {
     let path = Path::new(program);
     let has_separator = program.contains('/') || (cfg!(windows) && program.contains('\\'));
@@ -152,6 +185,24 @@ mod tests {
         assert!(is_windows_batch_file_name(OsStr::new("script.BAT")));
         assert!(!is_windows_batch_file_name(OsStr::new("node.exe")));
         assert!(!is_windows_batch_file_name(OsStr::new("node")));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_batch_pty_command_runs_through_command_shell() {
+        let command = pty_command_for_argv("pi.cmd", &["--thinking".into(), "low".into()]);
+        let argv = command.get_argv();
+        assert!(argv[0]
+            .to_string_lossy()
+            .to_ascii_lowercase()
+            .ends_with("cmd.exe"));
+        assert_eq!(
+            argv[1..]
+                .iter()
+                .map(|arg| arg.to_string_lossy().into_owned())
+                .collect::<Vec<_>>(),
+            ["/d", "/c", "pi.cmd", "--thinking", "low"]
+        );
     }
 
     #[cfg(windows)]

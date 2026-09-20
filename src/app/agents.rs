@@ -141,16 +141,15 @@ impl App {
             })
     }
 
-    pub(super) fn start_agent(
-        &mut self,
-        params: AgentStartParams,
-    ) -> Result<(crate::api::schema::AgentInfo, Vec<String>), AgentStartError> {
-        let name = params.name;
-        if !valid_agent_name(&name) {
+    pub(super) fn prepare_agent_launch(
+        &self,
+        params: &AgentStartParams,
+    ) -> Result<(crate::detect::Agent, Vec<String>), AgentStartError> {
+        if !valid_agent_name(&params.name) {
             return Err(AgentStartError::InvalidName);
         }
         let Some(kind) = crate::detect::parse_agent_label(&params.kind) else {
-            return Err(AgentStartError::UnsupportedKind(params.kind));
+            return Err(AgentStartError::UnsupportedKind(params.kind.clone()));
         };
         if params
             .args
@@ -159,13 +158,39 @@ impl App {
         {
             return Err(AgentStartError::InvalidArgument);
         }
-        let conflicts = self.agent_name_conflicts(&name, "");
+        let conflicts = self.agent_name_conflicts(&params.name, "");
         if !conflicts.is_empty() {
             return Err(AgentStartError::DuplicateName {
-                name,
+                name: params.name.clone(),
                 candidates: conflicts,
             });
         }
+        let mut argv = vec![crate::detect::interactive_agent_executable(kind).to_string()];
+        argv.extend(params.args.iter().cloned());
+        Ok((kind, argv))
+    }
+
+    pub(super) fn agent_start_timeout(
+        &self,
+        params: &AgentStartParams,
+    ) -> Result<Duration, AgentStartError> {
+        let timeout = Duration::from_millis(
+            params
+                .timeout_ms
+                .unwrap_or(DEFAULT_AGENT_START_TIMEOUT.as_millis() as u64),
+        );
+        if timeout <= AGENT_START_SETTLE_DELAY || timeout > MAX_AGENT_START_TIMEOUT {
+            return Err(AgentStartError::InvalidTimeout);
+        }
+        Ok(timeout)
+    }
+
+    pub(super) fn start_agent(
+        &mut self,
+        params: AgentStartParams,
+    ) -> Result<(crate::api::schema::AgentInfo, Vec<String>), AgentStartError> {
+        let (kind, argv) = self.prepare_agent_launch(&params)?;
+        let name = params.name.clone();
         let Some((ws_idx, pane_id)) = self.parse_current_public_pane_id(&params.pane_id) else {
             return Err(AgentStartError::TargetNotFound(params.pane_id));
         };
@@ -191,19 +216,10 @@ impl App {
         let shell_name = available_shell_name(runtime)
             .ok_or_else(|| AgentStartError::TargetBusy(params.pane_id.clone()))?;
 
-        let mut argv = vec![crate::detect::interactive_agent_executable(kind).to_string()];
-        argv.extend(params.args);
         let command = crate::platform::interactive_shell_command(&argv, &shell_name)
             .ok_or(AgentStartError::InvalidArgument)?;
         let bytes = crate::app::api_helpers::encode_api_submission(runtime, &command);
-        let timeout = Duration::from_millis(
-            params
-                .timeout_ms
-                .unwrap_or(DEFAULT_AGENT_START_TIMEOUT.as_millis() as u64),
-        );
-        if timeout <= AGENT_START_SETTLE_DELAY || timeout > MAX_AGENT_START_TIMEOUT {
-            return Err(AgentStartError::InvalidTimeout);
-        }
+        let timeout = self.agent_start_timeout(&params)?;
 
         let now = Instant::now();
         let terminal = self

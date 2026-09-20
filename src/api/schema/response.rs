@@ -1,7 +1,9 @@
 use serde::{Deserialize, Serialize};
 
 use super::agents::AgentInfo;
-use super::collections::{CollectionCreateMemberResult, CollectionInfo};
+use super::collections::{
+    CollectionCreateMemberResult, CollectionHelperLaunchResult, CollectionInfo,
+};
 use super::common::{ClientWindowTitleReason, NotificationShowReason};
 use super::delegations::{DelegationInfo, DelegationTreeEntry};
 use super::events::EventEnvelope;
@@ -140,6 +142,9 @@ pub enum ResponseResult {
     },
     CollectionMemberCreated {
         created: Box<CollectionCreateMemberResult>,
+    },
+    CollectionHelperLaunched {
+        launched: Box<CollectionHelperLaunchResult>,
     },
     DelegationInfo {
         delegation: DelegationInfo,

@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::{collections::HashMap, time::Duration};
 
 use crate::api::schema::*;
 
@@ -6,6 +6,15 @@ pub(super) fn run_collection_command(args: &[String]) -> std::io::Result<i32> {
     let Some(command) = args.first().map(String::as_str) else {
         return usage(2);
     };
+    if command == "helper-launch" {
+        return match parse_helper_launch(&args[1..]) {
+            Ok(params) => helper_launch(params),
+            Err(message) => {
+                eprintln!("{message}");
+                usage(2)
+            }
+        };
+    }
     let result = match command {
         "list" => parse_list(&args[1..]).map(Method::CollectionList),
         "get" => one(&args[1..])
@@ -49,6 +58,155 @@ pub(super) fn run_collection_command(args: &[String]) -> std::io::Result<i32> {
             eprintln!("{message}");
             usage(2)
         }
+    }
+}
+
+fn helper_abort(
+    collection_id: &str,
+    pane_id: &str,
+    terminal_id: &str,
+) -> std::io::Result<serde_json::Value> {
+    super::send_request(&Request {
+        id: "cli:collection:helper-launch:rollback".into(),
+        method: Method::CollectionHelperAbort(CollectionHelperAbortParams {
+            collection_id: collection_id.into(),
+            pane_id: pane_id.into(),
+            terminal_id: terminal_id.into(),
+        }),
+    })
+}
+
+fn malformed_helper_launch_response(
+    collection_id: &str,
+    launched_value: Option<&serde_json::Value>,
+    mut abort: impl FnMut(&str, &str, &str) -> std::io::Result<serde_json::Value>,
+) -> serde_json::Value {
+    let pane_id = launched_value
+        .and_then(|value| value.pointer("/created/pane/pane_id"))
+        .and_then(serde_json::Value::as_str);
+    let terminal_id = launched_value
+        .and_then(|value| value.pointer("/agent/terminal_id"))
+        .and_then(serde_json::Value::as_str)
+        .or_else(|| {
+            launched_value
+                .and_then(|value| value.pointer("/created/pane/terminal_id"))
+                .and_then(serde_json::Value::as_str)
+        });
+    let (rollback_status, rollback_error) = match (pane_id, terminal_id) {
+        (Some(pane_id), Some(terminal_id)) => match abort(collection_id, pane_id, terminal_id) {
+            Ok(value) if value.get("error").is_none() => ("completed", None),
+            Ok(value) => ("failed", value.get("error").cloned()),
+            Err(error) => (
+                "uncertain",
+                Some(serde_json::json!({ "message": error.to_string() })),
+            ),
+        },
+        _ => ("unavailable", None),
+    };
+    serde_json::json!({
+        "id": "cli:collection:helper-launch",
+        "error": {
+            "code": "collection_helper_invalid_response",
+            "message": "helper-launch response omitted or malformed the created helper identity",
+            "rollback_status": rollback_status,
+            "rollback_error": rollback_error,
+            "collection_id": collection_id,
+            "pane_id": pane_id,
+            "terminal_id": terminal_id,
+        }
+    })
+}
+
+fn helper_launch(params: CollectionHelperLaunchParams) -> std::io::Result<i32> {
+    let expected_kind = crate::detect::parse_agent_label(&params.kind)
+        .map(crate::detect::agent_label)
+        .unwrap_or(params.kind.as_str())
+        .to_string();
+    let timeout = Duration::from_millis(params.timeout_ms.unwrap_or(30_000));
+    let collection_id = params.collection_id.clone();
+    let name = params.name.clone();
+    let mut response = super::send_request(&Request {
+        id: "cli:collection:helper-launch".into(),
+        method: Method::CollectionHelperLaunch(params),
+    })?;
+    if response.get("error").is_some() {
+        return super::print_response(&response);
+    }
+    let launched_value = response
+        .get("result")
+        .and_then(|result| result.get("launched"))
+        .cloned();
+    let launched = launched_value
+        .clone()
+        .and_then(|value| serde_json::from_value::<CollectionHelperLaunchResult>(value).ok());
+    let Some(launched) = launched else {
+        let malformed =
+            malformed_helper_launch_response(&collection_id, launched_value.as_ref(), helper_abort);
+        return super::print_response(&malformed);
+    };
+    let pane_id = launched.created.pane.pane_id;
+    let terminal_id = launched.agent.terminal_id;
+    match super::agent::wait_for_named_agent(
+        &name,
+        &pane_id,
+        timeout,
+        &expected_kind,
+        &terminal_id,
+        true,
+    ) {
+        Ok(Ok(agent)) => {
+            response["result"]["launched"]["agent"] = agent;
+            super::print_response(&response)
+        }
+        Ok(Err(start_error)) => match helper_abort(&collection_id, &pane_id, &terminal_id) {
+            Ok(rollback) if rollback.get("error").is_none() => super::print_response(&start_error),
+            Ok(rollback) => {
+                let combined = serde_json::json!({
+                    "id": "cli:collection:helper-launch",
+                    "error": {
+                        "code": "collection_helper_rollback_failed",
+                        "message": "helper startup failed and the created collection member could not be removed",
+                        "startup_error": start_error.get("error"),
+                        "rollback_error": rollback.get("error"),
+                        "collection_id": collection_id,
+                        "pane_id": pane_id,
+                        "terminal_id": terminal_id,
+                    }
+                });
+                super::print_response(&combined)
+            }
+            Err(rollback_error) => {
+                let combined = serde_json::json!({
+                    "id": "cli:collection:helper-launch",
+                    "error": {
+                        "code": "collection_helper_rollback_uncertain",
+                        "message": "helper startup failed and rollback could not be confirmed",
+                        "startup_error": start_error.get("error"),
+                        "rollback_error": rollback_error.to_string(),
+                        "collection_id": collection_id,
+                        "pane_id": pane_id,
+                        "terminal_id": terminal_id,
+                    }
+                });
+                super::print_response(&combined)
+            }
+        },
+        Err(err) => match helper_abort(&collection_id, &pane_id, &terminal_id) {
+            Ok(rollback) if rollback.get("error").is_none() => Err(err),
+            Ok(rollback) => Err(std::io::Error::new(
+                err.kind(),
+                format!(
+                    "{err}; helper rollback failed for {pane_id}/{terminal_id}: {}",
+                    rollback["error"]
+                ),
+            )),
+            Err(rollback_err) => Err(std::io::Error::new(
+                err.kind(),
+                format!(
+                    "{err}; helper rollback outcome is uncertain for {pane_id}/{terminal_id}: {rollback_err}"
+                ),
+            )),
+        },
     }
 }
 
@@ -262,6 +420,62 @@ fn parse_member_create(args: &[String]) -> Result<CollectionCreateMemberParams, 
     })
 }
 
+fn parse_helper_launch(args: &[String]) -> Result<CollectionHelperLaunchParams, String> {
+    let collection_id = args
+        .first()
+        .filter(|v| !v.starts_with('-'))
+        .cloned()
+        .ok_or("missing collection_id")?;
+    let separator = args
+        .iter()
+        .position(|arg| arg == "--")
+        .unwrap_or(args.len());
+    let mut cwd = None;
+    let mut env = HashMap::new();
+    let mut delegation_parent_id = None;
+    let mut purpose = None;
+    let mut name = None;
+    let mut kind = None;
+    let mut timeout_ms = None;
+    let mut index = 1;
+    while index < separator {
+        let option = args[index].as_str();
+        let value = args
+            .get(index + 1)
+            .filter(|_| index + 1 < separator)
+            .ok_or_else(|| format!("missing value for {option}"))?;
+        match option {
+            "--cwd" => cwd = Some(value.clone()),
+            "--env" => {
+                let (key, item) = super::parse_env_assignment(value)?;
+                env.insert(key, item);
+            }
+            "--parent" => delegation_parent_id = Some(value.clone()),
+            "--purpose" => purpose = Some(value.clone()),
+            "--name" => name = Some(value.clone()),
+            "--kind" => kind = Some(value.clone()),
+            "--timeout" => timeout_ms = Some(value.parse().map_err(|_| "invalid timeout")?),
+            _ => return Err(format!("unknown option: {option}")),
+        }
+        index += 2;
+    }
+    Ok(CollectionHelperLaunchParams {
+        collection_id,
+        cwd,
+        env,
+        delegation_parent_id,
+        purpose,
+        name: name.ok_or("missing --name")?,
+        kind: kind.ok_or("missing --kind")?,
+        args: if separator < args.len() {
+            args[separator + 1..].to_vec()
+        } else {
+            Vec::new()
+        },
+        timeout_ms,
+    })
+}
+
 fn parse_options(
     args: &[String],
     mut handle: impl FnMut(&str, Option<&String>) -> Result<(), String>,
@@ -312,7 +526,7 @@ fn two(args: &[String]) -> Result<(String, String), String> {
     }
 }
 fn usage(code: i32) -> std::io::Result<i32> {
-    eprintln!("herdr collection commands: list, get, create, add, move, promote, select, reorder, archive, restore, member-create, close");
+    eprintln!("herdr collection commands: list, get, create, add, move, promote, select, reorder, archive, restore, member-create, helper-launch, close");
     Ok(code)
 }
 
@@ -387,6 +601,102 @@ mod tests {
         .expect("member create");
         assert_eq!(member.env["ROLE"], "review");
         assert_eq!(member.delegation_parent_id.as_deref(), Some("d1"));
+
+        let launch = parse_helper_launch(&strings(&[
+            "collection_1",
+            "--cwd",
+            "/tmp",
+            "--name",
+            "reviewer",
+            "--kind",
+            "pi",
+            "--purpose",
+            "review",
+            "--",
+            "--thinking",
+            "low",
+        ]))
+        .expect("helper launch");
+        assert_eq!(launch.name, "reviewer");
+        assert_eq!(launch.args, vec!["--thinking", "low"]);
+    }
+
+    #[test]
+    fn malformed_helper_response_uses_created_pane_identity_for_exact_rollback_status() {
+        let launched = serde_json::json!({
+            "created": {
+                "pane": {
+                    "pane_id": "w1:p9",
+                    "terminal_id": "term_exact"
+                }
+            },
+            "agent": null
+        });
+
+        let mut completed_target = None;
+        let completed = malformed_helper_launch_response(
+            "collection_7",
+            Some(&launched),
+            |collection, pane, terminal| {
+                completed_target = Some((
+                    collection.to_string(),
+                    pane.to_string(),
+                    terminal.to_string(),
+                ));
+                Ok(serde_json::json!({"result": {"type": "ok"}}))
+            },
+        );
+        assert_eq!(
+            completed_target,
+            Some(("collection_7".into(), "w1:p9".into(), "term_exact".into()))
+        );
+        assert_eq!(completed["error"]["rollback_status"], "completed");
+        assert_eq!(completed["error"]["terminal_id"], "term_exact");
+
+        let mut failed_target = None;
+        let failed = malformed_helper_launch_response(
+            "collection_7",
+            Some(&launched),
+            |collection, pane, terminal| {
+                failed_target = Some((
+                    collection.to_string(),
+                    pane.to_string(),
+                    terminal.to_string(),
+                ));
+                Ok(serde_json::json!({
+                    "error": {"code": "collection_helper_rollback_mismatch", "message": "mismatch"}
+                }))
+            },
+        );
+        assert_eq!(failed_target, completed_target);
+        assert_eq!(failed["error"]["rollback_status"], "failed");
+        assert_eq!(
+            failed["error"]["rollback_error"]["code"],
+            "collection_helper_rollback_mismatch"
+        );
+
+        let mut uncertain_target = None;
+        let uncertain = malformed_helper_launch_response(
+            "collection_7",
+            Some(&launched),
+            |collection, pane, terminal| {
+                uncertain_target = Some((
+                    collection.to_string(),
+                    pane.to_string(),
+                    terminal.to_string(),
+                ));
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "socket timeout",
+                ))
+            },
+        );
+        assert_eq!(uncertain_target, completed_target);
+        assert_eq!(uncertain["error"]["rollback_status"], "uncertain");
+        assert_eq!(
+            uncertain["error"]["rollback_error"]["message"],
+            "socket timeout"
+        );
     }
 
     #[test]

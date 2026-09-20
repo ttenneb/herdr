@@ -448,6 +448,8 @@ fn api_method_name(method: &Method) -> &'static str {
         Method::CollectionArchive(_) => "collection.archive",
         Method::CollectionRestore(_) => "collection.restore",
         Method::CollectionCreateMember(_) => "collection.member_create",
+        Method::CollectionHelperLaunch(_) => "collection.helper_launch",
+        Method::CollectionHelperAbort(_) => "collection.helper_abort",
         Method::CollectionClose(_) => "collection.close",
         Method::DelegationCreate(_) => "delegation.create",
         Method::DelegationGet(_) => "delegation.get",

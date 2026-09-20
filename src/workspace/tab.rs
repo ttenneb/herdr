@@ -380,29 +380,53 @@ impl Tab {
         host_terminal_appearance: Option<crate::terminal_theme::HostAppearance>,
         shell_config: crate::pane::PaneShellConfig<'_>,
         launch_env: &PaneLaunchEnv,
+        argv: Option<&[String]>,
     ) -> Result<NewPane, CollectionCreateMemberError> {
         let pane_id = PaneId::alloc();
         self.validate_collection_insert(collection_id, pane_id)
             .map_err(CollectionCreateMemberError::Collection)?;
         let actual_cwd =
             cwd.unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| "/".into()));
-        let runtime = TerminalRuntime::spawn(
-            pane_id,
-            rows,
-            cols,
-            actual_cwd.clone(),
-            scrollback_limit_bytes,
-            host_terminal_theme,
-            host_terminal_appearance,
-            shell_config,
-            launch_env,
-            self.events.clone(),
-            self.render_notify.clone(),
-            self.render_dirty.clone(),
-        )
+        let runtime = if let Some(argv) = argv {
+            TerminalRuntime::spawn_argv_command(
+                pane_id,
+                rows,
+                cols,
+                actual_cwd.clone(),
+                argv,
+                launch_env,
+                crate::pane::AgentDetection::Enabled,
+                scrollback_limit_bytes,
+                host_terminal_theme,
+                host_terminal_appearance,
+                self.events.clone(),
+                self.render_notify.clone(),
+                self.render_dirty.clone(),
+            )
+        } else {
+            TerminalRuntime::spawn(
+                pane_id,
+                rows,
+                cols,
+                actual_cwd.clone(),
+                scrollback_limit_bytes,
+                host_terminal_theme,
+                host_terminal_appearance,
+                shell_config,
+                launch_env,
+                self.events.clone(),
+                self.render_notify.clone(),
+                self.render_dirty.clone(),
+            )
+        }
         .map_err(CollectionCreateMemberError::Spawn)?;
         let terminal_id = TerminalId::alloc();
-        let terminal = TerminalState::new(terminal_id.clone(), actual_cwd);
+        let terminal = match argv {
+            Some(argv) => {
+                TerminalState::new(terminal_id.clone(), actual_cwd).with_launch_argv(argv.to_vec())
+            }
+            None => TerminalState::new(terminal_id.clone(), actual_cwd),
+        };
         let mut layout = self.layout.clone();
         if !layout.add_collection_member(collection_id, pane_id) {
             runtime.shutdown();
