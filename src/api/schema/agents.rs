@@ -20,6 +20,12 @@ pub struct AgentReadParams {
 pub struct AgentSendKeysParams {
     pub target: String,
     pub keys: Vec<String>,
+    /// Optional exact terminal guard for lifecycle cleanup. A mismatch sends no input.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expected_terminal_id: Option<String>,
+    /// Optional exact managed-agent generation name guard. A mismatch sends no input.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expected_name: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]

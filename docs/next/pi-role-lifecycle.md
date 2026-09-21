@@ -2,9 +2,9 @@
 
 ## Frozen verification plan
 
-The owner verification for this change is `python3 -m unittest scripts.test_herdr_role_lifecycle` plus the focused Rust collection tests. It covers manifest/identity fail-closed behavior, durable receipts and heartbeats, truthful systemd readiness, bounded restart policy, default-deny `ask_user_question`, and exact helper assignment transport. The TPM consumes this evidence during integration.
+The owner verification for this change is `python3 -m unittest scripts.test_herdr_role_lifecycle` plus the focused Rust agent/Collection tests. It covers authority-file ownership/mode/symlink/parent checks, immutable task/issuer/route/digest bindings, exact post-start rollback and relaunch inhibition, durable receipts and heartbeats, truthful systemd readiness, bounded restart policy, default-deny `ask_user_question`, and exact helper assignment transport. The TPM consumes this evidence during integration.
 
-The distinct failure-seeking check is `python3 scripts/test_herdr_role_lifecycle.py -v` together with a targeted diff inspection for relative executables, premature `READY=1`, receipt-triggered prompts, unbounded restart, and extension-side supervision. It is intentionally a different static/adversarial path over the same revision, not a repeated broad suite.
+The distinct failure-seeking check is `python3 scripts/test_herdr_role_lifecycle.py -v` together with targeted diff inspection for malformed start/transport responses, mismatched cleanup identity, insecure authority material, relative executables, premature `READY=1`, receipt-triggered prompts, unbounded restart, and extension-side supervision. It is intentionally a different static/adversarial path over the same revision, not a repeated broad suite.
 
 ## Authority boundary
 
@@ -16,18 +16,22 @@ Every role manifest binds all of these fields:
 - exact Herdr workspace, pane, terminal, working tree, and Pi session reference;
 - canonical task reference;
 - mailbox path;
-- exact parent report route, including the full parent session identity;
+- exact authorized issuer/sender and parent report routes, including full session identities;
 - absolute Herdr, Pi, Python, and `systemd-notify` executables;
 - durable state and activation paths below `/home` (a different durable root is accepted only for isolated tests);
 - an explicit human-facing policy.
 
-`humanFacing` defaults to false. A non-human-facing launch always adds `--exclude-tools ask_user_question`. Enabling it requires an explicit grant object and a role class of `user-facing-pm` or `human-facing-controller`; TPMs, implementation owners, QA roles, and helpers are rejected. This is launch authority only. It is not evidence that a human-facing request was answered.
+`humanFacing` defaults to false. A non-human-facing launch always adds `--exclude-tools ask_user_question`. Enabling it requires a separate owner-only grant file whose SHA-256 digest is pinned by the manifest and whose complete content is exactly bound to the authorized issuer, canonical task, role ID/class, recipient route, and parent report route. Only `user-facing-pm` and `human-facing-controller` role classes are eligible; TPMs, implementation owners, QA roles, and helpers are rejected. This is launch authority only. It is not evidence that a human-facing request was answered.
+
+The manifest, activation, prompt, and human-facing grant must be regular non-symlink files owned by the effective user, owner-readable, inaccessible to group/other users, and located beneath owner-controlled non-group/world-writable parent directories under the durable root. The activation is immutable for an execution: it binds the authorized issuer, canonical task, exact sender and parent routes, execution ID, and prompt SHA-256 digest.
 
 ## Execution and hibernation
 
-An external actor writes a versioned activation artifact and starts the role's user service. The manager takes a per-role lock, validates the exact live pane identity, and either attaches to the already-running exact Pi generation or starts exactly one Pi with the stored session reference. It waits for Herdr's actual `interactive_ready` observation, validates the returned full session identity, submits the activation prompt to the exact pane, and records only a Herdr runtime transport receipt. Gate admission, model execution, report acceptance, and Todo acceptance remain `unknown`.
+An external actor writes a versioned activation artifact and starts the role's user service. The manager takes a per-role lock, validates and records the pre-start identity, refuses to attach to any already-live process, and starts exactly one Pi under a unique activation-derived managed-agent generation name in the stored terminal/session. It waits for Herdr's actual `interactive_ready` observation, validates the exact generation, terminal, and full session identity, submits the activation prompt to that pane, and records only a Herdr runtime transport receipt. Gate admission, model execution, report acceptance, and Todo acceptance remain `unknown`.
 
-`READY=1` is sent only after exact interactive readiness and prompt transport acceptance. Durable JSON heartbeats and phase receipts are written atomically below the role's state directory. When execution returns to idle/done after a post-submission state change, the manager sends `ctrl+d` to the exact pane and waits for Pi to leave. It never force-kills a mismatched or unresponsive process. The service then exits, leaving the durable role but no Pi process. Restart recovery first inspects the exact pane and attaches to an existing matching process instead of launching a second one.
+Every parse, identity, readiness, or activation-transport failure after the start attempt invokes `agent send-keys` with atomic expected-terminal and expected-generation guards. The manager then records a durable rollback disposition of `completed`, `failed`, or `uncertain`. A failed or uncertain cleanup writes a durable relaunch inhibit; later service invocations exit without attaching or relaunching until an explicit recovery removes that condition. Terminal activation records likewise prevent automatic replay.
+
+`READY=1` is sent only after exact interactive readiness and prompt transport acceptance. Durable JSON heartbeats and phase receipts are written atomically below the role's state directory. When execution returns to idle/done after a post-submission state change, the manager uses the same exact-identity guard to send `ctrl+d` and waits for that generation to leave. It never force-kills a mismatched or unresponsive process. The service then exits, leaving the durable role but no Pi process.
 
 The manager does not poll while hibernated. Activation is therefore externally driven, including report delivery that needs a parent turn. Mailbox or Gate state alone is never an activation.
 

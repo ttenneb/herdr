@@ -853,16 +853,58 @@ fn agent_prompt(args: &[String]) -> std::io::Result<i32> {
 }
 
 fn agent_send_keys(args: &[String]) -> std::io::Result<i32> {
-    if args.len() < 2 {
-        eprintln!("usage: herdr agent send-keys <target> <key> [key ...]");
+    let Some(target) = args.first() else {
+        eprintln!("usage: herdr agent send-keys <target> [--expected-terminal ID --expected-name NAME --] <key> [key ...]");
+        return Ok(2);
+    };
+    let mut expected_terminal_id = None;
+    let mut expected_name = None;
+    let mut keys = Vec::new();
+    let mut index = 1;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--expected-terminal" => {
+                let Some(value) = args.get(index + 1) else {
+                    eprintln!("missing value for --expected-terminal");
+                    return Ok(2);
+                };
+                expected_terminal_id = Some(value.clone());
+                index += 2;
+            }
+            "--expected-name" => {
+                let Some(value) = args.get(index + 1) else {
+                    eprintln!("missing value for --expected-name");
+                    return Ok(2);
+                };
+                expected_name = Some(value.clone());
+                index += 2;
+            }
+            "--" => {
+                keys.extend_from_slice(&args[index + 1..]);
+                break;
+            }
+            value if value.starts_with("--expected-") => {
+                eprintln!("unknown option: {value}");
+                return Ok(2);
+            }
+            _ => {
+                keys.extend_from_slice(&args[index..]);
+                break;
+            }
+        }
+    }
+    if keys.is_empty() {
+        eprintln!("agent send-keys requires at least one key");
         return Ok(2);
     }
 
     super::print_response(&super::send_request(&Request {
         id: "cli:agent:send-keys".into(),
         method: Method::AgentSendKeys(AgentSendKeysParams {
-            target: args[0].clone(),
-            keys: args[1..].to_vec(),
+            target: target.clone(),
+            keys,
+            expected_terminal_id,
+            expected_name,
         }),
     })?)
 }

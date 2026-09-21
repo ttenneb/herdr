@@ -281,6 +281,31 @@ impl App {
         else {
             return agent_not_found(id, &params.target);
         };
+        if params
+            .expected_terminal_id
+            .as_deref()
+            .is_some_and(|expected| expected != terminal_id.as_str())
+        {
+            return encode_error(
+                id,
+                "agent_identity_mismatch",
+                "exact terminal guard did not match; no keys were sent",
+            );
+        }
+        if let Some(expected_name) = params.expected_name.as_deref() {
+            let actual_name = self
+                .state
+                .terminals
+                .get(&terminal_id)
+                .and_then(|terminal| terminal.agent_name.as_deref());
+            if actual_name != Some(expected_name) {
+                return encode_error(
+                    id,
+                    "agent_identity_mismatch",
+                    "exact managed-agent generation guard did not match; no keys were sent",
+                );
+            }
+        }
         let Some(expected_agent) = self
             .state
             .terminals
@@ -453,6 +478,8 @@ mod tests {
             AgentSendKeysParams {
                 target: public_pane_id.clone(),
                 keys: Vec::new(),
+                expected_terminal_id: None,
+                expected_name: None,
             },
         );
         assert!(serde_json::from_str::<SuccessResponse>(&empty).is_ok());
@@ -469,6 +496,8 @@ mod tests {
             AgentSendKeysParams {
                 target: public_pane_id,
                 keys: vec!["enter".into()],
+                expected_terminal_id: None,
+                expected_name: None,
             },
         );
         assert!(serde_json::from_str::<SuccessResponse>(&sent).is_ok());
@@ -756,11 +785,39 @@ mod tests {
         let (runtime, mut rx) = crate::terminal::TerminalRuntime::test_with_channel(80, 24);
         app.state.insert_test_runtime(pane_id, runtime);
 
+        for (request, expected_terminal_id, expected_name) in [
+            (
+                "wrong-terminal",
+                Some("term_wrong".into()),
+                Some("reviewer".into()),
+            ),
+            (
+                "wrong-generation",
+                Some(terminal_id.to_string()),
+                Some("older-generation".into()),
+            ),
+        ] {
+            let rejected = app.handle_agent_send_keys(
+                request.into(),
+                AgentSendKeysParams {
+                    target: "reviewer".into(),
+                    keys: vec!["ctrl+d".into()],
+                    expected_terminal_id,
+                    expected_name,
+                },
+            );
+            let error: crate::api::schema::ErrorResponse = serde_json::from_str(&rejected).unwrap();
+            assert_eq!(error.error.code, "agent_identity_mismatch");
+            assert!(rx.try_recv().is_err());
+        }
+
         let rejected = app.handle_agent_send_keys(
             "req-invalid".into(),
             AgentSendKeysParams {
                 target: "reviewer".into(),
                 keys: vec!["enter".into(), "not-a-key".into()],
+                expected_terminal_id: None,
+                expected_name: None,
             },
         );
         let error: crate::api::schema::ErrorResponse = serde_json::from_str(&rejected).unwrap();
@@ -772,6 +829,8 @@ mod tests {
             AgentSendKeysParams {
                 target: "reviewer".into(),
                 keys: vec!["up".into(), "enter".into()],
+                expected_terminal_id: Some(terminal_id.to_string()),
+                expected_name: Some("reviewer".into()),
             },
         );
         let success: SuccessResponse = serde_json::from_str(&sent).unwrap();

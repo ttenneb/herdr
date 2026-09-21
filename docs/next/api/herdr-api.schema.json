@@ -2273,6 +2273,20 @@
         },
         "AgentSendKeysParams": {
           "properties": {
+            "expected_name": {
+              "description": "Optional exact managed-agent generation name guard. A mismatch sends no input.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "expected_terminal_id": {
+              "description": "Optional exact terminal guard for lifecycle cleanup. A mismatch sends no input.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
             "keys": {
               "items": {
                 "type": "string"
