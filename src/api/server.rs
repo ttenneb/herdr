@@ -351,6 +351,7 @@ fn handle_request(
                 version: crate::build_info::version(),
                 protocol: crate::protocol::PROTOCOL_VERSION,
                 capabilities,
+                build: Some(crate::build_info::identity()),
             },
         })
         .unwrap_or_else(|_| {

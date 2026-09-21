@@ -3,6 +3,8 @@
 ## Unreleased
 
 ### Added
+- Added a generic durable Pi-mailbox router that delivers directly to a compatible live recipient, schedules one nonblocking systemd wake only for a sleeping/stopped generation, preserves one mailbox path across wake, and rejects lifecycle lock cycles.
+- Added structured version, channel, build-ID, and source-commit identity to server ping and status output.
 - Added an owner-only exact-parent report acknowledgement Unix-socket transport with live issuer/child-session authority checks, durable content intent, accepted child-durability results, conflict-safe dedupe, and query-only lost-ack recovery.
 - Added a pinned role-specific user-systemd instance boundary for queued-input activations, with exact activation-ID start validation, durable duplicate/uncertain start handling, generated result schema, and no generic wake path.
 - Added an external queued-input lifecycle scheduler with exact v1 request/issuer validation, digest-bound secure activation materialization, durable conflict-safe idempotency, bounded role guards, and explicit same-ID uncertain recovery.

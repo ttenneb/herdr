@@ -2801,6 +2801,7 @@ mod tests {
             version: Some("0.5.5".to_string()),
             protocol: Some(2),
             capabilities: None,
+            build: None,
         };
         let compatible_release = ReleaseInfo {
             version: Version::parse("0.5.6").unwrap(),
@@ -2858,6 +2859,7 @@ mod tests {
                     live_handoff: true,
                     detached_server_daemon: true,
                 }),
+                build: None,
             },
         };
 
@@ -3043,6 +3045,7 @@ mod tests {
             version: Some("0.5.5".to_string()),
             protocol: Some(2),
             capabilities: None,
+            build: None,
         };
         let release = ReleaseInfo {
             version: Version::parse("0.5.6").unwrap(),

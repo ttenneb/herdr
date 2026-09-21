@@ -11252,6 +11252,33 @@
           ],
           "type": "string"
         },
+        "BuildIdentity": {
+          "properties": {
+            "buildId": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "channel": {
+              "type": "string"
+            },
+            "sourceCommit": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "version": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "version",
+            "channel"
+          ],
+          "type": "object"
+        },
         "CanonicalHerdrIdentity": {
           "properties": {
             "agentSession": {
@@ -14670,6 +14697,16 @@
           "oneOf": [
             {
               "properties": {
+                "build": {
+                  "anyOf": [
+                    {
+                      "$ref": "#/schemas/success_response/$defs/BuildIdentity"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
+                },
                 "capabilities": {
                   "anyOf": [
                     {

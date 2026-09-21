@@ -75,6 +75,7 @@ enum ServerRuntimeStatus {
         version: Option<String>,
         protocol: Option<u32>,
         capabilities: Option<crate::api::schema::ServerCapabilities>,
+        build: Option<crate::build_info::BuildIdentity>,
     },
     NotRunning,
 }
@@ -92,11 +93,7 @@ fn print_full_status(json: bool) -> std::io::Result<i32> {
     }
 
     println!("client:");
-    println!("  version: {}", crate::build_info::version());
-    println!(
-        "  channel: {}",
-        crate::config::Config::load().config.update.channel.as_str()
-    );
+    print_build_identity(&crate::build_info::identity(), "  ");
     println!("  protocol: {}", crate::protocol::PROTOCOL_VERSION);
     println!();
     println!("server:");
@@ -124,11 +121,7 @@ fn print_client_status(json: bool) -> std::io::Result<()> {
         return Ok(());
     }
 
-    println!("version: {}", crate::build_info::version());
-    println!(
-        "channel: {}",
-        crate::config::Config::load().config.update.channel.as_str()
-    );
+    print_build_identity(&crate::build_info::identity(), "");
     println!("protocol: {}", crate::protocol::PROTOCOL_VERSION);
     println!("binary: {}", current_exe_label());
     Ok(())
@@ -137,10 +130,19 @@ fn print_client_status(json: bool) -> std::io::Result<()> {
 fn print_server_status_body(server: &ServerRuntimeStatus, indent: &str) {
     match server {
         ServerRuntimeStatus::Running {
-            version, protocol, ..
+            version,
+            protocol,
+            build,
+            ..
         } => {
             println!("{indent}status: running");
-            println!("{indent}version: {}", option_label(version.as_deref()));
+            if let Some(build) = build {
+                print_build_identity(build, indent);
+            } else {
+                println!("{indent}version: {}", option_label(version.as_deref()));
+                println!("{indent}build_id: unknown");
+                println!("{indent}source_commit: unknown");
+            }
             println!("{indent}protocol: {}", protocol_label(*protocol));
             println!("{indent}compatible: {}", compatibility_label(*protocol));
             println!("{indent}socket: {}", api::socket_path().display());
@@ -158,6 +160,7 @@ fn read_server_runtime_status() -> std::io::Result<ServerRuntimeStatus> {
             version: status.version,
             protocol: status.protocol,
             capabilities: status.capabilities,
+            build: status.build,
         }),
         Err(ApiClientError::Io(err)) if super::server_not_running_error(&err) => {
             Ok(ServerRuntimeStatus::NotRunning)
@@ -213,6 +216,7 @@ struct FullStatusJson {
 struct ClientStatusJson {
     version: String,
     channel: &'static str,
+    build: crate::build_info::BuildIdentity,
     protocol: u32,
     binary: String,
     session: Option<String>,
@@ -225,6 +229,7 @@ struct ServerStatusJson {
     version: Option<String>,
     protocol: Option<u32>,
     capabilities: Option<ServerCapabilitiesJson>,
+    build: Option<crate::build_info::BuildIdentity>,
     compatible: Option<bool>,
     socket: String,
     session: Option<String>,
@@ -246,6 +251,7 @@ fn client_status_json() -> ClientStatusJson {
     ClientStatusJson {
         version: crate::build_info::version(),
         channel: crate::config::Config::load().config.update.channel.as_str(),
+        build: crate::build_info::identity(),
         protocol: crate::protocol::PROTOCOL_VERSION,
         binary: current_exe_label(),
         session: crate::session::active_name(),
@@ -258,6 +264,7 @@ fn server_status_json(server: &ServerRuntimeStatus) -> ServerStatusJson {
             version,
             protocol,
             capabilities,
+            build,
         } => ServerStatusJson {
             status: "running",
             running: true,
@@ -269,6 +276,7 @@ fn server_status_json(server: &ServerRuntimeStatus) -> ServerStatusJson {
                     live_handoff: capabilities.live_handoff,
                     detached_server_daemon: capabilities.detached_server_daemon,
                 }),
+            build: build.clone(),
             compatible: protocol.map(|value| value == crate::protocol::PROTOCOL_VERSION),
             socket: api::socket_path().display().to_string(),
             session: crate::session::active_name(),
@@ -280,6 +288,7 @@ fn server_status_json(server: &ServerRuntimeStatus) -> ServerStatusJson {
             version: None,
             protocol: None,
             capabilities: None,
+            build: None,
             compatible: None,
             socket: api::socket_path().display().to_string(),
             session: crate::session::active_name(),
@@ -303,6 +312,19 @@ fn restart_needed_bool(server: &ServerRuntimeStatus) -> Option<bool> {
         },
         ServerRuntimeStatus::NotRunning => Some(false),
     }
+}
+
+fn print_build_identity(identity: &crate::build_info::BuildIdentity, indent: &str) {
+    println!("{indent}version: {}", identity.version);
+    println!("{indent}channel: {}", identity.channel);
+    println!(
+        "{indent}build_id: {}",
+        option_label(identity.build_id.as_deref())
+    );
+    println!(
+        "{indent}source_commit: {}",
+        option_label(identity.source_commit.as_deref())
+    );
 }
 
 fn print_json(value: &impl Serialize) -> std::io::Result<()> {

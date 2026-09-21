@@ -302,6 +302,13 @@ fn ping_over_socket_returns_version() {
     assert_eq!(value["id"], "req_1");
     assert_eq!(value["result"]["type"], "pong");
     assert_eq!(value["result"]["version"], env!("CARGO_PKG_VERSION"));
+    assert_eq!(
+        value["result"]["build"]["version"],
+        env!("CARGO_PKG_VERSION")
+    );
+    assert_eq!(value["result"]["build"]["channel"], "stable");
+    assert!(value["result"]["build"].get("buildId").is_some());
+    assert!(value["result"]["build"].get("sourceCommit").is_some());
     // Intentionally hardcoded so wire protocol bumps require updating this test.
     // Changing this value means old clients/servers are no longer compatible.
     assert_eq!(value["result"]["protocol"], 21);

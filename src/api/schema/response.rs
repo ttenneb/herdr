@@ -53,6 +53,8 @@ pub enum ResponseResult {
         protocol: u32,
         #[serde(default)]
         capabilities: Option<ServerCapabilities>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        build: Option<crate::build_info::BuildIdentity>,
     },
     SessionSnapshot {
         snapshot: Box<SessionSnapshot>,
