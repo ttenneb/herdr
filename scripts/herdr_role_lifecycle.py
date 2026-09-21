@@ -271,7 +271,7 @@ def validate_manifest(raw: dict[str, Any], manifest_path: Path, durable_root: Pa
     executables = raw.get("executables")
     if not isinstance(executables, dict):
         raise LifecycleError("manifest.executables must be an object")
-    bins = {key: executable(require_string(executables, key, "manifest.executables"), f"manifest.executables.{key}") for key in ("herdr", "pi", "python", "systemdNotify", "systemctl")}
+    bins = {key: executable(require_string(executables, key, "manifest.executables"), f"manifest.executables.{key}") for key in ("herdr", "pi", "python", "systemctl")}
     herdr_socket_path = secure_herdr_socket(require_string(raw, "herdrSocketPath", "manifest"))
     human_facing = raw.get("humanFacing", False)
     if not isinstance(human_facing, bool):
@@ -607,8 +607,20 @@ def launch_args(role: dict[str, Any]) -> list[str]:
 
 
 def notify(role: dict[str, Any], *parts: str) -> None:
-    process = subprocess.run([role["executables"]["systemdNotify"], "--pid=parent", *parts], check=False, capture_output=True, text=True)
-    if process.returncode != 0: raise LifecycleError(f"systemd-notify failed: {process.stderr.strip()}")
+    del role
+    endpoint = os.environ.get("NOTIFY_SOCKET")
+    if not endpoint or not (endpoint.startswith("/") or endpoint.startswith("@")):
+        raise LifecycleError("NOTIFY_SOCKET is absent or invalid")
+    if not parts or any(not isinstance(part, str) or not part or "\x00" in part or "\n" in part or "\r" in part for part in parts):
+        raise LifecycleError("systemd notification assignments are invalid")
+    payload = "\n".join(parts).encode()
+    if len(payload) > 65535: raise LifecycleError("systemd notification payload exceeds 65535 bytes")
+    address = "\x00" + endpoint[1:] if endpoint.startswith("@") else endpoint
+    try:
+        with socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM) as channel:
+            sent = channel.sendto(payload, address)
+    except OSError as exc: raise LifecycleError(f"NOTIFY_SOCKET datagram failed: {exc}") from exc
+    if sent != len(payload): raise LifecycleError("NOTIFY_SOCKET datagram was truncated")
 
 
 def heartbeat(role: dict[str, Any], phase: str, state_dir: Path, detail: str = "") -> None:

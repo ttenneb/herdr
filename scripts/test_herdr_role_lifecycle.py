@@ -28,9 +28,10 @@ class RoleLifecycleTests(unittest.TestCase):
         self.worktree = self.root / "worktree"; self.worktree.mkdir(mode=0o700)
         self.events = self.root / "events"
         self.mode = self.root / "mode"; self.secure_write(self.mode, "normal")
+        self.notify_socket = self.root / "notify.sock"; self.notify_listener = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM); self.notify_listener.bind(str(self.notify_socket)); self.notify_listener.settimeout(1)
+        self.addCleanup(self.notify_listener.close); self.notify_environment = mock.patch.dict(os.environ, {"NOTIFY_SOCKET": str(self.notify_socket)}); self.notify_environment.start(); self.addCleanup(self.notify_environment.stop)
         self.pi = self.executable("pi", "#!/bin/sh\nexit 0\n")
         self.python = Path(shutil.which("python3")).resolve()
-        self.notify = self.executable("systemd-notify", f"#!/bin/sh\nprintf 'notify %s\\n' \"$*\" >> {self.events}\n")
         self.herdr_socket = self.root / "herdr.sock"; self.herdr_socket_listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM); self.herdr_socket_listener.bind(str(self.herdr_socket)); self.herdr_socket.chmod(0o600)
         self.addCleanup(self.herdr_socket_listener.close)
         self.herdr = self.executable("herdr", self.fake_herdr())
@@ -57,7 +58,7 @@ class RoleLifecycleTests(unittest.TestCase):
         return {"name": name, "workspaceId": workspace, "paneId": pane, "terminalId": terminal, "agentSession": self.session if hasattr(self, "session") else {"agent": "pi", "kind": "path", "source": "herdr:pi", "value": str(self.root / "session.jsonl")}}
 
     def base_manifest(self):
-        return {"version": 1, "roleId": "owner-1", "roleClass": "implementation-owner", "workspace": {"id": "w1", "path": str(self.worktree)}, "paneId": "w1:p2", "terminalId": "term2", "agentSession": self.session, "task": {"id": "100", "source": "todo"}, "mailboxPath": str(self.root / "mailbox.jsonl"), "reportRoute": self.parent, "authorizedIssuer": self.issuer, "stateDir": str(self.role_dir / "state"), "activationPath": str(self.activation), "executables": {"herdr": str(self.herdr), "pi": str(self.pi), "python": str(self.python), "systemdNotify": str(self.notify), "systemctl": str(self.systemctl)}, "herdrSocketPath": str(self.herdr_socket), "humanFacing": False, "reportAcknowledgement": {"endpointPath": str(self.ack_socket), "delegationId": "CCCCCCCCCCCCCCCCCCCCCC", "parentTaskId": 100, "parentAssignment": self.parent_assignment, "parentRoute": self.tasking_parent}}
+        return {"version": 1, "roleId": "owner-1", "roleClass": "implementation-owner", "workspace": {"id": "w1", "path": str(self.worktree)}, "paneId": "w1:p2", "terminalId": "term2", "agentSession": self.session, "task": {"id": "100", "source": "todo"}, "mailboxPath": str(self.root / "mailbox.jsonl"), "reportRoute": self.parent, "authorizedIssuer": self.issuer, "stateDir": str(self.role_dir / "state"), "activationPath": str(self.activation), "executables": {"herdr": str(self.herdr), "pi": str(self.pi), "python": str(self.python), "systemctl": str(self.systemctl)}, "herdrSocketPath": str(self.herdr_socket), "humanFacing": False, "reportAcknowledgement": {"endpointPath": str(self.ack_socket), "delegationId": "CCCCCCCCCCCCCCCCCCCCCC", "parentTaskId": 100, "parentAssignment": self.parent_assignment, "parentRoute": self.tasking_parent}}
 
     def activation_value(self):
         prompt_digest = hashlib.sha256(self.prompt.read_bytes()).hexdigest()
@@ -164,15 +165,18 @@ else: sys.exit(9)
             value = self.activation_value(); value[field] = bad; self.write_activation(value)
             with self.assertRaises(lifecycle.LifecycleError, msg=field): lifecycle.load_activation(role, self.root)
 
-    def test_systemd_notify_attributes_to_main_process_and_propagates_failure(self):
-        role = self.validated(); completed = __import__("subprocess").CompletedProcess([], 0, "", "")
-        with mock.patch.object(lifecycle.subprocess, "run", return_value=completed) as runner:
-            lifecycle.notify(role, "READY=1", "WATCHDOG=1", "STATUS=ready")
-        runner.assert_called_once_with([str(self.notify), "--pid=parent", "READY=1", "WATCHDOG=1", "STATUS=ready"], check=False, capture_output=True, text=True)
-        failed = __import__("subprocess").CompletedProcess([], 1, "", "attribution denied")
-        with mock.patch.object(lifecycle.subprocess, "run", return_value=failed):
-            with self.assertRaisesRegex(lifecycle.LifecycleError, "systemd-notify failed: attribution denied"):
+    def test_main_process_notify_socket_datagram_and_failures(self):
+        role = self.validated(); lifecycle.notify(role, "READY=1", "WATCHDOG=1", "STATUS=ready")
+        self.assertEqual(self.notify_listener.recv(65536), b"READY=1\nWATCHDOG=1\nSTATUS=ready")
+        with mock.patch.dict(os.environ, {}, clear=True):
+            with self.assertRaisesRegex(lifecycle.LifecycleError, "NOTIFY_SOCKET is absent"):
                 lifecycle.notify(role, "READY=1")
+        missing = self.root / "missing-notify.sock"
+        with mock.patch.dict(os.environ, {"NOTIFY_SOCKET": str(missing)}):
+            with self.assertRaisesRegex(lifecycle.LifecycleError, "NOTIFY_SOCKET datagram failed"):
+                lifecycle.notify(role, "READY=1")
+        with self.assertRaisesRegex(lifecycle.LifecycleError, "assignments are invalid"):
+            lifecycle.notify(role, "STATUS=bad\nREADY=1")
 
     def test_managed_generation_is_deterministic_safe_and_exactly_32_characters(self):
         role = self.validated(); activation = lifecycle.load_activation(role, self.root)
