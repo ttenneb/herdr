@@ -35,6 +35,16 @@ Every parse, identity, readiness, or activation-transport failure after the star
 
 The manager does not poll while hibernated. Activation is therefore externally driven, including report delivery that needs a parent turn. Mailbox or Gate state alone is never an activation.
 
+## Queued-input auto-release
+
+`schedule-queued-input` implements `QueuedInputActivationRequestV1` outside Pi. It accepts the exact versioned request plus a separately supplied secure exact tasking-issuer route. The request is rejected unless its 128-bit activation ID, batch and item IDs, 1–32 item bound, priority, correlation chain, depth, UTF-8 payload size, payload SHA-256, `accepted_queued_input` cause, authorized issuer, and complete managed-role recipient identity all match policy and the role manifest.
+
+Scheduling writes an owner-only payload, digest-bound explicit `queued_input` activation, and durable record beneath the role state directory. It never calls an editor API, writes raw PTY input, starts Pi, or submits a prompt. Only a later external lifecycle run that names that activation ID can consume the explicit activation. Empty settlement, receipt/import/status/heartbeat/supervisor events do not have the request shape or accepted cause and cannot schedule anything.
+
+The durable key binds activation ID, batch ID, payload digest, and exact recipient. The complete request digest is also retained. Exact retries return `duplicate`; same-ID content changes return `rejected`. An ambiguous materialization remains `uncertain` and normal retries remain uncertain. `recover-queued-input` is the only resolution path: it uses the same request and issuer, verifies the existing activation and payload digests, marks the prior schedule proven, and returns `duplicate` without creating another artifact, process, or prompt.
+
+Before materialization, the scheduler enforces per-role queue depth, an eight-per-minute rate limit, maximum depth eight, at most 32 correlation entries, no repeated namespace/key within a request, and monotonically increasing revisions for recently scheduled namespace/key chains. Lifecycle completion or inhibited rollback releases queue depth without changing the original scheduling receipt. Scheduling receipts claim only `scheduled`, `duplicate`, `uncertain`, or `rejected`; they do not claim Gate admission, model execution, report delivery, or Todo acceptance.
+
 ## User-systemd design
 
 Generate a role-specific unit with:

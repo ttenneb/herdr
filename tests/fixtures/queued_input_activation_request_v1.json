@@ -1,0 +1,52 @@
+{
+  "kind": "pi-input-gate.queued-input-activation",
+  "version": 1,
+  "activationId": "0123456789abcdef0123456789abcdef",
+  "batchId": "batch-1",
+  "itemIds": ["item-1"],
+  "priority": "normal",
+  "correlation": [
+    {
+      "namespace": "report",
+      "key": "parent-ready",
+      "revision": 1
+    }
+  ],
+  "depth": 0,
+  "cause": "accepted_queued_input",
+  "payload": "Queued explicit input.",
+  "payloadSha256": "75d1708b861946d4e622492327453cf482a8fa8266928d24fd38ba471e17c404",
+  "recipient": {
+    "roleId": "owner-1",
+    "roleClass": "implementation-owner",
+    "workspace": {
+      "id": "w1",
+      "path": "/home/example/worktree"
+    },
+    "paneId": "w1:p2",
+    "terminalId": "term2",
+    "agentSession": {
+      "agent": "pi",
+      "kind": "path",
+      "source": "herdr:pi",
+      "value": "/home/example/session.jsonl"
+    },
+    "canonicalTask": {
+      "id": "100",
+      "source": "todo"
+    },
+    "mailboxPath": "/home/example/mailbox.jsonl",
+    "reportRoute": {
+      "name": "parent",
+      "workspaceId": "wp",
+      "paneId": "wp:p1",
+      "terminalId": "termp",
+      "agentSession": {
+        "agent": "pi",
+        "kind": "path",
+        "source": "herdr:pi",
+        "value": "/home/example/session.jsonl"
+      }
+    }
+  }
+}

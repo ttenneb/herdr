@@ -54,6 +54,10 @@ class RoleLifecycleTests(unittest.TestCase):
         prompt_digest = hashlib.sha256(self.prompt.read_bytes()).hexdigest()
         return {"version": 1, "roleId": "owner-1", "executionId": "exec-1", "kind": "assignment", "canonicalTask": self.manifest["task"], "issuer": self.issuer, "senderRoute": self.issuer, "parentRoute": self.parent, "promptPath": str(self.prompt), "promptDigest": prompt_digest}
 
+    def queued_request(self, activation_id="0123456789abcdef0123456789abcdef", batch_id="batch-1", correlation=None, depth=0):
+        payload = "Queued explicit input."
+        return {"kind": "pi-input-gate.queued-input-activation", "version": 1, "activationId": activation_id, "batchId": batch_id, "itemIds": ["item-1"], "priority": "normal", "correlation": correlation or [], "depth": depth, "cause": "accepted_queued_input", "payload": payload, "payloadSha256": hashlib.sha256(payload.encode()).hexdigest(), "recipient": lifecycle.exact_lifecycle_recipient(self.validated())}
+
     def write_activation(self, value=None): self.secure_write(self.activation, json.dumps(value or self.activation_value(), sort_keys=True))
     def write_manifest(self): self.secure_write(self.manifest_path, json.dumps(self.manifest, sort_keys=True))
     def validated(self): return lifecycle.load_manifest(self.manifest_path, self.root)
@@ -157,6 +161,97 @@ else: sys.exit(9)
         role = self.validated()
         with self.assertRaises(lifecycle.LifecycleInhibited): lifecycle.lifecycle_run(role, self.root, 0.001, 1)
         self.assertTrue((Path(role["stateDir"]) / "relaunch-inhibit.json").exists())
+
+    def test_frozen_queued_input_v1_fixture_matches_exact_contract(self):
+        fixture_path = Path(__file__).parents[1] / "tests/fixtures/queued_input_activation_request_v1.json"
+        fixture = json.loads(fixture_path.read_text())
+        self.assertEqual(set(fixture), {"kind", "version", "activationId", "batchId", "itemIds", "priority", "correlation", "depth", "cause", "payload", "payloadSha256", "recipient"})
+        self.assertEqual(hashlib.sha256(fixture["payload"].encode()).hexdigest(), fixture["payloadSha256"])
+        fixture["recipient"] = lifecycle.exact_lifecycle_recipient(self.validated())
+        lifecycle.validate_queued_input_request(self.validated(), fixture)
+
+    def test_queued_input_schedules_once_and_exact_duplicate_does_not_prompt(self):
+        role = self.validated(); request = self.queued_request()
+        first = lifecycle.schedule_queued_input(role, request, self.root, self.issuer)
+        self.assertEqual(first["outcome"], "scheduled")
+        record_path, activation_path, payload_path = lifecycle.queue_record_paths(role, request["activationId"])
+        before = (activation_path.read_bytes(), payload_path.read_bytes(), activation_path.stat().st_mtime_ns)
+        second = lifecycle.schedule_queued_input(role, request, self.root, self.issuer)
+        self.assertEqual(second["outcome"], "duplicate"); self.assertEqual(second["receiptId"], first["receiptId"])
+        self.assertEqual(before, (activation_path.read_bytes(), payload_path.read_bytes(), activation_path.stat().st_mtime_ns))
+        activation = json.loads(activation_path.read_text())
+        self.assertEqual(activation["cause"], "accepted_queued_input"); self.assertEqual(activation["issuer"], self.issuer)
+        self.assertEqual(activation["queuedInputActivation"]["recipient"], lifecycle.exact_lifecycle_recipient(role))
+        self.assertFalse(self.events.exists(), "scheduling must not start a process or submit a prompt")
+        self.assertEqual(json.loads(record_path.read_text())["outcome"], "scheduled")
+
+    def test_scheduled_queued_activation_runs_once_through_external_lifecycle(self):
+        role = self.validated(); request = self.queued_request()
+        self.assertEqual(lifecycle.schedule_queued_input(role, request, self.root, self.issuer)["outcome"], "scheduled")
+        record_path, activation_path, _ = lifecycle.queue_record_paths(role, request["activationId"])
+        lifecycle.lifecycle_run(role, self.root, 0.001, 1, activation_path)
+        record = json.loads(record_path.read_text())
+        self.assertFalse(record["active"]); self.assertEqual(record["lifecycleOutcome"], "completed")
+        events = self.events.read_text().splitlines()
+        self.assertEqual(sum(line == "herdr agent start" for line in events), 1)
+        self.assertEqual(sum(line == "herdr agent prompt" for line in events), 1)
+
+    def test_same_id_conflict_is_rejected(self):
+        role = self.validated(); request = self.queued_request()
+        self.assertEqual(lifecycle.schedule_queued_input(role, request, self.root, self.issuer)["outcome"], "scheduled")
+        conflict = dict(request); conflict["batchId"] = "batch-2"
+        result = lifecycle.schedule_queued_input(role, conflict, self.root, self.issuer)
+        self.assertEqual(result["outcome"], "rejected"); self.assertIn("conflicts", result["reason"])
+
+    def test_lost_ack_stays_uncertain_until_same_id_recovery_without_rematerializing(self):
+        role = self.validated(); request = self.queued_request()
+        first = lifecycle.schedule_queued_input(role, request, self.root, self.issuer, fault="lost_ack")
+        self.assertEqual(first["outcome"], "uncertain")
+        _, activation_path, _ = lifecycle.queue_record_paths(role, request["activationId"])
+        before = (activation_path.read_bytes(), activation_path.stat().st_mtime_ns)
+        with self.assertRaisesRegex(lifecycle.LifecycleError, "scheduled record"):
+            lifecycle.load_activation(role, self.root, activation_path)
+        retry = lifecycle.schedule_queued_input(role, request, self.root, self.issuer)
+        self.assertEqual(retry["outcome"], "uncertain")
+        recovered = lifecycle.schedule_queued_input(role, request, self.root, self.issuer, recover=True)
+        self.assertEqual(recovered["outcome"], "duplicate"); self.assertIn("no second activation", recovered["reason"])
+        self.assertEqual(before, (activation_path.read_bytes(), activation_path.stat().st_mtime_ns))
+        lifecycle.load_activation(role, self.root, activation_path)
+        self.assertFalse(self.events.exists())
+
+    def test_queued_input_rejects_noncauses_digest_bounds_and_wrong_recipient(self):
+        role = self.validated()
+        unauthorized = dict(self.issuer); unauthorized["terminalId"] = "other"
+        denied = lifecycle.schedule_queued_input(role, self.queued_request(), self.root, unauthorized)
+        self.assertEqual(denied["outcome"], "rejected"); self.assertIn("issuer", denied["reason"])
+        cases = []
+        for index, cause in enumerate(("empty_settlement", "transport_receipt", "report_import", "status", "heartbeat", "supervisor_observation"), start=10):
+            wrong_cause = self.queued_request(f"{index:032x}"); wrong_cause["cause"] = cause; cases.append(wrong_cause)
+        empty = self.queued_request("1123456789abcdef0123456789abcdef"); empty["payload"] = ""; empty["payloadSha256"] = hashlib.sha256(b"").hexdigest(); cases.append(empty)
+        bad_digest = self.queued_request("2123456789abcdef0123456789abcdef"); bad_digest["payloadSha256"] = "0" * 64; cases.append(bad_digest)
+        wrong_recipient = self.queued_request("3123456789abcdef0123456789abcdef"); wrong_recipient["recipient"] = dict(wrong_recipient["recipient"]); wrong_recipient["recipient"]["terminalId"] = "other"; cases.append(wrong_recipient)
+        too_deep = self.queued_request("4123456789abcdef0123456789abcdef", depth=lifecycle.MAX_QUEUED_DEPTH + 1); cases.append(too_deep)
+        too_many = self.queued_request("5123456789abcdef0123456789abcdef"); too_many["itemIds"] = [f"item-{i}" for i in range(33)]; cases.append(too_many)
+        for request in cases:
+            self.assertEqual(lifecycle.schedule_queued_input(role, request, self.root, self.issuer)["outcome"], "rejected")
+        self.assertFalse(self.events.exists())
+
+    def test_per_role_rate_queue_and_correlation_loop_guards(self):
+        role = self.validated()
+        first = self.queued_request(correlation=[{"namespace": "report", "key": "chain", "revision": 5}])
+        self.assertEqual(lifecycle.schedule_queued_input(role, first, self.root, self.issuer)["outcome"], "scheduled")
+        loop = self.queued_request("1123456789abcdef0123456789abcdef", "batch-2", [{"namespace": "report", "key": "chain", "revision": 5}])
+        result = lifecycle.schedule_queued_input(role, loop, self.root, self.issuer)
+        self.assertEqual(result["outcome"], "rejected"); self.assertIn("correlation loop", result["reason"])
+        with mock.patch.object(lifecycle, "ROLE_QUEUE_LIMIT", 1):
+            depth = self.queued_request("2123456789abcdef0123456789abcdef", "batch-3")
+            self.assertIn("depth limit", lifecycle.schedule_queued_input(role, depth, self.root, self.issuer)["reason"])
+        for index in range(1, lifecycle.ROLE_RATE_LIMIT):
+            request = self.queued_request(f"{index + 3:032x}", f"rate-{index}")
+            self.assertEqual(lifecycle.schedule_queued_input(role, request, self.root, self.issuer)["outcome"], "scheduled")
+        limited = self.queued_request("f123456789abcdef0123456789abcdef", "rate-limit")
+        rate = lifecycle.schedule_queued_input(role, limited, self.root, self.issuer)
+        self.assertEqual(rate["outcome"], "rejected"); self.assertIn("rate limit", rate["reason"])
 
     def test_unit_remains_bounded_and_no_watcher_exists(self):
         unit = lifecycle.render_unit(self.validated(), MODULE_PATH.resolve())

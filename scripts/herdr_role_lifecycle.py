@@ -25,6 +25,14 @@ ROLE_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$")
 SHA256 = re.compile(r"^[0-9a-f]{64}$")
 HUMAN_ROLES = {"user-facing-pm", "human-facing-controller"}
 TERMINAL_STATES = {"completed", "failed", "hibernate_failed", "rejected"}
+ACTIVATION_ID = re.compile(r"^(?:[0-9a-f]{32}|[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12})$")
+MAX_QUEUED_ITEMS = 32
+MAX_QUEUED_PAYLOAD_BYTES = 65536
+MAX_QUEUED_DEPTH = 8
+MAX_CORRELATIONS = 32
+ROLE_RATE_LIMIT = 8
+ROLE_RATE_WINDOW_MS = 60_000
+ROLE_QUEUE_LIMIT = 32
 
 
 class LifecycleError(RuntimeError):
@@ -153,6 +161,10 @@ def role_route(role: dict[str, Any]) -> dict[str, Any]:
     return {"workspaceId": role["workspace"]["id"], "paneId": role["paneId"], "terminalId": role["terminalId"], "agentSession": role["agentSession"]}
 
 
+def exact_lifecycle_recipient(role: dict[str, Any]) -> dict[str, Any]:
+    return {"roleId": role["roleId"], "roleClass": role["roleClass"], "workspace": role["workspace"], "paneId": role["paneId"], "terminalId": role["terminalId"], "agentSession": role["agentSession"], "canonicalTask": role["task"], "mailboxPath": role["mailboxPath"], "reportRoute": role["reportRoute"]}
+
+
 def executable(path: str, field: str) -> str:
     candidate = Path(path)
     if not candidate.is_absolute() or not candidate.is_file() or not os.access(candidate, os.X_OK):
@@ -248,8 +260,199 @@ def atomic_json(path: Path, value: dict[str, Any]) -> None:
         except FileNotFoundError: pass
 
 
+def fsync_directory(path: Path) -> None:
+    descriptor = os.open(path, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def write_new_secure(path: Path, data: bytes) -> None:
+    descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    try:
+        os.write(descriptor, data); os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+    fsync_directory(path.parent)
+
+
 def receipt(role: dict[str, Any], phase: str, **extra: Any) -> dict[str, Any]:
     return {"version": 1, "atEpochMs": int(time.time() * 1000), "roleId": role["roleId"], "task": role["task"], "workspace": role["workspace"], "paneId": role["paneId"], "terminalId": role["terminalId"], "agentSession": role["agentSession"], "mailboxPath": role["mailboxPath"], "reportRoute": role["reportRoute"], "phase": phase, **extra}
+
+
+def canonical_digest(value: Any) -> str:
+    encoded = json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def validate_queued_input_request(role: dict[str, Any], request: dict[str, Any]) -> dict[str, Any]:
+    required = {"kind", "version", "activationId", "batchId", "itemIds", "priority", "correlation", "depth", "cause", "payload", "payloadSha256", "recipient"}
+    if set(request) != required:
+        raise LifecycleError("queued-input activation request fields do not match v1 exactly")
+    if request.get("kind") != "pi-input-gate.queued-input-activation" or request.get("version") != 1:
+        raise LifecycleError("queued-input activation kind/version mismatch")
+    activation_id = require_string(request, "activationId", "request")
+    if not ACTIVATION_ID.fullmatch(activation_id):
+        raise LifecycleError("request.activationId must be a canonical random 128-bit ID")
+    batch_id = require_string(request, "batchId", "request")
+    if not ROLE_ID.fullmatch(batch_id):
+        raise LifecycleError("request.batchId is out of bounds")
+    item_ids = request.get("itemIds")
+    if not isinstance(item_ids, list) or not 1 <= len(item_ids) <= MAX_QUEUED_ITEMS:
+        raise LifecycleError("request.itemIds must contain 1..32 items")
+    if any(not isinstance(item, str) or not ROLE_ID.fullmatch(item) for item in item_ids) or len(set(item_ids)) != len(item_ids):
+        raise LifecycleError("request.itemIds must be unique bounded IDs")
+    if request.get("priority") not in {"low", "normal", "high"}:
+        raise LifecycleError("request.priority is invalid")
+    depth = request.get("depth")
+    if not isinstance(depth, int) or isinstance(depth, bool) or not 0 <= depth <= MAX_QUEUED_DEPTH:
+        raise LifecycleError("request.depth exceeds the lifecycle guard")
+    correlations = request.get("correlation")
+    if not isinstance(correlations, list) or len(correlations) > MAX_CORRELATIONS:
+        raise LifecycleError("request.correlation exceeds the lifecycle guard")
+    seen = set()
+    normalized_correlations = []
+    for index, correlation in enumerate(correlations):
+        if not isinstance(correlation, dict) or set(correlation) != {"namespace", "key", "revision"}:
+            raise LifecycleError(f"request.correlation[{index}] is malformed")
+        namespace = require_string(correlation, "namespace", f"request.correlation[{index}]")
+        key = require_string(correlation, "key", f"request.correlation[{index}]")
+        revision = correlation.get("revision")
+        if len(namespace.encode()) > 128 or len(key.encode()) > 128 or not isinstance(revision, int) or isinstance(revision, bool) or not 0 <= revision <= 9_007_199_254_740_991:
+            raise LifecycleError(f"request.correlation[{index}] is out of bounds")
+        pair = (namespace, key)
+        if pair in seen:
+            raise LifecycleError("request.correlation repeats a namespace/key loop")
+        seen.add(pair); normalized_correlations.append({"namespace": namespace, "key": key, "revision": revision})
+    if request.get("cause") != "accepted_queued_input":
+        raise LifecycleError("only accepted_queued_input can activate a managed role")
+    payload = request.get("payload")
+    if not isinstance(payload, str) or not payload or "\x00" in payload or len(payload.encode("utf-8")) > MAX_QUEUED_PAYLOAD_BYTES:
+        raise LifecycleError("request.payload is empty, unsafe, or out of bounds")
+    payload_digest = require_digest(request, "payloadSha256", "request")
+    if hashlib.sha256(payload.encode("utf-8")).hexdigest() != payload_digest:
+        raise LifecycleError("request payload digest mismatch")
+    if request.get("recipient") != exact_lifecycle_recipient(role):
+        raise LifecycleError("request recipient is not the exact managed lifecycle role")
+    result = dict(request); result["correlation"] = normalized_correlations
+    return result
+
+
+def queue_record_paths(role: dict[str, Any], activation_id: str) -> tuple[Path, Path, Path]:
+    root = Path(role["stateDir"]) / "queued-input-activations" / activation_id
+    return root / "record.json", root / "activation.json", root / "payload.txt"
+
+
+def update_queued_lifecycle_record(activation_path: Path | None, lifecycle_outcome: str) -> None:
+    if activation_path is None or activation_path.name != "activation.json":
+        return
+    record_path = activation_path.with_name("record.json")
+    queue_root = activation_path.parents[1]
+    if not record_path.exists() or queue_root.name != "queued-input-activations":
+        return
+    lock_path = queue_root / "schedule.lock"
+    lock = lock_path.open("a+")
+    try:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        record = read_json(record_path)
+        record["active"] = False
+        record["lifecycleOutcome"] = lifecycle_outcome
+        record["lifecycleUpdatedAtEpochMs"] = int(time.time() * 1000)
+        atomic_json(record_path, record)
+    finally:
+        lock.close()
+
+
+def queued_result(activation_id: str, outcome: str, *, receipt_id: str | None = None, reason: str | None = None) -> dict[str, Any]:
+    result: dict[str, Any] = {"activationId": activation_id, "outcome": outcome}
+    if receipt_id is not None: result["receiptId"] = receipt_id
+    if reason is not None: result["reason"] = reason
+    return result
+
+
+def schedule_queued_input(role: dict[str, Any], request: dict[str, Any], durable_root: Path, invoking_issuer: dict[str, Any] | None, *, recover: bool = False, fault: str | None = None) -> dict[str, Any]:
+    try:
+        issuer = exact_route(invoking_issuer, "invoking issuer")
+        if issuer != role["authorizedIssuer"]:
+            raise LifecycleError("invoking tasking issuer is not authorized for this role")
+        request = validate_queued_input_request(role, request)
+    except LifecycleError as exc:
+        raw_id = request.get("activationId") if isinstance(request, dict) else None
+        return queued_result(raw_id if isinstance(raw_id, str) else "invalid", "rejected", reason=str(exc))
+    activation_id = request["activationId"]
+    record_path, activation_path, payload_path = queue_record_paths(role, activation_id)
+    queue_root = record_path.parents[1]
+    queue_root.mkdir(mode=0o700, parents=True, exist_ok=True); os.chmod(queue_root, 0o700)
+    lock_path = queue_root / "schedule.lock"
+    lock = lock_path.open("a+"); os.chmod(lock_path, 0o600)
+    try:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        request_digest = canonical_digest(request)
+        identity = {"activationId": activation_id, "batchId": request["batchId"], "payloadSha256": request["payloadSha256"], "recipient": request["recipient"]}
+        identity_digest = canonical_digest(identity)
+        if record_path.exists():
+            record = read_json(record_path)
+            if record.get("identityDigest") != identity_digest or record.get("requestDigest") != request_digest:
+                return queued_result(activation_id, "rejected", reason="activation ID conflicts with durable content")
+            if record.get("outcome") == "scheduled":
+                return queued_result(activation_id, "duplicate", receipt_id=record.get("receiptId"), reason="same activation was already scheduled")
+            if record.get("outcome") == "uncertain":
+                if not recover:
+                    return queued_result(activation_id, "uncertain", receipt_id=record.get("receiptId"), reason="explicit same-ID recovery is required")
+                try:
+                    activation_bytes = read_secure_bytes(activation_path, durable_root, "queued-input activation", limit=131072)
+                    payload_bytes = read_secure_bytes(payload_path, durable_root, "queued-input payload", limit=MAX_QUEUED_PAYLOAD_BYTES)
+                except LifecycleError as exc:
+                    return queued_result(activation_id, "uncertain", receipt_id=record.get("receiptId"), reason=f"recovery could not prove prior materialization: {exc}")
+                if hashlib.sha256(activation_bytes).hexdigest() != record.get("activationArtifactSha256") or hashlib.sha256(payload_bytes).hexdigest() != request["payloadSha256"]:
+                    return queued_result(activation_id, "uncertain", receipt_id=record.get("receiptId"), reason="recovery artifact digest mismatch")
+                record["outcome"] = "scheduled"; record["recoveredAtEpochMs"] = int(time.time() * 1000); atomic_json(record_path, record)
+                return queued_result(activation_id, "duplicate", receipt_id=record.get("receiptId"), reason="same-ID recovery proved the prior schedule; no second activation was created")
+            return queued_result(activation_id, "rejected", reason="activation ID is terminal")
+        if recover:
+            return queued_result(activation_id, "rejected", reason="no uncertain activation exists for recovery")
+        now = int(time.time() * 1000)
+        active_records = []
+        recent_correlations: dict[tuple[str, str], int] = {}
+        recent_scheduled = 0
+        for candidate in queue_root.glob("*/record.json"):
+            try: previous = read_json(candidate)
+            except LifecycleError: continue
+            if previous.get("active") is True and previous.get("outcome") in {"scheduled", "uncertain"}: active_records.append(previous)
+            scheduled_at = previous.get("scheduledAtEpochMs")
+            if isinstance(scheduled_at, int) and now - scheduled_at < ROLE_RATE_WINDOW_MS:
+                recent_scheduled += 1
+                for correlation in previous.get("correlation", []):
+                    if isinstance(correlation, dict):
+                        pair = (correlation.get("namespace"), correlation.get("key")); revision = correlation.get("revision")
+                        if all(isinstance(value, str) for value in pair) and isinstance(revision, int): recent_correlations[pair] = max(revision, recent_correlations.get(pair, -1))
+        if len(active_records) >= ROLE_QUEUE_LIMIT:
+            return queued_result(activation_id, "rejected", reason="per-role queued activation depth limit reached")
+        if recent_scheduled >= ROLE_RATE_LIMIT:
+            return queued_result(activation_id, "rejected", reason="per-role activation rate limit reached")
+        for correlation in request["correlation"]:
+            previous_revision = recent_correlations.get((correlation["namespace"], correlation["key"]))
+            if previous_revision is not None and correlation["revision"] <= previous_revision:
+                return queued_result(activation_id, "rejected", reason="correlation loop or stale revision rejected")
+        record_path.parent.mkdir(mode=0o700, parents=True, exist_ok=False)
+        fsync_directory(queue_root)
+        receipt_id = hashlib.sha256(f"queued-input:{identity_digest}".encode()).hexdigest()
+        record = {"version": 1, "activationId": activation_id, "identityDigest": identity_digest, "requestDigest": request_digest, "batchId": request["batchId"], "payloadSha256": request["payloadSha256"], "recipient": request["recipient"], "correlation": request["correlation"], "depth": request["depth"], "cause": "accepted_queued_input", "authorizedIssuer": role["authorizedIssuer"], "outcome": "uncertain", "active": True, "receiptId": receipt_id, "scheduledAtEpochMs": now}
+        atomic_json(record_path, record)
+        write_new_secure(payload_path, request["payload"].encode("utf-8"))
+        activation = {"version": 1, "roleId": role["roleId"], "executionId": activation_id, "kind": "queued_input", "cause": "accepted_queued_input", "canonicalTask": role["task"], "issuer": role["authorizedIssuer"], "senderRoute": role["authorizedIssuer"], "parentRoute": role["reportRoute"], "promptPath": str(payload_path), "promptDigest": request["payloadSha256"], "queuedInputActivation": {"activationId": activation_id, "batchId": request["batchId"], "itemIds": request["itemIds"], "priority": request["priority"], "correlation": request["correlation"], "depth": request["depth"], "recipient": request["recipient"], "requestDigest": request_digest}}
+        activation_bytes = (json.dumps(activation, sort_keys=True, separators=(",", ":")) + "\n").encode()
+        write_new_secure(activation_path, activation_bytes)
+        record["activationArtifactSha256"] = hashlib.sha256(activation_bytes).hexdigest(); atomic_json(record_path, record)
+        if fault == "lost_ack":
+            return queued_result(activation_id, "uncertain", receipt_id=receipt_id, reason="activation materialized but scheduling acknowledgement was lost")
+        record["outcome"] = "scheduled"; atomic_json(record_path, record)
+        return queued_result(activation_id, "scheduled", receipt_id=receipt_id)
+    except OSError as exc:
+        return queued_result(activation_id, "uncertain", reason=f"durable scheduling outcome is uncertain: {exc}")
+    finally:
+        lock.close()
 
 
 def run_json(argv: list[str], *, timeout: float = 35, env: dict[str, str] | None = None) -> dict[str, Any]:
@@ -301,13 +504,24 @@ def heartbeat(role: dict[str, Any], phase: str, state_dir: Path, detail: str = "
     notify(role, "WATCHDOG=1", f"STATUS={phase}: {detail}".rstrip())
 
 
-def load_activation(role: dict[str, Any], durable_root: Path) -> dict[str, Any]:
-    data = read_secure_bytes(Path(role["activationPath"]), durable_root, "activation", limit=65536)
+def load_activation(role: dict[str, Any], durable_root: Path, activation_path: Path | None = None) -> dict[str, Any]:
+    path = activation_path or Path(role["activationPath"])
+    data = read_secure_bytes(path, durable_root, "activation", limit=131072)
     value = decode_json(data, "activation")
     if value.get("version") != 1 or value.get("roleId") != role["roleId"]: raise LifecycleError("activation version or roleId mismatch")
     execution_id = require_string(value, "executionId", "activation")
     if not ROLE_ID.fullmatch(execution_id): raise LifecycleError("activation.executionId has invalid characters")
-    if value.get("kind") not in {"assignment", "report"}: raise LifecycleError("activation.kind must be assignment or report")
+    if value.get("kind") not in {"assignment", "report", "queued_input"}: raise LifecycleError("activation.kind is invalid")
+    if value.get("kind") == "queued_input":
+        if value.get("cause") != "accepted_queued_input": raise LifecycleError("queued activation cause must be accepted_queued_input")
+        queued = value.get("queuedInputActivation")
+        if not isinstance(queued, dict) or queued.get("activationId") != value.get("executionId") or queued.get("recipient") != exact_lifecycle_recipient(role): raise LifecycleError("queued activation identity/recipient mismatch")
+        record_path = path.with_name("record.json")
+        record = decode_json(read_secure_bytes(record_path, durable_root, "queued-input schedule record", limit=131072), "queued-input schedule record")
+        if record.get("outcome") != "scheduled" or record.get("activationId") != queued.get("activationId") or record.get("requestDigest") != queued.get("requestDigest") or record.get("payloadSha256") != value.get("promptDigest") or record.get("recipient") != queued.get("recipient"):
+            raise LifecycleError("queued activation lacks an exact scheduled record binding")
+        if hashlib.sha256(data).hexdigest() != record.get("activationArtifactSha256"):
+            raise LifecycleError("queued activation artifact digest mismatch")
     if value.get("canonicalTask") != role["task"]: raise LifecycleError("activation canonical task mismatch")
     if value.get("issuer") != role["authorizedIssuer"] or value.get("senderRoute") != role["authorizedIssuer"]: raise LifecycleError("activation issuer/sender route mismatch")
     if value.get("parentRoute") != role["reportRoute"]: raise LifecycleError("activation parent route mismatch")
@@ -355,14 +569,16 @@ def rollback_started(role: dict[str, Any], activation: dict[str, Any], state_dir
     return disposition
 
 
-def lifecycle_run(role: dict[str, Any], durable_root: Path, poll_seconds: float, idle_timeout: float) -> None:
+def lifecycle_run(role: dict[str, Any], durable_root: Path, poll_seconds: float, idle_timeout: float, activation_path: Path | None = None) -> None:
     state_dir = Path(role["stateDir"]); state_dir.mkdir(mode=0o700, parents=True, exist_ok=True); os.chmod(state_dir, 0o700)
     lock_stream = (state_dir / "manager.lock").open("a+")
     try: fcntl.flock(lock_stream, fcntl.LOCK_EX | fcntl.LOCK_NB)
     except BlockingIOError as exc: raise LifecycleError("another lifecycle manager owns this role") from exc
     try:
-        if (state_dir / "relaunch-inhibit.json").exists(): raise LifecycleInhibited("automatic relaunch is inhibited pending explicit recovery")
-        activation = load_activation(role, durable_root)
+        if (state_dir / "relaunch-inhibit.json").exists():
+            update_queued_lifecycle_record(activation_path, "relaunch_inhibited")
+            raise LifecycleInhibited("automatic relaunch is inhibited pending explicit recovery")
+        activation = load_activation(role, durable_root, activation_path)
         current_path = state_dir / "activation-receipt.json"
         if current_path.exists():
             previous = read_json(current_path)
@@ -371,6 +587,7 @@ def lifecycle_run(role: dict[str, Any], durable_root: Path, poll_seconds: float,
         initial = agent_from(run_json([herdr, "agent", "get", role["paneId"]])); assert_identity(role, initial, require_ready=False)
         if initial.get("agent_status") not in {"unknown", "exited", None} or initial.get("agent") is not None:
             atomic_json(state_dir / "relaunch-inhibit.json", receipt(role, "relaunch_inhibited", executionId=activation["executionId"], detail="pane was not provably hibernated before start"))
+            update_queued_lifecycle_record(activation_path, "ambiguous_live_process_inhibited")
             raise LifecycleInhibited("pane was not provably hibernated; refusing ambiguous attach/retry")
         generation = f"{role['roleId']}-{activation['executionId']}-{activation['promptDigest'][:12]}"
         activation["preStartIdentity"] = {key: initial.get(key) for key in ("workspace_id", "pane_id", "terminal_id", "agent", "agent_status", "agent_session", "name", "revision", "state_change_seq")}
@@ -386,6 +603,7 @@ def lifecycle_run(role: dict[str, Any], durable_root: Path, poll_seconds: float,
         except Exception as failure:
             disposition = rollback_started(role, activation, state_dir, generation, failure)
             atomic_json(current_path, receipt(role, "failed", executionId=activation["executionId"], activationDigest=activation["activationDigest"], promptDigest=activation["promptDigest"], generation=generation, rollbackDisposition=disposition, error=str(failure), gateAdmission="unknown", modelExecution="unknown", todoAcceptance="unknown"))
+            update_queued_lifecycle_record(activation_path, f"failed_rollback_{disposition}")
             raise LifecycleError(f"post-start failure; rollback {disposition}: {failure}") from failure
         atomic_json(current_path, receipt(role, "transport_accepted", executionId=activation["executionId"], activationDigest=activation["activationDigest"], promptDigest=activation["promptDigest"], generation=generation, runtimeTransportAccepted=True, gateAdmission="unknown", modelExecution="unknown", reportAcceptance="unknown", todoAcceptance="unknown"))
         notify(role, "READY=1", "WATCHDOG=1", "STATUS=Pi interactive; activation transport accepted"); heartbeat(role, "executing", state_dir, f"execution={activation['executionId']}")
@@ -403,8 +621,10 @@ def lifecycle_run(role: dict[str, Any], durable_root: Path, poll_seconds: float,
         except Exception as failure:
             disposition = rollback_started(role, activation, state_dir, generation, failure)
             atomic_json(current_path, receipt(role, "failed", executionId=activation["executionId"], generation=generation, rollbackDisposition=disposition, error=str(failure), gateAdmission="unknown", modelExecution="unknown", todoAcceptance="unknown"))
+            update_queued_lifecycle_record(activation_path, f"failed_rollback_{disposition}")
             raise LifecycleError(f"execution/hibernate failure; rollback {disposition}: {failure}") from failure
         atomic_json(current_path, receipt(role, "completed", executionId=activation["executionId"], activationDigest=activation["activationDigest"], promptDigest=activation["promptDigest"], generation=generation, runtimeTransportAccepted=True, gateAdmission="unknown", modelExecution="unknown", reportAcceptance="unknown", todoAcceptance="unknown", hibernated=True)); heartbeat(role, "hibernated", state_dir, f"execution={activation['executionId']}")
+        update_queued_lifecycle_record(activation_path, "completed")
     finally: lock_stream.close()
 
 
@@ -415,10 +635,13 @@ def render_unit(role: dict[str, Any], manager: Path) -> str:
 
 def parser() -> argparse.ArgumentParser:
     result = argparse.ArgumentParser(); sub = result.add_subparsers(dest="command", required=True)
-    for name in ("validate", "launch-argv", "run", "render-unit"):
+    for name in ("validate", "launch-argv", "run", "render-unit", "schedule-queued-input", "recover-queued-input"):
         item = sub.add_parser(name); item.add_argument("--manifest", required=True); item.add_argument("--durable-root", default="/home")
-        if name == "run": item.add_argument("--poll-seconds", type=float, default=2.0); item.add_argument("--execution-timeout", type=float, default=14400.0)
+        if name == "run":
+            item.add_argument("--poll-seconds", type=float, default=2.0); item.add_argument("--execution-timeout", type=float, default=14400.0); item.add_argument("--activation-id")
         if name == "render-unit": item.add_argument("--manager", required=True)
+        if name in {"schedule-queued-input", "recover-queued-input"}:
+            item.add_argument("--request", required=True); item.add_argument("--issuer", required=True)
     return result
 
 
@@ -429,7 +652,18 @@ def main(argv: list[str] | None = None) -> int:
         if args.command == "validate": print(json.dumps({"valid": True, "roleId": role["roleId"], "humanFacing": role["humanFacing"]}, sort_keys=True))
         elif args.command == "launch-argv": print(json.dumps({"argv": launch_args(role), "humanFacingGranted": role["humanFacing"]}, sort_keys=True))
         elif args.command == "render-unit": print(render_unit(role, Path(args.manager)), end="")
-        else: lifecycle_run(role, Path(args.durable_root), args.poll_seconds, args.execution_timeout)
+        elif args.command in {"schedule-queued-input", "recover-queued-input"}:
+            request_data = read_secure_bytes(Path(args.request), Path(args.durable_root), "queued-input request", limit=131072)
+            request = decode_json(request_data, "queued-input request")
+            issuer_data = read_secure_bytes(Path(args.issuer), Path(args.durable_root), "tasking issuer route", limit=32768)
+            issuer = decode_json(issuer_data, "tasking issuer route")
+            print(json.dumps(schedule_queued_input(role, request, Path(args.durable_root), issuer, recover=args.command == "recover-queued-input"), sort_keys=True))
+        else:
+            activation_path = None
+            if args.activation_id:
+                if not ACTIVATION_ID.fullmatch(args.activation_id): raise LifecycleError("--activation-id is invalid")
+                activation_path = queue_record_paths(role, args.activation_id)[1]
+            lifecycle_run(role, Path(args.durable_root), args.poll_seconds, args.execution_timeout, activation_path)
         return 0
     except LifecycleInhibited as exc:
         print(f"herdr-role-lifecycle: {exc}", file=sys.stderr); return 0
