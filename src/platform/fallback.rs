@@ -180,7 +180,11 @@ pub(crate) fn pane_custom_command_pty_builder_platform(
     portable_pty::CommandBuilder::from_argv(raw_command_argv(command, "-c"))
 }
 
-pub(crate) fn interactive_shell_command(_argv: &[String], _shell_name: &str) -> Option<String> {
+pub(crate) fn interactive_shell_command(
+    _argv: &[String],
+    _environment: &[String],
+    _shell_name: &str,
+) -> Option<String> {
     None
 }
 

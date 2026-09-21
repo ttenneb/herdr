@@ -1,4 +1,7 @@
-use std::time::{Duration, Instant};
+use std::{
+    collections::HashSet,
+    time::{Duration, Instant},
+};
 
 use bytes::Bytes;
 
@@ -11,6 +14,29 @@ pub(crate) const AGENT_START_SETTLE_DELAY: Duration = Duration::from_secs(3);
 const INVALID_AGENT_TIMEOUT_MESSAGE: &str =
     "agent start timeout must be greater than 3000ms and at most 300000ms";
 const INVALID_AGENT_NAME_MESSAGE: &str = "agent name must start with a lowercase letter and contain only lowercase letters, digits, '-' or '_' (1-32 characters)";
+const MAX_AGENT_ENVIRONMENT_ITEMS: usize = 16;
+const MAX_AGENT_ENVIRONMENT_BYTES: usize = 16 * 1024;
+
+fn valid_agent_environment(values: &[String]) -> bool {
+    if values.len() > MAX_AGENT_ENVIRONMENT_ITEMS
+        || values.iter().map(String::len).sum::<usize>() > MAX_AGENT_ENVIRONMENT_BYTES
+    {
+        return false;
+    }
+    let mut names = HashSet::new();
+    values.iter().all(|entry| {
+        let Some((name, value)) = entry.split_once('=') else {
+            return false;
+        };
+        let mut chars = name.chars();
+        matches!(chars.next(), Some('A'..='Z' | 'a'..='z' | '_'))
+            && name.len() <= 128
+            && chars.all(|ch| ch.is_ascii_alphanumeric() || ch == '_')
+            && value.len() <= 4096
+            && !value.chars().any(char::is_control)
+            && names.insert(name.to_ascii_uppercase())
+    })
+}
 
 fn valid_agent_name(name: &str) -> bool {
     let mut chars = name.chars();
@@ -158,6 +184,9 @@ impl App {
         {
             return Err(AgentStartError::InvalidArgument);
         }
+        if !valid_agent_environment(&params.env) {
+            return Err(AgentStartError::InvalidEnvironment);
+        }
         let conflicts = self.agent_name_conflicts(&params.name, "");
         if !conflicts.is_empty() {
             return Err(AgentStartError::DuplicateName {
@@ -216,7 +245,7 @@ impl App {
         let shell_name = available_shell_name(runtime)
             .ok_or_else(|| AgentStartError::TargetBusy(params.pane_id.clone()))?;
 
-        let command = crate::platform::interactive_shell_command(&argv, &shell_name)
+        let command = crate::platform::interactive_shell_command(&argv, &params.env, &shell_name)
             .ok_or(AgentStartError::InvalidArgument)?;
         let bytes = crate::app::api_helpers::encode_api_submission(runtime, &command);
         let timeout = self.agent_start_timeout(&params)?;
@@ -258,6 +287,10 @@ impl App {
             AgentStartError::InvalidArgument => crate::api::schema::ErrorBody {
                 code: "invalid_agent_argument".into(),
                 message: "agent arguments cannot be encoded safely for the target shell".into(),
+            },
+            AgentStartError::InvalidEnvironment => crate::api::schema::ErrorBody {
+                code: "invalid_agent_environment".into(),
+                message: "agent environment must contain at most 16 unique bounded NAME=VALUE assignments".into(),
             },
             AgentStartError::InvalidTimeout => crate::api::schema::ErrorBody {
                 code: "invalid_agent_timeout".into(),
@@ -460,6 +493,7 @@ pub(super) enum AgentStartError {
     InvalidName,
     UnsupportedKind(String),
     InvalidArgument,
+    InvalidEnvironment,
     InvalidTimeout,
     TargetNotFound(String),
     TargetBusy(String),
@@ -484,7 +518,7 @@ pub(super) enum AgentRenameError {
 
 #[cfg(test)]
 mod tests {
-    use super::valid_agent_name;
+    use super::{valid_agent_environment, valid_agent_name};
 
     #[test]
     fn agent_names_use_a_small_cli_safe_grammar() {
@@ -502,6 +536,28 @@ mod tests {
             &"a".repeat(33),
         ] {
             assert!(!valid_agent_name(name), "expected {name:?} to be invalid");
+        }
+    }
+
+    #[test]
+    fn agent_environment_is_bounded_unique_and_shell_safe() {
+        assert!(valid_agent_environment(&[
+            "PI_TASKING_HERDR_ADAPTER_CONFIG=/home/user/adapter.json".into()
+        ]));
+        for invalid in [
+            vec!["NO_EQUALS".into()],
+            vec!["1BAD=value".into()],
+            vec!["BAD-NAME=value".into()],
+            vec!["DUP=one".into(), "DUP=two".into()],
+            vec!["DUP=one".into(), "dup=two".into()],
+            vec!["CONTROL=bad\nvalue".into()],
+            vec![format!("TOO_LONG={}", "x".repeat(4097))],
+            (0..17).map(|index| format!("KEY_{index}=value")).collect(),
+        ] {
+            assert!(
+                !valid_agent_environment(&invalid),
+                "expected {invalid:?} to be invalid"
+            );
         }
     }
 }

@@ -120,6 +120,9 @@ if a[:2]==["agent","get"]:
 elif a[:2]==["pane","get"]:
  pane=agent(s,"unknown",False); pane["terminal_id"]="wrong" if mode=="production_agent_not_found_bad_pane" else "term2"; emit({{"pane":pane}})
 elif a[:2]==["agent","start"]:
+ if mode=="require_adapter_env":
+  expected="PI_TASKING_HERDR_ADAPTER_CONFIG="+{str(self.root / 'adapter.json')!r}; separator=a.index("--") if "--" in a else -1
+  if "--env" not in a or a.index("--env")>=separator or a[a.index("--env")+1]!=expected: print(json.dumps({{"error":{{"code":"missing_child_environment"}}}}),file=sys.stderr); sys.exit(1)
  if not re.fullmatch(r"[a-z][a-z0-9_-]{{0,31}}",a[2]): print(json.dumps({{"error":{{"code":"invalid_agent_name"}}}}),file=sys.stderr); sys.exit(1)
  s={{"phase":"started","name":a[2],"gets":0}}; save(s)
  if mode in ("start_malformed","cleanup_uncertain"): print("bad")
@@ -177,6 +180,19 @@ else: sys.exit(9)
                 lifecycle.notify(role, "READY=1")
         with self.assertRaisesRegex(lifecycle.LifecycleError, "assignments are invalid"):
             lifecycle.notify(role, "STATUS=bad\nREADY=1")
+
+    def test_exact_adapter_config_is_bounded_and_transported_to_child(self):
+        adapter = self.root / "adapter.json"; self.secure_write(adapter, '{"version":1}\n'); self.secure_write(self.mode, "require_adapter_env")
+        role = self.validated()
+        with mock.patch.dict(os.environ, {"PI_TASKING_HERDR_ADAPTER_CONFIG": str(adapter)}):
+            lifecycle.lifecycle_run(role, self.root, 0.001, 1)
+        self.assertEqual(json.loads((Path(role["stateDir"]) / "activation-receipt.json").read_text())["phase"], "completed")
+
+        shutil.rmtree(role["stateDir"]); (self.root / "fake-state.json").unlink(); adapter.chmod(0o644)
+        with mock.patch.dict(os.environ, {"PI_TASKING_HERDR_ADAPTER_CONFIG": str(adapter)}):
+            with self.assertRaisesRegex(lifecycle.LifecycleError, "tasking adapter config.*mode"):
+                lifecycle.lifecycle_run(role, self.root, 0.001, 1)
+        self.assertEqual(self.events.read_text().splitlines().count("herdr agent start"), 1)
 
     def test_managed_generation_is_deterministic_safe_and_exactly_32_characters(self):
         role = self.validated(); activation = lifecycle.load_activation(role, self.root)

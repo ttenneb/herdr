@@ -700,10 +700,14 @@ fn raw_command_shell(comspec: Option<std::ffi::OsString>) -> std::ffi::OsString 
         .unwrap_or_else(|| r"C:\Windows\System32\cmd.exe".into())
 }
 
-pub(crate) fn interactive_shell_command(argv: &[String], shell_name: &str) -> Option<String> {
+pub(crate) fn interactive_shell_command(
+    argv: &[String],
+    environment: &[String],
+    shell_name: &str,
+) -> Option<String> {
     let shell_name = shell_name.to_ascii_lowercase();
     let powershell = shell_name.contains("powershell") || shell_name.contains("pwsh");
-    let script = powershell_agent_script(argv)?;
+    let script = powershell_agent_script(argv, environment)?;
     if powershell {
         Some(script)
     } else {
@@ -711,10 +715,22 @@ pub(crate) fn interactive_shell_command(argv: &[String], shell_name: &str) -> Op
     }
 }
 
-fn powershell_agent_script(argv: &[String]) -> Option<String> {
+fn powershell_agent_script(argv: &[String], environment: &[String]) -> Option<String> {
     let (program, args) = argv.split_first()?;
+    let mut prefix = String::new();
+    for entry in environment {
+        let (name, value) = entry.split_once('=')?;
+        prefix.push_str("$env:");
+        prefix.push_str(name);
+        prefix.push_str(" = ");
+        prefix.push_str(&super::quote_powershell_arg(value));
+        prefix.push_str("; ");
+    }
     if args.is_empty() {
-        return Some(format!("& {}", super::quote_powershell_arg(program)));
+        return Some(format!(
+            "{prefix}& {}",
+            super::quote_powershell_arg(program)
+        ));
     }
 
     let command_line = args
@@ -723,7 +739,7 @@ fn powershell_agent_script(argv: &[String]) -> Option<String> {
         .collect::<Vec<_>>()
         .join(" ");
     Some(format!(
-        "$p=Start-Process -FilePath {} -ArgumentList {} -NoNewWindow -Wait -PassThru",
+        "{prefix}$p=Start-Process -FilePath {} -ArgumentList {} -NoNewWindow -Wait -PassThru",
         super::quote_powershell_arg(program),
         super::quote_powershell_arg(&command_line),
     ))
@@ -2865,7 +2881,7 @@ mod tests {
         let argv = vec!["opencode".into()];
 
         assert_eq!(
-            super::interactive_shell_command(&argv, "powershell.exe").as_deref(),
+            super::interactive_shell_command(&argv, &[], "powershell.exe").as_deref(),
             Some("& opencode")
         );
     }
@@ -2883,7 +2899,7 @@ mod tests {
             "wow!".into(),
             "a'b".into(),
         ];
-        let command = super::interactive_shell_command(&argv, "cmd.exe").unwrap();
+        let command = super::interactive_shell_command(&argv, &[], "cmd.exe").unwrap();
         let encoded = command.split_whitespace().last().unwrap();
         let bytes = base64::engine::general_purpose::STANDARD
             .decode(encoded)
@@ -2946,7 +2962,8 @@ mod tests {
 
         for shell in ["powershell.exe", "cmd.exe"] {
             let no_args_capture = base.join(format!("{shell}-no-args.txt"));
-            let no_args_command = super::interactive_shell_command(&["pi".into()], shell).unwrap();
+            let no_args_command =
+                super::interactive_shell_command(&["pi".into()], &[], shell).unwrap();
             let status = run_command(shell, &no_args_command, &no_args_capture);
             assert!(status.success(), "{shell} argument-free command failed");
             assert_eq!(
@@ -2957,7 +2974,7 @@ mod tests {
             );
 
             let capture = base.join(format!("{shell}.txt"));
-            let command = super::interactive_shell_command(&argv, shell).unwrap();
+            let command = super::interactive_shell_command(&argv, &[], shell).unwrap();
             let status = run_command(shell, &command, &capture);
             assert!(status.success(), "{shell} command failed");
             assert_eq!(

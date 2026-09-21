@@ -707,7 +707,7 @@ fn agent_command() -> Command {
             Command::new("start")
                 .about("Start a supported interactive agent in an existing pane")
                 .override_usage(
-                    "herdr agent start <NAME> --kind <KIND> --pane <ID> [OPTIONS] [-- [AGENT_ARG]...]",
+                    "herdr agent start <NAME> --kind <KIND> --pane <ID> [--env <NAME=VALUE>]... [OPTIONS] [-- [AGENT_ARG]...]",
                 )
                 .arg(required("name", "NAME"))
                 .arg(
@@ -720,6 +720,11 @@ fn agent_command() -> Command {
                     option("pane", "ID")
                         .required(true)
                         .help("Existing pane at an interactive shell prompt"),
+                )
+                .arg(
+                    option("env", "NAME=VALUE")
+                        .action(ArgAction::Append)
+                        .help("Bounded environment assignment applied only to the managed child"),
                 )
                 .arg(
                     option("timeout", "MS")
@@ -1595,7 +1600,8 @@ mod tests {
                 .map(str::to_string)
         );
         assert!(has_option(agent_start, "pane"));
-        for legacy in ["cwd", "workspace", "tab", "split", "focus", "env", "argv"] {
+        assert!(has_option(agent_start, "env"));
+        for legacy in ["cwd", "workspace", "tab", "split", "focus", "argv"] {
             assert!(!has_option(agent_start, legacy), "legacy option --{legacy}");
         }
         assert!(agent_start

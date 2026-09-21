@@ -2341,6 +2341,13 @@
               },
               "type": "array"
             },
+            "env": {
+              "description": "Bounded `NAME=VALUE` assignments applied only to the managed child process.",
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
             "kind": {
               "type": "string"
             },

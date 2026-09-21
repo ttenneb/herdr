@@ -1051,6 +1051,7 @@ impl App {
             kind: params.kind,
             pane_id: String::new(),
             args: params.args,
+            env: Vec::new(),
             timeout_ms: params.timeout_ms,
         };
         // Validate every managed-agent field before allocating a pane or emitting lifecycle

@@ -22,6 +22,7 @@
 - Custom themes can now define separate light and dark color overrides when automatic theme switching is enabled. (#837, thanks @aneym)
 
 ### Changed
+- `herdr agent start` now accepts bounded repeatable `--env NAME=VALUE` child-only assignments; the lifecycle manager uses it to transport the exact secure `PI_TASKING_HERDR_ADAPTER_CONFIG` into Pi launched by the separate Herdr server.
 - Lifecycle readiness, watchdog, and status notifications now use bounded direct main-process `NOTIFY_SOCKET` datagrams, satisfying `NotifyAccess=main` attribution without helper-process races or PID spoofing.
 - Lifecycle managed-agent generations now use a deterministic activation-bound 32-character Herdr-safe digest name, independent of readable role or execution ID length and characters.
 - Lifecycle role manifests now securely pin the owner-only Herdr server socket and propagate it to the rendered service plus every Herdr CLI subprocess, preventing user-systemd from falling back to an unrelated default socket.

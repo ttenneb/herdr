@@ -321,6 +321,7 @@ pub(crate) fn is_powershell_process_name(name: &str) -> bool {
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 pub(crate) fn interactive_unix_shell_command(
     argv: &[String],
+    environment: &[String],
     shell_name: &str,
     quote_posix_arg: fn(&str) -> String,
 ) -> Option<String> {
@@ -329,8 +330,24 @@ pub(crate) fn interactive_unix_shell_command(
     } else {
         quote_posix_arg
     };
+    let mut command = String::new();
+    for entry in environment {
+        let (name, value) = entry.split_once('=')?;
+        if is_powershell_process_name(shell_name) {
+            command.push_str("$env:");
+            command.push_str(name);
+            command.push_str(" = ");
+            command.push_str(&quote_powershell_arg(value));
+            command.push_str("; ");
+        } else {
+            command.push_str(name);
+            command.push('=');
+            command.push_str(&quote(value));
+            command.push(' ');
+        }
+    }
     let mut parts = argv.iter();
-    let mut command = quote(parts.next()?);
+    command.push_str(&quote(parts.next()?));
     for part in parts {
         command.push(' ');
         command.push_str(&quote(part));
@@ -519,12 +536,22 @@ mod tests {
             "@options".into(),
         ];
         assert_eq!(
-            interactive_shell_command(&argv, "bash").as_deref(),
+            interactive_shell_command(&argv, &[], "bash").as_deref(),
             Some("pi '' 'two words' 'a'\\''b' '$HOME' 'semi;colon' @options")
         );
         assert_eq!(
-            interactive_shell_command(&argv, "pwsh").as_deref(),
+            interactive_shell_command(&argv, &[], "pwsh").as_deref(),
             Some("pi '' 'two words' 'a''b' '$HOME' 'semi;colon' '@options'")
+        );
+        let environment =
+            vec!["PI_TASKING_HERDR_ADAPTER_CONFIG=/home/two words/adapter.json".into()];
+        assert_eq!(
+            interactive_shell_command(&["pi".into()], &environment, "bash").as_deref(),
+            Some("PI_TASKING_HERDR_ADAPTER_CONFIG='/home/two words/adapter.json' pi")
+        );
+        assert_eq!(
+            interactive_shell_command(&["pi".into()], &environment, "pwsh").as_deref(),
+            Some("$env:PI_TASKING_HERDR_ADAPTER_CONFIG = '/home/two words/adapter.json'; pi")
         );
     }
 

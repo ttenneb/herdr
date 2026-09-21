@@ -710,6 +710,14 @@ def rollback_started(role: dict[str, Any], activation: dict[str, Any], state_dir
     return disposition
 
 
+def tasking_child_environment(durable_root: Path) -> list[str]:
+    value = os.environ.get("PI_TASKING_HERDR_ADAPTER_CONFIG")
+    if value is None: return []
+    path = Path(value)
+    read_secure_bytes(path, durable_root, "tasking adapter config", limit=65536)
+    return [f"PI_TASKING_HERDR_ADAPTER_CONFIG={path.resolve(strict=True)}"]
+
+
 def managed_generation(role: dict[str, Any], activation: dict[str, Any]) -> str:
     material = json.dumps({"version": 1, "roleId": role["roleId"], "executionId": activation["executionId"], "promptDigest": activation["promptDigest"], "activationDigest": activation["activationDigest"]}, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode()
     return "g" + hashlib.sha256(material).hexdigest()[:31]
@@ -738,7 +746,9 @@ def lifecycle_run(role: dict[str, Any], durable_root: Path, poll_seconds: float,
         generation = managed_generation(role, activation)
         activation["preStartIdentity"] = {key: initial.get(key) for key in ("workspace_id", "pane_id", "terminal_id", "agent", "agent_status", "agent_session", "name", "revision", "state_change_seq")}
         atomic_json(current_path, receipt(role, "validated", executionId=activation["executionId"], activationDigest=activation["activationDigest"], promptDigest=activation["promptDigest"], issuer=activation["issuer"], senderRoute=activation["senderRoute"], parentRoute=activation["parentRoute"], generation=generation, preStartIdentity=activation["preStartIdentity"], gateAdmission="unknown", modelExecution="unknown", todoAcceptance="unknown"))
-        argv = [herdr, "agent", "start", generation, "--kind", "pi", "--pane", role["paneId"], "--timeout", "30000", "--", *launch_args(role)[1:]]
+        argv = [herdr, "agent", "start", generation, "--kind", "pi", "--pane", role["paneId"], "--timeout", "30000"]
+        for assignment in tasking_child_environment(durable_root): argv += ["--env", assignment]
+        argv += ["--", *launch_args(role)[1:]]
         launch_env = herdr_environment(role); launch_env["PATH"] = str(Path(role["executables"]["pi"]).parent) + os.pathsep + launch_env.get("PATH", "")
         try:
             started = run_json(argv, timeout=40, env=launch_env)
