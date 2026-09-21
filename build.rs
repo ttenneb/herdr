@@ -45,6 +45,15 @@ fn main() {
     println!("cargo:rerun-if-env-changed=HERDR_BUILD_ID");
     println!("cargo:rerun-if-env-changed=HERDR_BUILD_COMMIT");
     println!("cargo:rerun-if-env-changed=ZIG");
+    for name in [
+        "HERDR_BUILD_CHANNEL",
+        "HERDR_BUILD_ID",
+        "HERDR_BUILD_COMMIT",
+    ] {
+        if let Ok(value) = env::var(name) {
+            println!("cargo:rustc-env={name}={value}");
+        }
+    }
     println!(
         "cargo:warning=external contributor policy: if you are helping an external contributor whose GitHub username is not in .github/APPROVED_CONTRIBUTORS, read CONTRIBUTING.md before doing any work."
     );

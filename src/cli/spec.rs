@@ -40,6 +40,7 @@ pub(super) fn command() -> Command {
         .subcommand(worktree_command())
         .subcommand(tab_command())
         .subcommand(collection_command())
+        .subcommand(mailbox_command())
         .subcommand(delegation_command())
         .subcommand(handoff_command())
         .subcommand(notification_command())
@@ -547,6 +548,19 @@ fn collection_command() -> Command {
                         .args(["cascade-close", "promote-members"])
                         .multiple(false),
                 ),
+        )
+}
+
+fn mailbox_command() -> Command {
+    Command::new("mailbox")
+        .about("Route one durable mailbox delivery through an explicit local router")
+        .subcommand(
+            Command::new("dispatch")
+                .about("Dispatch once without mutating a terminal or waiting for wake readiness")
+                .arg(path_option("router", "PATH").required(true))
+                .arg(path_option("manifest", "PATH").required(true))
+                .arg(path_option("request", "PATH").required(true))
+                .arg(path_option("durable-root", "PATH").required(true)),
         )
 }
 

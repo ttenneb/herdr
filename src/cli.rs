@@ -29,6 +29,7 @@ mod completion;
 mod delegation;
 mod handoff;
 mod integration;
+mod mailbox;
 mod notification;
 mod pane;
 mod plugin;
@@ -125,6 +126,7 @@ pub fn maybe_run(args: &[String]) -> std::io::Result<CommandOutcome> {
         "worktree" => worktree::run_worktree_command(&args[2..])?,
         "tab" => tab::run_tab_command(&args[2..])?,
         "collection" => collection::run_collection_command(&args[2..])?,
+        "mailbox" => mailbox::run_mailbox_command(&args[2..])?,
         "delegation" => delegation::run_delegation_command(&args[2..])?,
         "handoff" => handoff::run_handoff_command(&args[2..])?,
         "notification" => notification::run_notification_command(&args[2..])?,
