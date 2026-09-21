@@ -607,7 +607,7 @@ def launch_args(role: dict[str, Any]) -> list[str]:
 
 
 def notify(role: dict[str, Any], *parts: str) -> None:
-    process = subprocess.run([role["executables"]["systemdNotify"], *parts], check=False, capture_output=True, text=True)
+    process = subprocess.run([role["executables"]["systemdNotify"], "--pid=parent", *parts], check=False, capture_output=True, text=True)
     if process.returncode != 0: raise LifecycleError(f"systemd-notify failed: {process.stderr.strip()}")
 
 

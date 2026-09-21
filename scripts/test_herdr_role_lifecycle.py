@@ -164,6 +164,16 @@ else: sys.exit(9)
             value = self.activation_value(); value[field] = bad; self.write_activation(value)
             with self.assertRaises(lifecycle.LifecycleError, msg=field): lifecycle.load_activation(role, self.root)
 
+    def test_systemd_notify_attributes_to_main_process_and_propagates_failure(self):
+        role = self.validated(); completed = __import__("subprocess").CompletedProcess([], 0, "", "")
+        with mock.patch.object(lifecycle.subprocess, "run", return_value=completed) as runner:
+            lifecycle.notify(role, "READY=1", "WATCHDOG=1", "STATUS=ready")
+        runner.assert_called_once_with([str(self.notify), "--pid=parent", "READY=1", "WATCHDOG=1", "STATUS=ready"], check=False, capture_output=True, text=True)
+        failed = __import__("subprocess").CompletedProcess([], 1, "", "attribution denied")
+        with mock.patch.object(lifecycle.subprocess, "run", return_value=failed):
+            with self.assertRaisesRegex(lifecycle.LifecycleError, "systemd-notify failed: attribution denied"):
+                lifecycle.notify(role, "READY=1")
+
     def test_managed_generation_is_deterministic_safe_and_exactly_32_characters(self):
         role = self.validated(); activation = lifecycle.load_activation(role, self.root)
         generation = lifecycle.managed_generation(role, activation)

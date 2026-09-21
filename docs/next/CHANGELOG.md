@@ -22,6 +22,7 @@
 - Custom themes can now define separate light and dark color overrides when automatic theme switching is enabled. (#837, thanks @aneym)
 
 ### Changed
+- Lifecycle readiness, watchdog, and status notifications now use `systemd-notify --pid=parent`, satisfying `NotifyAccess=main` attribution while retaining fail-closed helper errors.
 - Lifecycle managed-agent generations now use a deterministic activation-bound 32-character Herdr-safe digest name, independent of readable role or execution ID length and characters.
 - Lifecycle role manifests now securely pin the owner-only Herdr server socket and propagate it to the rendered service plus every Herdr CLI subprocess, preventing user-systemd from falling back to an unrelated default socket.
 - Corrected the parent-acknowledgement wire to use tasking's exact assignment object, canonical 22-character IDs, four-field Herdr identities, and authoritative 512-byte required-identity bounds while rejecting every additional property; optional `assignedByPaneId` remains capped at 128 bytes.
