@@ -103,11 +103,15 @@ s=load()
 if a[:2]==["agent","get"]:
  if len(a)>2 and a[2]=="wp:p1":
   emit({{"agent":{{"workspace_id":"wp","pane_id":"wp:p1","terminal_id":"termp","cwd":{str(self.worktree)!r},"agent":"pi","agent_session":session,"interactive_ready":True,"name":"parent","agent_status":"idle","state_change_seq":1,"revision":1}}}}); sys.exit(0)
+ if mode in ("production_agent_not_found","production_agent_not_found_bad_pane") and s["phase"]=="empty":
+  print(json.dumps({{"id":"cli:agent:get","error":{{"code":"agent_not_found","message":"agent not found"}}}}),file=sys.stderr); sys.exit(1)
  if mode=="cleanup_uncertain" and s["phase"]=="started" and s.get("cleanup_failed"): print("bad"); sys.exit(0)
  if s["phase"]=="empty": emit({{"agent":agent(s,"unknown",False)}})
  elif s["phase"]=="exited": emit({{"agent":agent({{"phase":"empty","name":None,"gets":s["gets"]}},"unknown",False)}})
  else:
   s["gets"]+=1; save(s); emit({{"agent":agent(s,"working" if s["gets"]==1 else "idle")}})
+elif a[:2]==["pane","get"]:
+ pane=agent(s,"unknown",False); pane["terminal_id"]="wrong" if mode=="production_agent_not_found_bad_pane" else "term2"; emit({{"pane":pane}})
 elif a[:2]==["agent","start"]:
  s={{"phase":"started","name":a[2],"gets":0}}; save(s)
  if mode in ("start_malformed","cleanup_uncertain"): print("bad")
@@ -159,6 +163,20 @@ else: sys.exit(9)
         self.assertEqual(final["phase"], "completed"); self.assertTrue(final["hibernated"]); self.assertEqual(final["gateAdmission"], "unknown")
         self.assertIn("activationDigest", final); self.assertIn("promptDigest", final); self.assertIn("generation", final)
         events = self.events.read_text().splitlines(); self.assertEqual(sum(x == "herdr agent start" for x in events), 1); self.assertIn("herdr agent send-keys", events)
+
+    def test_production_agent_not_found_preflight_accepts_only_exact_hibernated_pane(self):
+        self.secure_write(self.mode, "production_agent_not_found")
+        role = self.validated(); preflight = lifecycle.preflight_agent_state(role)
+        self.assertIsNone(preflight["agent"]); self.assertEqual(preflight["terminal_id"], "term2")
+        lifecycle.lifecycle_run(role, self.root, 0.001, 1)
+        final = json.loads((Path(role["stateDir"]) / "activation-receipt.json").read_text())
+        self.assertEqual(final["phase"], "completed"); self.assertTrue(final["hibernated"])
+        events = self.events.read_text().splitlines(); self.assertLess(events.index("herdr agent get"), events.index("herdr pane get")); self.assertLess(events.index("herdr pane get"), events.index("herdr agent start"))
+
+        shutil.rmtree(role["stateDir"]); (self.root / "fake-state.json").unlink(); self.secure_write(self.mode, "production_agent_not_found_bad_pane")
+        with self.assertRaisesRegex(lifecycle.LifecycleError, "terminal_id mismatch"):
+            lifecycle.lifecycle_run(role, self.root, 0.001, 1)
+        self.assertEqual(self.events.read_text().splitlines().count("herdr agent start"), 1)
 
     def test_malformed_start_response_rolls_back_exact_generation(self):
         self.secure_write(self.mode, "start_malformed")

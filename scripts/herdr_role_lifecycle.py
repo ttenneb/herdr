@@ -533,6 +533,28 @@ def run_json(argv: list[str], *, timeout: float = 35, env: dict[str, str] | None
     return value
 
 
+def preflight_agent_state(role: dict[str, Any]) -> dict[str, Any]:
+    argv = [role["executables"]["herdr"], "agent", "get", role["paneId"]]
+    try: process = subprocess.run(argv, check=False, capture_output=True, text=True, timeout=35)
+    except (OSError, subprocess.TimeoutExpired) as exc: raise LifecycleError(f"command failed: {argv[0]}: {exc}") from exc
+    if process.returncode == 0:
+        try: value = json.loads(process.stdout)
+        except json.JSONDecodeError as exc: raise LifecycleError(f"command returned malformed JSON: {argv[0]}") from exc
+        if not isinstance(value, dict) or value.get("error") is not None: raise LifecycleError(f"command returned an error: {value}")
+        return agent_from(value)
+    try: error_value = json.loads(process.stderr)
+    except json.JSONDecodeError as exc: raise LifecycleError(f"command exited {process.returncode}: {argv[0]}: {process.stderr.strip()}") from exc
+    error = error_value.get("error") if isinstance(error_value, dict) else None
+    if not isinstance(error, dict) or error.get("code") != "agent_not_found":
+        raise LifecycleError(f"command exited {process.returncode}: {argv[0]}: {process.stderr.strip()}")
+    pane_response = run_json([role["executables"]["herdr"], "pane", "get", role["paneId"]], timeout=5)
+    result = pane_response.get("result")
+    pane = result.get("pane") if isinstance(result, dict) else None
+    if not isinstance(pane, dict): raise LifecycleError("Herdr response omitted pane after agent_not_found")
+    assert_identity(role, pane, require_ready=False)
+    return pane
+
+
 def agent_from(value: dict[str, Any]) -> dict[str, Any]:
     result = value.get("result")
     if not isinstance(result, dict) or not isinstance(result.get("agent"), dict):
@@ -648,7 +670,7 @@ def lifecycle_run(role: dict[str, Any], durable_root: Path, poll_seconds: float,
             previous = read_json(current_path)
             if previous.get("executionId") == activation["executionId"] and previous.get("phase") in TERMINAL_STATES: raise LifecycleInhibited("activation executionId is already terminal and cannot be replayed")
         herdr = role["executables"]["herdr"]
-        initial = agent_from(run_json([herdr, "agent", "get", role["paneId"]])); assert_identity(role, initial, require_ready=False)
+        initial = preflight_agent_state(role); assert_identity(role, initial, require_ready=False)
         if initial.get("agent_status") not in {"unknown", "exited", None} or initial.get("agent") is not None:
             atomic_json(state_dir / "relaunch-inhibit.json", receipt(role, "relaunch_inhibited", executionId=activation["executionId"], detail="pane was not provably hibernated before start"))
             update_queued_lifecycle_record(activation_path, "ambiguous_live_process_inhibited")
