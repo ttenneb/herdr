@@ -1,0 +1,44 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "properties": {
+    "activationId": {
+      "pattern": "^(?:[0-9a-f]{32}|[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12})$",
+      "type": "string"
+    },
+    "kind": {
+      "const": "herdr.queued-input-service-start-result"
+    },
+    "outcome": {
+      "enum": [
+        "accepted",
+        "duplicate",
+        "uncertain",
+        "rejected"
+      ]
+    },
+    "reason": {
+      "maxLength": 4096,
+      "type": "string"
+    },
+    "receiptId": {
+      "pattern": "^[0-9a-f]{64}$",
+      "type": "string"
+    },
+    "unit": {
+      "maxLength": 255,
+      "type": "string"
+    },
+    "version": {
+      "const": 1
+    }
+  },
+  "required": [
+    "kind",
+    "version",
+    "activationId",
+    "outcome"
+  ],
+  "title": "Herdr queued input service start result v1",
+  "type": "object"
+}

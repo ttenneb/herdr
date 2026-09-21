@@ -17,7 +17,7 @@ Every role manifest binds all of these fields:
 - canonical task reference;
 - mailbox path;
 - exact authorized issuer/sender and parent report routes, including full session identities;
-- absolute Herdr, Pi, Python, and `systemd-notify` executables;
+- absolute Herdr, Pi, Python, `systemd-notify`, and `systemctl` executables;
 - durable state and activation paths below `/home` (a different durable root is accepted only for isolated tests);
 - an explicit human-facing policy.
 
@@ -44,6 +44,30 @@ Scheduling writes an owner-only payload, digest-bound explicit `queued_input` ac
 The durable key binds activation ID, batch ID, payload digest, and exact recipient. The complete request digest is also retained. Exact retries return `duplicate`; same-ID content changes return `rejected`. An ambiguous materialization remains `uncertain` and normal retries remain uncertain. `recover-queued-input` is the only resolution path: it uses the same request and issuer, verifies the existing activation and payload digests, marks the prior schedule proven, and returns `duplicate` without creating another artifact, process, or prompt.
 
 Before materialization, the scheduler enforces per-role queue depth, an eight-per-minute rate limit, maximum depth eight, at most 32 correlation entries, no repeated namespace/key within a request, and monotonically increasing revisions for recently scheduled namespace/key chains. Lifecycle completion or inhibited rollback releases queue depth without changing the original scheduling receipt. Scheduling receipts claim only `scheduled`, `duplicate`, `uncertain`, or `rejected`; they do not claim Gate admission, model execution, report delivery, or Todo acceptance.
+
+### Exact service-start boundary
+
+Generate the role-specific instance template with:
+
+```sh
+/usr/bin/python3 /absolute/herdr_role_lifecycle.py render-queued-unit \
+  --manifest /absolute/role.json \
+  --manager /absolute/herdr_role_lifecycle.py
+```
+
+Install it separately under the exact `# UnitName=...` name on the rendered first line, such as `herdr-role-owner-1@.service`. The template has no `WantedBy` target and no generic wake command. Its only execution path is an explicit instance whose `%i` is passed to `run --activation-id %i`. The manager validates the canonical 128-bit ID and its exact secure scheduled record before launch. Paths are absolute and systemd-quoted; `%` in configured paths is escaped without escaping the intentional `%i` instance specifier.
+
+After `schedule-queued-input` returns `scheduled`, or `recover-queued-input` proves the prior schedule and returns `duplicate`, the trusted tasking adapter may invoke exactly:
+
+```sh
+/usr/bin/python3 /absolute/herdr_role_lifecycle.py start-queued-input \
+  --manifest /absolute/role.json \
+  --activation-id 0123456789abcdef0123456789abcdef
+```
+
+The manager revalidates the scheduled activation and then executes exactly `SYSTEMCTL --user start herdr-role-ROLE@ACTIVATION.service`, where `SYSTEMCTL` is the absolute executable pinned by the secure role manifest. Because the unit is `Type=notify`, a successful systemctl return follows the lifecycle manager's truthful `READY=1`, which is still emitted only after interactive readiness and prompt transport. The JSON result is `herdr.queued-input-service-start-result` v1 with the exact activation ID and one of `accepted`, `duplicate`, `uncertain`, or `rejected`; its generated schema is `docs/next/queued-input-service-start-v1.schema.json`.
+
+Before invoking systemctl, the manager durably records an uncertain exact start attempt. A successful acknowledgement becomes `accepted`; another call returns `duplicate` without invoking systemctl again. Timeout or lost acknowledgement remains `uncertain` and repeated calls do not retry. After external same-unit evidence, `recover-queued-start --disposition started` marks the attempt proven and returns `duplicate`; `--disposition not-started` terminates it as rejected and requires a new activation ID. Empty settlement, receipts, imports, status, heartbeat, supervisor observations, invalid IDs, and unscheduled IDs cannot reach systemctl.
 
 ## User-systemd design
 

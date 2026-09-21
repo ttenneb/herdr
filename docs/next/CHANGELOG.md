@@ -3,6 +3,7 @@
 ## Unreleased
 
 ### Added
+- Added a pinned role-specific user-systemd instance boundary for queued-input activations, with exact activation-ID start validation, durable duplicate/uncertain start handling, generated result schema, and no generic wake path.
 - Added an external queued-input lifecycle scheduler with exact v1 request/issuer validation, digest-bound secure activation materialization, durable conflict-safe idempotency, bounded role guards, and explicit same-ID uncertain recovery.
 - Added an external one-shot Pi role lifecycle manager with exact durable identity/resume binding, default-deny human-question grants, truthful user-systemd readiness, bounded restart policy, and durable activation/transport receipts.
 - Added failure-atomic `herdr collection helper-launch`, which starts the managed agent as the newly selected collection member's initial process, waits for interactive readiness, transports an exact bounded assignment, and removes the member if startup or assignment transport does not complete.

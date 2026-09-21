@@ -29,6 +29,7 @@ class RoleLifecycleTests(unittest.TestCase):
         self.python = Path(shutil.which("python3")).resolve()
         self.notify = self.executable("systemd-notify", f"#!/bin/sh\nprintf 'notify %s\\n' \"$*\" >> {self.events}\n")
         self.herdr = self.executable("herdr", self.fake_herdr())
+        self.systemctl = self.executable("systemctl", "#!/bin/sh\nexit 0\n")
         self.session = {"agent": "pi", "kind": "path", "source": "herdr:pi", "value": str(self.root / "session.jsonl")}
         self.issuer = self.route("issuer", "wi", "wi:p1", "termi")
         self.parent = self.route("parent", "wp", "wp:p1", "termp")
@@ -48,7 +49,7 @@ class RoleLifecycleTests(unittest.TestCase):
         return {"name": name, "workspaceId": workspace, "paneId": pane, "terminalId": terminal, "agentSession": self.session if hasattr(self, "session") else {"agent": "pi", "kind": "path", "source": "herdr:pi", "value": str(self.root / "session.jsonl")}}
 
     def base_manifest(self):
-        return {"version": 1, "roleId": "owner-1", "roleClass": "implementation-owner", "workspace": {"id": "w1", "path": str(self.worktree)}, "paneId": "w1:p2", "terminalId": "term2", "agentSession": self.session, "task": {"id": "100", "source": "todo"}, "mailboxPath": str(self.root / "mailbox.jsonl"), "reportRoute": self.parent, "authorizedIssuer": self.issuer, "stateDir": str(self.role_dir / "state"), "activationPath": str(self.activation), "executables": {"herdr": str(self.herdr), "pi": str(self.pi), "python": str(self.python), "systemdNotify": str(self.notify)}, "humanFacing": False}
+        return {"version": 1, "roleId": "owner-1", "roleClass": "implementation-owner", "workspace": {"id": "w1", "path": str(self.worktree)}, "paneId": "w1:p2", "terminalId": "term2", "agentSession": self.session, "task": {"id": "100", "source": "todo"}, "mailboxPath": str(self.root / "mailbox.jsonl"), "reportRoute": self.parent, "authorizedIssuer": self.issuer, "stateDir": str(self.role_dir / "state"), "activationPath": str(self.activation), "executables": {"herdr": str(self.herdr), "pi": str(self.pi), "python": str(self.python), "systemdNotify": str(self.notify), "systemctl": str(self.systemctl)}, "humanFacing": False}
 
     def activation_value(self):
         prompt_digest = hashlib.sha256(self.prompt.read_bytes()).hexdigest()
@@ -213,10 +214,17 @@ else: sys.exit(9)
             lifecycle.load_activation(role, self.root, activation_path)
         retry = lifecycle.schedule_queued_input(role, request, self.root, self.issuer)
         self.assertEqual(retry["outcome"], "uncertain")
+        start_calls = []
+        def start_runner(command, **kwargs):
+            start_calls.append(command); return __import__("subprocess").CompletedProcess(command, 0, "", "")
+        blocked_start = lifecycle.start_queued_input_service(role, request["activationId"], self.root, runner=start_runner)
+        self.assertEqual(blocked_start["outcome"], "rejected"); self.assertEqual(start_calls, [])
         recovered = lifecycle.schedule_queued_input(role, request, self.root, self.issuer, recover=True)
         self.assertEqual(recovered["outcome"], "duplicate"); self.assertIn("no second activation", recovered["reason"])
         self.assertEqual(before, (activation_path.read_bytes(), activation_path.stat().st_mtime_ns))
         lifecycle.load_activation(role, self.root, activation_path)
+        started = lifecycle.start_queued_input_service(role, request["activationId"], self.root, runner=start_runner)
+        self.assertEqual(started["outcome"], "accepted"); self.assertEqual(len(start_calls), 1)
         self.assertFalse(self.events.exists())
 
     def test_queued_input_rejects_noncauses_digest_bounds_and_wrong_recipient(self):
@@ -252,6 +260,62 @@ else: sys.exit(9)
         limited = self.queued_request("f123456789abcdef0123456789abcdef", "rate-limit")
         rate = lifecycle.schedule_queued_input(role, limited, self.root, self.issuer)
         self.assertEqual(rate["outcome"], "rejected"); self.assertIn("rate limit", rate["reason"])
+
+    def test_queued_unit_pins_exact_activation_id_and_escapes_paths(self):
+        role = self.validated()
+        special_manager = self.root / 'manager % "quoted".py'; self.secure_write(special_manager, "# manager\n")
+        role["_manifestPath"] = str(self.root / 'role/manifest % "quoted".json')
+        unit = lifecycle.render_queued_unit(role, special_manager)
+        self.assertIn("Type=notify", unit); self.assertIn("NotifyAccess=main", unit); self.assertIn("Restart=on-failure", unit)
+        self.assertIn("RestartSec=15s", unit); self.assertIn("WatchdogSec=120s", unit); self.assertIn("StartLimitBurst=3", unit)
+        self.assertTrue(unit.startswith("# UnitName=herdr-role-owner-1@.service\n"))
+        self.assertIn("--activation-id %i", unit); self.assertNotIn("WantedBy=", unit)
+        self.assertIn('%%', unit); self.assertIn('\\"quoted\\"', unit)
+        self.assertEqual(lifecycle.queued_unit_template_name(role), "herdr-role-owner-1@.service")
+
+    def test_service_start_requires_scheduled_exact_id_and_is_idempotent(self):
+        role = self.validated(); activation_id = "0123456789abcdef0123456789abcdef"
+        calls = []
+        def runner(command, **kwargs):
+            calls.append((command, kwargs)); return __import__("subprocess").CompletedProcess(command, 0, "", "")
+        rejected = lifecycle.start_queued_input_service(role, activation_id, self.root, runner=runner)
+        self.assertEqual(rejected["outcome"], "rejected"); self.assertEqual(calls, [])
+        request = self.queued_request(activation_id)
+        self.assertEqual(lifecycle.schedule_queued_input(role, request, self.root, self.issuer)["outcome"], "scheduled")
+        started = lifecycle.start_queued_input_service(role, activation_id, self.root, runner=runner)
+        self.assertEqual(started["outcome"], "accepted"); self.assertEqual(len(calls), 1)
+        expected_unit = lifecycle.queued_unit_instance_name(role, activation_id)
+        self.assertEqual(calls[0][0], [str(self.systemctl), "--user", "start", expected_unit])
+        duplicate = lifecycle.start_queued_input_service(role, activation_id, self.root, runner=runner)
+        self.assertEqual(duplicate["outcome"], "duplicate"); self.assertEqual(len(calls), 1)
+
+    def test_invalid_or_generic_service_start_has_no_start_path(self):
+        role = self.validated(); calls = []
+        def runner(command, **kwargs): calls.append(command); raise AssertionError("must not run")
+        for activation_id in ("", "not-an-id", "0" * 31, "../../generic"):
+            result = lifecycle.start_queued_input_service(role, activation_id, self.root, runner=runner)
+            self.assertEqual(result["outcome"], "rejected")
+        self.assertEqual(calls, [])
+
+    def test_service_start_lost_ack_stays_uncertain_until_explicit_recovery(self):
+        role = self.validated(); request = self.queued_request()
+        lifecycle.schedule_queued_input(role, request, self.root, self.issuer)
+        calls = []
+        def runner(command, **kwargs):
+            calls.append(command); return __import__("subprocess").CompletedProcess(command, 0, "", "")
+        first = lifecycle.start_queued_input_service(role, request["activationId"], self.root, runner=runner, fault="lost_ack")
+        self.assertEqual(first["outcome"], "uncertain"); self.assertEqual(len(calls), 1)
+        retry = lifecycle.start_queued_input_service(role, request["activationId"], self.root, runner=runner)
+        self.assertEqual(retry["outcome"], "uncertain"); self.assertEqual(len(calls), 1)
+        recovered = lifecycle.recover_queued_input_start(role, request["activationId"], "started")
+        self.assertEqual(recovered["outcome"], "duplicate"); self.assertEqual(len(calls), 1)
+        final = lifecycle.start_queued_input_service(role, request["activationId"], self.root, runner=runner)
+        self.assertEqual(final["outcome"], "duplicate"); self.assertEqual(len(calls), 1)
+
+    def test_generated_queued_start_schema_is_current(self):
+        expected = lifecycle.queued_service_start_schema()
+        artifact = Path(__file__).parents[1] / "docs/next/queued-input-service-start-v1.schema.json"
+        self.assertEqual(json.loads(artifact.read_text()), expected)
 
     def test_unit_remains_bounded_and_no_watcher_exists(self):
         unit = lifecycle.render_unit(self.validated(), MODULE_PATH.resolve())

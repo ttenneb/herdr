@@ -204,7 +204,7 @@ def validate_manifest(raw: dict[str, Any], manifest_path: Path, durable_root: Pa
     executables = raw.get("executables")
     if not isinstance(executables, dict):
         raise LifecycleError("manifest.executables must be an object")
-    bins = {key: executable(require_string(executables, key, "manifest.executables"), f"manifest.executables.{key}") for key in ("herdr", "pi", "python", "systemdNotify")}
+    bins = {key: executable(require_string(executables, key, "manifest.executables"), f"manifest.executables.{key}") for key in ("herdr", "pi", "python", "systemdNotify", "systemctl")}
     human_facing = raw.get("humanFacing", False)
     if not isinstance(human_facing, bool):
         raise LifecycleError("manifest.humanFacing must be boolean")
@@ -628,20 +628,137 @@ def lifecycle_run(role: dict[str, Any], durable_root: Path, poll_seconds: float,
     finally: lock_stream.close()
 
 
+def systemd_quote(value: str) -> str:
+    if not value or "\x00" in value or "\n" in value or "\r" in value:
+        raise LifecycleError("systemd argument is empty or contains a control character")
+    return '"' + value.replace("\\", "\\\\").replace('"', '\\"').replace("%", "%%") + '"'
+
+
+def queued_unit_template_name(role: dict[str, Any]) -> str:
+    name = f"herdr-role-{role['roleId']}@.service"
+    if len(name.encode("utf-8")) > 240:
+        raise LifecycleError("role-specific unit template name is too long")
+    return name
+
+
+def queued_unit_instance_name(role: dict[str, Any], activation_id: str) -> str:
+    if not ACTIVATION_ID.fullmatch(activation_id):
+        raise LifecycleError("activation ID is invalid for the queued role service")
+    name = f"herdr-role-{role['roleId']}@{activation_id}.service"
+    if len(name.encode("utf-8")) > 255:
+        raise LifecycleError("role activation unit instance name is too long")
+    return name
+
+
 def render_unit(role: dict[str, Any], manager: Path) -> str:
     if not manager.is_absolute() or not manager.is_file(): raise LifecycleError("--manager must be an absolute regular file")
-    return f"""[Unit]\nDescription=Herdr one-shot Pi role {role['roleId']}\nAfter=herdr.service\nStartLimitIntervalSec=300\nStartLimitBurst=3\n\n[Service]\nType=notify\nNotifyAccess=main\nExecStart={role['executables']['python']} {manager} run --manifest {role['_manifestPath']}\nRestart=on-failure\nRestartSec=15s\nWatchdogSec=120s\nTimeoutStartSec=60s\nTimeoutStopSec=30s\nKillMode=process\n\n[Install]\nWantedBy=default.target\n"""
+    return f"""[Unit]\nDescription=Herdr one-shot Pi role {role['roleId']}\nAfter=herdr.service\nStartLimitIntervalSec=300\nStartLimitBurst=3\n\n[Service]\nType=notify\nNotifyAccess=main\nExecStart={systemd_quote(role['executables']['python'])} {systemd_quote(str(manager))} run --manifest {systemd_quote(role['_manifestPath'])}\nRestart=on-failure\nRestartSec=15s\nWatchdogSec=120s\nTimeoutStartSec=60s\nTimeoutStopSec=30s\nKillMode=process\n\n[Install]\nWantedBy=default.target\n"""
+
+
+def render_queued_unit(role: dict[str, Any], manager: Path) -> str:
+    if not manager.is_absolute() or not manager.is_file():
+        raise LifecycleError("--manager must be an absolute regular file")
+    python = systemd_quote(role["executables"]["python"])
+    manager_arg = systemd_quote(str(manager))
+    manifest_arg = systemd_quote(role["_manifestPath"])
+    return f"""# UnitName={queued_unit_template_name(role)}\n[Unit]\nDescription=Herdr queued activation for role {role['roleId']} (%i)\nAfter=herdr.service\nStartLimitIntervalSec=300\nStartLimitBurst=3\n\n[Service]\nType=notify\nNotifyAccess=main\nExecStart={python} {manager_arg} run --manifest {manifest_arg} --activation-id %i\nRestart=on-failure\nRestartSec=15s\nWatchdogSec=120s\nTimeoutStartSec=60s\nTimeoutStopSec=30s\nKillMode=process\n\n# Deliberately no WantedBy: an explicit validated instance start is the only wake path.\n"""
+
+
+def queued_start_result(activation_id: str, outcome: str, unit: str | None = None, receipt_id: str | None = None, reason: str | None = None) -> dict[str, Any]:
+    result: dict[str, Any] = {"kind": "herdr.queued-input-service-start-result", "version": 1, "activationId": activation_id, "outcome": outcome}
+    if unit is not None: result["unit"] = unit
+    if receipt_id is not None: result["receiptId"] = receipt_id
+    if reason is not None: result["reason"] = reason
+    return result
+
+
+def start_queued_input_service(role: dict[str, Any], activation_id: str, durable_root: Path, *, runner: Any = subprocess.run, fault: str | None = None) -> dict[str, Any]:
+    try:
+        unit = queued_unit_instance_name(role, activation_id)
+        systemctl_path = role["executables"]["systemctl"]
+        record_path, activation_path, _ = queue_record_paths(role, activation_id)
+        load_activation(role, durable_root, activation_path)
+    except (LifecycleError, OSError) as exc:
+        return queued_start_result(activation_id, "rejected", reason=str(exc))
+    queue_root = record_path.parents[1]
+    lock = (queue_root / "schedule.lock").open("a+")
+    try:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        record = read_json(record_path)
+        if record.get("outcome") != "scheduled":
+            return queued_start_result(activation_id, "rejected", unit, reason="activation is not durably scheduled or recovery-proven")
+        prior = record.get("serviceStart")
+        if isinstance(prior, dict):
+            prior_outcome = prior.get("outcome")
+            if prior_outcome == "accepted":
+                return queued_start_result(activation_id, "duplicate", unit, prior.get("receiptId"), "exact service start was already accepted")
+            if prior_outcome == "uncertain":
+                return queued_start_result(activation_id, "uncertain", unit, prior.get("receiptId"), "explicit same-ID start recovery is required")
+            return queued_start_result(activation_id, "rejected", unit, prior.get("receiptId"), "exact service start is terminal")
+        receipt_id = hashlib.sha256(f"queued-service-start:{record['receiptId']}:{unit}".encode()).hexdigest()
+        command = [systemctl_path, "--user", "start", unit]
+        record["serviceStart"] = {"outcome": "uncertain", "receiptId": receipt_id, "unit": unit, "command": command, "attemptedAtEpochMs": int(time.time() * 1000)}
+        atomic_json(record_path, record)
+        try:
+            completed = runner(command, check=False, capture_output=True, text=True, timeout=75)
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            return queued_start_result(activation_id, "uncertain", unit, receipt_id, f"service start acknowledgement is uncertain: {exc}")
+        if fault == "lost_ack":
+            return queued_start_result(activation_id, "uncertain", unit, receipt_id, "service start completed but acknowledgement was lost")
+        if completed.returncode != 0:
+            record["serviceStart"].update({"outcome": "rejected", "completedAtEpochMs": int(time.time() * 1000), "reason": (completed.stderr or "systemctl start failed").strip()[:2048]})
+            atomic_json(record_path, record)
+            return queued_start_result(activation_id, "rejected", unit, receipt_id, record["serviceStart"]["reason"])
+        record["serviceStart"].update({"outcome": "accepted", "completedAtEpochMs": int(time.time() * 1000)})
+        atomic_json(record_path, record)
+        return queued_start_result(activation_id, "accepted", unit, receipt_id)
+    finally:
+        lock.close()
+
+
+def recover_queued_input_start(role: dict[str, Any], activation_id: str, disposition: str) -> dict[str, Any]:
+    try:
+        unit = queued_unit_instance_name(role, activation_id)
+        record_path, _, _ = queue_record_paths(role, activation_id)
+        queue_root = record_path.parents[1]
+        lock = (queue_root / "schedule.lock").open("a+")
+    except (LifecycleError, OSError) as exc:
+        return queued_start_result(activation_id, "rejected", reason=str(exc))
+    try:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        record = read_json(record_path); start = record.get("serviceStart")
+        if not isinstance(start, dict) or start.get("outcome") != "uncertain":
+            return queued_start_result(activation_id, "rejected", unit, reason="no uncertain exact service start exists")
+        if disposition == "started":
+            start["outcome"] = "accepted"; outcome = "duplicate"; reason = "external same-ID recovery proved the prior start; no second start was issued"
+        elif disposition == "not-started":
+            start["outcome"] = "rejected"; outcome = "rejected"; reason = "external recovery proved no start; a new activation ID is required"
+        else:
+            return queued_start_result(activation_id, "rejected", unit, start.get("receiptId"), "recovery disposition must be started or not-started")
+        start["recoveredAtEpochMs"] = int(time.time() * 1000); start["recoveryDisposition"] = disposition; atomic_json(record_path, record)
+        return queued_start_result(activation_id, outcome, unit, start.get("receiptId"), reason)
+    except (LifecycleError, OSError) as exc:
+        return queued_start_result(activation_id, "uncertain", unit, reason=str(exc))
+    finally:
+        lock.close()
+
+
+def queued_service_start_schema() -> dict[str, Any]:
+    return {"$schema": "https://json-schema.org/draft/2020-12/schema", "title": "Herdr queued input service start result v1", "type": "object", "additionalProperties": False, "required": ["kind", "version", "activationId", "outcome"], "properties": {"kind": {"const": "herdr.queued-input-service-start-result"}, "version": {"const": 1}, "activationId": {"type": "string", "pattern": ACTIVATION_ID.pattern}, "outcome": {"enum": ["accepted", "duplicate", "uncertain", "rejected"]}, "unit": {"type": "string", "maxLength": 255}, "receiptId": {"type": "string", "pattern": "^[0-9a-f]{64}$"}, "reason": {"type": "string", "maxLength": 4096}}}
 
 
 def parser() -> argparse.ArgumentParser:
     result = argparse.ArgumentParser(); sub = result.add_subparsers(dest="command", required=True)
-    for name in ("validate", "launch-argv", "run", "render-unit", "schedule-queued-input", "recover-queued-input"):
+    for name in ("validate", "launch-argv", "run", "render-unit", "render-queued-unit", "schedule-queued-input", "recover-queued-input", "start-queued-input", "recover-queued-start", "queued-start-schema"):
         item = sub.add_parser(name); item.add_argument("--manifest", required=True); item.add_argument("--durable-root", default="/home")
         if name == "run":
             item.add_argument("--poll-seconds", type=float, default=2.0); item.add_argument("--execution-timeout", type=float, default=14400.0); item.add_argument("--activation-id")
-        if name == "render-unit": item.add_argument("--manager", required=True)
+        if name in {"render-unit", "render-queued-unit"}: item.add_argument("--manager", required=True)
         if name in {"schedule-queued-input", "recover-queued-input"}:
             item.add_argument("--request", required=True); item.add_argument("--issuer", required=True)
+        if name == "start-queued-input": item.add_argument("--activation-id", required=True)
+        if name == "recover-queued-start":
+            item.add_argument("--activation-id", required=True); item.add_argument("--disposition", choices=("started", "not-started"), required=True)
     return result
 
 
@@ -652,12 +769,18 @@ def main(argv: list[str] | None = None) -> int:
         if args.command == "validate": print(json.dumps({"valid": True, "roleId": role["roleId"], "humanFacing": role["humanFacing"]}, sort_keys=True))
         elif args.command == "launch-argv": print(json.dumps({"argv": launch_args(role), "humanFacingGranted": role["humanFacing"]}, sort_keys=True))
         elif args.command == "render-unit": print(render_unit(role, Path(args.manager)), end="")
+        elif args.command == "render-queued-unit": print(render_queued_unit(role, Path(args.manager)), end="")
+        elif args.command == "queued-start-schema": print(json.dumps(queued_service_start_schema(), sort_keys=True, indent=2))
         elif args.command in {"schedule-queued-input", "recover-queued-input"}:
             request_data = read_secure_bytes(Path(args.request), Path(args.durable_root), "queued-input request", limit=131072)
             request = decode_json(request_data, "queued-input request")
             issuer_data = read_secure_bytes(Path(args.issuer), Path(args.durable_root), "tasking issuer route", limit=32768)
             issuer = decode_json(issuer_data, "tasking issuer route")
             print(json.dumps(schedule_queued_input(role, request, Path(args.durable_root), issuer, recover=args.command == "recover-queued-input"), sort_keys=True))
+        elif args.command == "start-queued-input":
+            print(json.dumps(start_queued_input_service(role, args.activation_id, Path(args.durable_root)), sort_keys=True))
+        elif args.command == "recover-queued-start":
+            print(json.dumps(recover_queued_input_start(role, args.activation_id, args.disposition), sort_keys=True))
         else:
             activation_path = None
             if args.activation_id:
