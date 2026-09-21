@@ -35,6 +35,8 @@ class RoleLifecycleTests(unittest.TestCase):
         self.session = {"agent": "pi", "kind": "path", "source": "herdr:pi", "value": str(self.root / "session.jsonl")}
         self.issuer = self.route("issuer", "wi", "wi:p1", "termi")
         self.parent = self.route("parent", "wp", "wp:p1", "termp")
+        self.tasking_parent = {key: self.parent[key] for key in ("workspaceId", "paneId", "terminalId", "agentSession")}
+        self.parent_assignment = {"paneId": "wp:p1", "workspaceId": "wp", "agent": "pi", "agentSession": self.session, "assignedByPaneId": "controller:p1", "boundAt": "2026-09-21T04:00:00Z"}
         self.prompt = self.root / "prompt.txt"; self.secure_write(self.prompt, "Do the exact bounded assignment.\n")
         self.activation = self.role_dir / "activation.json"
         self.ack_socket = self.root / "a.sock"
@@ -52,14 +54,14 @@ class RoleLifecycleTests(unittest.TestCase):
         return {"name": name, "workspaceId": workspace, "paneId": pane, "terminalId": terminal, "agentSession": self.session if hasattr(self, "session") else {"agent": "pi", "kind": "path", "source": "herdr:pi", "value": str(self.root / "session.jsonl")}}
 
     def base_manifest(self):
-        return {"version": 1, "roleId": "owner-1", "roleClass": "implementation-owner", "workspace": {"id": "w1", "path": str(self.worktree)}, "paneId": "w1:p2", "terminalId": "term2", "agentSession": self.session, "task": {"id": "100", "source": "todo"}, "mailboxPath": str(self.root / "mailbox.jsonl"), "reportRoute": self.parent, "authorizedIssuer": self.issuer, "stateDir": str(self.role_dir / "state"), "activationPath": str(self.activation), "executables": {"herdr": str(self.herdr), "pi": str(self.pi), "python": str(self.python), "systemdNotify": str(self.notify), "systemctl": str(self.systemctl)}, "humanFacing": False, "reportAcknowledgement": {"endpointPath": str(self.ack_socket), "delegationId": "delegation-1", "parentTaskId": 100, "parentAssignment": "Deliver the exact report.", "parentRoute": self.parent}}
+        return {"version": 1, "roleId": "owner-1", "roleClass": "implementation-owner", "workspace": {"id": "w1", "path": str(self.worktree)}, "paneId": "w1:p2", "terminalId": "term2", "agentSession": self.session, "task": {"id": "100", "source": "todo"}, "mailboxPath": str(self.root / "mailbox.jsonl"), "reportRoute": self.parent, "authorizedIssuer": self.issuer, "stateDir": str(self.role_dir / "state"), "activationPath": str(self.activation), "executables": {"herdr": str(self.herdr), "pi": str(self.pi), "python": str(self.python), "systemdNotify": str(self.notify), "systemctl": str(self.systemctl)}, "humanFacing": False, "reportAcknowledgement": {"endpointPath": str(self.ack_socket), "delegationId": "CCCCCCCCCCCCCCCCCCCCCC", "parentTaskId": 100, "parentAssignment": self.parent_assignment, "parentRoute": self.tasking_parent}}
 
     def activation_value(self):
         prompt_digest = hashlib.sha256(self.prompt.read_bytes()).hexdigest()
         return {"version": 1, "roleId": "owner-1", "executionId": "exec-1", "kind": "assignment", "canonicalTask": self.manifest["task"], "issuer": self.issuer, "senderRoute": self.issuer, "parentRoute": self.parent, "promptPath": str(self.prompt), "promptDigest": prompt_digest}
 
     def parent_ack_request(self, acknowledgement_id="abcdef0123456789abcdef0123456789"):
-        return {"kind": "pi-tasking.report-parent-acknowledgement", "version": 1, "acknowledgementId": acknowledgement_id, "target": lifecycle.role_route(self.validated()), "attemptId": "attempt-1", "reportId": "report-1", "delegationId": "delegation-1", "parentTaskId": 100, "sequence": 1, "sha256": "1" * 64, "parentAssignment": "Deliver the exact report.", "parentRoute": self.parent, "acknowledgedBy": self.parent, "receiptId": "parent-receipt-1", "confirmedAt": "2026-09-21T05:00:00Z"}
+        return {"kind": "pi-tasking.report-parent-acknowledgement", "version": 1, "acknowledgementId": acknowledgement_id, "target": lifecycle.role_route(self.validated()), "attemptId": "AAAAAAAAAAAAAAAAAAAAAA", "reportId": "BBBBBBBBBBBBBBBBBBBBBB", "delegationId": "CCCCCCCCCCCCCCCCCCCCCC", "parentTaskId": 100, "sequence": 1, "sha256": "1" * 64, "parentAssignment": self.parent_assignment, "parentRoute": self.tasking_parent, "acknowledgedBy": self.tasking_parent, "receiptId": "parent-receipt-1", "confirmedAt": "2026-09-21T05:00:00Z"}
 
     def start_ack_listener(self, response_factory, frames, durable_marker=None, mode=0o600):
         ready = threading.Event()
@@ -289,15 +291,26 @@ else: sys.exit(9)
         role = self.validated(); request = self.parent_ack_request()
         lifecycle.validate_parent_ack_request(role, request)
         fixture_path = Path(__file__).parents[1] / "tests/fixtures/report_parent_acknowledgement_v1.json"
-        fixture = json.loads(fixture_path.read_text()); fixture["target"] = lifecycle.role_route(role); fixture["parentRoute"] = self.parent; fixture["acknowledgedBy"] = self.parent
+        fixture = json.loads(fixture_path.read_text()); fixture["target"] = lifecycle.role_route(role); fixture["parentRoute"] = self.tasking_parent; fixture["acknowledgedBy"] = self.tasking_parent; fixture["parentAssignment"] = self.parent_assignment
         lifecycle.validate_parent_ack_request(role, fixture)
         def reject_live(*_): raise lifecycle.LifecycleError("live parent issuer route/session mismatch")
         live_mismatch = lifecycle.deliver_parent_acknowledgement(role, request, self.root, verify_parent=reject_live)
         self.assertEqual(live_mismatch["outcome"], "rejected"); self.assertIn("live parent", live_mismatch["reason"])
-        for field, value in (("delegationId", "other"), ("parentTaskId", 101), ("parentAssignment", "other"), ("acknowledgedBy", self.issuer), ("target", self.issuer), ("sha256", "0" * 63)):
+        assignment_extra = dict(self.parent_assignment, extra="forbidden")
+        route_extra = dict(self.tasking_parent, name="forbidden")
+        route_session_extra = json.loads(json.dumps(self.tasking_parent)); route_session_extra["agentSession"]["extra"] = "forbidden"
+        for field, value in (("attemptId", "A" * 21), ("reportId", "B" * 23), ("delegationId", "other"), ("parentTaskId", 101), ("parentAssignment", assignment_extra), ("parentRoute", route_extra), ("acknowledgedBy", route_session_extra), ("acknowledgedBy", self.issuer), ("target", self.issuer), ("sha256", "0" * 63)):
             bad = dict(request); bad[field] = value
             result = lifecycle.deliver_parent_acknowledgement(role, bad, self.root)
             self.assertEqual(result["outcome"], "rejected", field)
+        bad = dict(request); bad["extra"] = True
+        self.assertEqual(lifecycle.deliver_parent_acknowledgement(role, bad, self.root)["outcome"], "rejected")
+        bad_result = {"kind": "pi-tasking.report-parent-acknowledgement-result", "version": 1, "acknowledgementId": request["acknowledgementId"], "attemptId": request["attemptId"], "reportId": request["reportId"], "outcome": "uncertain", "extra": True}
+        with self.assertRaises(lifecycle.LifecycleError): lifecycle.validate_parent_ack_result(request, bad_result)
+        for field, value in (("delegationId", "short"), ("parentAssignment", assignment_extra), ("parentRoute", route_extra)):
+            bad_manifest = json.loads(json.dumps(self.manifest)); bad_manifest["reportAcknowledgement"][field] = value
+            with self.assertRaises(lifecycle.LifecycleError, msg=field):
+                lifecycle.validate_manifest(bad_manifest, self.manifest_path, self.root)
         artifact = Path(__file__).parents[1] / "docs/next/report-parent-acknowledgement-v1.schema.json"
         self.assertEqual(json.loads(artifact.read_text()), lifecycle.parent_ack_schemas())
 

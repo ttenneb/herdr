@@ -13,15 +13,26 @@
       "value": "/home/example/child-session.jsonl"
     }
   },
-  "attemptId": "attempt-1",
-  "reportId": "report-1",
-  "delegationId": "delegation-1",
+  "attemptId": "AAAAAAAAAAAAAAAAAAAAAA",
+  "reportId": "BBBBBBBBBBBBBBBBBBBBBB",
+  "delegationId": "CCCCCCCCCCCCCCCCCCCCCC",
   "parentTaskId": 100,
   "sequence": 1,
   "sha256": "1111111111111111111111111111111111111111111111111111111111111111",
-  "parentAssignment": "Deliver the exact report.",
+  "parentAssignment": {
+    "paneId": "wp:p1",
+    "workspaceId": "wp",
+    "agent": "pi",
+    "agentSession": {
+      "agent": "pi",
+      "kind": "path",
+      "source": "herdr:pi",
+      "value": "/home/example/parent-session.jsonl"
+    },
+    "assignedByPaneId": "controller:p1",
+    "boundAt": "2026-09-21T04:00:00Z"
+  },
   "parentRoute": {
-    "name": "parent",
     "workspaceId": "wp",
     "paneId": "wp:p1",
     "terminalId": "termp",
@@ -33,7 +44,6 @@
     }
   },
   "acknowledgedBy": {
-    "name": "parent",
     "workspaceId": "wp",
     "paneId": "wp:p1",
     "terminalId": "termp",

@@ -26,6 +26,8 @@ from typing import Any
 
 ROLE_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$")
 SHA256 = re.compile(r"^[0-9a-f]{64}$")
+TASKING_ID = re.compile(r"^[A-Za-z0-9_-]{22}$")
+TASKING_UNSAFE = re.compile(r"[\u0000-\u001f\u007f-\u009f\u200e\u200f\u202a-\u202e\u2066-\u2069]")
 HUMAN_ROLES = {"user-facing-pm", "human-facing-controller"}
 TERMINAL_STATES = {"completed", "failed", "hibernate_failed", "rejected"}
 ACTIVATION_ID = re.compile(r"^(?:[0-9a-f]{32}|[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12})$")
@@ -38,8 +40,6 @@ ROLE_RATE_WINDOW_MS = 60_000
 ROLE_QUEUE_LIMIT = 32
 MAX_ACK_BYTES = 32768
 MAX_ACK_ID_BYTES = 256
-MAX_ACK_ROUTE_BYTES = 512
-MAX_ACK_ASSIGNMENT_BYTES = 8192
 MAX_UNIX_SOCKET_PATH_BYTES = 100
 
 
@@ -165,6 +165,45 @@ def exact_route(value: Any, where: str) -> dict[str, Any]:
     return route
 
 
+def tasking_safe(value: str, maximum: int) -> bool:
+    return bool(value) and len(value.encode()) <= maximum and TASKING_UNSAFE.search(value) is None
+
+
+def exact_tasking_route(value: Any, where: str) -> dict[str, Any]:
+    required = {"workspaceId", "paneId", "terminalId", "agentSession"}
+    if not isinstance(value, dict) or set(value) != required:
+        raise LifecycleError(f"{where} must be the exact four-field tasking HerdrIdentity")
+    session = value.get("agentSession")
+    if not isinstance(session, dict) or set(session) != {"agent", "kind", "source", "value"}:
+        raise LifecycleError(f"{where}.agentSession fields are invalid")
+    route = {key: require_string(value, key, where) for key in ("workspaceId", "paneId", "terminalId")}
+    route["agentSession"] = {key: require_string(session, key, f"{where}.agentSession") for key in ("agent", "kind", "source", "value")}
+    strings = [route[key] for key in ("workspaceId", "paneId", "terminalId")] + list(route["agentSession"].values())
+    if route["agentSession"]["agent"] != "pi" or not all(tasking_safe(item, 128) for item in strings):
+        raise LifecycleError(f"{where} is not a bounded tasking HerdrIdentity")
+    return route
+
+
+def exact_task_assignment(value: Any, where: str) -> dict[str, Any]:
+    required = {"paneId", "workspaceId", "agent", "agentSession", "boundAt"}; optional = {"assignedByPaneId"}
+    if not isinstance(value, dict) or not required.issubset(value) or not set(value).issubset(required | optional):
+        raise LifecycleError(f"{where} must be an exact TaskAssignmentIdentityV1")
+    session = value.get("agentSession")
+    if not isinstance(session, dict) or set(session) != {"agent", "kind", "source", "value"}:
+        raise LifecycleError(f"{where}.agentSession fields are invalid")
+    assignment = {key: require_string(value, key, where) for key in ("paneId", "workspaceId", "agent", "boundAt")}
+    assignment["agentSession"] = {key: require_string(session, key, f"{where}.agentSession") for key in ("agent", "kind", "source", "value")}
+    if "assignedByPaneId" in value: assignment["assignedByPaneId"] = require_string(value, "assignedByPaneId", where)
+    strings = [assignment[key] for key in ("paneId", "workspaceId", "agent", "boundAt")] + list(assignment["agentSession"].values()) + ([assignment["assignedByPaneId"]] if "assignedByPaneId" in assignment else [])
+    if assignment["agent"] != assignment["agentSession"]["agent"] or assignment["agent"] != "pi" or not all(tasking_safe(item, 128) for item in strings):
+        raise LifecycleError(f"{where} is not a bounded TaskAssignmentIdentityV1")
+    return assignment
+
+
+def assignment_matches_route(assignment: dict[str, Any], route: dict[str, Any]) -> bool:
+    return assignment["workspaceId"] == route["workspaceId"] and assignment["paneId"] == route["paneId"] and assignment["agentSession"] == route["agentSession"] and assignment["agent"] == route["agentSession"]["agent"]
+
+
 def role_route(role: dict[str, Any]) -> dict[str, Any]:
     return {"workspaceId": role["workspace"]["id"], "paneId": role["paneId"], "terminalId": role["terminalId"], "agentSession": role["agentSession"]}
 
@@ -248,11 +287,12 @@ def validate_manifest(raw: dict[str, Any], manifest_path: Path, durable_root: Pa
         validate_secure_parents(endpoint, durable_root, "report acknowledgement endpoint")
         delegation_id = require_string(acknowledgement, "delegationId", "manifest.reportAcknowledgement")
         parent_task_id = acknowledgement.get("parentTaskId")
-        assignment = require_string(acknowledgement, "parentAssignment", "manifest.reportAcknowledgement")
-        acknowledgement_route = exact_route(acknowledgement.get("parentRoute"), "manifest.reportAcknowledgement.parentRoute")
-        if len(delegation_id.encode()) > MAX_ACK_ID_BYTES or not isinstance(parent_task_id, int) or isinstance(parent_task_id, bool) or parent_task_id <= 0 or parent_task_id > 9_007_199_254_740_991:
+        assignment = exact_task_assignment(acknowledgement.get("parentAssignment"), "manifest.reportAcknowledgement.parentAssignment")
+        acknowledgement_route = exact_tasking_route(acknowledgement.get("parentRoute"), "manifest.reportAcknowledgement.parentRoute")
+        tasking_report_route = exact_tasking_route({key: report_route[key] for key in ("workspaceId", "paneId", "terminalId", "agentSession")}, "manifest.reportRoute")
+        if not TASKING_ID.fullmatch(delegation_id) or not isinstance(parent_task_id, int) or isinstance(parent_task_id, bool) or parent_task_id <= 0 or parent_task_id > 9_007_199_254_740_991:
             raise LifecycleError("manifest report acknowledgement delegation/task is out of bounds")
-        if len(assignment.encode()) > MAX_ACK_ASSIGNMENT_BYTES or acknowledgement_route != report_route:
+        if acknowledgement_route != tasking_report_route or not assignment_matches_route(assignment, acknowledgement_route):
             raise LifecycleError("manifest report acknowledgement assignment/parent route mismatch")
         result["reportAcknowledgement"] = {"endpointPath": str(endpoint), "delegationId": delegation_id, "parentTaskId": parent_task_id, "parentAssignment": assignment, "parentRoute": acknowledgement_route}
     return result
@@ -786,8 +826,13 @@ def validate_parent_ack_request(role: dict[str, Any], request: dict[str, Any]) -
     acknowledgement_id = bounded_identifier(request.get("acknowledgementId"), "acknowledgementId")
     if not ACTIVATION_ID.fullmatch(acknowledgement_id):
         raise LifecycleError("acknowledgementId must be a canonical random 128-bit ID")
-    for field in ("attemptId", "reportId", "delegationId", "receiptId"):
-        bounded_identifier(request.get(field), field)
+    for field in ("attemptId", "reportId", "delegationId"):
+        identifier = bounded_identifier(request.get(field), field)
+        if not TASKING_ID.fullmatch(identifier):
+            raise LifecycleError(f"{field} must be a canonical 22-character tasking ID")
+    receipt_id = bounded_identifier(request.get("receiptId"), "receiptId")
+    if not tasking_safe(receipt_id, 256):
+        raise LifecycleError("receiptId is not tasking-safe")
     target = request.get("target")
     if target != role_route(role):
         raise LifecycleError("acknowledgement target is not the exact child role/session")
@@ -798,14 +843,11 @@ def validate_parent_ack_request(role: dict[str, Any], request: dict[str, Any]) -
     if not isinstance(parent_task_id, int) or isinstance(parent_task_id, bool) or parent_task_id <= 0 or not isinstance(sequence, int) or isinstance(sequence, bool) or sequence <= 0 or max(parent_task_id, sequence) > 9_007_199_254_740_991:
         raise LifecycleError("parent task or report sequence is invalid")
     digest = require_digest(request, "sha256", "acknowledgement")
-    assignment = request.get("parentAssignment")
-    if not isinstance(assignment, str) or not assignment or len(assignment.encode()) > MAX_ACK_ASSIGNMENT_BYTES:
-        raise LifecycleError("parent assignment is invalid")
-    parent_route = exact_route(request.get("parentRoute"), "acknowledgement.parentRoute")
-    acknowledged_by = exact_route(request.get("acknowledgedBy"), "acknowledgement.acknowledgedBy")
-    for route in (parent_route, acknowledged_by):
-        if any(len(str(value).encode()) > MAX_ACK_ROUTE_BYTES for key, value in route.items() if key != "agentSession") or any(len(value.encode()) > MAX_ACK_ROUTE_BYTES for value in route["agentSession"].values()):
-            raise LifecycleError("parent route string exceeds bounds")
+    assignment = exact_task_assignment(request.get("parentAssignment"), "acknowledgement.parentAssignment")
+    parent_route = exact_tasking_route(request.get("parentRoute"), "acknowledgement.parentRoute")
+    acknowledged_by = exact_tasking_route(request.get("acknowledgedBy"), "acknowledgement.acknowledgedBy")
+    if not assignment_matches_route(assignment, parent_route):
+        raise LifecycleError("parent assignment does not match the exact parent route")
     if parent_route != acknowledged_by or parent_route != authority["parentRoute"] or request["delegationId"] != authority["delegationId"] or parent_task_id != authority["parentTaskId"] or assignment != authority["parentAssignment"]:
         raise LifecycleError("parent issuer/delegation/task/assignment/route authority mismatch")
     confirmed_at = request.get("confirmedAt")
@@ -928,9 +970,12 @@ def deliver_parent_acknowledgement(role: dict[str, Any], request: dict[str, Any]
 
 
 def parent_ack_schemas() -> dict[str, Any]:
-    route = {"type": "object", "additionalProperties": False, "required": ["workspaceId", "paneId", "terminalId", "agentSession"], "properties": {"name": {"type": "string", "maxLength": MAX_ACK_ROUTE_BYTES}, "workspaceId": {"type": "string", "maxLength": MAX_ACK_ROUTE_BYTES}, "paneId": {"type": "string", "maxLength": MAX_ACK_ROUTE_BYTES}, "terminalId": {"type": "string", "maxLength": MAX_ACK_ROUTE_BYTES}, "agentSession": {"type": "object", "additionalProperties": False, "required": ["agent", "kind", "source", "value"], "properties": {key: {"type": "string", "maxLength": MAX_ACK_ROUTE_BYTES} for key in ("agent", "kind", "source", "value")}}}}
-    request_properties = {"kind": {"const": "pi-tasking.report-parent-acknowledgement"}, "version": {"const": 1}, "acknowledgementId": {"type": "string", "pattern": ACTIVATION_ID.pattern}, "target": route, "attemptId": {"type": "string", "maxLength": MAX_ACK_ID_BYTES}, "reportId": {"type": "string", "maxLength": MAX_ACK_ID_BYTES}, "delegationId": {"type": "string", "maxLength": MAX_ACK_ID_BYTES}, "parentTaskId": {"type": "integer", "minimum": 1}, "sequence": {"type": "integer", "minimum": 1}, "sha256": {"type": "string", "pattern": SHA256.pattern}, "parentAssignment": {"type": "string", "maxLength": MAX_ACK_ASSIGNMENT_BYTES}, "parentRoute": route, "acknowledgedBy": route, "receiptId": {"type": "string", "maxLength": MAX_ACK_ID_BYTES}, "confirmedAt": {"type": "string", "maxLength": 64}}
-    result_properties = {"kind": {"const": "pi-tasking.report-parent-acknowledgement-result"}, "version": {"const": 1}, "acknowledgementId": {"type": "string", "pattern": ACTIVATION_ID.pattern}, "attemptId": {"type": "string", "maxLength": MAX_ACK_ID_BYTES}, "reportId": {"type": "string", "maxLength": MAX_ACK_ID_BYTES}, "outcome": {"enum": ["confirmed", "duplicate", "uncertain", "rejected"]}, "receiptId": {"type": "string", "maxLength": MAX_ACK_ID_BYTES}, "reason": {"type": "string", "maxLength": 4096}}
+    session = {"type": "object", "additionalProperties": False, "required": ["agent", "kind", "source", "value"], "properties": {"agent": {"const": "pi"}, **{key: {"type": "string", "minLength": 1, "maxLength": 128} for key in ("kind", "source", "value")}}}
+    route = {"type": "object", "additionalProperties": False, "required": ["workspaceId", "paneId", "terminalId", "agentSession"], "properties": {**{key: {"type": "string", "minLength": 1, "maxLength": 128} for key in ("workspaceId", "paneId", "terminalId")}, "agentSession": session}}
+    assignment = {"type": "object", "additionalProperties": False, "required": ["paneId", "workspaceId", "agent", "agentSession", "boundAt"], "properties": {"paneId": {"type": "string", "minLength": 1, "maxLength": 128}, "workspaceId": {"type": "string", "minLength": 1, "maxLength": 128}, "agent": {"const": "pi"}, "agentSession": session, "assignedByPaneId": {"type": "string", "minLength": 1, "maxLength": 128}, "boundAt": {"type": "string", "minLength": 1, "maxLength": 128}}}
+    tasking_id = {"type": "string", "pattern": TASKING_ID.pattern}
+    request_properties = {"kind": {"const": "pi-tasking.report-parent-acknowledgement"}, "version": {"const": 1}, "acknowledgementId": {"type": "string", "pattern": ACTIVATION_ID.pattern}, "target": route, "attemptId": tasking_id, "reportId": tasking_id, "delegationId": tasking_id, "parentTaskId": {"type": "integer", "minimum": 1}, "sequence": {"type": "integer", "minimum": 1}, "sha256": {"type": "string", "pattern": SHA256.pattern}, "parentAssignment": assignment, "parentRoute": route, "acknowledgedBy": route, "receiptId": {"type": "string", "minLength": 1, "maxLength": MAX_ACK_ID_BYTES}, "confirmedAt": {"type": "string", "maxLength": 64}}
+    result_properties = {"kind": {"const": "pi-tasking.report-parent-acknowledgement-result"}, "version": {"const": 1}, "acknowledgementId": {"type": "string", "pattern": ACTIVATION_ID.pattern}, "attemptId": tasking_id, "reportId": tasking_id, "outcome": {"enum": ["confirmed", "duplicate", "uncertain", "rejected"]}, "receiptId": {"type": "string", "maxLength": MAX_ACK_ID_BYTES}, "reason": {"type": "string", "maxLength": 4096}}
     return {"request": {"$schema": "https://json-schema.org/draft/2020-12/schema", "title": "Pi tasking exact-parent acknowledgement request v1", "type": "object", "additionalProperties": False, "maxProperties": len(request_properties), "required": list(request_properties), "properties": request_properties}, "result": {"$schema": "https://json-schema.org/draft/2020-12/schema", "title": "Pi tasking exact-parent acknowledgement result v1", "type": "object", "additionalProperties": False, "required": ["kind", "version", "acknowledgementId", "attemptId", "reportId", "outcome"], "properties": result_properties}}
 
 

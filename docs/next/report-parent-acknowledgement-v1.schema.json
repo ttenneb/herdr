@@ -11,19 +11,21 @@
             "additionalProperties": false,
             "properties": {
               "agent": {
-                "maxLength": 512,
-                "type": "string"
+                "const": "pi"
               },
               "kind": {
-                "maxLength": 512,
+                "maxLength": 128,
+                "minLength": 1,
                 "type": "string"
               },
               "source": {
-                "maxLength": 512,
+                "maxLength": 128,
+                "minLength": 1,
                 "type": "string"
               },
               "value": {
-                "maxLength": 512,
+                "maxLength": 128,
+                "minLength": 1,
                 "type": "string"
               }
             },
@@ -35,20 +37,19 @@
             ],
             "type": "object"
           },
-          "name": {
-            "maxLength": 512,
-            "type": "string"
-          },
           "paneId": {
-            "maxLength": 512,
+            "maxLength": 128,
+            "minLength": 1,
             "type": "string"
           },
           "terminalId": {
-            "maxLength": 512,
+            "maxLength": 128,
+            "minLength": 1,
             "type": "string"
           },
           "workspaceId": {
-            "maxLength": 512,
+            "maxLength": 128,
+            "minLength": 1,
             "type": "string"
           }
         },
@@ -65,7 +66,7 @@
         "type": "string"
       },
       "attemptId": {
-        "maxLength": 256,
+        "pattern": "^[A-Za-z0-9_-]{22}$",
         "type": "string"
       },
       "confirmedAt": {
@@ -73,36 +74,37 @@
         "type": "string"
       },
       "delegationId": {
-        "maxLength": 256,
+        "pattern": "^[A-Za-z0-9_-]{22}$",
         "type": "string"
       },
       "kind": {
         "const": "pi-tasking.report-parent-acknowledgement"
       },
       "parentAssignment": {
-        "maxLength": 8192,
-        "type": "string"
-      },
-      "parentRoute": {
         "additionalProperties": false,
         "properties": {
+          "agent": {
+            "const": "pi"
+          },
           "agentSession": {
             "additionalProperties": false,
             "properties": {
               "agent": {
-                "maxLength": 512,
-                "type": "string"
+                "const": "pi"
               },
               "kind": {
-                "maxLength": 512,
+                "maxLength": 128,
+                "minLength": 1,
                 "type": "string"
               },
               "source": {
-                "maxLength": 512,
+                "maxLength": 128,
+                "minLength": 1,
                 "type": "string"
               },
               "value": {
-                "maxLength": 512,
+                "maxLength": 128,
+                "minLength": 1,
                 "type": "string"
               }
             },
@@ -114,20 +116,82 @@
             ],
             "type": "object"
           },
-          "name": {
-            "maxLength": 512,
+          "assignedByPaneId": {
+            "maxLength": 128,
+            "minLength": 1,
+            "type": "string"
+          },
+          "boundAt": {
+            "maxLength": 128,
+            "minLength": 1,
             "type": "string"
           },
           "paneId": {
-            "maxLength": 512,
-            "type": "string"
-          },
-          "terminalId": {
-            "maxLength": 512,
+            "maxLength": 128,
+            "minLength": 1,
             "type": "string"
           },
           "workspaceId": {
-            "maxLength": 512,
+            "maxLength": 128,
+            "minLength": 1,
+            "type": "string"
+          }
+        },
+        "required": [
+          "paneId",
+          "workspaceId",
+          "agent",
+          "agentSession",
+          "boundAt"
+        ],
+        "type": "object"
+      },
+      "parentRoute": {
+        "additionalProperties": false,
+        "properties": {
+          "agentSession": {
+            "additionalProperties": false,
+            "properties": {
+              "agent": {
+                "const": "pi"
+              },
+              "kind": {
+                "maxLength": 128,
+                "minLength": 1,
+                "type": "string"
+              },
+              "source": {
+                "maxLength": 128,
+                "minLength": 1,
+                "type": "string"
+              },
+              "value": {
+                "maxLength": 128,
+                "minLength": 1,
+                "type": "string"
+              }
+            },
+            "required": [
+              "agent",
+              "kind",
+              "source",
+              "value"
+            ],
+            "type": "object"
+          },
+          "paneId": {
+            "maxLength": 128,
+            "minLength": 1,
+            "type": "string"
+          },
+          "terminalId": {
+            "maxLength": 128,
+            "minLength": 1,
+            "type": "string"
+          },
+          "workspaceId": {
+            "maxLength": 128,
+            "minLength": 1,
             "type": "string"
           }
         },
@@ -145,10 +209,11 @@
       },
       "receiptId": {
         "maxLength": 256,
+        "minLength": 1,
         "type": "string"
       },
       "reportId": {
-        "maxLength": 256,
+        "pattern": "^[A-Za-z0-9_-]{22}$",
         "type": "string"
       },
       "sequence": {
@@ -166,19 +231,21 @@
             "additionalProperties": false,
             "properties": {
               "agent": {
-                "maxLength": 512,
-                "type": "string"
+                "const": "pi"
               },
               "kind": {
-                "maxLength": 512,
+                "maxLength": 128,
+                "minLength": 1,
                 "type": "string"
               },
               "source": {
-                "maxLength": 512,
+                "maxLength": 128,
+                "minLength": 1,
                 "type": "string"
               },
               "value": {
-                "maxLength": 512,
+                "maxLength": 128,
+                "minLength": 1,
                 "type": "string"
               }
             },
@@ -190,20 +257,19 @@
             ],
             "type": "object"
           },
-          "name": {
-            "maxLength": 512,
-            "type": "string"
-          },
           "paneId": {
-            "maxLength": 512,
+            "maxLength": 128,
+            "minLength": 1,
             "type": "string"
           },
           "terminalId": {
-            "maxLength": 512,
+            "maxLength": 128,
+            "minLength": 1,
             "type": "string"
           },
           "workspaceId": {
-            "maxLength": 512,
+            "maxLength": 128,
+            "minLength": 1,
             "type": "string"
           }
         },
@@ -248,7 +314,7 @@
         "type": "string"
       },
       "attemptId": {
-        "maxLength": 256,
+        "pattern": "^[A-Za-z0-9_-]{22}$",
         "type": "string"
       },
       "kind": {
@@ -271,7 +337,7 @@
         "type": "string"
       },
       "reportId": {
-        "maxLength": 256,
+        "pattern": "^[A-Za-z0-9_-]{22}$",
         "type": "string"
       },
       "version": {
