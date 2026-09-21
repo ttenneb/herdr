@@ -1065,14 +1065,33 @@ impl App {
             Ok(timeout) => timeout,
             Err(err) => return encode_error_body(id, self.agent_start_error_body(err)),
         };
-        let parent = match params
-            .delegation_parent_id
-            .as_deref()
-            .map(str::parse::<DelegationId>)
-            .transpose()
-        {
-            Ok(value) => value,
-            Err(err) => return encode_error(id, "invalid_delegation_id", err.to_string()),
+        let parent = match params.delegation_parent_id.as_deref() {
+            None => None,
+            Some(raw) => match raw.parse::<DelegationId>() {
+                Ok(parent) => Some(parent),
+                Err(_) => {
+                    let Some((_workspace, pane_id)) = self.parse_pane_id(raw) else {
+                        return encode_error(
+                            id,
+                            "invalid_delegation_id",
+                            "parent must be a delegation ID or a live pane with delegation provenance",
+                        );
+                    };
+                    let Some(record) = self
+                        .state
+                        .delegations
+                        .delegation_for_pane(pane_id)
+                        .filter(|record| !record.tombstone)
+                    else {
+                        return encode_error(
+                            id,
+                            "delegation_create_failed",
+                            "parent pane has no delegation provenance",
+                        );
+                    };
+                    Some(record.id)
+                }
+            },
         };
         if let Some(parent_id) = parent {
             if self.state.delegations.get(parent_id).is_none() {
@@ -1946,6 +1965,124 @@ mod tests {
             );
             assert!(aborted.get("error").is_none(), "{aborted}");
         }
+        std::fs::remove_dir_all(fake_root).expect("remove fake agent directory");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn helper_launch_resolves_live_parent_panes_and_rejects_stale_or_invalid_provenance() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let fake_root = std::env::temp_dir().join(format!(
+            "herdr-collection-helper-parent-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&fake_root);
+        std::fs::create_dir_all(&fake_root).expect("create fake agent directory");
+        let fake_pi = fake_root.join("pi");
+        std::fs::write(&fake_pi, "#!/bin/sh\nwhile IFS= read -r line; do :; done\n")
+            .expect("write fake pi");
+        let mut permissions = std::fs::metadata(&fake_pi)
+            .expect("fake pi metadata")
+            .permissions();
+        permissions.set_mode(0o700);
+        std::fs::set_permissions(&fake_pi, permissions).expect("make fake pi executable");
+
+        let (mut app, root, no_provenance, stale) = app_with_panes();
+        let collection_id = create_collection(&mut app, root);
+        let root_public = app.public_pane_id(0, root).expect("root public pane");
+        let no_provenance_public = app
+            .public_pane_id(0, no_provenance)
+            .expect("no-provenance public pane");
+        let stale_public = app.public_pane_id(0, stale).expect("stale public pane");
+        let parent = app
+            .state
+            .delegations
+            .create(Some(root), None, Some("parent".into()))
+            .expect("parent delegation");
+        app.state
+            .delegations
+            .create(Some(stale), None, Some("stale".into()))
+            .expect("stale delegation");
+        app.state
+            .delegations
+            .tombstone_pane(stale)
+            .expect("tombstone stale delegation");
+
+        let launch = |parent: String, name: &str| CollectionHelperLaunchParams {
+            collection_id: collection_id.clone(),
+            cwd: None,
+            env: std::collections::HashMap::from([(
+                "PATH".into(),
+                fake_root.display().to_string(),
+            )]),
+            delegation_parent_id: Some(parent),
+            purpose: Some("helper".into()),
+            name: name.into(),
+            kind: "pi".into(),
+            args: Vec::new(),
+            timeout_ms: Some(5_000),
+        };
+
+        let launched = request(
+            &mut app,
+            Method::CollectionHelperLaunch(launch(root_public, "provenance-helper")),
+        );
+        assert!(launched.get("error").is_none(), "{launched}");
+        let child = launched["result"]["launched"]["created"]["delegation_id"]
+            .as_str()
+            .expect("child delegation ID")
+            .parse::<DelegationId>()
+            .expect("valid child delegation ID");
+        assert_eq!(
+            app.state
+                .delegations
+                .get(child)
+                .and_then(|record| record.parent_id),
+            Some(parent)
+        );
+        let pane_id = launched["result"]["launched"]["created"]["pane"]["pane_id"]
+            .as_str()
+            .expect("helper pane")
+            .to_string();
+        let terminal_id = launched["result"]["launched"]["agent"]["terminal_id"]
+            .as_str()
+            .expect("helper terminal")
+            .to_string();
+        assert!(request(
+            &mut app,
+            Method::CollectionHelperAbort(CollectionHelperAbortParams {
+                collection_id: collection_id.clone(),
+                pane_id,
+                terminal_id,
+            }),
+        )
+        .get("error")
+        .is_none());
+
+        let malformed = request(
+            &mut app,
+            Method::CollectionHelperLaunch(launch("not-a-pane".into(), "bad-helper")),
+        );
+        assert_eq!(malformed["error"]["code"], "invalid_delegation_id");
+
+        let missing = request(
+            &mut app,
+            Method::CollectionHelperLaunch(launch(no_provenance_public, "missing-helper")),
+        );
+        assert_eq!(missing["error"]["code"], "delegation_create_failed");
+        assert!(missing["error"]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("no delegation provenance")));
+
+        let stale = request(
+            &mut app,
+            Method::CollectionHelperLaunch(launch(stale_public, "stale-helper")),
+        );
+        assert_eq!(stale["error"]["code"], "delegation_create_failed");
+        assert!(stale["error"]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("no delegation provenance")));
         std::fs::remove_dir_all(fake_root).expect("remove fake agent directory");
     }
 
