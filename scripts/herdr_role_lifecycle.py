@@ -698,6 +698,11 @@ def rollback_started(role: dict[str, Any], activation: dict[str, Any], state_dir
     return disposition
 
 
+def managed_generation(role: dict[str, Any], activation: dict[str, Any]) -> str:
+    material = json.dumps({"version": 1, "roleId": role["roleId"], "executionId": activation["executionId"], "promptDigest": activation["promptDigest"], "activationDigest": activation["activationDigest"]}, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode()
+    return "g" + hashlib.sha256(material).hexdigest()[:31]
+
+
 def lifecycle_run(role: dict[str, Any], durable_root: Path, poll_seconds: float, idle_timeout: float, activation_path: Path | None = None) -> None:
     state_dir = Path(role["stateDir"]); state_dir.mkdir(mode=0o700, parents=True, exist_ok=True); os.chmod(state_dir, 0o700)
     lock_stream = (state_dir / "manager.lock").open("a+")
@@ -718,7 +723,7 @@ def lifecycle_run(role: dict[str, Any], durable_root: Path, poll_seconds: float,
             atomic_json(state_dir / "relaunch-inhibit.json", receipt(role, "relaunch_inhibited", executionId=activation["executionId"], detail="pane was not provably hibernated before start"))
             update_queued_lifecycle_record(activation_path, "ambiguous_live_process_inhibited")
             raise LifecycleInhibited("pane was not provably hibernated; refusing ambiguous attach/retry")
-        generation = f"{role['roleId']}-{activation['executionId']}-{activation['promptDigest'][:12]}"
+        generation = managed_generation(role, activation)
         activation["preStartIdentity"] = {key: initial.get(key) for key in ("workspace_id", "pane_id", "terminal_id", "agent", "agent_status", "agent_session", "name", "revision", "state_change_seq")}
         atomic_json(current_path, receipt(role, "validated", executionId=activation["executionId"], activationDigest=activation["activationDigest"], promptDigest=activation["promptDigest"], issuer=activation["issuer"], senderRoute=activation["senderRoute"], parentRoute=activation["parentRoute"], generation=generation, preStartIdentity=activation["preStartIdentity"], gateAdmission="unknown", modelExecution="unknown", todoAcceptance="unknown"))
         argv = [herdr, "agent", "start", generation, "--kind", "pi", "--pane", role["paneId"], "--timeout", "30000", "--", *launch_args(role)[1:]]

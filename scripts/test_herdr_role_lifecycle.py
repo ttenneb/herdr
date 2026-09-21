@@ -93,7 +93,7 @@ class RoleLifecycleTests(unittest.TestCase):
     def fake_herdr(self):
         state = self.root / "fake-state.json"
         return f'''#!/usr/bin/python3
-import json,os,pathlib,sys
+import json,os,pathlib,re,sys
 state=pathlib.Path({str(state)!r}); mode=pathlib.Path({str(self.mode)!r}).read_text().strip(); events=pathlib.Path({str(self.events)!r})
 session={{"agent":"pi","kind":"path","source":"herdr:pi","value":{str(self.root / "session.jsonl")!r}}}
 def load(): return json.loads(state.read_text()) if state.exists() else {{"phase":"empty","name":None,"gets":0}}
@@ -119,6 +119,7 @@ if a[:2]==["agent","get"]:
 elif a[:2]==["pane","get"]:
  pane=agent(s,"unknown",False); pane["terminal_id"]="wrong" if mode=="production_agent_not_found_bad_pane" else "term2"; emit({{"pane":pane}})
 elif a[:2]==["agent","start"]:
+ if not re.fullmatch(r"[a-z][a-z0-9_-]{{0,31}}",a[2]): print(json.dumps({{"error":{{"code":"invalid_agent_name"}}}}),file=sys.stderr); sys.exit(1)
  s={{"phase":"started","name":a[2],"gets":0}}; save(s)
  if mode in ("start_malformed","cleanup_uncertain"): print("bad")
  else: emit({{"agent":agent(s,"idle")}})
@@ -163,11 +164,25 @@ else: sys.exit(9)
             value = self.activation_value(); value[field] = bad; self.write_activation(value)
             with self.assertRaises(lifecycle.LifecycleError, msg=field): lifecycle.load_activation(role, self.root)
 
+    def test_managed_generation_is_deterministic_safe_and_exactly_32_characters(self):
+        role = self.validated(); activation = lifecycle.load_activation(role, self.root)
+        generation = lifecycle.managed_generation(role, activation)
+        self.assertEqual(generation, lifecycle.managed_generation(role, activation))
+        self.assertEqual(len(generation), 32); self.assertRegex(generation, r"^[a-z][a-z0-9_-]{31}$")
+        variants = []
+        long_role = dict(role); long_role["roleId"] = "Z" + ".Mixed_UNSAFE-readable-prefix" * 4; variants.append(lifecycle.managed_generation(long_role, activation))
+        for field, value in (("executionId", "different-execution"), ("promptDigest", "2" * 64), ("activationDigest", "3" * 64)):
+            changed = dict(activation); changed[field] = value; variants.append(lifecycle.managed_generation(role, changed))
+        self.assertEqual(len(set([generation, *variants])), 5)
+        for value in variants:
+            self.assertEqual(len(value), 32); self.assertRegex(value, r"^[a-z][a-z0-9_-]{31}$")
+
     def test_run_records_bound_identity_starts_once_and_hibernates(self):
         role = self.validated(); lifecycle.lifecycle_run(role, self.root, 0.001, 1)
         final = json.loads((Path(role["stateDir"]) / "activation-receipt.json").read_text())
         self.assertEqual(final["phase"], "completed"); self.assertTrue(final["hibernated"]); self.assertEqual(final["gateAdmission"], "unknown")
         self.assertIn("activationDigest", final); self.assertIn("promptDigest", final); self.assertIn("generation", final)
+        self.assertEqual(len(final["generation"]), 32); self.assertRegex(final["generation"], r"^[a-z][a-z0-9_-]{0,31}$")
         events = self.events.read_text().splitlines(); self.assertEqual(sum(x == "herdr agent start" for x in events), 1); self.assertIn("herdr agent send-keys", events)
 
     def test_production_agent_not_found_preflight_accepts_only_exact_hibernated_pane(self):
