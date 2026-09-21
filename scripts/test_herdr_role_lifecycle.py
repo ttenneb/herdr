@@ -291,8 +291,21 @@ else: sys.exit(9)
         role = self.validated(); request = self.parent_ack_request()
         lifecycle.validate_parent_ack_request(role, request)
         fixture_path = Path(__file__).parents[1] / "tests/fixtures/report_parent_acknowledgement_v1.json"
-        fixture = json.loads(fixture_path.read_text()); fixture["target"] = lifecycle.role_route(role); fixture["parentRoute"] = self.tasking_parent; fixture["acknowledgedBy"] = self.tasking_parent; fixture["parentAssignment"] = self.parent_assignment
-        lifecycle.validate_parent_ack_request(role, fixture)
+        fixture = json.loads(fixture_path.read_text())
+        long_value = fixture["parentRoute"]["agentSession"]["value"]
+        self.assertGreater(len(long_value.encode()), 128); self.assertLessEqual(len(long_value.encode()), 512)
+        long_manifest = json.loads(json.dumps(self.manifest)); long_manifest["reportRoute"] = {"name": "parent", **fixture["parentRoute"]}
+        long_manifest["reportAcknowledgement"]["parentRoute"] = fixture["parentRoute"]
+        long_manifest["reportAcknowledgement"]["parentAssignment"] = fixture["parentAssignment"]
+        long_role = lifecycle.validate_manifest(long_manifest, self.manifest_path, self.root)
+        fixture["target"] = lifecycle.role_route(long_role)
+        lifecycle.validate_parent_ack_request(long_role, fixture)
+        overlong_route = json.loads(json.dumps(fixture["parentRoute"])); overlong_route["agentSession"]["value"] = "x" * 513
+        overlong_assignment = json.loads(json.dumps(fixture["parentAssignment"])); overlong_assignment["agentSession"]["value"] = "x" * 513
+        with self.assertRaises(lifecycle.LifecycleError): lifecycle.exact_tasking_route(overlong_route, "test.route")
+        with self.assertRaises(lifecycle.LifecycleError): lifecycle.exact_task_assignment(overlong_assignment, "test.assignment")
+        optional_overlong = json.loads(json.dumps(fixture["parentAssignment"])); optional_overlong["assignedByPaneId"] = "x" * 129
+        with self.assertRaises(lifecycle.LifecycleError): lifecycle.exact_task_assignment(optional_overlong, "test.assignment")
         def reject_live(*_): raise lifecycle.LifecycleError("live parent issuer route/session mismatch")
         live_mismatch = lifecycle.deliver_parent_acknowledgement(role, request, self.root, verify_parent=reject_live)
         self.assertEqual(live_mismatch["outcome"], "rejected"); self.assertIn("live parent", live_mismatch["reason"])

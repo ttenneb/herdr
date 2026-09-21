@@ -179,7 +179,7 @@ def exact_tasking_route(value: Any, where: str) -> dict[str, Any]:
     route = {key: require_string(value, key, where) for key in ("workspaceId", "paneId", "terminalId")}
     route["agentSession"] = {key: require_string(session, key, f"{where}.agentSession") for key in ("agent", "kind", "source", "value")}
     strings = [route[key] for key in ("workspaceId", "paneId", "terminalId")] + list(route["agentSession"].values())
-    if route["agentSession"]["agent"] != "pi" or not all(tasking_safe(item, 128) for item in strings):
+    if route["agentSession"]["agent"] != "pi" or not all(tasking_safe(item, 512) for item in strings):
         raise LifecycleError(f"{where} is not a bounded tasking HerdrIdentity")
     return route
 
@@ -194,8 +194,9 @@ def exact_task_assignment(value: Any, where: str) -> dict[str, Any]:
     assignment = {key: require_string(value, key, where) for key in ("paneId", "workspaceId", "agent", "boundAt")}
     assignment["agentSession"] = {key: require_string(session, key, f"{where}.agentSession") for key in ("agent", "kind", "source", "value")}
     if "assignedByPaneId" in value: assignment["assignedByPaneId"] = require_string(value, "assignedByPaneId", where)
-    strings = [assignment[key] for key in ("paneId", "workspaceId", "agent", "boundAt")] + list(assignment["agentSession"].values()) + ([assignment["assignedByPaneId"]] if "assignedByPaneId" in assignment else [])
-    if assignment["agent"] != assignment["agentSession"]["agent"] or assignment["agent"] != "pi" or not all(tasking_safe(item, 128) for item in strings):
+    required_strings = [assignment[key] for key in ("paneId", "workspaceId", "agent", "boundAt")] + list(assignment["agentSession"].values())
+    optional_valid = "assignedByPaneId" not in assignment or tasking_safe(assignment["assignedByPaneId"], 128)
+    if assignment["agent"] != assignment["agentSession"]["agent"] or assignment["agent"] != "pi" or not all(tasking_safe(item, 512) for item in required_strings) or not optional_valid:
         raise LifecycleError(f"{where} is not a bounded TaskAssignmentIdentityV1")
     return assignment
 
@@ -970,9 +971,9 @@ def deliver_parent_acknowledgement(role: dict[str, Any], request: dict[str, Any]
 
 
 def parent_ack_schemas() -> dict[str, Any]:
-    session = {"type": "object", "additionalProperties": False, "required": ["agent", "kind", "source", "value"], "properties": {"agent": {"const": "pi"}, **{key: {"type": "string", "minLength": 1, "maxLength": 128} for key in ("kind", "source", "value")}}}
-    route = {"type": "object", "additionalProperties": False, "required": ["workspaceId", "paneId", "terminalId", "agentSession"], "properties": {**{key: {"type": "string", "minLength": 1, "maxLength": 128} for key in ("workspaceId", "paneId", "terminalId")}, "agentSession": session}}
-    assignment = {"type": "object", "additionalProperties": False, "required": ["paneId", "workspaceId", "agent", "agentSession", "boundAt"], "properties": {"paneId": {"type": "string", "minLength": 1, "maxLength": 128}, "workspaceId": {"type": "string", "minLength": 1, "maxLength": 128}, "agent": {"const": "pi"}, "agentSession": session, "assignedByPaneId": {"type": "string", "minLength": 1, "maxLength": 128}, "boundAt": {"type": "string", "minLength": 1, "maxLength": 128}}}
+    session = {"type": "object", "additionalProperties": False, "required": ["agent", "kind", "source", "value"], "properties": {"agent": {"const": "pi"}, **{key: {"type": "string", "minLength": 1, "maxLength": 512} for key in ("kind", "source", "value")}}}
+    route = {"type": "object", "additionalProperties": False, "required": ["workspaceId", "paneId", "terminalId", "agentSession"], "properties": {**{key: {"type": "string", "minLength": 1, "maxLength": 512} for key in ("workspaceId", "paneId", "terminalId")}, "agentSession": session}}
+    assignment = {"type": "object", "additionalProperties": False, "required": ["paneId", "workspaceId", "agent", "agentSession", "boundAt"], "properties": {"paneId": {"type": "string", "minLength": 1, "maxLength": 512}, "workspaceId": {"type": "string", "minLength": 1, "maxLength": 512}, "agent": {"const": "pi"}, "agentSession": session, "assignedByPaneId": {"type": "string", "minLength": 1, "maxLength": 128}, "boundAt": {"type": "string", "minLength": 1, "maxLength": 512}}}
     tasking_id = {"type": "string", "pattern": TASKING_ID.pattern}
     request_properties = {"kind": {"const": "pi-tasking.report-parent-acknowledgement"}, "version": {"const": 1}, "acknowledgementId": {"type": "string", "pattern": ACTIVATION_ID.pattern}, "target": route, "attemptId": tasking_id, "reportId": tasking_id, "delegationId": tasking_id, "parentTaskId": {"type": "integer", "minimum": 1}, "sequence": {"type": "integer", "minimum": 1}, "sha256": {"type": "string", "pattern": SHA256.pattern}, "parentAssignment": assignment, "parentRoute": route, "acknowledgedBy": route, "receiptId": {"type": "string", "minLength": 1, "maxLength": MAX_ACK_ID_BYTES}, "confirmedAt": {"type": "string", "maxLength": 64}}
     result_properties = {"kind": {"const": "pi-tasking.report-parent-acknowledgement-result"}, "version": {"const": 1}, "acknowledgementId": {"type": "string", "pattern": ACTIVATION_ID.pattern}, "attemptId": tasking_id, "reportId": tasking_id, "outcome": {"enum": ["confirmed", "duplicate", "uncertain", "rejected"]}, "receiptId": {"type": "string", "maxLength": MAX_ACK_ID_BYTES}, "reason": {"type": "string", "maxLength": 4096}}

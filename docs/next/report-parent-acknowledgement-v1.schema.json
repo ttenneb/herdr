@@ -14,17 +14,17 @@
                 "const": "pi"
               },
               "kind": {
-                "maxLength": 128,
+                "maxLength": 512,
                 "minLength": 1,
                 "type": "string"
               },
               "source": {
-                "maxLength": 128,
+                "maxLength": 512,
                 "minLength": 1,
                 "type": "string"
               },
               "value": {
-                "maxLength": 128,
+                "maxLength": 512,
                 "minLength": 1,
                 "type": "string"
               }
@@ -38,17 +38,17 @@
             "type": "object"
           },
           "paneId": {
-            "maxLength": 128,
+            "maxLength": 512,
             "minLength": 1,
             "type": "string"
           },
           "terminalId": {
-            "maxLength": 128,
+            "maxLength": 512,
             "minLength": 1,
             "type": "string"
           },
           "workspaceId": {
-            "maxLength": 128,
+            "maxLength": 512,
             "minLength": 1,
             "type": "string"
           }
@@ -93,17 +93,17 @@
                 "const": "pi"
               },
               "kind": {
-                "maxLength": 128,
+                "maxLength": 512,
                 "minLength": 1,
                 "type": "string"
               },
               "source": {
-                "maxLength": 128,
+                "maxLength": 512,
                 "minLength": 1,
                 "type": "string"
               },
               "value": {
-                "maxLength": 128,
+                "maxLength": 512,
                 "minLength": 1,
                 "type": "string"
               }
@@ -122,17 +122,17 @@
             "type": "string"
           },
           "boundAt": {
-            "maxLength": 128,
+            "maxLength": 512,
             "minLength": 1,
             "type": "string"
           },
           "paneId": {
-            "maxLength": 128,
+            "maxLength": 512,
             "minLength": 1,
             "type": "string"
           },
           "workspaceId": {
-            "maxLength": 128,
+            "maxLength": 512,
             "minLength": 1,
             "type": "string"
           }
@@ -156,17 +156,17 @@
                 "const": "pi"
               },
               "kind": {
-                "maxLength": 128,
+                "maxLength": 512,
                 "minLength": 1,
                 "type": "string"
               },
               "source": {
-                "maxLength": 128,
+                "maxLength": 512,
                 "minLength": 1,
                 "type": "string"
               },
               "value": {
-                "maxLength": 128,
+                "maxLength": 512,
                 "minLength": 1,
                 "type": "string"
               }
@@ -180,17 +180,17 @@
             "type": "object"
           },
           "paneId": {
-            "maxLength": 128,
+            "maxLength": 512,
             "minLength": 1,
             "type": "string"
           },
           "terminalId": {
-            "maxLength": 128,
+            "maxLength": 512,
             "minLength": 1,
             "type": "string"
           },
           "workspaceId": {
-            "maxLength": 128,
+            "maxLength": 512,
             "minLength": 1,
             "type": "string"
           }
@@ -234,17 +234,17 @@
                 "const": "pi"
               },
               "kind": {
-                "maxLength": 128,
+                "maxLength": 512,
                 "minLength": 1,
                 "type": "string"
               },
               "source": {
-                "maxLength": 128,
+                "maxLength": 512,
                 "minLength": 1,
                 "type": "string"
               },
               "value": {
-                "maxLength": 128,
+                "maxLength": 512,
                 "minLength": 1,
                 "type": "string"
               }
@@ -258,17 +258,17 @@
             "type": "object"
           },
           "paneId": {
-            "maxLength": 128,
+            "maxLength": 512,
             "minLength": 1,
             "type": "string"
           },
           "terminalId": {
-            "maxLength": 128,
+            "maxLength": 512,
             "minLength": 1,
             "type": "string"
           },
           "workspaceId": {
-            "maxLength": 128,
+            "maxLength": 512,
             "minLength": 1,
             "type": "string"
           }

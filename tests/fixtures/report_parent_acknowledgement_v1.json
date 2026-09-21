@@ -27,7 +27,7 @@
       "agent": "pi",
       "kind": "path",
       "source": "herdr:pi",
-      "value": "/home/example/parent-session.jsonl"
+      "value": "/home/example/session-session-session-session-session-session-session-session-session-session-session-session-session-session-session-session-session-session-session-session-session-session-session-session-parent.jsonl"
     },
     "assignedByPaneId": "controller:p1",
     "boundAt": "2026-09-21T04:00:00Z"
@@ -40,7 +40,7 @@
       "agent": "pi",
       "kind": "path",
       "source": "herdr:pi",
-      "value": "/home/example/parent-session.jsonl"
+      "value": "/home/example/session-session-session-session-session-session-session-session-session-session-session-session-session-session-session-session-session-session-session-session-session-session-session-session-parent.jsonl"
     }
   },
   "acknowledgedBy": {
@@ -51,7 +51,7 @@
       "agent": "pi",
       "kind": "path",
       "source": "herdr:pi",
-      "value": "/home/example/parent-session.jsonl"
+      "value": "/home/example/session-session-session-session-session-session-session-session-session-session-session-session-session-session-session-session-session-session-session-session-session-session-session-session-parent.jsonl"
     }
   },
   "receiptId": "parent-receipt-1",

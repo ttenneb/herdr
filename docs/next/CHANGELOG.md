@@ -22,7 +22,7 @@
 - Custom themes can now define separate light and dark color overrides when automatic theme switching is enabled. (#837, thanks @aneym)
 
 ### Changed
-- Corrected the parent-acknowledgement wire to use tasking's exact assignment object, canonical 22-character IDs, and four-field Herdr identities while rejecting every additional property.
+- Corrected the parent-acknowledgement wire to use tasking's exact assignment object, canonical 22-character IDs, four-field Herdr identities, and authoritative 512-byte required-identity bounds while rejecting every additional property; optional `assignedByPaneId` remains capped at 128 bytes.
 - Space and tab activity now follow top-level agents while completed delegated subagents outside collections appear as a separate unread attention badge that clears when terminal input is delivered to their top-level parent. Completed collection members remain local to their collection, while blocked descendants still make the primary status red regardless of placement.
 - Newly expanded collection previews now automatically use at least half of the collection height while preserving explicit manual sizes.
 - `close_pane` now closes the focused collection through its promote-or-cascade flow when a collection leaf is focused; promotion preserves every member in its own standalone tab, `Shift+X` remains a collection-close alias, and bare list `x`/`Delete` still closes the selected member.
