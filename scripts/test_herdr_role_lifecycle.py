@@ -110,6 +110,8 @@ if a[:2]==["agent","get"]:
  if mode in ("production_agent_not_found","production_agent_not_found_bad_pane") and s["phase"]=="empty":
   print(json.dumps({{"id":"cli:agent:get","error":{{"code":"agent_not_found","message":"agent not found"}}}}),file=sys.stderr); sys.exit(1)
  if mode=="cleanup_uncertain" and s["phase"]=="started" and s.get("cleanup_failed"): print("bad"); sys.exit(0)
+ if mode in ("production_hibernate_not_found","production_hibernate_other_error") and s["phase"]=="exited":
+  code="agent_not_found" if mode=="production_hibernate_not_found" else "server_not_running"; print(json.dumps({{"id":"cli:agent:get","error":{{"code":code,"message":"post-hibernate observation"}}}}),file=sys.stderr); sys.exit(1)
  if s["phase"]=="empty": emit({{"agent":agent(s,"unknown",False)}})
  elif s["phase"]=="exited": emit({{"agent":agent({{"phase":"empty","name":None,"gets":s["gets"]}},"unknown",False)}})
  else:
@@ -181,6 +183,19 @@ else: sys.exit(9)
         with self.assertRaisesRegex(lifecycle.LifecycleError, "terminal_id mismatch"):
             lifecycle.lifecycle_run(role, self.root, 0.001, 1)
         self.assertEqual(self.events.read_text().splitlines().count("herdr agent start"), 1)
+
+    def test_post_hibernate_accepts_only_production_agent_not_found(self):
+        role = self.validated(); fake_state = self.root / "fake-state.json"
+        fake_state.write_text(json.dumps({"phase": "started", "name": "exact-generation", "gets": 0}))
+        self.secure_write(self.mode, "production_hibernate_not_found")
+        lifecycle.exact_hibernate(role, "exact-generation", timeout=0.2)
+        events = self.events.read_text().splitlines(); self.assertLess(events.index("herdr agent send-keys"), events.index("herdr agent get"))
+
+        fake_state.write_text(json.dumps({"phase": "started", "name": "exact-generation", "gets": 0}))
+        self.secure_write(self.mode, "production_hibernate_other_error")
+        with self.assertRaisesRegex(lifecycle.LifecycleError, "server_not_running"):
+            lifecycle.exact_hibernate(role, "exact-generation", timeout=0.2)
+        self.assertEqual(self.events.read_text().splitlines().count("herdr agent send-keys"), 2)
 
     def test_malformed_start_response_rolls_back_exact_generation(self):
         self.secure_write(self.mode, "start_malformed")

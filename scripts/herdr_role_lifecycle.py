@@ -648,13 +648,30 @@ def load_activation(role: dict[str, Any], durable_root: Path, activation_path: P
     return result
 
 
+def post_hibernate_agent_state(role: dict[str, Any]) -> dict[str, Any] | None:
+    argv = [role["executables"]["herdr"], "agent", "get", role["paneId"]]
+    try: process = subprocess.run(argv, check=False, capture_output=True, text=True, timeout=5, env=herdr_environment(role))
+    except (OSError, subprocess.TimeoutExpired) as exc: raise LifecycleError(f"command failed: {argv[0]}: {exc}") from exc
+    if process.returncode == 0:
+        try: value = json.loads(process.stdout)
+        except json.JSONDecodeError as exc: raise LifecycleError(f"command returned malformed JSON: {argv[0]}") from exc
+        if not isinstance(value, dict) or value.get("error") is not None: raise LifecycleError(f"command returned an error: {value}")
+        return agent_from(value)
+    try: error_value = json.loads(process.stderr)
+    except json.JSONDecodeError as exc: raise LifecycleError(f"command exited {process.returncode}: {argv[0]}: {process.stderr.strip()}") from exc
+    error = error_value.get("error") if isinstance(error_value, dict) else None
+    if isinstance(error, dict) and error.get("code") == "agent_not_found": return None
+    raise LifecycleError(f"command exited {process.returncode}: {argv[0]}: {process.stderr.strip()}")
+
+
 def exact_hibernate(role: dict[str, Any], generation: str, *, timeout: float = 8) -> None:
     herdr = role["executables"]["herdr"]
     run_json([herdr, "agent", "send-keys", role["paneId"], "--expected-terminal", role["terminalId"], "--expected-name", generation, "--", "ctrl+d"], timeout=5, env=herdr_environment(role))
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         time.sleep(0.05)
-        current = agent_from(run_json([herdr, "agent", "get", role["paneId"]], timeout=5, env=herdr_environment(role)))
+        current = post_hibernate_agent_state(role)
+        if current is None: return
         if current.get("terminal_id") != role["terminalId"]: raise LifecycleError("terminal changed while confirming hibernate")
         if current.get("agent_status") in {"unknown", "exited"} and current.get("agent") is None: return
     raise LifecycleError("exact managed-agent generation stayed live after graceful hibernate")
