@@ -69,6 +69,32 @@ The manager revalidates the scheduled activation and then executes exactly `SYST
 
 Before invoking systemctl, the manager durably records an uncertain exact start attempt. A successful acknowledgement becomes `accepted`; another call returns `duplicate` without invoking systemctl again. Timeout or lost acknowledgement remains `uncertain` and repeated calls do not retry. After external same-unit evidence, `recover-queued-start --disposition started` marks the attempt proven and returns `duplicate`; `--disposition not-started` terminates it as rejected and requires a new activation ID. Empty settlement, receipts, imports, status, heartbeat, supervisor observations, invalid IDs, and unscheduled IDs cannot reach systemctl.
 
+## Exact-parent report acknowledgement transport
+
+Herdr does have a production `handoff send` CLI, but it intentionally submits a normal prompt transaction and its receipt is nonterminal. It is therefore prohibited for report acknowledgement. Todo #20 instead uses a separate non-model Unix-socket transport owned by the child tasking adapter.
+
+A role that can receive acknowledgements adds `reportAcknowledgement` to its secure manifest. This pins an owner-controlled socket path, delegation ID, positive parent task ID, exact parent assignment, and exact parent route/session. The endpoint must be a regular Unix socket owned by the effective user with mode `0600`, beneath validated non-symlink/non-writable parents, and within the bounded Unix path length. The connected peer UID is verified with OS credentials. Neither side uses Pi input, an editor, a PTY, Gate admission, model APIs, Todo acceptance, status, heartbeat, or UI state.
+
+The parent transport writes an owner-only request file matching `docs/next/report-parent-acknowledgement-v1.schema.json`, then calls:
+
+```sh
+/usr/bin/python3 /absolute/herdr_role_lifecycle.py send-parent-ack \
+  --manifest /absolute/child-role.json \
+  --request /absolute/parent-ack.json
+```
+
+Before delivery, Herdr validates the exact live parent issuer route/session; exact child workspace, pane, terminal, and full Pi session; acknowledgement/attempt/report/delegation IDs; parent task; positive sequence; report digest; exact assignment; parent and acknowledging routes; parent receipt; and timestamp. It persists the complete request and its canonical digest under the child role state before the first socket connection. The child must durably append its authority and confirmed-send records before returning `confirmed`.
+
+Exact retries after an accepted child result return `duplicate` without reconnecting. Same acknowledgement ID with different content is rejected. A timeout, malformed result, or lost parent-side persistence acknowledgement stays `uncertain`; normal calls never resend it. Explicit recovery sends only a bounded query for the same ID, content digest, and child target:
+
+```sh
+/usr/bin/python3 /absolute/herdr_role_lifecycle.py recover-parent-ack \
+  --manifest /absolute/child-role.json \
+  --request /absolute/parent-ack.json
+```
+
+A child durable duplicate reconciles the intent without a second confirmation append. Transport acceptance, report import, UI/status, heartbeat, supervisor observation, and Todo acceptance cannot produce a confirmed result. The child adapter listener is the only authority that can return the tasking receipt after its own durable confirmation.
+
 ## User-systemd design
 
 Generate a role-specific unit with:

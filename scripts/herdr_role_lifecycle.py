@@ -8,13 +8,16 @@ receipts as model-turn triggers or acceptance evidence.
 from __future__ import annotations
 
 import argparse
+import datetime as dt
 import fcntl
 import hashlib
 import json
 import os
 from pathlib import Path
 import re
+import socket
 import stat
+import struct
 import subprocess
 import sys
 import tempfile
@@ -33,6 +36,11 @@ MAX_CORRELATIONS = 32
 ROLE_RATE_LIMIT = 8
 ROLE_RATE_WINDOW_MS = 60_000
 ROLE_QUEUE_LIMIT = 32
+MAX_ACK_BYTES = 32768
+MAX_ACK_ID_BYTES = 256
+MAX_ACK_ROUTE_BYTES = 512
+MAX_ACK_ASSIGNMENT_BYTES = 8192
+MAX_UNIX_SOCKET_PATH_BYTES = 100
 
 
 class LifecycleError(RuntimeError):
@@ -232,6 +240,21 @@ def validate_manifest(raw: dict[str, Any], manifest_path: Path, durable_root: Pa
             raise LifecycleError("human-facing grant is not exactly bound to issuer/task/role/routes")
         result["humanFacingGrantPath"] = str(grant_file)
         result["humanFacingGrantDigest"] = grant_digest
+    acknowledgement = raw.get("reportAcknowledgement")
+    if acknowledgement is not None:
+        if not isinstance(acknowledgement, dict) or set(acknowledgement) != {"endpointPath", "delegationId", "parentTaskId", "parentAssignment", "parentRoute"}:
+            raise LifecycleError("manifest.reportAcknowledgement fields are invalid")
+        endpoint = Path(require_string(acknowledgement, "endpointPath", "manifest.reportAcknowledgement"))
+        validate_secure_parents(endpoint, durable_root, "report acknowledgement endpoint")
+        delegation_id = require_string(acknowledgement, "delegationId", "manifest.reportAcknowledgement")
+        parent_task_id = acknowledgement.get("parentTaskId")
+        assignment = require_string(acknowledgement, "parentAssignment", "manifest.reportAcknowledgement")
+        acknowledgement_route = exact_route(acknowledgement.get("parentRoute"), "manifest.reportAcknowledgement.parentRoute")
+        if len(delegation_id.encode()) > MAX_ACK_ID_BYTES or not isinstance(parent_task_id, int) or isinstance(parent_task_id, bool) or parent_task_id <= 0 or parent_task_id > 9_007_199_254_740_991:
+            raise LifecycleError("manifest report acknowledgement delegation/task is out of bounds")
+        if len(assignment.encode()) > MAX_ACK_ASSIGNMENT_BYTES or acknowledgement_route != report_route:
+            raise LifecycleError("manifest report acknowledgement assignment/parent route mismatch")
+        result["reportAcknowledgement"] = {"endpointPath": str(endpoint), "delegationId": delegation_id, "parentTaskId": parent_task_id, "parentAssignment": assignment, "parentRoute": acknowledgement_route}
     return result
 
 
@@ -747,9 +770,173 @@ def queued_service_start_schema() -> dict[str, Any]:
     return {"$schema": "https://json-schema.org/draft/2020-12/schema", "title": "Herdr queued input service start result v1", "type": "object", "additionalProperties": False, "required": ["kind", "version", "activationId", "outcome"], "properties": {"kind": {"const": "herdr.queued-input-service-start-result"}, "version": {"const": 1}, "activationId": {"type": "string", "pattern": ACTIVATION_ID.pattern}, "outcome": {"enum": ["accepted", "duplicate", "uncertain", "rejected"]}, "unit": {"type": "string", "maxLength": 255}, "receiptId": {"type": "string", "pattern": "^[0-9a-f]{64}$"}, "reason": {"type": "string", "maxLength": 4096}}}
 
 
+def bounded_identifier(value: Any, field: str) -> str:
+    if not isinstance(value, str) or not value or len(value.encode("utf-8")) > MAX_ACK_ID_BYTES or any(ord(character) < 0x20 for character in value):
+        raise LifecycleError(f"{field} is not a bounded identifier")
+    return value
+
+
+def validate_parent_ack_request(role: dict[str, Any], request: dict[str, Any]) -> dict[str, Any]:
+    fields = {"kind", "version", "acknowledgementId", "target", "attemptId", "reportId", "delegationId", "parentTaskId", "sequence", "sha256", "parentAssignment", "parentRoute", "acknowledgedBy", "receiptId", "confirmedAt"}
+    encoded = json.dumps(request, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+    if len(encoded) > MAX_ACK_BYTES or set(request) != fields:
+        raise LifecycleError("parent acknowledgement fields or encoded size violate v1")
+    if request.get("kind") != "pi-tasking.report-parent-acknowledgement" or request.get("version") != 1:
+        raise LifecycleError("parent acknowledgement kind/version mismatch")
+    acknowledgement_id = bounded_identifier(request.get("acknowledgementId"), "acknowledgementId")
+    if not ACTIVATION_ID.fullmatch(acknowledgement_id):
+        raise LifecycleError("acknowledgementId must be a canonical random 128-bit ID")
+    for field in ("attemptId", "reportId", "delegationId", "receiptId"):
+        bounded_identifier(request.get(field), field)
+    target = request.get("target")
+    if target != role_route(role):
+        raise LifecycleError("acknowledgement target is not the exact child role/session")
+    authority = role.get("reportAcknowledgement")
+    if not isinstance(authority, dict):
+        raise LifecycleError("role has no report acknowledgement authority")
+    parent_task_id = request.get("parentTaskId"); sequence = request.get("sequence")
+    if not isinstance(parent_task_id, int) or isinstance(parent_task_id, bool) or parent_task_id <= 0 or not isinstance(sequence, int) or isinstance(sequence, bool) or sequence <= 0 or max(parent_task_id, sequence) > 9_007_199_254_740_991:
+        raise LifecycleError("parent task or report sequence is invalid")
+    digest = require_digest(request, "sha256", "acknowledgement")
+    assignment = request.get("parentAssignment")
+    if not isinstance(assignment, str) or not assignment or len(assignment.encode()) > MAX_ACK_ASSIGNMENT_BYTES:
+        raise LifecycleError("parent assignment is invalid")
+    parent_route = exact_route(request.get("parentRoute"), "acknowledgement.parentRoute")
+    acknowledged_by = exact_route(request.get("acknowledgedBy"), "acknowledgement.acknowledgedBy")
+    for route in (parent_route, acknowledged_by):
+        if any(len(str(value).encode()) > MAX_ACK_ROUTE_BYTES for key, value in route.items() if key != "agentSession") or any(len(value.encode()) > MAX_ACK_ROUTE_BYTES for value in route["agentSession"].values()):
+            raise LifecycleError("parent route string exceeds bounds")
+    if parent_route != acknowledged_by or parent_route != authority["parentRoute"] or request["delegationId"] != authority["delegationId"] or parent_task_id != authority["parentTaskId"] or assignment != authority["parentAssignment"]:
+        raise LifecycleError("parent issuer/delegation/task/assignment/route authority mismatch")
+    confirmed_at = request.get("confirmedAt")
+    if not isinstance(confirmed_at, str) or len(confirmed_at) > 64:
+        raise LifecycleError("confirmedAt is invalid")
+    try: timestamp = dt.datetime.fromisoformat(confirmed_at.replace("Z", "+00:00"))
+    except ValueError as exc: raise LifecycleError("confirmedAt is not an ISO timestamp") from exc
+    if timestamp.tzinfo is None:
+        raise LifecycleError("confirmedAt must include a timezone")
+    result = dict(request); result["sha256"] = digest
+    return result
+
+
+def validate_parent_ack_result(request: dict[str, Any], result: dict[str, Any]) -> dict[str, Any]:
+    allowed = {"kind", "version", "acknowledgementId", "attemptId", "reportId", "outcome", "receiptId", "reason"}
+    if not isinstance(result, dict) or not set(result).issubset(allowed) or not {"kind", "version", "acknowledgementId", "attemptId", "reportId", "outcome"}.issubset(result):
+        raise LifecycleError("child acknowledgement result is malformed")
+    if result.get("kind") != "pi-tasking.report-parent-acknowledgement-result" or result.get("version") != 1 or result.get("acknowledgementId") != request["acknowledgementId"] or result.get("attemptId") != request["attemptId"] or result.get("reportId") != request["reportId"]:
+        raise LifecycleError("child acknowledgement result identity mismatch")
+    if result.get("outcome") not in {"confirmed", "duplicate", "uncertain", "rejected"}:
+        raise LifecycleError("child acknowledgement result outcome is invalid")
+    if result["outcome"] in {"confirmed", "duplicate"}:
+        bounded_identifier(result.get("receiptId"), "result.receiptId")
+    if "reason" in result and (not isinstance(result["reason"], str) or len(result["reason"].encode()) > 4096):
+        raise LifecycleError("child acknowledgement result reason is invalid")
+    return result
+
+
+def validate_ack_endpoint(path: Path, durable_root: Path) -> None:
+    validate_secure_parents(path, durable_root, "report acknowledgement endpoint")
+    if len(os.fsencode(path)) > MAX_UNIX_SOCKET_PATH_BYTES:
+        raise LifecycleError("report acknowledgement endpoint path is too long")
+    info = path.lstat()
+    if not stat.S_ISSOCK(info.st_mode) or info.st_uid != os.geteuid() or stat.S_IMODE(info.st_mode) != 0o600:
+        raise LifecycleError("report acknowledgement endpoint must be an owner-only Unix socket")
+
+
+def exchange_ack_socket(path: Path, frame: dict[str, Any], durable_root: Path, *, timeout: float = 5) -> dict[str, Any]:
+    validate_ack_endpoint(path, durable_root)
+    payload = json.dumps(frame, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8") + b"\n"
+    if len(payload) > MAX_ACK_BYTES:
+        raise LifecycleError("acknowledgement socket frame exceeds bounds")
+    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as connection:
+        connection.settimeout(timeout); connection.connect(str(path))
+        if hasattr(socket, "SO_PEERCRED"):
+            _, uid, _ = struct.unpack("3i", connection.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, struct.calcsize("3i")))
+            if uid != os.geteuid(): raise LifecycleError("acknowledgement endpoint peer owner mismatch")
+        elif hasattr(connection, "getpeereid"):
+            uid, _ = connection.getpeereid()
+            if uid != os.geteuid(): raise LifecycleError("acknowledgement endpoint peer owner mismatch")
+        else:
+            raise LifecycleError("platform cannot authenticate acknowledgement endpoint peer")
+        connection.sendall(payload); connection.shutdown(socket.SHUT_WR)
+        response = b""
+        while len(response) <= MAX_ACK_BYTES:
+            chunk = connection.recv(min(65536, MAX_ACK_BYTES + 1 - len(response)))
+            if not chunk: break
+            response += chunk
+    if len(response) > MAX_ACK_BYTES or not response.endswith(b"\n"):
+        raise LifecycleError("acknowledgement endpoint result is missing or oversized")
+    return decode_json(response[:-1], "acknowledgement endpoint result")
+
+
+def parent_ack_result(request: dict[str, Any], outcome: str, *, receipt_id: str | None = None, reason: str | None = None) -> dict[str, Any]:
+    result = {"kind": "pi-tasking.report-parent-acknowledgement-result", "version": 1, "acknowledgementId": request.get("acknowledgementId", "invalid"), "attemptId": request.get("attemptId", "invalid"), "reportId": request.get("reportId", "invalid"), "outcome": outcome}
+    if receipt_id is not None: result["receiptId"] = receipt_id
+    if reason is not None: result["reason"] = reason[:4096]
+    return result
+
+
+def verify_live_parent_issuer(role: dict[str, Any], parent_route: dict[str, Any]) -> None:
+    live = agent_from(run_json([role["executables"]["herdr"], "agent", "get", parent_route["paneId"]], timeout=5))
+    expected = {"workspace_id": parent_route["workspaceId"], "pane_id": parent_route["paneId"], "terminal_id": parent_route["terminalId"], "agent_session": parent_route["agentSession"]}
+    if any(live.get(key) != value for key, value in expected.items()) or ("name" in parent_route and live.get("name") != parent_route["name"]):
+        raise LifecycleError("live parent issuer route/session mismatch")
+
+
+def deliver_parent_acknowledgement(role: dict[str, Any], request: dict[str, Any], durable_root: Path, *, recover: bool = False, exchange: Any = exchange_ack_socket, verify_parent: Any = verify_live_parent_issuer, fault: str | None = None) -> dict[str, Any]:
+    try:
+        request = validate_parent_ack_request(role, request)
+        verify_parent(role, request["acknowledgedBy"])
+    except LifecycleError as exc: return parent_ack_result(request if isinstance(request, dict) else {}, "rejected", reason=str(exc))
+    acknowledgement_id = request["acknowledgementId"]; content_digest = canonical_digest(request)
+    root = Path(role["stateDir"]) / "report-parent-acknowledgements"; root.mkdir(mode=0o700, parents=True, exist_ok=True); os.chmod(root, 0o700)
+    lock = (root / "delivery.lock").open("a+"); os.chmod(root / "delivery.lock", 0o600)
+    intent_path = root / acknowledgement_id / "intent.json"
+    endpoint = Path(role["reportAcknowledgement"]["endpointPath"])
+    try:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        if intent_path.exists():
+            intent = read_json(intent_path)
+            if intent.get("contentDigest") != content_digest:
+                return parent_ack_result(request, "rejected", reason="acknowledgement ID conflicts with durable content")
+            if intent.get("outcome") == "accepted":
+                child = intent.get("childResult", {}); return parent_ack_result(request, "duplicate", receipt_id=child.get("receiptId"), reason="exact child durability was already acknowledged")
+            if intent.get("outcome") == "rejected":
+                return parent_ack_result(request, "rejected", reason=intent.get("reason", "acknowledgement is terminal"))
+            if not recover:
+                return parent_ack_result(request, "uncertain", reason="explicit same-ID child-record recovery is required")
+        elif recover:
+            return parent_ack_result(request, "rejected", reason="no uncertain acknowledgement exists for recovery")
+        else:
+            intent_path.parent.mkdir(mode=0o700, parents=True, exist_ok=False); fsync_directory(root)
+            intent = {"version": 1, "acknowledgementId": acknowledgement_id, "contentDigest": content_digest, "request": request, "target": request["target"], "parentRoute": request["parentRoute"], "outcome": "uncertain", "createdAtEpochMs": int(time.time() * 1000)}
+            atomic_json(intent_path, intent)
+        frame = request if not recover else {"kind": "pi-tasking.report-parent-acknowledgement-query", "version": 1, "acknowledgementId": acknowledgement_id, "contentSha256": content_digest, "target": request["target"]}
+        try: child = validate_parent_ack_result(request, exchange(endpoint, frame, durable_root))
+        except (LifecycleError, OSError, TimeoutError, socket.timeout) as exc:
+            return parent_ack_result(request, "uncertain", reason=f"child durable acknowledgement is uncertain: {exc}")
+        if fault == "lost_ack":
+            return parent_ack_result(request, "uncertain", receipt_id=child.get("receiptId"), reason="child replied but parent persistence acknowledgement was lost")
+        if child["outcome"] in {"confirmed", "duplicate"}:
+            intent["outcome"] = "accepted"; intent["childResult"] = child; intent["acceptedAtEpochMs"] = int(time.time() * 1000); atomic_json(intent_path, intent)
+            return child if child["outcome"] == "confirmed" and not recover else parent_ack_result(request, "duplicate", receipt_id=child.get("receiptId"), reason="same-ID recovery reconciled the child durable record" if recover else "exact child durability was already acknowledged")
+        if child["outcome"] == "rejected":
+            intent["outcome"] = "rejected"; intent["reason"] = child.get("reason", "child rejected acknowledgement"); atomic_json(intent_path, intent)
+        return child
+    finally:
+        lock.close()
+
+
+def parent_ack_schemas() -> dict[str, Any]:
+    route = {"type": "object", "additionalProperties": False, "required": ["workspaceId", "paneId", "terminalId", "agentSession"], "properties": {"name": {"type": "string", "maxLength": MAX_ACK_ROUTE_BYTES}, "workspaceId": {"type": "string", "maxLength": MAX_ACK_ROUTE_BYTES}, "paneId": {"type": "string", "maxLength": MAX_ACK_ROUTE_BYTES}, "terminalId": {"type": "string", "maxLength": MAX_ACK_ROUTE_BYTES}, "agentSession": {"type": "object", "additionalProperties": False, "required": ["agent", "kind", "source", "value"], "properties": {key: {"type": "string", "maxLength": MAX_ACK_ROUTE_BYTES} for key in ("agent", "kind", "source", "value")}}}}
+    request_properties = {"kind": {"const": "pi-tasking.report-parent-acknowledgement"}, "version": {"const": 1}, "acknowledgementId": {"type": "string", "pattern": ACTIVATION_ID.pattern}, "target": route, "attemptId": {"type": "string", "maxLength": MAX_ACK_ID_BYTES}, "reportId": {"type": "string", "maxLength": MAX_ACK_ID_BYTES}, "delegationId": {"type": "string", "maxLength": MAX_ACK_ID_BYTES}, "parentTaskId": {"type": "integer", "minimum": 1}, "sequence": {"type": "integer", "minimum": 1}, "sha256": {"type": "string", "pattern": SHA256.pattern}, "parentAssignment": {"type": "string", "maxLength": MAX_ACK_ASSIGNMENT_BYTES}, "parentRoute": route, "acknowledgedBy": route, "receiptId": {"type": "string", "maxLength": MAX_ACK_ID_BYTES}, "confirmedAt": {"type": "string", "maxLength": 64}}
+    result_properties = {"kind": {"const": "pi-tasking.report-parent-acknowledgement-result"}, "version": {"const": 1}, "acknowledgementId": {"type": "string", "pattern": ACTIVATION_ID.pattern}, "attemptId": {"type": "string", "maxLength": MAX_ACK_ID_BYTES}, "reportId": {"type": "string", "maxLength": MAX_ACK_ID_BYTES}, "outcome": {"enum": ["confirmed", "duplicate", "uncertain", "rejected"]}, "receiptId": {"type": "string", "maxLength": MAX_ACK_ID_BYTES}, "reason": {"type": "string", "maxLength": 4096}}
+    return {"request": {"$schema": "https://json-schema.org/draft/2020-12/schema", "title": "Pi tasking exact-parent acknowledgement request v1", "type": "object", "additionalProperties": False, "maxProperties": len(request_properties), "required": list(request_properties), "properties": request_properties}, "result": {"$schema": "https://json-schema.org/draft/2020-12/schema", "title": "Pi tasking exact-parent acknowledgement result v1", "type": "object", "additionalProperties": False, "required": ["kind", "version", "acknowledgementId", "attemptId", "reportId", "outcome"], "properties": result_properties}}
+
+
 def parser() -> argparse.ArgumentParser:
     result = argparse.ArgumentParser(); sub = result.add_subparsers(dest="command", required=True)
-    for name in ("validate", "launch-argv", "run", "render-unit", "render-queued-unit", "schedule-queued-input", "recover-queued-input", "start-queued-input", "recover-queued-start", "queued-start-schema"):
+    for name in ("validate", "launch-argv", "run", "render-unit", "render-queued-unit", "schedule-queued-input", "recover-queued-input", "start-queued-input", "recover-queued-start", "queued-start-schema", "send-parent-ack", "recover-parent-ack", "parent-ack-schema"):
         item = sub.add_parser(name); item.add_argument("--manifest", required=True); item.add_argument("--durable-root", default="/home")
         if name == "run":
             item.add_argument("--poll-seconds", type=float, default=2.0); item.add_argument("--execution-timeout", type=float, default=14400.0); item.add_argument("--activation-id")
@@ -759,6 +946,7 @@ def parser() -> argparse.ArgumentParser:
         if name == "start-queued-input": item.add_argument("--activation-id", required=True)
         if name == "recover-queued-start":
             item.add_argument("--activation-id", required=True); item.add_argument("--disposition", choices=("started", "not-started"), required=True)
+        if name in {"send-parent-ack", "recover-parent-ack"}: item.add_argument("--request", required=True)
     return result
 
 
@@ -771,6 +959,7 @@ def main(argv: list[str] | None = None) -> int:
         elif args.command == "render-unit": print(render_unit(role, Path(args.manager)), end="")
         elif args.command == "render-queued-unit": print(render_queued_unit(role, Path(args.manager)), end="")
         elif args.command == "queued-start-schema": print(json.dumps(queued_service_start_schema(), sort_keys=True, indent=2))
+        elif args.command == "parent-ack-schema": print(json.dumps(parent_ack_schemas(), sort_keys=True, indent=2))
         elif args.command in {"schedule-queued-input", "recover-queued-input"}:
             request_data = read_secure_bytes(Path(args.request), Path(args.durable_root), "queued-input request", limit=131072)
             request = decode_json(request_data, "queued-input request")
@@ -781,6 +970,10 @@ def main(argv: list[str] | None = None) -> int:
             print(json.dumps(start_queued_input_service(role, args.activation_id, Path(args.durable_root)), sort_keys=True))
         elif args.command == "recover-queued-start":
             print(json.dumps(recover_queued_input_start(role, args.activation_id, args.disposition), sort_keys=True))
+        elif args.command in {"send-parent-ack", "recover-parent-ack"}:
+            request_data = read_secure_bytes(Path(args.request), Path(args.durable_root), "parent acknowledgement request", limit=MAX_ACK_BYTES)
+            request = decode_json(request_data, "parent acknowledgement request")
+            print(json.dumps(deliver_parent_acknowledgement(role, request, Path(args.durable_root), recover=args.command == "recover-parent-ack"), sort_keys=True))
         else:
             activation_path = None
             if args.activation_id:

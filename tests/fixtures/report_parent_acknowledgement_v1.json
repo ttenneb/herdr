@@ -1,0 +1,49 @@
+{
+  "kind": "pi-tasking.report-parent-acknowledgement",
+  "version": 1,
+  "acknowledgementId": "abcdef0123456789abcdef0123456789",
+  "target": {
+    "workspaceId": "w1",
+    "paneId": "w1:p2",
+    "terminalId": "term2",
+    "agentSession": {
+      "agent": "pi",
+      "kind": "path",
+      "source": "herdr:pi",
+      "value": "/home/example/child-session.jsonl"
+    }
+  },
+  "attemptId": "attempt-1",
+  "reportId": "report-1",
+  "delegationId": "delegation-1",
+  "parentTaskId": 100,
+  "sequence": 1,
+  "sha256": "1111111111111111111111111111111111111111111111111111111111111111",
+  "parentAssignment": "Deliver the exact report.",
+  "parentRoute": {
+    "name": "parent",
+    "workspaceId": "wp",
+    "paneId": "wp:p1",
+    "terminalId": "termp",
+    "agentSession": {
+      "agent": "pi",
+      "kind": "path",
+      "source": "herdr:pi",
+      "value": "/home/example/parent-session.jsonl"
+    }
+  },
+  "acknowledgedBy": {
+    "name": "parent",
+    "workspaceId": "wp",
+    "paneId": "wp:p1",
+    "terminalId": "termp",
+    "agentSession": {
+      "agent": "pi",
+      "kind": "path",
+      "source": "herdr:pi",
+      "value": "/home/example/parent-session.jsonl"
+    }
+  },
+  "receiptId": "parent-receipt-1",
+  "confirmedAt": "2026-09-21T05:00:00Z"
+}

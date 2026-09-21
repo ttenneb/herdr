@@ -1,0 +1,292 @@
+{
+  "request": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "additionalProperties": false,
+    "maxProperties": 15,
+    "properties": {
+      "acknowledgedBy": {
+        "additionalProperties": false,
+        "properties": {
+          "agentSession": {
+            "additionalProperties": false,
+            "properties": {
+              "agent": {
+                "maxLength": 512,
+                "type": "string"
+              },
+              "kind": {
+                "maxLength": 512,
+                "type": "string"
+              },
+              "source": {
+                "maxLength": 512,
+                "type": "string"
+              },
+              "value": {
+                "maxLength": 512,
+                "type": "string"
+              }
+            },
+            "required": [
+              "agent",
+              "kind",
+              "source",
+              "value"
+            ],
+            "type": "object"
+          },
+          "name": {
+            "maxLength": 512,
+            "type": "string"
+          },
+          "paneId": {
+            "maxLength": 512,
+            "type": "string"
+          },
+          "terminalId": {
+            "maxLength": 512,
+            "type": "string"
+          },
+          "workspaceId": {
+            "maxLength": 512,
+            "type": "string"
+          }
+        },
+        "required": [
+          "workspaceId",
+          "paneId",
+          "terminalId",
+          "agentSession"
+        ],
+        "type": "object"
+      },
+      "acknowledgementId": {
+        "pattern": "^(?:[0-9a-f]{32}|[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12})$",
+        "type": "string"
+      },
+      "attemptId": {
+        "maxLength": 256,
+        "type": "string"
+      },
+      "confirmedAt": {
+        "maxLength": 64,
+        "type": "string"
+      },
+      "delegationId": {
+        "maxLength": 256,
+        "type": "string"
+      },
+      "kind": {
+        "const": "pi-tasking.report-parent-acknowledgement"
+      },
+      "parentAssignment": {
+        "maxLength": 8192,
+        "type": "string"
+      },
+      "parentRoute": {
+        "additionalProperties": false,
+        "properties": {
+          "agentSession": {
+            "additionalProperties": false,
+            "properties": {
+              "agent": {
+                "maxLength": 512,
+                "type": "string"
+              },
+              "kind": {
+                "maxLength": 512,
+                "type": "string"
+              },
+              "source": {
+                "maxLength": 512,
+                "type": "string"
+              },
+              "value": {
+                "maxLength": 512,
+                "type": "string"
+              }
+            },
+            "required": [
+              "agent",
+              "kind",
+              "source",
+              "value"
+            ],
+            "type": "object"
+          },
+          "name": {
+            "maxLength": 512,
+            "type": "string"
+          },
+          "paneId": {
+            "maxLength": 512,
+            "type": "string"
+          },
+          "terminalId": {
+            "maxLength": 512,
+            "type": "string"
+          },
+          "workspaceId": {
+            "maxLength": 512,
+            "type": "string"
+          }
+        },
+        "required": [
+          "workspaceId",
+          "paneId",
+          "terminalId",
+          "agentSession"
+        ],
+        "type": "object"
+      },
+      "parentTaskId": {
+        "minimum": 1,
+        "type": "integer"
+      },
+      "receiptId": {
+        "maxLength": 256,
+        "type": "string"
+      },
+      "reportId": {
+        "maxLength": 256,
+        "type": "string"
+      },
+      "sequence": {
+        "minimum": 1,
+        "type": "integer"
+      },
+      "sha256": {
+        "pattern": "^[0-9a-f]{64}$",
+        "type": "string"
+      },
+      "target": {
+        "additionalProperties": false,
+        "properties": {
+          "agentSession": {
+            "additionalProperties": false,
+            "properties": {
+              "agent": {
+                "maxLength": 512,
+                "type": "string"
+              },
+              "kind": {
+                "maxLength": 512,
+                "type": "string"
+              },
+              "source": {
+                "maxLength": 512,
+                "type": "string"
+              },
+              "value": {
+                "maxLength": 512,
+                "type": "string"
+              }
+            },
+            "required": [
+              "agent",
+              "kind",
+              "source",
+              "value"
+            ],
+            "type": "object"
+          },
+          "name": {
+            "maxLength": 512,
+            "type": "string"
+          },
+          "paneId": {
+            "maxLength": 512,
+            "type": "string"
+          },
+          "terminalId": {
+            "maxLength": 512,
+            "type": "string"
+          },
+          "workspaceId": {
+            "maxLength": 512,
+            "type": "string"
+          }
+        },
+        "required": [
+          "workspaceId",
+          "paneId",
+          "terminalId",
+          "agentSession"
+        ],
+        "type": "object"
+      },
+      "version": {
+        "const": 1
+      }
+    },
+    "required": [
+      "kind",
+      "version",
+      "acknowledgementId",
+      "target",
+      "attemptId",
+      "reportId",
+      "delegationId",
+      "parentTaskId",
+      "sequence",
+      "sha256",
+      "parentAssignment",
+      "parentRoute",
+      "acknowledgedBy",
+      "receiptId",
+      "confirmedAt"
+    ],
+    "title": "Pi tasking exact-parent acknowledgement request v1",
+    "type": "object"
+  },
+  "result": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "additionalProperties": false,
+    "properties": {
+      "acknowledgementId": {
+        "pattern": "^(?:[0-9a-f]{32}|[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12})$",
+        "type": "string"
+      },
+      "attemptId": {
+        "maxLength": 256,
+        "type": "string"
+      },
+      "kind": {
+        "const": "pi-tasking.report-parent-acknowledgement-result"
+      },
+      "outcome": {
+        "enum": [
+          "confirmed",
+          "duplicate",
+          "uncertain",
+          "rejected"
+        ]
+      },
+      "reason": {
+        "maxLength": 4096,
+        "type": "string"
+      },
+      "receiptId": {
+        "maxLength": 256,
+        "type": "string"
+      },
+      "reportId": {
+        "maxLength": 256,
+        "type": "string"
+      },
+      "version": {
+        "const": 1
+      }
+    },
+    "required": [
+      "kind",
+      "version",
+      "acknowledgementId",
+      "attemptId",
+      "reportId",
+      "outcome"
+    ],
+    "title": "Pi tasking exact-parent acknowledgement result v1",
+    "type": "object"
+  }
+}

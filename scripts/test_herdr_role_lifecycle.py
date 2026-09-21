@@ -3,7 +3,9 @@ import importlib.util
 import json
 from pathlib import Path
 import shutil
+import socket
 import tempfile
+import threading
 import unittest
 from unittest import mock
 
@@ -35,6 +37,7 @@ class RoleLifecycleTests(unittest.TestCase):
         self.parent = self.route("parent", "wp", "wp:p1", "termp")
         self.prompt = self.root / "prompt.txt"; self.secure_write(self.prompt, "Do the exact bounded assignment.\n")
         self.activation = self.role_dir / "activation.json"
+        self.ack_socket = self.root / "a.sock"
         self.manifest_path = self.role_dir / "role.json"
         self.manifest = self.base_manifest()
         self.write_activation(); self.write_manifest()
@@ -49,11 +52,30 @@ class RoleLifecycleTests(unittest.TestCase):
         return {"name": name, "workspaceId": workspace, "paneId": pane, "terminalId": terminal, "agentSession": self.session if hasattr(self, "session") else {"agent": "pi", "kind": "path", "source": "herdr:pi", "value": str(self.root / "session.jsonl")}}
 
     def base_manifest(self):
-        return {"version": 1, "roleId": "owner-1", "roleClass": "implementation-owner", "workspace": {"id": "w1", "path": str(self.worktree)}, "paneId": "w1:p2", "terminalId": "term2", "agentSession": self.session, "task": {"id": "100", "source": "todo"}, "mailboxPath": str(self.root / "mailbox.jsonl"), "reportRoute": self.parent, "authorizedIssuer": self.issuer, "stateDir": str(self.role_dir / "state"), "activationPath": str(self.activation), "executables": {"herdr": str(self.herdr), "pi": str(self.pi), "python": str(self.python), "systemdNotify": str(self.notify), "systemctl": str(self.systemctl)}, "humanFacing": False}
+        return {"version": 1, "roleId": "owner-1", "roleClass": "implementation-owner", "workspace": {"id": "w1", "path": str(self.worktree)}, "paneId": "w1:p2", "terminalId": "term2", "agentSession": self.session, "task": {"id": "100", "source": "todo"}, "mailboxPath": str(self.root / "mailbox.jsonl"), "reportRoute": self.parent, "authorizedIssuer": self.issuer, "stateDir": str(self.role_dir / "state"), "activationPath": str(self.activation), "executables": {"herdr": str(self.herdr), "pi": str(self.pi), "python": str(self.python), "systemdNotify": str(self.notify), "systemctl": str(self.systemctl)}, "humanFacing": False, "reportAcknowledgement": {"endpointPath": str(self.ack_socket), "delegationId": "delegation-1", "parentTaskId": 100, "parentAssignment": "Deliver the exact report.", "parentRoute": self.parent}}
 
     def activation_value(self):
         prompt_digest = hashlib.sha256(self.prompt.read_bytes()).hexdigest()
         return {"version": 1, "roleId": "owner-1", "executionId": "exec-1", "kind": "assignment", "canonicalTask": self.manifest["task"], "issuer": self.issuer, "senderRoute": self.issuer, "parentRoute": self.parent, "promptPath": str(self.prompt), "promptDigest": prompt_digest}
+
+    def parent_ack_request(self, acknowledgement_id="abcdef0123456789abcdef0123456789"):
+        return {"kind": "pi-tasking.report-parent-acknowledgement", "version": 1, "acknowledgementId": acknowledgement_id, "target": lifecycle.role_route(self.validated()), "attemptId": "attempt-1", "reportId": "report-1", "delegationId": "delegation-1", "parentTaskId": 100, "sequence": 1, "sha256": "1" * 64, "parentAssignment": "Deliver the exact report.", "parentRoute": self.parent, "acknowledgedBy": self.parent, "receiptId": "parent-receipt-1", "confirmedAt": "2026-09-21T05:00:00Z"}
+
+    def start_ack_listener(self, response_factory, frames, durable_marker=None, mode=0o600):
+        ready = threading.Event()
+        def serve():
+            with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as listener:
+                listener.bind(str(self.ack_socket)); self.ack_socket.chmod(mode); listener.listen(1); ready.set()
+                connection, _ = listener.accept()
+                with connection:
+                    data = b""
+                    while not data.endswith(b"\n"): data += connection.recv(65536)
+                    frame = json.loads(data); frames.append(frame)
+                    if durable_marker is not None: self.secure_write(durable_marker, json.dumps({"acknowledgementId": frame["acknowledgementId"]}))
+                    response = response_factory(frame)
+                    connection.sendall(json.dumps(response, sort_keys=True).encode() + b"\n")
+            self.ack_socket.unlink(missing_ok=True)
+        thread = threading.Thread(target=serve, daemon=True); thread.start(); self.assertTrue(ready.wait(2)); return thread
 
     def queued_request(self, activation_id="0123456789abcdef0123456789abcdef", batch_id="batch-1", correlation=None, depth=0):
         payload = "Queued explicit input."
@@ -77,6 +99,8 @@ a=sys.argv[1:]; events.parent.mkdir(parents=True,exist_ok=True)
 with events.open("a") as f: f.write("herdr "+" ".join(a[:2])+"\\n")
 s=load()
 if a[:2]==["agent","get"]:
+ if len(a)>2 and a[2]=="wp:p1":
+  emit({{"agent":{{"workspace_id":"wp","pane_id":"wp:p1","terminal_id":"termp","cwd":{str(self.worktree)!r},"agent":"pi","agent_session":session,"interactive_ready":True,"name":"parent","agent_status":"idle","state_change_seq":1,"revision":1}}}}); sys.exit(0)
  if mode=="cleanup_uncertain" and s["phase"]=="started" and s.get("cleanup_failed"): print("bad"); sys.exit(0)
  if s["phase"]=="empty": emit({{"agent":agent(s,"unknown",False)}})
  elif s["phase"]=="exited": emit({{"agent":agent({{"phase":"empty","name":None,"gets":s["gets"]}},"unknown",False)}})
@@ -260,6 +284,76 @@ else: sys.exit(9)
         limited = self.queued_request("f123456789abcdef0123456789abcdef", "rate-limit")
         rate = lifecycle.schedule_queued_input(role, limited, self.root, self.issuer)
         self.assertEqual(rate["outcome"], "rejected"); self.assertIn("rate limit", rate["reason"])
+
+    def test_parent_ack_schema_and_authority_bindings(self):
+        role = self.validated(); request = self.parent_ack_request()
+        lifecycle.validate_parent_ack_request(role, request)
+        fixture_path = Path(__file__).parents[1] / "tests/fixtures/report_parent_acknowledgement_v1.json"
+        fixture = json.loads(fixture_path.read_text()); fixture["target"] = lifecycle.role_route(role); fixture["parentRoute"] = self.parent; fixture["acknowledgedBy"] = self.parent
+        lifecycle.validate_parent_ack_request(role, fixture)
+        def reject_live(*_): raise lifecycle.LifecycleError("live parent issuer route/session mismatch")
+        live_mismatch = lifecycle.deliver_parent_acknowledgement(role, request, self.root, verify_parent=reject_live)
+        self.assertEqual(live_mismatch["outcome"], "rejected"); self.assertIn("live parent", live_mismatch["reason"])
+        for field, value in (("delegationId", "other"), ("parentTaskId", 101), ("parentAssignment", "other"), ("acknowledgedBy", self.issuer), ("target", self.issuer), ("sha256", "0" * 63)):
+            bad = dict(request); bad[field] = value
+            result = lifecycle.deliver_parent_acknowledgement(role, bad, self.root)
+            self.assertEqual(result["outcome"], "rejected", field)
+        artifact = Path(__file__).parents[1] / "docs/next/report-parent-acknowledgement-v1.schema.json"
+        self.assertEqual(json.loads(artifact.read_text()), lifecycle.parent_ack_schemas())
+
+    def test_parent_ack_socket_delivery_requires_child_durability_and_dedupes_after_restart(self):
+        role = self.validated(); request = self.parent_ack_request(); frames = []; marker = self.role_dir / "child-durable.json"
+        def confirmed(frame):
+            return {"kind": "pi-tasking.report-parent-acknowledgement-result", "version": 1, "acknowledgementId": request["acknowledgementId"], "attemptId": request["attemptId"], "reportId": request["reportId"], "outcome": "confirmed", "receiptId": "tasking-send-receipt-1"}
+        thread = self.start_ack_listener(confirmed, frames, marker)
+        result = lifecycle.deliver_parent_acknowledgement(role, request, self.root, verify_parent=lambda *_: None)
+        thread.join(2); self.assertFalse(thread.is_alive()); self.assertTrue(marker.exists())
+        self.assertEqual(result["outcome"], "confirmed"); self.assertEqual(len(frames), 1)
+        restarted_role = self.validated()
+        duplicate = lifecycle.deliver_parent_acknowledgement(restarted_role, request, self.root, verify_parent=lambda *_: None)
+        self.assertEqual(duplicate["outcome"], "duplicate"); self.assertEqual(duplicate["receiptId"], "tasking-send-receipt-1")
+
+    def test_parent_ack_cli_is_a_real_non_prompt_delivery_path(self):
+        request = self.parent_ack_request(); request_path = self.role_dir / "ack-request.json"; self.secure_write(request_path, json.dumps(request))
+        frames = []
+        def confirmed(_frame):
+            return {"kind": "pi-tasking.report-parent-acknowledgement-result", "version": 1, "acknowledgementId": request["acknowledgementId"], "attemptId": request["attemptId"], "reportId": request["reportId"], "outcome": "confirmed", "receiptId": "tasking-send-receipt-cli"}
+        thread = self.start_ack_listener(confirmed, frames)
+        process = __import__("subprocess").run([str(self.python), str(MODULE_PATH), "send-parent-ack", "--manifest", str(self.manifest_path), "--durable-root", str(self.root), "--request", str(request_path)], capture_output=True, text=True, timeout=10)
+        thread.join(2)
+        self.assertEqual(process.returncode, 0, process.stderr)
+        self.assertEqual(json.loads(process.stdout)["outcome"], "confirmed"); self.assertEqual(len(frames), 1)
+        self.assertEqual(frames[0]["kind"], "pi-tasking.report-parent-acknowledgement")
+
+    def test_parent_ack_lost_result_stays_uncertain_and_recovery_only_queries(self):
+        role = self.validated(); request = self.parent_ack_request(); frames = []
+        def confirmed(_frame):
+            return {"kind": "pi-tasking.report-parent-acknowledgement-result", "version": 1, "acknowledgementId": request["acknowledgementId"], "attemptId": request["attemptId"], "reportId": request["reportId"], "outcome": "confirmed", "receiptId": "tasking-send-receipt-1"}
+        thread = self.start_ack_listener(confirmed, frames)
+        uncertain = lifecycle.deliver_parent_acknowledgement(role, request, self.root, verify_parent=lambda *_: None, fault="lost_ack")
+        thread.join(2); self.assertEqual(uncertain["outcome"], "uncertain")
+        retry = lifecycle.deliver_parent_acknowledgement(role, request, self.root, verify_parent=lambda *_: None)
+        self.assertEqual(retry["outcome"], "uncertain"); self.assertEqual(len(frames), 1)
+        def duplicate(_frame):
+            return {"kind": "pi-tasking.report-parent-acknowledgement-result", "version": 1, "acknowledgementId": request["acknowledgementId"], "attemptId": request["attemptId"], "reportId": request["reportId"], "outcome": "duplicate", "receiptId": "tasking-send-receipt-1"}
+        thread = self.start_ack_listener(duplicate, frames)
+        recovered = lifecycle.deliver_parent_acknowledgement(role, request, self.root, verify_parent=lambda *_: None, recover=True)
+        thread.join(2); self.assertEqual(recovered["outcome"], "duplicate"); self.assertEqual(len(frames), 2)
+        self.assertEqual(frames[0]["kind"], "pi-tasking.report-parent-acknowledgement")
+        self.assertEqual(frames[1]["kind"], "pi-tasking.report-parent-acknowledgement-query")
+        final = lifecycle.deliver_parent_acknowledgement(role, request, self.root, verify_parent=lambda *_: None)
+        self.assertEqual(final["outcome"], "duplicate"); self.assertEqual(len(frames), 2)
+
+    def test_parent_ack_endpoint_is_owner_only_and_non_model(self):
+        role = self.validated()
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as listener:
+            listener.bind(str(self.ack_socket)); self.ack_socket.chmod(0o666)
+            with self.assertRaisesRegex(lifecycle.LifecycleError, "owner-only"):
+                lifecycle.validate_ack_endpoint(self.ack_socket, self.root)
+        self.ack_socket.unlink(missing_ok=True)
+        source = __import__("inspect").getsource(lifecycle.deliver_parent_acknowledgement)
+        for forbidden in ("agent prompt", "send-keys", "editor", "PTY", "sendUserMessage"):
+            self.assertNotIn(forbidden, source)
 
     def test_queued_unit_pins_exact_activation_id_and_escapes_paths(self):
         role = self.validated()
