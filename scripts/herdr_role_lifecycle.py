@@ -213,6 +213,25 @@ def exact_lifecycle_recipient(role: dict[str, Any]) -> dict[str, Any]:
     return {"roleId": role["roleId"], "roleClass": role["roleClass"], "workspace": role["workspace"], "paneId": role["paneId"], "terminalId": role["terminalId"], "agentSession": role["agentSession"], "canonicalTask": role["task"], "mailboxPath": role["mailboxPath"], "reportRoute": role["reportRoute"]}
 
 
+def secure_herdr_socket(path_value: str) -> str:
+    path = Path(path_value)
+    if not path.is_absolute() or ".." in path.parts or len(os.fsencode(path)) > MAX_UNIX_SOCKET_PATH_BYTES or any(ord(character) < 0x20 or ord(character) == 0x7f for character in path_value):
+        raise LifecycleError("manifest.herdrSocketPath must be a bounded absolute normalized Unix socket path")
+    try:
+        canonical = path.resolve(strict=True); info = path.lstat()
+    except OSError as exc: raise LifecycleError(f"manifest.herdrSocketPath cannot be resolved: {exc}") from exc
+    if canonical != path or stat.S_ISLNK(info.st_mode) or not stat.S_ISSOCK(info.st_mode) or info.st_uid != os.geteuid() or stat.S_IMODE(info.st_mode) & 0o077:
+        raise LifecycleError("manifest.herdrSocketPath must be an owner-only non-symlink Unix socket")
+    current = path.parent
+    while True:
+        parent = current.lstat()
+        if stat.S_ISLNK(parent.st_mode) or not stat.S_ISDIR(parent.st_mode) or parent.st_uid not in {0, os.geteuid()} or stat.S_IMODE(parent.st_mode) & 0o022:
+            raise LifecycleError(f"manifest.herdrSocketPath parent {current} is not secure")
+        if current.parent == current: break
+        current = current.parent
+    return str(canonical)
+
+
 def executable(path: str, field: str) -> str:
     candidate = Path(path)
     if not candidate.is_absolute() or not candidate.is_file() or not os.access(candidate, os.X_OK):
@@ -253,6 +272,7 @@ def validate_manifest(raw: dict[str, Any], manifest_path: Path, durable_root: Pa
     if not isinstance(executables, dict):
         raise LifecycleError("manifest.executables must be an object")
     bins = {key: executable(require_string(executables, key, "manifest.executables"), f"manifest.executables.{key}") for key in ("herdr", "pi", "python", "systemdNotify", "systemctl")}
+    herdr_socket_path = secure_herdr_socket(require_string(raw, "herdrSocketPath", "manifest"))
     human_facing = raw.get("humanFacing", False)
     if not isinstance(human_facing, bool):
         raise LifecycleError("manifest.humanFacing must be boolean")
@@ -267,7 +287,7 @@ def validate_manifest(raw: dict[str, Any], manifest_path: Path, durable_root: Pa
     elif grant_path is not None or grant_digest is not None:
         raise LifecycleError("human-facing grant material must be absent when humanFacing is false")
     result = dict(raw)
-    result.update({"roleId": role_id, "roleClass": role_class, "workspace": {"id": workspace_id, "path": str(workspace_path)}, "paneId": pane_id, "terminalId": terminal_id, "agentSession": session, "task": task, "mailboxPath": str(mailbox), "stateDir": str(state_dir), "activationPath": str(activation), "reportRoute": report_route, "authorizedIssuer": issuer, "executables": bins, "humanFacing": human_facing})
+    result.update({"roleId": role_id, "roleClass": role_class, "workspace": {"id": workspace_id, "path": str(workspace_path)}, "paneId": pane_id, "terminalId": terminal_id, "agentSession": session, "task": task, "mailboxPath": str(mailbox), "stateDir": str(state_dir), "activationPath": str(activation), "reportRoute": report_route, "authorizedIssuer": issuer, "executables": bins, "herdrSocketPath": herdr_socket_path, "humanFacing": human_facing})
     result["_manifestPath"] = str(manifest_path.resolve())
     if human_facing:
         grant_file = Path(str(grant_path))
@@ -533,9 +553,15 @@ def run_json(argv: list[str], *, timeout: float = 35, env: dict[str, str] | None
     return value
 
 
+def herdr_environment(role: dict[str, Any], base: dict[str, str] | None = None) -> dict[str, str]:
+    environment = dict(os.environ if base is None else base)
+    environment["HERDR_SOCKET_PATH"] = role["herdrSocketPath"]
+    return environment
+
+
 def preflight_agent_state(role: dict[str, Any]) -> dict[str, Any]:
     argv = [role["executables"]["herdr"], "agent", "get", role["paneId"]]
-    try: process = subprocess.run(argv, check=False, capture_output=True, text=True, timeout=35)
+    try: process = subprocess.run(argv, check=False, capture_output=True, text=True, timeout=35, env=herdr_environment(role))
     except (OSError, subprocess.TimeoutExpired) as exc: raise LifecycleError(f"command failed: {argv[0]}: {exc}") from exc
     if process.returncode == 0:
         try: value = json.loads(process.stdout)
@@ -547,7 +573,7 @@ def preflight_agent_state(role: dict[str, Any]) -> dict[str, Any]:
     error = error_value.get("error") if isinstance(error_value, dict) else None
     if not isinstance(error, dict) or error.get("code") != "agent_not_found":
         raise LifecycleError(f"command exited {process.returncode}: {argv[0]}: {process.stderr.strip()}")
-    pane_response = run_json([role["executables"]["herdr"], "pane", "get", role["paneId"]], timeout=5)
+    pane_response = run_json([role["executables"]["herdr"], "pane", "get", role["paneId"]], timeout=5, env=herdr_environment(role))
     result = pane_response.get("result")
     pane = result.get("pane") if isinstance(result, dict) else None
     if not isinstance(pane, dict): raise LifecycleError("Herdr response omitted pane after agent_not_found")
@@ -624,11 +650,11 @@ def load_activation(role: dict[str, Any], durable_root: Path, activation_path: P
 
 def exact_hibernate(role: dict[str, Any], generation: str, *, timeout: float = 8) -> None:
     herdr = role["executables"]["herdr"]
-    run_json([herdr, "agent", "send-keys", role["paneId"], "--expected-terminal", role["terminalId"], "--expected-name", generation, "--", "ctrl+d"], timeout=5)
+    run_json([herdr, "agent", "send-keys", role["paneId"], "--expected-terminal", role["terminalId"], "--expected-name", generation, "--", "ctrl+d"], timeout=5, env=herdr_environment(role))
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         time.sleep(0.05)
-        current = agent_from(run_json([herdr, "agent", "get", role["paneId"]], timeout=5))
+        current = agent_from(run_json([herdr, "agent", "get", role["paneId"]], timeout=5, env=herdr_environment(role)))
         if current.get("terminal_id") != role["terminalId"]: raise LifecycleError("terminal changed while confirming hibernate")
         if current.get("agent_status") in {"unknown", "exited"} and current.get("agent") is None: return
     raise LifecycleError("exact managed-agent generation stayed live after graceful hibernate")
@@ -643,7 +669,7 @@ def rollback_started(role: dict[str, Any], activation: dict[str, Any], state_dir
     except Exception as cleanup_error:
         detail = f"{detail}; cleanup={cleanup_error}"
         try:
-            current = agent_from(run_json([role["executables"]["herdr"], "agent", "get", role["paneId"]], timeout=5))
+            current = agent_from(run_json([role["executables"]["herdr"], "agent", "get", role["paneId"]], timeout=5, env=herdr_environment(role)))
             if current.get("terminal_id") == role["terminalId"] and current.get("name") == generation:
                 disposition = "failed"
         except Exception:
@@ -679,13 +705,13 @@ def lifecycle_run(role: dict[str, Any], durable_root: Path, poll_seconds: float,
         activation["preStartIdentity"] = {key: initial.get(key) for key in ("workspace_id", "pane_id", "terminal_id", "agent", "agent_status", "agent_session", "name", "revision", "state_change_seq")}
         atomic_json(current_path, receipt(role, "validated", executionId=activation["executionId"], activationDigest=activation["activationDigest"], promptDigest=activation["promptDigest"], issuer=activation["issuer"], senderRoute=activation["senderRoute"], parentRoute=activation["parentRoute"], generation=generation, preStartIdentity=activation["preStartIdentity"], gateAdmission="unknown", modelExecution="unknown", todoAcceptance="unknown"))
         argv = [herdr, "agent", "start", generation, "--kind", "pi", "--pane", role["paneId"], "--timeout", "30000", "--", *launch_args(role)[1:]]
-        launch_env = dict(os.environ); launch_env["PATH"] = str(Path(role["executables"]["pi"]).parent) + os.pathsep + launch_env.get("PATH", "")
+        launch_env = herdr_environment(role); launch_env["PATH"] = str(Path(role["executables"]["pi"]).parent) + os.pathsep + launch_env.get("PATH", "")
         try:
             started = run_json(argv, timeout=40, env=launch_env)
             live = agent_from(started); assert_identity(role, live, require_ready=True, expected_name=generation)
             atomic_json(current_path, receipt(role, "started", executionId=activation["executionId"], activationDigest=activation["activationDigest"], promptDigest=activation["promptDigest"], generation=generation, createdIdentity={key: live.get(key) for key in ("workspace_id", "pane_id", "terminal_id", "agent_session", "name", "revision", "state_change_seq")}, gateAdmission="unknown", modelExecution="unknown", todoAcceptance="unknown"))
             baseline_seq = int(live.get("state_change_seq", 0))
-            transported = agent_from(run_json([herdr, "agent", "prompt", role["paneId"], activation["prompt"]])); assert_identity(role, transported, require_ready=False, expected_name=generation)
+            transported = agent_from(run_json([herdr, "agent", "prompt", role["paneId"], activation["prompt"]], env=herdr_environment(role))); assert_identity(role, transported, require_ready=False, expected_name=generation)
         except Exception as failure:
             disposition = rollback_started(role, activation, state_dir, generation, failure)
             atomic_json(current_path, receipt(role, "failed", executionId=activation["executionId"], activationDigest=activation["activationDigest"], promptDigest=activation["promptDigest"], generation=generation, rollbackDisposition=disposition, error=str(failure), gateAdmission="unknown", modelExecution="unknown", todoAcceptance="unknown"))
@@ -697,7 +723,7 @@ def lifecycle_run(role: dict[str, Any], durable_root: Path, poll_seconds: float,
             deadline = time.monotonic() + idle_timeout; observed_activity = False
             while time.monotonic() < deadline:
                 time.sleep(poll_seconds)
-                live = agent_from(run_json([herdr, "agent", "get", role["paneId"]])); assert_identity(role, live, require_ready=False, expected_name=generation)
+                live = agent_from(run_json([herdr, "agent", "get", role["paneId"]], env=herdr_environment(role))); assert_identity(role, live, require_ready=False, expected_name=generation)
                 sequence = int(live.get("state_change_seq", 0)); status = live.get("agent_status")
                 if status in {"working", "blocked"} or sequence > baseline_seq: observed_activity = True
                 heartbeat(role, "executing", state_dir, f"status={status} sequence={sequence}")
@@ -738,7 +764,7 @@ def queued_unit_instance_name(role: dict[str, Any], activation_id: str) -> str:
 
 def render_unit(role: dict[str, Any], manager: Path) -> str:
     if not manager.is_absolute() or not manager.is_file(): raise LifecycleError("--manager must be an absolute regular file")
-    return f"""[Unit]\nDescription=Herdr one-shot Pi role {role['roleId']}\nAfter=herdr.service\nStartLimitIntervalSec=300\nStartLimitBurst=3\n\n[Service]\nType=notify\nNotifyAccess=main\nExecStart={systemd_quote(role['executables']['python'])} {systemd_quote(str(manager))} run --manifest {systemd_quote(role['_manifestPath'])}\nRestart=on-failure\nRestartSec=15s\nWatchdogSec=120s\nTimeoutStartSec=60s\nTimeoutStopSec=30s\nKillMode=process\n\n[Install]\nWantedBy=default.target\n"""
+    return f"""[Unit]\nDescription=Herdr one-shot Pi role {role['roleId']}\nAfter=herdr.service\nStartLimitIntervalSec=300\nStartLimitBurst=3\n\n[Service]\nType=notify\nNotifyAccess=main\nEnvironment={systemd_quote('HERDR_SOCKET_PATH=' + role['herdrSocketPath'])}\nExecStart={systemd_quote(role['executables']['python'])} {systemd_quote(str(manager))} run --manifest {systemd_quote(role['_manifestPath'])}\nRestart=on-failure\nRestartSec=15s\nWatchdogSec=120s\nTimeoutStartSec=60s\nTimeoutStopSec=30s\nKillMode=process\n\n[Install]\nWantedBy=default.target\n"""
 
 
 def render_queued_unit(role: dict[str, Any], manager: Path) -> str:
@@ -747,7 +773,7 @@ def render_queued_unit(role: dict[str, Any], manager: Path) -> str:
     python = systemd_quote(role["executables"]["python"])
     manager_arg = systemd_quote(str(manager))
     manifest_arg = systemd_quote(role["_manifestPath"])
-    return f"""# UnitName={queued_unit_template_name(role)}\n[Unit]\nDescription=Herdr queued activation for role {role['roleId']} (%i)\nAfter=herdr.service\nStartLimitIntervalSec=300\nStartLimitBurst=3\n\n[Service]\nType=notify\nNotifyAccess=main\nExecStart={python} {manager_arg} run --manifest {manifest_arg} --activation-id %i\nRestart=on-failure\nRestartSec=15s\nWatchdogSec=120s\nTimeoutStartSec=60s\nTimeoutStopSec=30s\nKillMode=process\n\n# Deliberately no WantedBy: an explicit validated instance start is the only wake path.\n"""
+    return f"""# UnitName={queued_unit_template_name(role)}\n[Unit]\nDescription=Herdr queued activation for role {role['roleId']} (%i)\nAfter=herdr.service\nStartLimitIntervalSec=300\nStartLimitBurst=3\n\n[Service]\nType=notify\nNotifyAccess=main\nEnvironment={systemd_quote('HERDR_SOCKET_PATH=' + role['herdrSocketPath'])}\nExecStart={python} {manager_arg} run --manifest {manifest_arg} --activation-id %i\nRestart=on-failure\nRestartSec=15s\nWatchdogSec=120s\nTimeoutStartSec=60s\nTimeoutStopSec=30s\nKillMode=process\n\n# Deliberately no WantedBy: an explicit validated instance start is the only wake path.\n"""
 
 
 def queued_start_result(activation_id: str, outcome: str, unit: str | None = None, receipt_id: str | None = None, reason: str | None = None) -> dict[str, Any]:
@@ -942,7 +968,7 @@ def parent_ack_result(request: dict[str, Any], outcome: str, *, receipt_id: str 
 
 
 def verify_live_parent_issuer(role: dict[str, Any], parent_route: dict[str, Any]) -> None:
-    live = agent_from(run_json([role["executables"]["herdr"], "agent", "get", parent_route["paneId"]], timeout=5))
+    live = agent_from(run_json([role["executables"]["herdr"], "agent", "get", parent_route["paneId"]], timeout=5, env=herdr_environment(role)))
     expected = {"workspace_id": parent_route["workspaceId"], "pane_id": parent_route["paneId"], "terminal_id": parent_route["terminalId"], "agent_session": parent_route["agentSession"]}
     if any(live.get(key) != value for key, value in expected.items()) or ("name" in parent_route and live.get("name") != parent_route["name"]):
         raise LifecycleError("live parent issuer route/session mismatch")

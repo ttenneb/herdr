@@ -1,6 +1,7 @@
 import hashlib
 import importlib.util
 import json
+import os
 from pathlib import Path
 import shutil
 import socket
@@ -30,6 +31,8 @@ class RoleLifecycleTests(unittest.TestCase):
         self.pi = self.executable("pi", "#!/bin/sh\nexit 0\n")
         self.python = Path(shutil.which("python3")).resolve()
         self.notify = self.executable("systemd-notify", f"#!/bin/sh\nprintf 'notify %s\\n' \"$*\" >> {self.events}\n")
+        self.herdr_socket = self.root / "herdr.sock"; self.herdr_socket_listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM); self.herdr_socket_listener.bind(str(self.herdr_socket)); self.herdr_socket.chmod(0o600)
+        self.addCleanup(self.herdr_socket_listener.close)
         self.herdr = self.executable("herdr", self.fake_herdr())
         self.systemctl = self.executable("systemctl", "#!/bin/sh\nexit 0\n")
         self.session = {"agent": "pi", "kind": "path", "source": "herdr:pi", "value": str(self.root / "session.jsonl")}
@@ -54,7 +57,7 @@ class RoleLifecycleTests(unittest.TestCase):
         return {"name": name, "workspaceId": workspace, "paneId": pane, "terminalId": terminal, "agentSession": self.session if hasattr(self, "session") else {"agent": "pi", "kind": "path", "source": "herdr:pi", "value": str(self.root / "session.jsonl")}}
 
     def base_manifest(self):
-        return {"version": 1, "roleId": "owner-1", "roleClass": "implementation-owner", "workspace": {"id": "w1", "path": str(self.worktree)}, "paneId": "w1:p2", "terminalId": "term2", "agentSession": self.session, "task": {"id": "100", "source": "todo"}, "mailboxPath": str(self.root / "mailbox.jsonl"), "reportRoute": self.parent, "authorizedIssuer": self.issuer, "stateDir": str(self.role_dir / "state"), "activationPath": str(self.activation), "executables": {"herdr": str(self.herdr), "pi": str(self.pi), "python": str(self.python), "systemdNotify": str(self.notify), "systemctl": str(self.systemctl)}, "humanFacing": False, "reportAcknowledgement": {"endpointPath": str(self.ack_socket), "delegationId": "CCCCCCCCCCCCCCCCCCCCCC", "parentTaskId": 100, "parentAssignment": self.parent_assignment, "parentRoute": self.tasking_parent}}
+        return {"version": 1, "roleId": "owner-1", "roleClass": "implementation-owner", "workspace": {"id": "w1", "path": str(self.worktree)}, "paneId": "w1:p2", "terminalId": "term2", "agentSession": self.session, "task": {"id": "100", "source": "todo"}, "mailboxPath": str(self.root / "mailbox.jsonl"), "reportRoute": self.parent, "authorizedIssuer": self.issuer, "stateDir": str(self.role_dir / "state"), "activationPath": str(self.activation), "executables": {"herdr": str(self.herdr), "pi": str(self.pi), "python": str(self.python), "systemdNotify": str(self.notify), "systemctl": str(self.systemctl)}, "herdrSocketPath": str(self.herdr_socket), "humanFacing": False, "reportAcknowledgement": {"endpointPath": str(self.ack_socket), "delegationId": "CCCCCCCCCCCCCCCCCCCCCC", "parentTaskId": 100, "parentAssignment": self.parent_assignment, "parentRoute": self.tasking_parent}}
 
     def activation_value(self):
         prompt_digest = hashlib.sha256(self.prompt.read_bytes()).hexdigest()
@@ -90,7 +93,7 @@ class RoleLifecycleTests(unittest.TestCase):
     def fake_herdr(self):
         state = self.root / "fake-state.json"
         return f'''#!/usr/bin/python3
-import json,pathlib,sys
+import json,os,pathlib,sys
 state=pathlib.Path({str(state)!r}); mode=pathlib.Path({str(self.mode)!r}).read_text().strip(); events=pathlib.Path({str(self.events)!r})
 session={{"agent":"pi","kind":"path","source":"herdr:pi","value":{str(self.root / "session.jsonl")!r}}}
 def load(): return json.loads(state.read_text()) if state.exists() else {{"phase":"empty","name":None,"gets":0}}
@@ -98,6 +101,7 @@ def save(x): state.write_text(json.dumps(x))
 def emit(x): print(json.dumps({{"id":"fake","result":x}}))
 def agent(s,status,ready=True): return {{"workspace_id":"w1","pane_id":"w1:p2","terminal_id":"term2","cwd":{str(self.worktree)!r},"agent":"pi" if s["phase"]!="empty" else None,"agent_session":session if s["phase"]!="empty" else None,"interactive_ready":ready,"name":s.get("name"),"agent_status":status,"state_change_seq":s.get("gets",0)+1,"revision":9}}
 a=sys.argv[1:]; events.parent.mkdir(parents=True,exist_ok=True)
+if mode=="require_socket" and os.environ.get("HERDR_SOCKET_PATH")!={str(self.herdr_socket)!r}: print("wrong socket",file=sys.stderr); sys.exit(7)
 with events.open("a") as f: f.write("herdr "+" ".join(a[:2])+"\\n")
 s=load()
 if a[:2]==["agent","get"]:
@@ -406,6 +410,7 @@ else: sys.exit(9)
         unit = lifecycle.render_queued_unit(role, special_manager)
         self.assertIn("Type=notify", unit); self.assertIn("NotifyAccess=main", unit); self.assertIn("Restart=on-failure", unit)
         self.assertIn("RestartSec=15s", unit); self.assertIn("WatchdogSec=120s", unit); self.assertIn("StartLimitBurst=3", unit)
+        self.assertIn(f'Environment="HERDR_SOCKET_PATH={self.herdr_socket}"', unit)
         self.assertTrue(unit.startswith("# UnitName=herdr-role-owner-1@.service\n"))
         self.assertIn("--activation-id %i", unit); self.assertNotIn("WantedBy=", unit)
         self.assertIn('%%', unit); self.assertIn('\\"quoted\\"', unit)
@@ -454,6 +459,24 @@ else: sys.exit(9)
         expected = lifecycle.queued_service_start_schema()
         artifact = Path(__file__).parents[1] / "docs/next/queued-input-service-start-v1.schema.json"
         self.assertEqual(json.loads(artifact.read_text()), expected)
+
+    def test_manifest_bound_herdr_socket_is_secure_and_propagated(self):
+        role = self.validated(); self.herdr_socket.chmod(0o666)
+        with self.assertRaisesRegex(lifecycle.LifecycleError, "owner-only"):
+            self.validated()
+        self.herdr_socket.chmod(0o600)
+        link = self.root / "herdr-link.sock"; link.symlink_to(self.herdr_socket)
+        self.manifest["herdrSocketPath"] = str(link); self.write_manifest()
+        with self.assertRaisesRegex(lifecycle.LifecycleError, "owner-only"):
+            self.validated()
+        self.manifest["herdrSocketPath"] = str(self.herdr_socket); self.write_manifest(); role = self.validated()
+        self.secure_write(self.mode, "require_socket")
+        with mock.patch.dict(os.environ, {"HERDR_SOCKET_PATH": "/wrong/ambient.sock"}):
+            lifecycle.verify_live_parent_issuer(role, self.tasking_parent)
+            lifecycle.lifecycle_run(role, self.root, 0.001, 1)
+        unit = lifecycle.render_unit(role, MODULE_PATH.resolve())
+        self.assertIn(f'Environment="HERDR_SOCKET_PATH={self.herdr_socket}"', unit)
+        self.assertEqual(json.loads((Path(role["stateDir"]) / "activation-receipt.json").read_text())["phase"], "completed")
 
     def test_unit_remains_bounded_and_no_watcher_exists(self):
         unit = lifecycle.render_unit(self.validated(), MODULE_PATH.resolve())

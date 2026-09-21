@@ -18,10 +18,13 @@ Every role manifest binds all of these fields:
 - mailbox path;
 - exact authorized issuer/sender and parent report routes, including full session identities;
 - absolute Herdr, Pi, Python, `systemd-notify`, and `systemctl` executables;
+- the exact owner-only Herdr server Unix socket path;
 - durable state and activation paths below `/home` (a different durable root is accepted only for isolated tests);
 - an explicit human-facing policy.
 
 `humanFacing` defaults to false. A non-human-facing launch always adds `--exclude-tools ask_user_question`. Enabling it requires a separate owner-only grant file whose SHA-256 digest is pinned by the manifest and whose complete content is exactly bound to the authorized issuer, canonical task, role ID/class, recipient route, and parent report route. Only `user-facing-pm` and `human-facing-controller` role classes are eligible; TPMs, implementation owners, QA roles, and helpers are rejected. This is launch authority only. It is not evidence that a human-facing request was answered.
+
+`herdrSocketPath` is mandatory and must resolve to an existing owner-owned Unix socket with no group/other permissions, a normalized bounded absolute path, and only non-symlink, non-group/world-writable owner/root-controlled parent directories. The rendered unit pins it as `HERDR_SOCKET_PATH`, and the manager overwrites any ambient value with the manifest binding for every Herdr CLI preflight, launch, prompt, poll, rollback, hibernate, and acknowledgement-authority call. User-manager or development defaults therefore cannot redirect a managed role to another Herdr server.
 
 The manifest, activation, prompt, and human-facing grant must be regular non-symlink files owned by the effective user, owner-readable, inaccessible to group/other users, and located beneath owner-controlled non-group/world-writable parent directories under the durable root. The activation is immutable for an execution: it binds the authorized issuer, canonical task, exact sender and parent routes, execution ID, and prompt SHA-256 digest.
 
