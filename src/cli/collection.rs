@@ -1,4 +1,4 @@
-use std::{collections::HashMap, time::Duration};
+use std::{collections::HashMap, path::PathBuf, time::Duration};
 
 use crate::api::schema::*;
 
@@ -117,7 +117,35 @@ fn malformed_helper_launch_response(
     })
 }
 
-fn helper_launch(params: CollectionHelperLaunchParams) -> std::io::Result<i32> {
+#[derive(Debug)]
+struct ParsedHelperLaunch {
+    params: CollectionHelperLaunchParams,
+    assignment: String,
+}
+
+fn read_helper_assignment(path: &str) -> Result<String, String> {
+    const MAX_ASSIGNMENT_BYTES: u64 = 16 * 1024;
+    let path = PathBuf::from(path);
+    let metadata = std::fs::symlink_metadata(&path)
+        .map_err(|err| format!("failed to inspect --assignment-file {path:?}: {err}"))?;
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        return Err("--assignment-file must be a regular non-symlink file".into());
+    }
+    if metadata.len() > MAX_ASSIGNMENT_BYTES {
+        return Err(format!(
+            "--assignment-file exceeds {MAX_ASSIGNMENT_BYTES} bytes"
+        ));
+    }
+    let assignment = std::fs::read_to_string(&path)
+        .map_err(|err| format!("failed to read --assignment-file {path:?}: {err}"))?;
+    if assignment.trim().is_empty() || assignment.as_bytes().contains(&0) {
+        return Err("--assignment-file must contain nonempty UTF-8 text without NUL".into());
+    }
+    Ok(assignment)
+}
+
+fn helper_launch(parsed: ParsedHelperLaunch) -> std::io::Result<i32> {
+    let ParsedHelperLaunch { params, assignment } = parsed;
     let expected_kind = crate::detect::parse_agent_label(&params.kind)
         .map(crate::detect::agent_label)
         .unwrap_or(params.kind.as_str())
@@ -155,7 +183,75 @@ fn helper_launch(params: CollectionHelperLaunchParams) -> std::io::Result<i32> {
         true,
     ) {
         Ok(Ok(agent)) => {
+            let session = agent.get("agent_session").cloned();
+            let prompt = super::send_request(&Request {
+                id: "cli:collection:helper-launch:assignment".into(),
+                method: Method::AgentPrompt(AgentPromptParams {
+                    target: pane_id.clone(),
+                    text: assignment,
+                    wait: None,
+                }),
+            });
+            let prompt_error = match prompt {
+                Ok(value) if value.get("error").is_some() => value.get("error").cloned(),
+                Ok(value) => {
+                    let prompted = value.pointer("/result/agent");
+                    match prompted {
+                        Some(prompted)
+                            if prompted.get("pane_id").and_then(serde_json::Value::as_str)
+                                == Some(pane_id.as_str())
+                                && prompted
+                                    .get("terminal_id")
+                                    .and_then(serde_json::Value::as_str)
+                                    == Some(terminal_id.as_str())
+                                && prompted.get("agent_session").cloned() == session =>
+                        {
+                            None
+                        }
+                        _ => Some(serde_json::json!({
+                            "code": "collection_helper_assignment_identity_mismatch",
+                            "message": "assignment transport did not return the exact created helper identity"
+                        })),
+                    }
+                }
+                Err(err) => Some(serde_json::json!({
+                    "code": "collection_helper_assignment_transport_failed",
+                    "message": err.to_string()
+                })),
+            };
+            if let Some(assignment_error) = prompt_error {
+                let rollback = helper_abort(&collection_id, &pane_id, &terminal_id);
+                let (rollback_status, rollback_error) = match rollback {
+                    Ok(value) if value.get("error").is_none() => ("completed", None),
+                    Ok(value) => ("failed", value.get("error").cloned()),
+                    Err(err) => (
+                        "uncertain",
+                        Some(serde_json::json!({"message": err.to_string()})),
+                    ),
+                };
+                return super::print_response(&serde_json::json!({
+                    "id": "cli:collection:helper-launch",
+                    "error": {
+                        "code": "collection_helper_assignment_failed",
+                        "message": "helper became ready but exact assignment transport failed",
+                        "assignment_error": assignment_error,
+                        "rollback_status": rollback_status,
+                        "rollback_error": rollback_error,
+                        "collection_id": collection_id,
+                        "pane_id": pane_id,
+                        "terminal_id": terminal_id,
+                    }
+                }));
+            }
             response["result"]["launched"]["agent"] = agent;
+            response["result"]["assignment_transport"] = serde_json::json!({
+                "outcome": "runtime_transaction_admitted",
+                "target_pane_id": pane_id,
+                "target_terminal_id": terminal_id,
+                "gate_admission": "unknown",
+                "model_execution": "unknown",
+                "todo_acceptance": "unknown"
+            });
             super::print_response(&response)
         }
         Ok(Err(start_error)) => match helper_abort(&collection_id, &pane_id, &terminal_id) {
@@ -397,8 +493,8 @@ fn parse_member_create(args: &[String]) -> Result<CollectionCreateMemberParams, 
         }
         "--env" => {
             let raw = required_value(name, value)?;
-            let (key, value) = super::parse_env_assignment(&raw)?;
-            env.insert(key, value);
+            let parsed = super::parse_env_assignment(raw.as_str())?;
+            env.insert(parsed.0, parsed.1);
             Ok(())
         }
         "--parent" => {
@@ -420,7 +516,7 @@ fn parse_member_create(args: &[String]) -> Result<CollectionCreateMemberParams, 
     })
 }
 
-fn parse_helper_launch(args: &[String]) -> Result<CollectionHelperLaunchParams, String> {
+fn parse_helper_launch(args: &[String]) -> Result<ParsedHelperLaunch, String> {
     let collection_id = args
         .first()
         .filter(|v| !v.starts_with('-'))
@@ -437,6 +533,7 @@ fn parse_helper_launch(args: &[String]) -> Result<CollectionHelperLaunchParams, 
     let mut name = None;
     let mut kind = None;
     let mut timeout_ms = None;
+    let mut assignment_file = None;
     let mut index = 1;
     while index < separator {
         let option = args[index].as_str();
@@ -455,24 +552,30 @@ fn parse_helper_launch(args: &[String]) -> Result<CollectionHelperLaunchParams, 
             "--name" => name = Some(value.clone()),
             "--kind" => kind = Some(value.clone()),
             "--timeout" => timeout_ms = Some(value.parse().map_err(|_| "invalid timeout")?),
+            "--assignment-file" => assignment_file = Some(value.clone()),
             _ => return Err(format!("unknown option: {option}")),
         }
         index += 2;
     }
-    Ok(CollectionHelperLaunchParams {
-        collection_id,
-        cwd,
-        env,
-        delegation_parent_id,
-        purpose,
-        name: name.ok_or("missing --name")?,
-        kind: kind.ok_or("missing --kind")?,
-        args: if separator < args.len() {
-            args[separator + 1..].to_vec()
-        } else {
-            Vec::new()
+    let assignment_path = assignment_file.ok_or("missing --assignment-file")?;
+    let assignment = read_helper_assignment(&assignment_path)?;
+    Ok(ParsedHelperLaunch {
+        params: CollectionHelperLaunchParams {
+            collection_id,
+            cwd,
+            env,
+            delegation_parent_id,
+            purpose,
+            name: name.ok_or("missing --name")?,
+            kind: kind.ok_or("missing --kind")?,
+            args: if separator < args.len() {
+                args[separator + 1..].to_vec()
+            } else {
+                Vec::new()
+            },
+            timeout_ms,
         },
-        timeout_ms,
+        assignment,
     })
 }
 
@@ -602,6 +705,13 @@ mod tests {
         assert_eq!(member.env["ROLE"], "review");
         assert_eq!(member.delegation_parent_id.as_deref(), Some("d1"));
 
+        let assignment_path = std::env::temp_dir().join(format!(
+            "herdr-helper-assignment-{}-{}.txt",
+            std::process::id(),
+            std::thread::current().name().unwrap_or("test")
+        ));
+        std::fs::write(&assignment_path, "Review the exact bounded surface.\n")
+            .expect("write assignment");
         let launch = parse_helper_launch(&strings(&[
             "collection_1",
             "--cwd",
@@ -612,13 +722,17 @@ mod tests {
             "pi",
             "--purpose",
             "review",
+            "--assignment-file",
+            assignment_path.to_str().expect("UTF-8 assignment path"),
             "--",
             "--thinking",
             "low",
         ]))
         .expect("helper launch");
-        assert_eq!(launch.name, "reviewer");
-        assert_eq!(launch.args, vec!["--thinking", "low"]);
+        std::fs::remove_file(assignment_path).expect("remove assignment");
+        assert_eq!(launch.params.name, "reviewer");
+        assert_eq!(launch.params.args, vec!["--thinking", "low"]);
+        assert_eq!(launch.assignment, "Review the exact bounded surface.\n");
     }
 
     #[test]

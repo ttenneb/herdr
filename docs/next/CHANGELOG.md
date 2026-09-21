@@ -3,7 +3,8 @@
 ## Unreleased
 
 ### Added
-- Added failure-atomic `herdr collection helper-launch`, which starts the managed agent as the collection member's initial process, waits for readiness, and removes the member if startup does not complete.
+- Added an external one-shot Pi role lifecycle manager with exact durable identity/resume binding, default-deny human-question grants, truthful user-systemd readiness, bounded restart policy, and durable activation/transport receipts.
+- Added failure-atomic `herdr collection helper-launch`, which starts the managed agent as the newly selected collection member's initial process, waits for interactive readiness, transports an exact bounded assignment, and removes the member if startup or assignment transport does not complete.
 - Added bounded exact-session `herdr handoff` validation/submission and staged `herdr run` launch receipts; run profile application remains delegated to a verified Pi-owned helper interface.
 - Added strict `herdr worktree create --new-branch-only` semantics that cannot race into reusing an existing branch.
 - Added first-class Repository and Checkout Spaces, including grouped hierarchy, Repository lifecycle/API commands, and compatibility-preserving workspace projections.

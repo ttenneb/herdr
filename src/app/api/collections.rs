@@ -1019,8 +1019,29 @@ impl App {
     pub(super) fn handle_collection_helper_launch(
         &mut self,
         id: String,
-        params: CollectionHelperLaunchParams,
+        mut params: CollectionHelperLaunchParams,
     ) -> String {
+        let has_default_deny = params
+            .args
+            .windows(2)
+            .any(|pair| pair == ["--exclude-tools", "ask_user_question"]);
+        let has_unscoped_reference = params.args.iter().enumerate().any(|(index, value)| {
+            value == "ask_user_question"
+                && (index == 0 || params.args[index - 1] != "--exclude-tools")
+        });
+        if has_unscoped_reference {
+            return encode_error(
+                id,
+                "collection_helper_human_facing_forbidden",
+                "Collection helpers cannot receive ask_user_question",
+            );
+        }
+        if !has_default_deny {
+            params.args.extend([
+                "--exclude-tools".to_string(),
+                "ask_user_question".to_string(),
+            ]);
+        }
         let Some((ws_idx, tab_idx, collection_id)) = self.resolve_collection(&params.collection_id)
         else {
             return collection_not_found(id, &params.collection_id);
@@ -1123,6 +1144,9 @@ impl App {
         self.state
             .terminals
             .insert(new_pane.terminal.id.clone(), new_pane.terminal);
+        // Always select the newly allocated helper. In a nonempty Collection, leaving an
+        // older member selected risks assigning or observing the old busy pane instead.
+        self.select_new_collection_helper(ws_idx, pane_id, collection_id);
         let delegation_id = if create_delegation {
             match self
                 .state
@@ -1204,6 +1228,17 @@ impl App {
                 }),
             },
         )
+    }
+
+    fn select_new_collection_helper(
+        &mut self,
+        workspace_index: usize,
+        pane_id: crate::layout::PaneId,
+        collection_id: CollectionId,
+    ) {
+        self.state.workspaces[workspace_index]
+            .select_collection_member(pane_id, collection_id)
+            .expect("newly created helper belongs to its collection");
     }
 
     pub(super) fn handle_collection_helper_abort(
@@ -1794,6 +1829,147 @@ mod tests {
         assert_eq!(response["error"]["code"], "delegation_create_failed");
         assert_eq!(app.state.terminals.len(), panes_before);
         assert_eq!(app.event_hub.current_sequence(), events_before);
+    }
+
+    #[test]
+    fn two_sequential_helper_selections_use_new_distinct_members_in_nonempty_collection() {
+        let (mut app, root, first_helper, second_helper) = app_with_panes();
+        let collection_id = create_collection(&mut app, root);
+        let (_, _, collection) = app
+            .resolve_collection(&collection_id)
+            .expect("collection resolves");
+        for helper in [first_helper, second_helper] {
+            let pane_id = app.public_pane_id(0, helper).expect("public pane");
+            let added = request(
+                &mut app,
+                Method::CollectionAdd(CollectionAddParams {
+                    collection_id: collection_id.clone(),
+                    pane_id,
+                }),
+            );
+            assert!(added.get("error").is_none(), "{added}");
+            app.select_new_collection_helper(0, helper, collection);
+            assert_eq!(
+                app.state.workspaces[0].tabs[0]
+                    .collection(collection)
+                    .and_then(|value| value.selected()),
+                Some(helper)
+            );
+        }
+        assert_ne!(first_helper, second_helper, "busy pane identity was reused");
+        let members = app.state.workspaces[0].tabs[0]
+            .collection(collection)
+            .expect("collection")
+            .members();
+        assert!(members.contains(&first_helper));
+        assert!(members.contains(&second_helper));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn two_sequential_helper_launches_allocate_and_select_distinct_panes() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let fake_root = std::env::temp_dir().join(format!(
+            "herdr-collection-helper-launch-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&fake_root);
+        std::fs::create_dir_all(&fake_root).expect("create fake agent directory");
+        let fake_pi = fake_root.join("pi");
+        std::fs::write(&fake_pi, "#!/bin/sh\nwhile IFS= read -r line; do :; done\n")
+            .expect("write fake pi");
+        let mut permissions = std::fs::metadata(&fake_pi)
+            .expect("fake pi metadata")
+            .permissions();
+        permissions.set_mode(0o700);
+        std::fs::set_permissions(&fake_pi, permissions).expect("make fake pi executable");
+
+        let (mut app, root, _, _) = app_with_panes();
+        let collection_id = create_collection(&mut app, root);
+        let mut launched = Vec::new();
+        for suffix in ["one", "two"] {
+            let response = request(
+                &mut app,
+                Method::CollectionHelperLaunch(CollectionHelperLaunchParams {
+                    collection_id: collection_id.clone(),
+                    cwd: None,
+                    env: std::collections::HashMap::from([(
+                        "PATH".into(),
+                        fake_root.display().to_string(),
+                    )]),
+                    delegation_parent_id: None,
+                    purpose: Some(format!("helper {suffix}")),
+                    name: format!("reviewer-{suffix}"),
+                    kind: "pi".into(),
+                    args: Vec::new(),
+                    timeout_ms: Some(5_000),
+                }),
+            );
+            assert!(response.get("error").is_none(), "{response}");
+            let argv = response["result"]["launched"]["argv"]
+                .as_array()
+                .expect("launch argv");
+            assert_eq!(
+                &argv[argv.len() - 2..],
+                ["--exclude-tools", "ask_user_question"]
+            );
+            let pane = response["result"]["launched"]["created"]["pane"]["pane_id"]
+                .as_str()
+                .expect("created pane")
+                .to_string();
+            let terminal = response["result"]["launched"]["agent"]["terminal_id"]
+                .as_str()
+                .expect("created terminal")
+                .to_string();
+            assert_eq!(
+                response["result"]["launched"]["created"]["collection"]["selected_pane_id"]
+                    .as_str(),
+                Some(pane.as_str()),
+                "new launch was not selected in the nonempty Collection"
+            );
+            launched.push((pane, terminal));
+        }
+        assert_ne!(
+            launched[0].0, launched[1].0,
+            "busy pane identity was reused"
+        );
+        for (pane_id, terminal_id) in launched {
+            let aborted = request(
+                &mut app,
+                Method::CollectionHelperAbort(CollectionHelperAbortParams {
+                    collection_id: collection_id.clone(),
+                    pane_id,
+                    terminal_id,
+                }),
+            );
+            assert!(aborted.get("error").is_none(), "{aborted}");
+        }
+        std::fs::remove_dir_all(fake_root).expect("remove fake agent directory");
+    }
+
+    #[test]
+    fn helper_launch_default_denies_human_question_capability() {
+        let (mut app, root, _, _) = app_with_panes();
+        let collection_id = create_collection(&mut app, root);
+        let response = request(
+            &mut app,
+            Method::CollectionHelperLaunch(CollectionHelperLaunchParams {
+                collection_id,
+                cwd: None,
+                env: Default::default(),
+                delegation_parent_id: None,
+                purpose: None,
+                name: "reviewer".into(),
+                kind: "pi".into(),
+                args: vec!["--tools".into(), "ask_user_question".into()],
+                timeout_ms: None,
+            }),
+        );
+        assert_eq!(
+            response["error"]["code"],
+            "collection_helper_human_facing_forbidden"
+        );
     }
 
     #[tokio::test]
