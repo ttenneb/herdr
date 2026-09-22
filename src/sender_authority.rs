@@ -61,6 +61,70 @@ impl SenderAuthorityStore {
         std::fs::rename(tmp, &self.path)?;
         Ok(())
     }
+    /// Promotes only the exact committed launch generation after a server-owned
+    /// lifecycle observation. Preparing and Issued remain non-authoritative
+    /// until this version-checked transition succeeds.
+    pub(crate) fn promote_active(
+        &self,
+        sender_key: &str,
+        process_generation: u64,
+    ) -> std::io::Result<SenderAuthorityRecord> {
+        let current = self
+            .load()?
+            .ok_or_else(|| std::io::Error::other("sender authority missing"))?;
+        if current.sender_key != sender_key
+            || current.process_generation != process_generation
+            || !matches!(
+                current.phase,
+                SenderAuthorityPhase::Preparing | SenderAuthorityPhase::Issued
+            )
+        {
+            return Err(std::io::Error::other("sender authority promotion rejected"));
+        }
+        let next_revision = current
+            .transition_revision
+            .checked_add(1)
+            .ok_or_else(|| std::io::Error::other("sender authority revision exhausted"))?;
+        let active = SenderAuthorityRecord {
+            phase: SenderAuthorityPhase::Active,
+            transition_revision: next_revision,
+            ..current
+        };
+        self.cas(Some(next_revision - 1), active.clone())?;
+        Ok(active)
+    }
+
+    /// Invalidates only the exact active sender generation. A later exit or
+    /// replacement cannot revoke a newer record.
+    pub(crate) fn invalidate_active(
+        &self,
+        sender_key: &str,
+        process_generation: u64,
+    ) -> std::io::Result<SenderAuthorityRecord> {
+        let current = self
+            .load()?
+            .ok_or_else(|| std::io::Error::other("sender authority missing"))?;
+        if current.sender_key != sender_key
+            || current.process_generation != process_generation
+            || current.phase != SenderAuthorityPhase::Active
+        {
+            return Err(std::io::Error::other(
+                "sender authority invalidation rejected",
+            ));
+        }
+        let next_revision = current
+            .transition_revision
+            .checked_add(1)
+            .ok_or_else(|| std::io::Error::other("sender authority revision exhausted"))?;
+        let invalidated = SenderAuthorityRecord {
+            phase: SenderAuthorityPhase::Invalidated,
+            transition_revision: next_revision,
+            ..current
+        };
+        self.cas(Some(next_revision - 1), invalidated.clone())?;
+        Ok(invalidated)
+    }
+
     pub(crate) fn recover(&self) -> std::io::Result<Option<SenderAuthorityRecord>> {
         let Some(mut r) = self.load()? else {
             return Ok(None);

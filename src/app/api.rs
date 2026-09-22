@@ -130,6 +130,24 @@ impl App {
             return Vec::new();
         }
 
+        if let AppEvent::PaneDied { pane_id } = &ev {
+            self.invalidate_offline_mailbox_authority_for_pane(*pane_id);
+        }
+
+        if let AppEvent::AgentProcessDetected {
+            pane_id,
+            agent,
+            process_generation,
+            ..
+        } = &ev
+        {
+            self.promote_and_install_offline_mailbox_authority(
+                *pane_id,
+                *agent,
+                *process_generation,
+            );
+        }
+
         if let AppEvent::ClipboardWrite { content } = ev {
             #[cfg(not(test))]
             crate::selection::write_osc52_bytes(&content);

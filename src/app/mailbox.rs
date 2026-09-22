@@ -1,23 +1,26 @@
+use std::collections::BTreeMap;
+
 use crate::api::schema::MailboxOfflineSubmitParams;
 use crate::app::App;
-use crate::direct_transport::{
-    AuthorityContext, Effect, GrantAuthority, MessageKind, RecipientChannelRegistry, RouteScope,
-    SessionGeneration, TransportError,
-};
+use crate::direct_transport::TransportError;
 
-/// Server-injected local authority for offline mailbox admission. None of these
-/// fields are decoded from the mailbox wire request.
+/// Server-minted offline capability. Its grant and recipient identifiers are
+/// selectors on the wire; the exact sender key/generation remains server-owned.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct OfflineMailboxCapability {
+    pub(crate) grant_id: String,
+    pub(crate) recipient: crate::mailbox::RecipientKey,
+}
+
+/// Server-owned authority installed only from an Active sender record. It has
+/// no Pi attachment, consumer socket, process ID, manifest, or client-supplied
+/// identity dependency.
 pub(crate) struct OfflineMailboxAuthority {
-    /// Exact durable sender record that installed this server-local route.
     pub(crate) sender_key: String,
     pub(crate) sender_generation: u64,
     pub(crate) caller_selector: String,
-    pub(crate) caller: SessionGeneration,
-    pub(crate) scope: RouteScope,
-    pub(crate) recipients: RecipientChannelRegistry,
-    pub(crate) grants: GrantAuthority,
+    capabilities: BTreeMap<String, OfflineMailboxCapability>,
     pub(crate) store: crate::mailbox::MailboxStore,
-    pub(crate) now: u64,
 }
 
 #[derive(Debug)]
@@ -25,52 +28,50 @@ pub(crate) enum OfflineMailboxInstallError {
     SenderRecordUnavailable,
     SenderRecordMismatch,
     Store(std::io::Error),
+    MailboxStore(crate::mailbox::MailboxError),
 }
 
 pub(crate) enum OfflineMailboxError {
     CallerMismatch,
+    CapabilityMismatch,
+    Replay,
     Transport(TransportError),
     Store(crate::mailbox::MailboxError),
     ReceiptMissing,
 }
 
-impl App {
-    /// Installs a route only when its caller is the current authoritative
-    /// sender record. The server must construct the route from its verified
-    /// local channel and canonical grant state before calling this method.
-    pub(crate) fn install_offline_mailbox_authority(
-        &mut self,
-        authority: OfflineMailboxAuthority,
-    ) -> Result<(), OfflineMailboxInstallError> {
-        let store = crate::sender_authority::SenderAuthorityStore::open(&self.sender_authority_dir)
-            .map_err(OfflineMailboxInstallError::Store)?;
-        let record = store
-            .load()
-            .map_err(OfflineMailboxInstallError::Store)?
-            .ok_or(OfflineMailboxInstallError::SenderRecordUnavailable)?;
-        if !authority.matches_sender_record(&record) {
-            return Err(OfflineMailboxInstallError::SenderRecordMismatch);
-        }
-        self.offline_mailbox_authority = Some(authority);
-        Ok(())
-    }
-
-    pub(crate) fn offline_mailbox_authority_current(
-        &self,
-    ) -> Result<bool, OfflineMailboxInstallError> {
-        let Some(authority) = self.offline_mailbox_authority.as_ref() else {
-            return Ok(false);
-        };
-        let store = crate::sender_authority::SenderAuthorityStore::open(&self.sender_authority_dir)
-            .map_err(OfflineMailboxInstallError::Store)?;
-        Ok(store
-            .load()
-            .map_err(OfflineMailboxInstallError::Store)?
-            .is_some_and(|record| authority.matches_sender_record(&record)))
-    }
-}
-
 impl OfflineMailboxAuthority {
+    /// Mints the narrow default capability for the durable sender generation.
+    /// Future server-side recipient provisioning may add separately scoped
+    /// capabilities; neither wire selectors nor attachments can do so.
+    pub(crate) fn from_active_sender(
+        record: &crate::sender_authority::SenderAuthorityRecord,
+        store: crate::mailbox::MailboxStore,
+    ) -> Option<Self> {
+        if !record.authoritative() {
+            return None;
+        }
+        let recipient = crate::mailbox::RecipientKey {
+            recipient_id: record.sender_key.clone(),
+            generation: record.process_generation.to_string(),
+        };
+        let grant_id = format!(
+            "offline:{}:{}",
+            record.sender_key, record.process_generation
+        );
+        let capability = OfflineMailboxCapability {
+            grant_id: grant_id.clone(),
+            recipient,
+        };
+        Some(Self {
+            sender_key: record.sender_key.clone(),
+            sender_generation: record.process_generation,
+            caller_selector: record.sender_key.clone(),
+            capabilities: BTreeMap::from([(grant_id, capability)]),
+            store,
+        })
+    }
+
     pub(crate) fn matches_sender_record(
         &self,
         record: &crate::sender_authority::SenderAuthorityRecord,
@@ -91,45 +92,27 @@ impl OfflineMailboxAuthority {
         if params.caller != self.caller_selector {
             return Err(OfflineMailboxError::CallerMismatch);
         }
-        let recipient = self
-            .recipients
-            .resolve_mailbox_recipient(&params.recipient)
-            .map_err(OfflineMailboxError::Transport)?;
-        let authority_context = AuthorityContext {
-            issuer: self.caller.clone(),
-            recipient: recipient.clone(),
-            scope: self.scope.clone(),
-            topology_revision: 0,
-            grant_revision: self.grants.revision(),
-            connected: true,
-            authority_confirmed: true,
+        let Some(capability) = self.capabilities.get(&params.grant_id) else {
+            return Err(OfflineMailboxError::CapabilityMismatch);
         };
-        let selector = params.recipient;
-        let grant_id = params.grant_id;
-        let submit = params.submit;
-        let now = self.now;
-        let recipients = &self.recipients;
-        let grants = &mut self.grants;
-        recipients
-            .with_authenticated_route(&recipient, now, |_, manifests, topology, route| {
-                let mut context = authority_context;
-                context.topology_revision = topology.revision();
-                crate::mailbox_v1::authorize(
-                    grants,
-                    manifests,
-                    &grant_id,
-                    &context,
-                    &route,
-                    &recipient,
-                    Effect::Send,
-                    Some(MessageKind::Report),
-                    now,
-                )
-                .map(|_| ())
-            })
-            .map_err(OfflineMailboxError::Transport)?;
-        let receipt = crate::mailbox_v1::submit_offline(&self.store, selector, submit)
-            .map_err(OfflineMailboxError::Store)?;
+        if capability.recipient != params.recipient {
+            return Err(OfflineMailboxError::CapabilityMismatch);
+        }
+        if self
+            .store
+            .load()
+            .map_err(OfflineMailboxError::Store)?
+            .receipts
+            .contains_key(&params.submit.delivery_digest)
+        {
+            return Err(OfflineMailboxError::Replay);
+        }
+        let receipt = crate::mailbox_v1::submit_offline(
+            &self.store,
+            capability.recipient.clone(),
+            params.submit,
+        )
+        .map_err(OfflineMailboxError::Store)?;
         match self
             .store
             .load()
@@ -140,5 +123,110 @@ impl OfflineMailboxAuthority {
             Some(persisted) if persisted == &receipt => Ok(receipt),
             _ => Err(OfflineMailboxError::ReceiptMissing),
         }
+    }
+}
+
+impl App {
+    /// Installs a route only when its caller is the current authoritative
+    /// sender record. The lifecycle caller supplies the already-promoted record;
+    /// this method mints a server-owned capability without recipient attachment.
+    pub(crate) fn install_offline_mailbox_authority(
+        &mut self,
+        record: crate::sender_authority::SenderAuthorityRecord,
+    ) -> Result<(), OfflineMailboxInstallError> {
+        let sender_store =
+            crate::sender_authority::SenderAuthorityStore::open(&self.sender_authority_dir)
+                .map_err(OfflineMailboxInstallError::Store)?;
+        let current = sender_store
+            .load()
+            .map_err(OfflineMailboxInstallError::Store)?
+            .ok_or(OfflineMailboxInstallError::SenderRecordUnavailable)?;
+        if current != record || !record.authoritative() {
+            return Err(OfflineMailboxInstallError::SenderRecordMismatch);
+        }
+        let store = crate::mailbox::MailboxStore::open(&self.sender_authority_dir)
+            .map_err(OfflineMailboxInstallError::MailboxStore)?;
+        let authority = OfflineMailboxAuthority::from_active_sender(&record, store)
+            .ok_or(OfflineMailboxInstallError::SenderRecordMismatch)?;
+        self.offline_mailbox_authority = Some(authority);
+        Ok(())
+    }
+
+    pub(crate) fn offline_mailbox_authority_current(
+        &self,
+    ) -> Result<bool, OfflineMailboxInstallError> {
+        let Some(authority) = self.offline_mailbox_authority.as_ref() else {
+            return Ok(false);
+        };
+        let store = crate::sender_authority::SenderAuthorityStore::open(&self.sender_authority_dir)
+            .map_err(OfflineMailboxInstallError::Store)?;
+        Ok(store
+            .load()
+            .map_err(OfflineMailboxInstallError::Store)?
+            .is_some_and(|record| authority.matches_sender_record(&record)))
+    }
+
+    /// Called only by the App event path after it verified the current terminal
+    /// and generation. A stale/replayed detector event cannot promote a record.
+    pub(crate) fn invalidate_offline_mailbox_authority_for_pane(
+        &mut self,
+        pane_id: crate::layout::PaneId,
+    ) {
+        let Some((ws_idx, _)) = self.find_pane(pane_id) else {
+            return;
+        };
+        let Some(terminal_id) = self.state.workspaces[ws_idx].terminal_id(pane_id).cloned() else {
+            return;
+        };
+        let Some(authority) = self.offline_mailbox_authority.as_ref() else {
+            return;
+        };
+        if authority.sender_key != terminal_id.to_string() {
+            return;
+        }
+        let sender_store =
+            match crate::sender_authority::SenderAuthorityStore::open(&self.sender_authority_dir) {
+                Ok(store) => store,
+                Err(_) => return,
+            };
+        if sender_store
+            .invalidate_active(&authority.sender_key, authority.sender_generation)
+            .is_ok()
+        {
+            self.offline_mailbox_authority = None;
+        }
+    }
+
+    pub(crate) fn promote_and_install_offline_mailbox_authority(
+        &mut self,
+        pane_id: crate::layout::PaneId,
+        agent: crate::detect::Agent,
+        process_generation: u64,
+    ) {
+        let Some((ws_idx, _)) = self.find_pane(pane_id) else {
+            return;
+        };
+        let Some(terminal_id) = self.state.workspaces[ws_idx].terminal_id(pane_id).cloned() else {
+            return;
+        };
+        let Some(terminal) = self.state.terminals.get(&terminal_id) else {
+            return;
+        };
+        if terminal.managed_agent_kind() != Some(agent)
+            || !terminal.accepts_managed_agent_generation(process_generation)
+        {
+            return;
+        }
+        let sender_store =
+            match crate::sender_authority::SenderAuthorityStore::open(&self.sender_authority_dir) {
+                Ok(store) => store,
+                Err(_) => return,
+            };
+        let record = match sender_store.promote_active(&terminal_id.to_string(), process_generation)
+        {
+            Ok(record) => record,
+            Err(_) => return,
+        };
+        let _ = self.install_offline_mailbox_authority(record);
     }
 }
