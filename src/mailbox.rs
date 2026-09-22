@@ -15,7 +15,9 @@ pub const RECORD_STREAM_FILE: &str = "mailbox.v1.jsonl";
 pub const LOCK_FILE: &str = "mailbox.v1.lock";
 
 /// Durable mailbox ownership. It is intentionally independent of Pi session files.
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[derive(
+    Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, schemars::JsonSchema,
+)]
 #[serde(rename_all = "camelCase")]
 pub struct RecipientKey {
     pub recipient_id: String,
@@ -34,7 +36,7 @@ pub struct MailboxHead {
     pub body: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct AdmissionReceipt {
     pub delivery_digest: String,
@@ -44,7 +46,7 @@ pub struct AdmissionReceipt {
     pub status: ReceiptStatus,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum ReceiptStatus {
     Admitted,

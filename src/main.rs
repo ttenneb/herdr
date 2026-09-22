@@ -95,6 +95,7 @@ mod render_prof;
 mod render_signal;
 mod repository;
 mod selection;
+mod sender_authority;
 mod server;
 mod session;
 mod sound;

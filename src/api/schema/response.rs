@@ -126,6 +126,9 @@ pub enum ResponseResult {
     HandoffTransport {
         receipt: HandoffTransportReceipt,
     },
+    MailboxOfflineSubmitted {
+        receipt: crate::mailbox::AdmissionReceipt,
+    },
     AgentList {
         agents: Vec<AgentInfo>,
     },

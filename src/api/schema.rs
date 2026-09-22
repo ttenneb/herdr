@@ -7,6 +7,7 @@ pub mod delegations;
 pub mod events;
 pub mod handoffs;
 pub mod integrations;
+pub mod mailbox;
 pub mod panes;
 pub mod plugins;
 pub mod repositories;
@@ -24,6 +25,7 @@ pub use delegations::*;
 pub use events::*;
 pub use handoffs::*;
 pub use integrations::*;
+pub use mailbox::*;
 pub use panes::*;
 pub use plugins::*;
 pub use repositories::*;
@@ -163,6 +165,8 @@ pub enum Method {
     HandoffValidate(HandoffValidateParams),
     #[serde(rename = "handoff.send")]
     HandoffSend(HandoffSendParams),
+    #[serde(rename = "mailbox.offline_submit")]
+    MailboxOfflineSubmit(MailboxOfflineSubmitParams),
     #[serde(rename = "collection.list")]
     CollectionList(CollectionListParams),
     #[serde(rename = "collection.get")]

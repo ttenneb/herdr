@@ -438,6 +438,7 @@ fn api_method_name(method: &Method) -> &'static str {
         Method::AgentWait(_) => "agent.wait",
         Method::HandoffValidate(_) => "handoff.validate",
         Method::HandoffSend(_) => "handoff.send",
+        Method::MailboxOfflineSubmit(_) => "mailbox.offline_submit",
         Method::CollectionList(_) => "collection.list",
         Method::CollectionGet(_) => "collection.get",
         Method::CollectionCreate(_) => "collection.create",

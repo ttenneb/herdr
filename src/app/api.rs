@@ -10,6 +10,7 @@ mod handoffs;
 mod handoffs_tests;
 mod integrations;
 mod layouts;
+mod mailbox;
 mod pane_graphics;
 mod panes;
 pub(crate) mod plugins;
@@ -1376,6 +1377,9 @@ impl App {
                 return self.handle_handoff_validate(request.id, params)
             }
             Method::HandoffSend(params) => return self.handle_handoff_send(request.id, params),
+            Method::MailboxOfflineSubmit(params) => {
+                return self.handle_mailbox_offline_submit(request.id, params)
+            }
             Method::AgentWait(_) => {
                 return responses::encode_error(
                     request.id,

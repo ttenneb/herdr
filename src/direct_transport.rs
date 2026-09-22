@@ -476,6 +476,20 @@ impl RecipientChannelRegistry {
     }
 
     /// Returns only server-recorded facts for diagnostics and endpoint selection.
+    pub(crate) fn resolve_mailbox_recipient(
+        &self,
+        selector: &crate::mailbox::RecipientKey,
+    ) -> Result<SessionGeneration, TransportError> {
+        self.recipients
+            .keys()
+            .find(|recipient| {
+                recipient.session == selector.recipient_id
+                    && recipient.generation.to_string() == selector.generation
+            })
+            .cloned()
+            .ok_or(TransportError::GrantScopeMismatch)
+    }
+
     pub(crate) fn registered(
         &self,
         recipient: &SessionGeneration,
@@ -820,6 +834,10 @@ impl GrantAuthority {
             authority_confirmed: topology_revision != 0,
             ..Self::default()
         }
+    }
+
+    pub fn revision(&self) -> u64 {
+        self.grant_revision
     }
 
     pub fn issue(

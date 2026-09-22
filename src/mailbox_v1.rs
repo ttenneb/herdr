@@ -24,7 +24,7 @@ pub struct Attachment {
 
 /// Untrusted offline sender input. The recipient is selected by the authenticated sender
 /// route and passed separately as server-owned state; no Pi attachment or receipt is accepted.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct Submit {
     pub protocol: String,
