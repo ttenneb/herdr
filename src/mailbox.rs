@@ -130,6 +130,38 @@ impl MailboxStore {
         Ok(recovered)
     }
 
+    /// Offline sender admission: the server syncs the immutable head, then mints and syncs
+    /// the exact receipt. Clients never provide the accepted receipt fields.
+    pub fn append_offline_head(&self, head: MailboxHead) -> Result<AdmissionReceipt, MailboxError> {
+        self.with_exclusive_lock(|| {
+            validate_head(&head)?;
+            let recovered = self.load()?;
+            if let Some(existing) = recovered.heads.get(&head.stable_id) {
+                if existing != &head {
+                    return Err(MailboxError::ConflictingDuplicate);
+                }
+                return recovered
+                    .receipts
+                    .get(&head.delivery_digest)
+                    .cloned()
+                    .ok_or(MailboxError::CorruptRecord);
+            }
+            self.append_synced(&MailboxRecord::Head { head: head.clone() })?;
+            // `append_synced` above completed `sync_all`; mint only after that durable head.
+            let receipt = AdmissionReceipt {
+                delivery_digest: head.delivery_digest.clone(),
+                stable_id: head.stable_id.clone(),
+                revision: head.revision,
+                digest: head.digest.clone(),
+                status: ReceiptStatus::Admitted,
+            };
+            self.append_synced(&MailboxRecord::Receipt {
+                receipt: receipt.clone(),
+            })?;
+            Ok(receipt)
+        })
+    }
+
     /// Appends the head and forces it to stable storage before appending the exact receipt.
     /// A caller must not treat either return value as a Pi or model acknowledgement.
     pub fn append_head_and_receipt(

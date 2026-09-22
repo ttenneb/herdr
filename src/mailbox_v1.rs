@@ -22,43 +22,42 @@ pub struct Attachment {
     pub session_file: Option<String>,
 }
 
+/// Untrusted offline sender input. The recipient is selected by the authenticated sender
+/// route and passed separately as server-owned state; no Pi attachment or receipt is accepted.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct Submit {
     pub protocol: String,
-    pub recipient: RecipientKey,
-    pub attachment: Attachment,
-    pub head: MailboxHead,
-    pub receipt: AdmissionReceipt,
+    pub stable_id: String,
+    pub revision: u64,
+    pub digest: String,
+    pub delivery_digest: String,
+    pub subject: String,
+    pub body: String,
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct Get {
     pub protocol: String,
     pub recipient: RecipientKey,
     pub delivery_digest: String,
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct List {
     pub protocol: String,
     pub recipient: RecipientKey,
-    pub attachment: Attachment,
 }
+/// Consumer-channel request: Herdr mints the claim after separately trusted consumer discovery.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ClaimRequest {
     pub protocol: String,
-    pub recipient: RecipientKey,
-    pub attachment: Attachment,
-    pub claim: Claim,
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct Resolve {
     pub protocol: String,
-    pub recipient: RecipientKey,
-    pub attachment: Attachment,
     pub claim_id: String,
     pub outcome: ResolveOutcome,
 }
@@ -119,52 +118,56 @@ pub fn snapshot(recovered: &RecoveredMailbox, recipient: &RecipientKey) -> Snaps
 }
 
 pub fn validate_request(request: &Request) -> Result<(), TransportError> {
-    let valid_identity =
-        |protocol: &str, recipient: &RecipientKey, attachment: Option<&Attachment>| {
-            protocol == PROTOCOL
-                && !recipient.recipient_id.is_empty()
-                && !recipient.generation.is_empty()
-                && attachment.is_none_or(|value| !value.session_id.is_empty())
-        };
+    let valid_recipient = |recipient: &RecipientKey| {
+        !recipient.recipient_id.is_empty() && !recipient.generation.is_empty()
+    };
     match request {
-        Request::Submit(value) => {
-            if !valid_identity(&value.protocol, &value.recipient, Some(&value.attachment)) {
-                return Err(TransportError::InvalidSchema);
-            }
-            if value.head.recipient != value.recipient
-                || value.receipt.delivery_digest != value.head.delivery_digest
-            {
-                return Err(TransportError::ReceiptMismatch);
-            }
-        }
-        Request::Get(value)
-            if !valid_identity(&value.protocol, &value.recipient, None)
+        Request::Submit(value)
+            if value.protocol != PROTOCOL
+                || value.stable_id.is_empty()
+                || value.revision == 0
+                || value.digest.len() != 64
                 || value.delivery_digest.len() != 64 =>
         {
-            return Err(TransportError::InvalidSchema)
+            Err(TransportError::InvalidSchema)
+        }
+        Request::Get(value)
+            if value.protocol != PROTOCOL
+                || !valid_recipient(&value.recipient)
+                || value.delivery_digest.len() != 64 =>
+        {
+            Err(TransportError::InvalidSchema)
         }
         Request::List(value)
-            if !valid_identity(&value.protocol, &value.recipient, Some(&value.attachment)) =>
+            if value.protocol != PROTOCOL || !valid_recipient(&value.recipient) =>
         {
-            return Err(TransportError::InvalidSchema)
+            Err(TransportError::InvalidSchema)
         }
-        Request::Claim(value) => {
-            if !valid_identity(&value.protocol, &value.recipient, Some(&value.attachment)) {
-                return Err(TransportError::InvalidSchema);
-            }
-            if value.claim.recipient != value.recipient {
-                return Err(TransportError::GrantScopeMismatch);
-            }
+        Request::Claim(value) if value.protocol != PROTOCOL => Err(TransportError::InvalidSchema),
+        Request::Resolve(value) if value.protocol != PROTOCOL || value.claim_id.is_empty() => {
+            Err(TransportError::InvalidSchema)
         }
-        Request::Resolve(value)
-            if !valid_identity(&value.protocol, &value.recipient, Some(&value.attachment))
-                || value.claim_id.is_empty() =>
-        {
-            return Err(TransportError::InvalidSchema)
-        }
-        _ => {}
+        _ => Ok(()),
     }
-    Ok(())
+}
+
+/// Server-side offline admission. The authenticated sender route supplies `recipient`; the
+/// wire DTO cannot select it or submit an accepted receipt. Store durability precedes receipt.
+pub fn submit_offline(
+    store: &crate::mailbox::MailboxStore,
+    recipient: RecipientKey,
+    submit: Submit,
+) -> Result<AdmissionReceipt, crate::mailbox::MailboxError> {
+    let head = MailboxHead {
+        stable_id: submit.stable_id,
+        revision: submit.revision,
+        digest: submit.digest,
+        delivery_digest: submit.delivery_digest,
+        recipient,
+        subject: submit.subject,
+        body: submit.body,
+    };
+    store.append_offline_head(head)
 }
 
 /// Binds mailbox operations to the existing grant/topology/manifest checks. It intentionally
@@ -211,7 +214,7 @@ pub fn authorize(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::mailbox::{MailboxHead, ReceiptStatus};
+    use crate::mailbox::MailboxHead;
     fn recipient() -> RecipientKey {
         RecipientKey {
             recipient_id: "r".into(),
@@ -230,34 +233,41 @@ mod tests {
         }
     }
     #[test]
-    fn codec_rejects_wrong_protocol_and_cross_recipient_submit() {
+    fn offline_submit_needs_no_attachment_and_mints_the_receipt_after_store_admission() {
+        let directory =
+            std::env::temp_dir().join(format!("herdr-mailbox-v1-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&directory);
+        let store = crate::mailbox::MailboxStore::open(&directory).unwrap();
         let h = head();
-        let r = AdmissionReceipt {
-            delivery_digest: h.delivery_digest.clone(),
-            stable_id: h.stable_id.clone(),
-            revision: 1,
-            digest: h.digest.clone(),
-            status: ReceiptStatus::Admitted,
-        };
-        let request = Request::Submit(Submit {
+        let submit = Submit {
             protocol: PROTOCOL.into(),
-            recipient: h.recipient.clone(),
-            attachment: Attachment {
-                session_id: "p".into(),
-                session_file: None,
-            },
-            head: h.clone(),
-            receipt: r,
-        });
-        assert!(validate_request(&request).is_ok());
-        let wrong = Request::List(List {
-            protocol: "wrong".into(),
-            recipient: recipient(),
-            attachment: Attachment {
-                session_id: "p".into(),
-                session_file: None,
-            },
-        });
-        assert_eq!(validate_request(&wrong), Err(TransportError::InvalidSchema));
+            stable_id: h.stable_id.clone(),
+            revision: h.revision,
+            digest: h.digest.clone(),
+            delivery_digest: h.delivery_digest.clone(),
+            subject: h.subject.clone(),
+            body: h.body.clone(),
+        };
+        assert!(validate_request(&Request::Submit(submit.clone())).is_ok());
+        let receipt = submit_offline(&store, recipient(), submit).unwrap();
+        assert_eq!(receipt.delivery_digest, h.delivery_digest);
+        assert_eq!(
+            store.load().unwrap().receipts.get(&h.delivery_digest),
+            Some(&receipt)
+        );
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn raw_clients_cannot_submit_receipts_or_claims() {
+        let forged_submit = format!(
+            r#"{{"method":"submit","params":{{"protocol":"mailbox.v1","stableId":"s","revision":1,"digest":"{}","deliveryDigest":"{}","subject":"x","body":"y","receipt":{{}}}}}}"#,
+            "a".repeat(64),
+            "b".repeat(64)
+        );
+        assert!(serde_json::from_str::<Request>(&forged_submit).is_err());
+        let forged_claim =
+            r#"{"method":"claim","params":{"protocol":"mailbox.v1","claim":{"claimId":"forged"}}}"#;
+        assert!(serde_json::from_str::<Request>(forged_claim).is_err());
     }
 }
