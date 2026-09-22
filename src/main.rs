@@ -75,6 +75,7 @@ mod kitty_graphics;
 mod layout;
 mod logging;
 pub mod mailbox;
+pub mod mailbox_v1;
 mod metadata_tokens;
 mod noninteractive_process;
 mod pane;
