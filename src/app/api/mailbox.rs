@@ -9,13 +9,20 @@ impl App {
         id: String,
         params: MailboxOfflineSubmitParams,
     ) -> String {
-        let Some(authority) = self.offline_mailbox_authority.as_mut() else {
-            return encode_error(
-                id,
-                "mailbox_authority_unavailable",
-                "the server has no authenticated local mailbox sender route",
-            );
-        };
+        match self.offline_mailbox_authority_current() {
+            Ok(true) => {}
+            Ok(false) | Err(_) => {
+                return encode_error(
+                    id,
+                    "mailbox_authority_unavailable",
+                    "the server has no current authenticated local mailbox sender route",
+                )
+            }
+        }
+        let authority = self
+            .offline_mailbox_authority
+            .as_mut()
+            .expect("current route must remain installed during serialized dispatch");
         match authority.submit(params) {
             Ok(receipt) => encode_success(id, ResponseResult::MailboxOfflineSubmitted { receipt }),
             Err(crate::app::mailbox::OfflineMailboxError::CallerMismatch) => encode_error(
@@ -213,7 +220,23 @@ mod tests {
             api_rx,
             crate::api::EventHub::default(),
         );
-        app.offline_mailbox_authority = Some(OfflineMailboxAuthority {
+        app.sender_authority_dir = directory.clone();
+        let sender_store = crate::sender_authority::SenderAuthorityStore::open(&directory)
+            .expect("sender authority store");
+        sender_store
+            .cas(
+                None,
+                crate::sender_authority::SenderAuthorityRecord {
+                    sender_key: "sender-1".into(),
+                    process_generation: 1,
+                    phase: crate::sender_authority::SenderAuthorityPhase::Active,
+                    transition_revision: 1,
+                },
+            )
+            .expect("persist active sender authority");
+        app.install_offline_mailbox_authority(OfflineMailboxAuthority {
+            sender_key: "sender-1".into(),
+            sender_generation: 1,
             caller_selector: caller.session.clone(),
             caller,
             scope: scope(),
@@ -221,7 +244,8 @@ mod tests {
             grants,
             store,
             now: 10,
-        });
+        })
+        .expect("install current authenticated authority");
         (
             app,
             RecipientKey {
@@ -281,6 +305,43 @@ mod tests {
                 .receipts
                 .is_empty(),
             "spoofed caller must not reach durable admission"
+        );
+        drop(app);
+        std::fs::remove_dir_all(directory).expect("remove mailbox test directory");
+    }
+
+    #[test]
+    fn offline_mailbox_endpoint_fails_closed_after_sender_generation_replacement() {
+        let (mut app, recipient, directory) = app_with_authenticated_mailbox();
+        let sender_store = crate::sender_authority::SenderAuthorityStore::open(&directory)
+            .expect("sender authority store");
+        sender_store
+            .cas(
+                Some(1),
+                crate::sender_authority::SenderAuthorityRecord {
+                    sender_key: "sender-1".into(),
+                    process_generation: 2,
+                    phase: crate::sender_authority::SenderAuthorityPhase::Active,
+                    transition_revision: 2,
+                },
+            )
+            .expect("replace sender generation");
+        let response = app.handle_api_request(Request {
+            id: "replaced".into(),
+            method: Method::MailboxOfflineSubmit(submit("session-1", recipient)),
+        });
+        let error: ErrorResponse = serde_json::from_str(&response).expect("error response");
+        assert_eq!(error.error.code, "mailbox_authority_unavailable");
+        assert!(
+            app.offline_mailbox_authority
+                .as_ref()
+                .expect("old authority remains only as a stale local value")
+                .store
+                .load()
+                .expect("read store")
+                .receipts
+                .is_empty(),
+            "a replaced sender generation cannot reach durable admission"
         );
         drop(app);
         std::fs::remove_dir_all(directory).expect("remove mailbox test directory");
