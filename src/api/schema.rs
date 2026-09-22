@@ -167,6 +167,10 @@ pub enum Method {
     HandoffSend(HandoffSendParams),
     #[serde(rename = "mailbox.offline_submit")]
     MailboxOfflineSubmit(MailboxOfflineSubmitParams),
+    #[serde(rename = "mailbox.claim")]
+    MailboxClaim(MailboxClaimParams),
+    #[serde(rename = "mailbox.resolve")]
+    MailboxResolve(MailboxResolveParams),
     #[serde(rename = "collection.list")]
     CollectionList(CollectionListParams),
     #[serde(rename = "collection.get")]

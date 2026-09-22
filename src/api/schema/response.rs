@@ -129,6 +129,12 @@ pub enum ResponseResult {
     MailboxOfflineSubmitted {
         receipt: crate::mailbox::AdmissionReceipt,
     },
+    MailboxClaimed {
+        claim: Option<crate::mailbox::Claim>,
+    },
+    MailboxResolved {
+        resolution: crate::mailbox::ClaimResolution,
+    },
     AgentList {
         agents: Vec<AgentInfo>,
     },

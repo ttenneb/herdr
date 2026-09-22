@@ -53,7 +53,7 @@ pub enum ReceiptStatus {
     Rejected,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct Claim {
     pub claim_id: String,
@@ -63,6 +63,20 @@ pub struct Claim {
     pub digest: String,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ClaimResolutionOutcome {
+    Admitted,
+    Settled,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct ClaimResolution {
+    pub claim_id: String,
+    pub outcome: ClaimResolutionOutcome,
+}
+
 /// Append-only stream. Records themselves are immutable; recovered state is a projection.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
@@ -70,6 +84,7 @@ pub enum MailboxRecord {
     Head { head: MailboxHead },
     Receipt { receipt: AdmissionReceipt },
     Claim { claim: Claim },
+    Resolution { resolution: ClaimResolution },
 }
 
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
@@ -77,6 +92,7 @@ pub struct RecoveredMailbox {
     pub heads: BTreeMap<String, MailboxHead>,
     pub receipts: BTreeMap<String, AdmissionReceipt>,
     pub claims: BTreeMap<String, Claim>,
+    pub resolutions: BTreeMap<String, ClaimResolution>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -85,6 +101,8 @@ pub enum MailboxError {
     ConflictingDuplicate,
     MissingHead,
     ClaimAlreadyExists,
+    ClaimAlreadyResolved,
+    MissingClaim,
     Io(String),
     CorruptRecord,
 }
@@ -228,6 +246,79 @@ impl MailboxStore {
         })
     }
 
+    /// Returns the one outstanding claim for a recipient, or atomically claims
+    /// its next unclaimed head. This prevents a replay from creating a second
+    /// consumer execution record.
+    pub fn claim_next(&self, recipient: &RecipientKey) -> Result<Option<Claim>, MailboxError> {
+        self.with_exclusive_lock(|| {
+            let recovered = self.load()?;
+            if let Some(existing) = recovered
+                .claims
+                .values()
+                .find(|claim| {
+                    &claim.recipient == recipient
+                        && !recovered.resolutions.contains_key(&claim.claim_id)
+                })
+                .cloned()
+            {
+                return Ok(Some(existing));
+            }
+            let Some(head) = recovered.heads.values().find(|head| {
+                &head.recipient == recipient && !recovered.claims.contains_key(&head.stable_id)
+            }) else {
+                return Ok(None);
+            };
+            let claim = Claim {
+                claim_id: format!(
+                    "claim:{}:{}:{}",
+                    recipient.recipient_id, recipient.generation, head.stable_id
+                ),
+                recipient: recipient.clone(),
+                stable_id: head.stable_id.clone(),
+                revision: head.revision,
+                digest: head.digest.clone(),
+            };
+            self.append_synced(&MailboxRecord::Claim {
+                claim: claim.clone(),
+            })?;
+            Ok(Some(claim))
+        })
+    }
+
+    /// Persists a single resolution for the claimed work. Matching retries read
+    /// back the first resolution; a conflicting replay cannot change outcome.
+    pub fn resolve_claim(
+        &self,
+        claim_id: &str,
+        outcome: ClaimResolutionOutcome,
+    ) -> Result<ClaimResolution, MailboxError> {
+        self.with_exclusive_lock(|| {
+            let recovered = self.load()?;
+            if !recovered
+                .claims
+                .values()
+                .any(|claim| claim.claim_id == claim_id)
+            {
+                return Err(MailboxError::MissingClaim);
+            }
+            let resolution = ClaimResolution {
+                claim_id: claim_id.into(),
+                outcome,
+            };
+            if let Some(existing) = recovered.resolutions.get(claim_id) {
+                return if existing == &resolution {
+                    Ok(existing.clone())
+                } else {
+                    Err(MailboxError::ClaimAlreadyResolved)
+                };
+            }
+            self.append_synced(&MailboxRecord::Resolution {
+                resolution: resolution.clone(),
+            })?;
+            Ok(resolution)
+        })
+    }
+
     fn append_synced(&self, record: &MailboxRecord) -> Result<(), MailboxError> {
         let mut stream = OpenOptions::new()
             .create(true)
@@ -280,6 +371,11 @@ impl RecoveredMailbox {
             MailboxRecord::Claim { claim } => {
                 insert_exact(&mut self.claims, claim.stable_id.clone(), claim)
             }
+            MailboxRecord::Resolution { resolution } => insert_exact(
+                &mut self.resolutions,
+                resolution.claim_id.clone(),
+                resolution,
+            ),
         }
     }
 }

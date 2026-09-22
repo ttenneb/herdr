@@ -1398,6 +1398,10 @@ impl App {
             Method::MailboxOfflineSubmit(params) => {
                 return self.handle_mailbox_offline_submit(request.id, params)
             }
+            Method::MailboxClaim(params) => return self.handle_mailbox_claim(request.id, params),
+            Method::MailboxResolve(params) => {
+                return self.handle_mailbox_resolve(request.id, params)
+            }
             Method::AgentWait(_) => {
                 return responses::encode_error(
                     request.id,

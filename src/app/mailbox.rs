@@ -81,6 +81,24 @@ impl OfflineMailboxAuthority {
             && record.process_generation == self.sender_generation
     }
 
+    fn capability_for(
+        &self,
+        caller: &str,
+        grant_id: &str,
+        recipient: &crate::mailbox::RecipientKey,
+    ) -> Result<&OfflineMailboxCapability, OfflineMailboxError> {
+        if caller != self.caller_selector {
+            return Err(OfflineMailboxError::CallerMismatch);
+        }
+        let Some(capability) = self.capabilities.get(grant_id) else {
+            return Err(OfflineMailboxError::CapabilityMismatch);
+        };
+        if &capability.recipient != recipient {
+            return Err(OfflineMailboxError::CapabilityMismatch);
+        }
+        Ok(capability)
+    }
+
     pub(crate) fn submit(
         &mut self,
         params: MailboxOfflineSubmitParams,
@@ -89,15 +107,8 @@ impl OfflineMailboxAuthority {
             params.submit.clone(),
         ))
         .map_err(OfflineMailboxError::Transport)?;
-        if params.caller != self.caller_selector {
-            return Err(OfflineMailboxError::CallerMismatch);
-        }
-        let Some(capability) = self.capabilities.get(&params.grant_id) else {
-            return Err(OfflineMailboxError::CapabilityMismatch);
-        };
-        if capability.recipient != params.recipient {
-            return Err(OfflineMailboxError::CapabilityMismatch);
-        }
+        let capability =
+            self.capability_for(&params.caller, &params.grant_id, &params.recipient)?;
         if self
             .store
             .load()
@@ -123,6 +134,54 @@ impl OfflineMailboxAuthority {
             Some(persisted) if persisted == &receipt => Ok(receipt),
             _ => Err(OfflineMailboxError::ReceiptMissing),
         }
+    }
+
+    pub(crate) fn claim(
+        &self,
+        params: crate::api::schema::MailboxClaimParams,
+    ) -> Result<Option<crate::mailbox::Claim>, OfflineMailboxError> {
+        crate::mailbox_v1::validate_request(&crate::mailbox_v1::Request::Claim(params.claim))
+            .map_err(OfflineMailboxError::Transport)?;
+        let capability =
+            self.capability_for(&params.caller, &params.grant_id, &params.recipient)?;
+        self.store
+            .claim_next(&capability.recipient)
+            .map_err(OfflineMailboxError::Store)
+    }
+
+    pub(crate) fn resolve(
+        &self,
+        params: crate::api::schema::MailboxResolveParams,
+    ) -> Result<crate::mailbox::ClaimResolution, OfflineMailboxError> {
+        crate::mailbox_v1::validate_request(&crate::mailbox_v1::Request::Resolve(
+            params.resolve.clone(),
+        ))
+        .map_err(OfflineMailboxError::Transport)?;
+        let capability =
+            self.capability_for(&params.caller, &params.grant_id, &params.recipient)?;
+        let claim = self
+            .store
+            .load()
+            .map_err(OfflineMailboxError::Store)?
+            .claims
+            .values()
+            .find(|claim| claim.claim_id == params.resolve.claim_id)
+            .cloned()
+            .ok_or(OfflineMailboxError::CapabilityMismatch)?;
+        if claim.recipient != capability.recipient {
+            return Err(OfflineMailboxError::CapabilityMismatch);
+        }
+        let outcome = match params.resolve.outcome {
+            crate::mailbox_v1::ResolveOutcome::Admitted => {
+                crate::mailbox::ClaimResolutionOutcome::Admitted
+            }
+            crate::mailbox_v1::ResolveOutcome::Settled => {
+                crate::mailbox::ClaimResolutionOutcome::Settled
+            }
+        };
+        self.store
+            .resolve_claim(&claim.claim_id, outcome)
+            .map_err(OfflineMailboxError::Store)
     }
 }
 
