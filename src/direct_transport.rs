@@ -303,6 +303,7 @@ impl ChannelBinding {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct TrustedMailboxChannelContext {
     binding: ChannelBinding,
+    foreground_pi_pid: u32,
 }
 
 impl TrustedMailboxChannelContext {
@@ -352,7 +353,10 @@ impl TrustedMailboxChannelContext {
             peer_in_foreground_tree,
             terminal_generation,
         )?;
-        Ok(Self { binding })
+        Ok(Self {
+            binding,
+            foreground_pi_pid,
+        })
     }
 
     #[cfg(not(target_os = "linux"))]
@@ -368,6 +372,10 @@ impl TrustedMailboxChannelContext {
 
     pub(crate) fn binding(&self) -> &ChannelBinding {
         &self.binding
+    }
+
+    pub(crate) fn foreground_pi_pid(&self) -> u32 {
+        self.foreground_pi_pid
     }
 
     /// Produces a route only from this verified binding and the live manifest registry.
@@ -409,6 +417,118 @@ fn process_descends_from(mut child: u32, ancestor: u32) -> bool {
         child = parent;
     }
     false
+}
+
+/// A registered recipient channel, built exclusively from a server-owned terminal/agent
+/// lifecycle event after `TrustedMailboxChannelContext` has verified the dedicated socket.
+/// It intentionally contains no API wire, Pi attachment, or control-socket caller fields.
+#[derive(Debug)]
+struct RegisteredRecipientChannel {
+    context: TrustedMailboxChannelContext,
+    manifests: ManifestRegistry,
+    topology: CanonicalTopology,
+}
+
+/// Server-owned registration table for live mailbox recipients. The API control socket must
+/// never call this directly: registration needs a dedicated recipient channel plus terminal
+/// lifecycle state. Removing a registration is the mandatory disconnect/reload/generation
+/// invalidation step and makes all later discovery fail with `ManifestMissing`.
+#[derive(Debug, Default)]
+pub(crate) struct RecipientChannelRegistry {
+    recipients: HashMap<SessionGeneration, RegisteredRecipientChannel>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RegisteredRecipientInfo {
+    pub(crate) recipient: SessionGeneration,
+    pub(crate) binding_id: String,
+    pub(crate) terminal_generation: u64,
+    pub(crate) foreground_pi_pid: u32,
+    pub(crate) topology_revision: u64,
+}
+
+impl RecipientChannelRegistry {
+    /// Registers one recipient generation. `context` must have been constructed from the
+    /// actual recipient Unix socket; `manifest` and `topology` are server lifecycle snapshots.
+    /// A duplicate generation fails closed rather than silently replacing its authority.
+    pub(crate) fn register(
+        &mut self,
+        context: TrustedMailboxChannelContext,
+        manifest: LiveManifest,
+        topology: CanonicalTopology,
+        now: u64,
+    ) -> Result<(), TransportError> {
+        let recipient = context.binding().recipient().clone();
+        if self.recipients.contains_key(&recipient) {
+            return Err(TransportError::SessionReplaced);
+        }
+        let mut manifests = ManifestRegistry::default();
+        manifests.register_atomic(manifest, context.binding(), now)?;
+        self.recipients.insert(
+            recipient,
+            RegisteredRecipientChannel {
+                context,
+                manifests,
+                topology,
+            },
+        );
+        Ok(())
+    }
+
+    /// Returns only server-recorded facts for diagnostics and endpoint selection.
+    pub(crate) fn registered(
+        &self,
+        recipient: &SessionGeneration,
+    ) -> Option<RegisteredRecipientInfo> {
+        let entry = self.recipients.get(recipient)?;
+        Some(RegisteredRecipientInfo {
+            recipient: entry.context.binding().recipient().clone(),
+            binding_id: entry.context.binding().id().to_string(),
+            terminal_generation: entry.context.binding().recipient().generation,
+            foreground_pi_pid: entry.context.foreground_pi_pid(),
+            topology_revision: entry.topology.revision(),
+        })
+    }
+
+    /// Derives a route from the server-owned registration. The caller supplies a recipient
+    /// selected from server state, not a request recipient or Pi attachment identity.
+    pub(crate) fn with_authenticated_route<T>(
+        &self,
+        recipient: &SessionGeneration,
+        now: u64,
+        operation: impl FnOnce(
+            &TrustedMailboxChannelContext,
+            &ManifestRegistry,
+            &CanonicalTopology,
+            NegotiatedRoute,
+        ) -> Result<T, TransportError>,
+    ) -> Result<T, TransportError> {
+        let entry = self
+            .recipients
+            .get(recipient)
+            .ok_or(TransportError::ManifestMissing)?;
+        let route = entry.context.negotiate(&entry.manifests, now)?;
+        operation(&entry.context, &entry.manifests, &entry.topology, route)
+    }
+
+    /// Call from the terminal/agent lifecycle on socket close, reload, or generation change.
+    /// The exact registered binding must match; a stale lifecycle event cannot remove a newer
+    /// recipient registration.
+    pub(crate) fn invalidate(
+        &mut self,
+        recipient: &SessionGeneration,
+        binding_id: &str,
+    ) -> Result<(), TransportError> {
+        let entry = self
+            .recipients
+            .get(recipient)
+            .ok_or(TransportError::ManifestMissing)?;
+        if entry.context.binding().id() != binding_id {
+            return Err(TransportError::ChannelPeerMismatch);
+        }
+        self.recipients.remove(recipient);
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -1869,6 +1989,93 @@ mod tests {
             )
             .unwrap_err(),
             TransportError::ChannelPeerMismatch
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn recipient_registry_derives_routes_only_from_registered_trusted_context() {
+        use std::os::fd::AsRawFd as _;
+        use std::os::unix::net::UnixStream;
+
+        let (server, _client) = UnixStream::pair().unwrap();
+        let recipient = principal(70_002, 70_002);
+        let context = TrustedMailboxChannelContext::from_verified_local_socket(
+            server.as_raw_fd(),
+            recipient.clone(),
+            "registered-binding".into(),
+            std::process::id(),
+            70_002,
+        )
+        .unwrap();
+        let mut registry = RecipientChannelRegistry::default();
+        registry
+            .register(context, manifest(9, &channel(70_002)), topology(), 9)
+            .unwrap_err();
+
+        // A manifest whose binding comes from another source cannot register. Build the
+        // matching manifest from the trusted context and prove discovery yields that route.
+        let context = TrustedMailboxChannelContext::from_verified_local_socket(
+            server.as_raw_fd(),
+            recipient.clone(),
+            "registered-binding".into(),
+            std::process::id(),
+            70_002,
+        )
+        .unwrap();
+        let matching_manifest = manifest(9, context.binding());
+        registry
+            .register(context, matching_manifest, topology(), 9)
+            .unwrap();
+        let info = registry.registered(&recipient).unwrap();
+        assert_eq!(info.recipient, recipient);
+        assert_eq!(info.binding_id, "registered-binding");
+        assert_eq!(info.foreground_pi_pid, std::process::id());
+        registry
+            .with_authenticated_route(
+                &info.recipient,
+                10,
+                |context, _manifests, topology, route| {
+                    assert_eq!(context.binding().id(), "registered-binding");
+                    assert_eq!(topology.revision(), 9);
+                    assert_eq!(route.identity().recipient(), &info.recipient);
+                    Ok(())
+                },
+            )
+            .unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn recipient_registry_rejects_stale_lifecycle_invalidation() {
+        use std::os::fd::AsRawFd as _;
+        use std::os::unix::net::UnixStream;
+
+        let (server, _client) = UnixStream::pair().unwrap();
+        let recipient = principal(70_002, 70_002);
+        let context = TrustedMailboxChannelContext::from_verified_local_socket(
+            server.as_raw_fd(),
+            recipient.clone(),
+            "live-binding".into(),
+            std::process::id(),
+            70_002,
+        )
+        .unwrap();
+        let manifest = manifest(9, context.binding());
+        let mut registry = RecipientChannelRegistry::default();
+        registry.register(context, manifest, topology(), 9).unwrap();
+        assert_eq!(
+            registry.invalidate(&recipient, "stale-binding"),
+            Err(TransportError::ChannelPeerMismatch)
+        );
+        registry.invalidate(&recipient, "live-binding").unwrap();
+        assert_eq!(
+            registry.with_authenticated_route(
+                &recipient,
+                10,
+                |_context, _manifests, _topology, _route| Ok(())
+            ),
+            Err(TransportError::ManifestMissing)
         );
     }
     fn manifest(epoch: u64, channel: &ChannelBinding) -> LiveManifest {
