@@ -133,6 +133,9 @@ pub struct TerminalState {
     pub agent_name: Option<String>,
     agent_name_owner: Option<AgentNameOwner>,
     managed_agent: Option<ManagedAgent>,
+    /// Server-minted generation for the current managed launch. Pane lifecycle
+    /// reports must present this exact value before they can claim it.
+    managed_agent_generation: Option<u64>,
     hook_report_sequences: HashMap<String, u64>,
     suppressed_full_lifecycle_hook_reports: HashMap<String, SuppressedFullLifecycleHookReport>,
     stale_full_lifecycle_hook_sessions: HashMap<String, Vec<StaleFullLifecycleHookSession>>,
@@ -167,6 +170,7 @@ impl TerminalState {
             agent_name: None,
             agent_name_owner: None,
             managed_agent: None,
+            managed_agent_generation: None,
             hook_report_sequences: HashMap::new(),
             suppressed_full_lifecycle_hook_reports: HashMap::new(),
             stale_full_lifecycle_hook_sessions: HashMap::new(),
@@ -1914,6 +1918,18 @@ impl TerminalState {
                 observed_expected: false,
             },
         });
+        self.managed_agent_generation = None;
+    }
+
+    pub(crate) fn set_managed_agent_generation(&mut self, generation: u64) {
+        self.managed_agent_generation = Some(generation);
+    }
+
+    pub(crate) fn accepts_managed_agent_generation(&self, generation: u64) -> bool {
+        match self.managed_agent_generation {
+            Some(expected) => generation == expected,
+            None => generation == 0,
+        }
     }
 
     pub fn managed_agent_launch_pending(&self) -> bool {
@@ -2044,6 +2060,7 @@ impl TerminalState {
         self.agent_name = None;
         self.agent_name_owner = None;
         self.managed_agent = None;
+        self.managed_agent_generation = None;
     }
 
     pub fn clear_agent_runtime_identity_after_respawn(&mut self) {

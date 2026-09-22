@@ -135,6 +135,8 @@ pub struct App {
     pub(crate) direct_graphics_available: bool,
     pub(crate) pixel_mouse_available: bool,
     pub(crate) terminal_runtimes: crate::terminal::TerminalRuntimeRegistry,
+    /// Session-scoped directory for durable server-owned sender authority.
+    pub(crate) sender_authority_dir: std::path::PathBuf,
     pub event_tx: mpsc::Sender<AppEvent>,
     pub(crate) event_rx: mpsc::Receiver<AppEvent>,
     pub(crate) api_rx: tokio::sync::mpsc::UnboundedReceiver<crate::api::ApiRequestMessage>,
@@ -855,6 +857,7 @@ impl App {
             direct_graphics_available: false,
             pixel_mouse_available: false,
             terminal_runtimes: restored_terminal_runtimes,
+            sender_authority_dir: crate::session::data_dir(),
             event_tx,
             event_rx,
             last_git_remote_status_refresh: Instant::now() - GIT_REMOTE_STATUS_REFRESH_INTERVAL,

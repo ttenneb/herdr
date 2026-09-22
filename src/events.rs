@@ -61,6 +61,9 @@ pub enum AppEvent {
     AgentProcessDetected {
         pane_id: PaneId,
         agent: Agent,
+        /// Server-minted launch generation captured by the pane runtime. Zero
+        /// denotes an unmanaged detection and can never claim a managed launch.
+        process_generation: u64,
         observed_at: Instant,
     },
     /// Fallback detector state changed in a pane.

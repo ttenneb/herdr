@@ -376,6 +376,7 @@ mod tests {
         app::Mode,
         config::Config,
         detect::{Agent, AgentState},
+        events::AppEvent,
         workspace::Workspace,
     };
 
@@ -394,6 +395,124 @@ mod tests {
         app.state.selected = 0;
         app.state.mode = Mode::Terminal;
         app
+    }
+
+    #[tokio::test]
+    async fn agent_start_persists_generation_before_input_and_rejects_stale_detection() {
+        let mut app = app_with_agent();
+        let pane_id = app.state.workspaces[0].tabs[0]
+            .root_pane
+            .expect("root pane");
+        let terminal_id = app.state.workspaces[0]
+            .terminal_id(pane_id)
+            .expect("terminal id")
+            .clone();
+        let authority_dir = std::env::temp_dir().join(format!(
+            "herdr-agent-start-authority-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock after epoch")
+                .as_nanos()
+        ));
+        app.sender_authority_dir = authority_dir.clone();
+        let (runtime, mut input) = crate::terminal::TerminalRuntime::test_with_channel(80, 24);
+        app.terminal_runtimes.insert(terminal_id.clone(), runtime);
+
+        let response = app.handle_agent_start(
+            "start".into(),
+            crate::api::schema::AgentStartParams {
+                name: "reviewer".into(),
+                kind: "pi".into(),
+                pane_id: app.public_pane_id(0, pane_id).expect("public pane"),
+                args: Vec::new(),
+                env: Vec::new(),
+                timeout_ms: None,
+            },
+        );
+        assert!(serde_json::from_str::<SuccessResponse>(&response).is_ok());
+        assert!(input.try_recv().is_ok(), "input follows durable intent");
+
+        let store = crate::sender_authority::SenderAuthorityStore::open(&authority_dir)
+            .expect("open authority store");
+        assert_eq!(
+            store.load().expect("read authority record"),
+            Some(crate::sender_authority::SenderAuthorityRecord {
+                sender_key: terminal_id.to_string(),
+                process_generation: 1,
+                phase: crate::sender_authority::SenderAuthorityPhase::Preparing,
+                transition_revision: 1,
+            })
+        );
+
+        app.handle_internal_event(AppEvent::AgentProcessDetected {
+            pane_id,
+            agent: Agent::Codex,
+            process_generation: 2,
+            observed_at: std::time::Instant::now(),
+        });
+        assert_eq!(
+            app.state.terminals[&terminal_id].detected_agent, None,
+            "a replaced generation cannot claim the managed launch"
+        );
+
+        app.handle_internal_event(AppEvent::AgentProcessDetected {
+            pane_id,
+            agent: Agent::Pi,
+            process_generation: 1,
+            observed_at: std::time::Instant::now(),
+        });
+        assert_eq!(
+            app.state.terminals[&terminal_id].detected_agent,
+            Some(Agent::Pi)
+        );
+
+        std::fs::remove_dir_all(authority_dir).expect("remove authority test directory");
+    }
+
+    #[tokio::test]
+    async fn agent_start_aborts_before_input_when_authority_persistence_fails() {
+        let mut app = app_with_agent();
+        let pane_id = app.state.workspaces[0].tabs[0]
+            .root_pane
+            .expect("root pane");
+        let terminal_id = app.state.workspaces[0]
+            .terminal_id(pane_id)
+            .expect("terminal id")
+            .clone();
+        let authority_path = std::env::temp_dir().join(format!(
+            "herdr-agent-start-authority-file-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock after epoch")
+                .as_nanos()
+        ));
+        std::fs::write(&authority_path, b"not a directory").expect("create authority blocker");
+        app.sender_authority_dir = authority_path.clone();
+        let (runtime, mut input) = crate::terminal::TerminalRuntime::test_with_channel(80, 24);
+        app.terminal_runtimes.insert(terminal_id.clone(), runtime);
+
+        let response = app.handle_agent_start(
+            "start".into(),
+            crate::api::schema::AgentStartParams {
+                name: "reviewer".into(),
+                kind: "pi".into(),
+                pane_id: app.public_pane_id(0, pane_id).expect("public pane"),
+                args: Vec::new(),
+                env: Vec::new(),
+                timeout_ms: None,
+            },
+        );
+        let error: crate::api::schema::ErrorResponse = serde_json::from_str(&response).unwrap();
+        assert_eq!(error.error.code, "agent_start_authority_persistence_failed");
+        assert!(
+            input.try_recv().is_err(),
+            "persistence failure must precede input"
+        );
+        assert!(!app.state.terminals[&terminal_id].is_agent_terminal());
+
+        std::fs::remove_file(authority_path).expect("remove authority blocker");
     }
 
     #[tokio::test]

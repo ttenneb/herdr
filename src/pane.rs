@@ -223,12 +223,14 @@ async fn publish_agent_process_detected_event(
     state_events: mpsc::Sender<AppEvent>,
     pane_id: PaneId,
     agent: Agent,
+    process_generation: u64,
     observed_at: std::time::Instant,
 ) {
     if let Err(e) = state_events
         .send(AppEvent::AgentProcessDetected {
             pane_id,
             agent,
+            process_generation,
             observed_at,
         })
         .await
@@ -692,6 +694,7 @@ fn spawn_basic_detection_task(
     terminal: Arc<PaneTerminal>,
     detection_content_seq: Arc<AtomicU64>,
     full_lifecycle_authority_active: Arc<AtomicBool>,
+    managed_agent_generation: Arc<AtomicU64>,
     state_events: mpsc::Sender<AppEvent>,
 ) -> (
     tokio::task::AbortHandle,
@@ -855,6 +858,7 @@ fn spawn_basic_detection_task(
                                 state_events.clone(),
                                 pane_id,
                                 agent,
+                                managed_agent_generation.load(Ordering::Acquire),
                                 now,
                             )
                             .await;
@@ -1055,6 +1059,7 @@ pub struct PaneRuntime {
     content_seq: Arc<AtomicU64>,
     detection_content_seq: Arc<AtomicU64>,
     full_lifecycle_authority_active: Arc<AtomicBool>,
+    managed_agent_generation: Arc<AtomicU64>,
     detect_reset_notify: Arc<Notify>,
     pending_release: Arc<Mutex<Option<PendingAgentRelease>>>,
     preserve_processes_on_drop: bool,
@@ -2260,12 +2265,14 @@ impl PaneRuntime {
         };
 
         let full_lifecycle_authority_active = Arc::new(AtomicBool::new(false));
+        let managed_agent_generation = Arc::new(AtomicU64::new(0));
         let (detect_handle, detect_reset_notify, pending_release) = spawn_basic_detection_task(
             pane_id,
             child_pid.clone(),
             terminal.clone(),
             detection_content_seq.clone(),
             full_lifecycle_authority_active.clone(),
+            managed_agent_generation.clone(),
             events,
         );
 
@@ -2282,6 +2289,7 @@ impl PaneRuntime {
             content_seq,
             detection_content_seq,
             full_lifecycle_authority_active,
+            managed_agent_generation,
             detect_reset_notify,
             pending_release,
             preserve_processes_on_drop: true,
@@ -2338,6 +2346,7 @@ impl PaneRuntime {
         let content_seq = Arc::new(AtomicU64::new(0));
         let detection_content_seq = Arc::new(AtomicU64::new(0));
         let full_lifecycle_authority_active = Arc::new(AtomicBool::new(false));
+        let managed_agent_generation = Arc::new(AtomicU64::new(0));
         {
             let child_pid = child_pid.clone();
             let child_wait_completed = child_wait_completed.clone();
@@ -2445,6 +2454,7 @@ impl PaneRuntime {
             let state_events = events.clone();
             let detection_content_seq = detection_content_seq.clone();
             let full_lifecycle_authority_active_for_task = full_lifecycle_authority_active.clone();
+            let managed_agent_generation_for_task = managed_agent_generation.clone();
             let render_notify = render_notify.clone();
             let render_dirty = render_dirty.clone();
             let detect_reset_notify = Arc::new(Notify::new());
@@ -2659,6 +2669,8 @@ impl PaneRuntime {
                                             state_events.clone(),
                                             pane_id,
                                             agent,
+                                            managed_agent_generation_for_task
+                                                .load(Ordering::Acquire),
                                             now,
                                         )
                                         .await;
@@ -2839,6 +2851,7 @@ impl PaneRuntime {
             content_seq,
             detection_content_seq,
             full_lifecycle_authority_active,
+            managed_agent_generation,
             detect_reset_notify,
             pending_release,
             preserve_processes_on_drop: false,
@@ -2877,6 +2890,12 @@ impl PaneRuntime {
         if active && !previous {
             self.detect_reset_notify.notify_one();
         }
+    }
+
+    pub fn set_managed_agent_generation(&self, generation: u64) {
+        self.managed_agent_generation
+            .store(generation, Ordering::Release);
+        self.detect_reset_notify.notify_one();
     }
 
     pub(crate) fn current_size(&self) -> (u16, u16) {
@@ -3391,6 +3410,7 @@ impl PaneRuntime {
                 content_seq: Arc::new(AtomicU64::new(0)),
                 detection_content_seq: Arc::new(AtomicU64::new(0)),
                 full_lifecycle_authority_active: Arc::new(AtomicBool::new(false)),
+                managed_agent_generation: Arc::new(AtomicU64::new(0)),
                 detect_reset_notify: Arc::new(Notify::new()),
                 pending_release: Arc::new(Mutex::new(None)),
                 preserve_processes_on_drop: true,
@@ -4108,6 +4128,7 @@ mod tests {
             content_seq: Arc::new(AtomicU64::new(0)),
             detection_content_seq: Arc::new(AtomicU64::new(0)),
             full_lifecycle_authority_active: Arc::new(AtomicBool::new(false)),
+            managed_agent_generation: Arc::new(AtomicU64::new(0)),
             detect_reset_notify: Arc::new(Notify::new()),
             pending_release: Arc::new(Mutex::new(None)),
             preserve_processes_on_drop: true,
@@ -4144,6 +4165,7 @@ mod tests {
             content_seq: Arc::new(AtomicU64::new(0)),
             detection_content_seq: Arc::new(AtomicU64::new(0)),
             full_lifecycle_authority_active: Arc::new(AtomicBool::new(false)),
+            managed_agent_generation: Arc::new(AtomicU64::new(0)),
             detect_reset_notify: Arc::new(Notify::new()),
             pending_release: Arc::new(Mutex::new(None)),
             preserve_processes_on_drop: true,

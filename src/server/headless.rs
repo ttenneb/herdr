@@ -12125,6 +12125,7 @@ next_tab = ""
             server.handle_internal_event_with_forwarding(AppEvent::AgentProcessDetected {
                 pane_id,
                 agent: crate::detect::Agent::Pi,
+                process_generation: 0,
                 observed_at: Instant::now(),
             })
         );

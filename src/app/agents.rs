@@ -214,6 +214,41 @@ impl App {
         Ok(timeout)
     }
 
+    fn allocate_sender_authority_generation(
+        &self,
+        sender_key: String,
+    ) -> Result<u64, AgentStartError> {
+        let store = crate::sender_authority::SenderAuthorityStore::open(&self.sender_authority_dir)
+            .map_err(|err| AgentStartError::AuthorityPersistence(err.to_string()))?;
+        let previous = store
+            .recover()
+            .map_err(|err| AgentStartError::AuthorityPersistence(err.to_string()))?;
+        let process_generation = previous
+            .as_ref()
+            .map(|record| record.process_generation)
+            .unwrap_or(0)
+            .checked_add(1)
+            .ok_or_else(|| AgentStartError::AuthorityPersistence("generation exhausted".into()))?;
+        let transition_revision = previous
+            .as_ref()
+            .map(|record| record.transition_revision)
+            .unwrap_or(0)
+            .checked_add(1)
+            .ok_or_else(|| AgentStartError::AuthorityPersistence("revision exhausted".into()))?;
+        store
+            .cas(
+                previous.as_ref().map(|record| record.transition_revision),
+                crate::sender_authority::SenderAuthorityRecord {
+                    sender_key,
+                    process_generation,
+                    phase: crate::sender_authority::SenderAuthorityPhase::Preparing,
+                    transition_revision,
+                },
+            )
+            .map_err(|err| AgentStartError::AuthorityPersistence(err.to_string()))?;
+        Ok(process_generation)
+    }
+
     pub(super) fn start_agent(
         &mut self,
         params: AgentStartParams,
@@ -249,6 +284,10 @@ impl App {
             .ok_or(AgentStartError::InvalidArgument)?;
         let bytes = crate::app::api_helpers::encode_api_submission(runtime, &command);
         let timeout = self.agent_start_timeout(&params)?;
+        // This write-ahead intent is the last fallible step before mutating
+        // launch state or sending bytes to the terminal.
+        let process_generation =
+            self.allocate_sender_authority_generation(terminal_id.to_string())?;
 
         let now = Instant::now();
         let terminal = self
@@ -256,9 +295,12 @@ impl App {
             .terminals
             .get_mut(&terminal_id)
             .ok_or_else(|| AgentStartError::TargetUnavailable(params.pane_id.clone()))?;
+        runtime.set_managed_agent_generation(process_generation);
         terminal.begin_managed_agent(name.clone(), kind, now, AGENT_START_SETTLE_DELAY, timeout);
+        terminal.set_managed_agent_generation(process_generation);
         if let Err(err) = runtime.try_send_bytes(Bytes::from(bytes)) {
             terminal.clear_agent_name();
+            runtime.set_managed_agent_generation(0);
             return Err(AgentStartError::InputFailed(err.to_string()));
         }
         self.acknowledge_terminal_input(&terminal_id);
@@ -311,6 +353,10 @@ impl App {
             AgentStartError::InputFailed(message) => crate::api::schema::ErrorBody {
                 code: "agent_start_input_failed".into(),
                 message,
+            },
+            AgentStartError::AuthorityPersistence(message) => crate::api::schema::ErrorBody {
+                code: "agent_start_authority_persistence_failed".into(),
+                message: format!("could not persist sender launch authority: {message}"),
             },
             AgentStartError::DuplicateName { name, candidates } => crate::api::schema::ErrorBody {
                 code: "agent_name_taken".into(),
@@ -499,6 +545,7 @@ pub(super) enum AgentStartError {
     TargetBusy(String),
     TargetUnavailable(String),
     InputFailed(String),
+    AuthorityPersistence(String),
     DuplicateName {
         name: String,
         candidates: Vec<crate::api::schema::AgentInfo>,
