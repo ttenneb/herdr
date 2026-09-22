@@ -433,8 +433,11 @@ mod tests {
         assert!(serde_json::from_str::<SuccessResponse>(&response).is_ok());
         assert!(input.try_recv().is_ok(), "input follows durable intent");
 
-        let store = crate::sender_authority::SenderAuthorityStore::open(&authority_dir)
-            .expect("open authority store");
+        let store = crate::sender_authority::SenderAuthorityStore::for_sender(
+            &authority_dir,
+            &terminal_id.to_string(),
+        )
+        .expect("open authority store");
         assert_eq!(
             store.load().expect("read authority record"),
             Some(crate::sender_authority::SenderAuthorityRecord {

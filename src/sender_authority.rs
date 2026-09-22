@@ -32,6 +32,22 @@ impl SenderAuthorityStore {
             path: dir.as_ref().join("sender-authority.json"),
         })
     }
+
+    /// Per-logical-sender records let one server retain independent active
+    /// execution bindings. The filename is an encoding, not an authority key.
+    pub(crate) fn for_sender(dir: impl AsRef<Path>, sender_key: &str) -> std::io::Result<Self> {
+        std::fs::create_dir_all(dir.as_ref())?;
+        let encoded: String = sender_key
+            .as_bytes()
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect();
+        Ok(Self {
+            path: dir
+                .as_ref()
+                .join(format!("sender-authority-{encoded}.json")),
+        })
+    }
     pub(crate) fn load(&self) -> std::io::Result<Option<SenderAuthorityRecord>> {
         match std::fs::read(&self.path) {
             Ok(v) => Ok(Some(

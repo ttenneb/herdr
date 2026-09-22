@@ -47,13 +47,16 @@ impl OfflineMailboxAuthority {
     pub(crate) fn from_active_sender(
         record: &crate::sender_authority::SenderAuthorityRecord,
         store: crate::mailbox::MailboxStore,
+        cross_grants: impl IntoIterator<Item = crate::mailbox::MailboxGrant>,
     ) -> Option<Self> {
         if !record.authoritative() {
             return None;
         }
+        // Logical identity stays stable across execution replacement; the
+        // Active sender record below remains the separate execution binding.
         let recipient = crate::mailbox::RecipientKey {
             recipient_id: record.sender_key.clone(),
-            generation: record.process_generation.to_string(),
+            generation: "1".into(),
         };
         let grant_id = format!(
             "offline:{}:{}",
@@ -61,13 +64,25 @@ impl OfflineMailboxAuthority {
         );
         let capability = OfflineMailboxCapability {
             grant_id: grant_id.clone(),
-            recipient,
+            recipient: recipient.clone(),
         };
+        let mut capabilities = BTreeMap::from([(grant_id, capability)]);
+        for grant in cross_grants {
+            if grant.sender == recipient {
+                capabilities.insert(
+                    grant.grant_id.clone(),
+                    OfflineMailboxCapability {
+                        grant_id: grant.grant_id,
+                        recipient: grant.recipient,
+                    },
+                );
+            }
+        }
         Some(Self {
             sender_key: record.sender_key.clone(),
             sender_generation: record.process_generation,
             caller_selector: record.sender_key.clone(),
-            capabilities: BTreeMap::from([(grant_id, capability)]),
+            capabilities,
             store,
         })
     }
@@ -186,16 +201,15 @@ impl OfflineMailboxAuthority {
 }
 
 impl App {
-    /// Installs a route only when its caller is the current authoritative
-    /// sender record. The lifecycle caller supplies the already-promoted record;
-    /// this method mints a server-owned capability without recipient attachment.
     pub(crate) fn install_offline_mailbox_authority(
         &mut self,
         record: crate::sender_authority::SenderAuthorityRecord,
     ) -> Result<(), OfflineMailboxInstallError> {
-        let sender_store =
-            crate::sender_authority::SenderAuthorityStore::open(&self.sender_authority_dir)
-                .map_err(OfflineMailboxInstallError::Store)?;
+        let sender_store = crate::sender_authority::SenderAuthorityStore::for_sender(
+            &self.sender_authority_dir,
+            &record.sender_key,
+        )
+        .map_err(OfflineMailboxInstallError::Store)?;
         let current = sender_store
             .load()
             .map_err(OfflineMailboxInstallError::Store)?
@@ -205,28 +219,75 @@ impl App {
         }
         let store = crate::mailbox::MailboxStore::open(&self.sender_authority_dir)
             .map_err(OfflineMailboxInstallError::MailboxStore)?;
-        let authority = OfflineMailboxAuthority::from_active_sender(&record, store)
+        let grants = store
+            .load()
+            .map_err(OfflineMailboxInstallError::MailboxStore)?
+            .grants
+            .into_values();
+        let authority = OfflineMailboxAuthority::from_active_sender(&record, store, grants)
             .ok_or(OfflineMailboxInstallError::SenderRecordMismatch)?;
-        self.offline_mailbox_authority = Some(authority);
+        self.offline_mailbox_authorities
+            .insert(record.sender_key.clone(), authority);
         Ok(())
     }
 
     pub(crate) fn offline_mailbox_authority_current(
         &self,
+        caller: &str,
     ) -> Result<bool, OfflineMailboxInstallError> {
-        let Some(authority) = self.offline_mailbox_authority.as_ref() else {
+        let Some(authority) = self.offline_mailbox_authorities.get(caller) else {
             return Ok(false);
         };
-        let store = crate::sender_authority::SenderAuthorityStore::open(&self.sender_authority_dir)
-            .map_err(OfflineMailboxInstallError::Store)?;
+        let store = crate::sender_authority::SenderAuthorityStore::for_sender(
+            &self.sender_authority_dir,
+            &authority.sender_key,
+        )
+        .map_err(OfflineMailboxInstallError::Store)?;
         Ok(store
             .load()
             .map_err(OfflineMailboxInstallError::Store)?
             .is_some_and(|record| authority.matches_sender_record(&record)))
     }
 
-    /// Called only by the App event path after it verified the current terminal
-    /// and generation. A stale/replayed detector event cannot promote a record.
+    /// Server-only provisioning seam. It requires a committed Active A binding,
+    /// persists recipient policy separately, and refreshes A's capability set.
+    pub(crate) fn provision_cross_recipient_mailbox_grant(
+        &mut self,
+        sender_key: &str,
+        recipient: crate::mailbox::RecipientKey,
+    ) -> Result<String, OfflineMailboxInstallError> {
+        if !self.offline_mailbox_authority_current(sender_key)? {
+            return Err(OfflineMailboxInstallError::SenderRecordMismatch);
+        }
+        let sender = crate::mailbox::RecipientKey {
+            recipient_id: sender_key.into(),
+            generation: "1".into(),
+        };
+        let grant_id = format!(
+            "mailbox:{}:{}:{}:{}",
+            sender.recipient_id, sender.generation, recipient.recipient_id, recipient.generation
+        );
+        let store = crate::mailbox::MailboxStore::open(&self.sender_authority_dir)
+            .map_err(OfflineMailboxInstallError::MailboxStore)?;
+        store
+            .provision_grant(crate::mailbox::MailboxGrant {
+                grant_id: grant_id.clone(),
+                sender,
+                recipient,
+            })
+            .map_err(OfflineMailboxInstallError::MailboxStore)?;
+        let record = crate::sender_authority::SenderAuthorityStore::for_sender(
+            &self.sender_authority_dir,
+            sender_key,
+        )
+        .map_err(OfflineMailboxInstallError::Store)?
+        .load()
+        .map_err(OfflineMailboxInstallError::Store)?
+        .ok_or(OfflineMailboxInstallError::SenderRecordUnavailable)?;
+        self.install_offline_mailbox_authority(record)?;
+        Ok(grant_id)
+    }
+
     pub(crate) fn invalidate_offline_mailbox_authority_for_pane(
         &mut self,
         pane_id: crate::layout::PaneId,
@@ -237,22 +298,22 @@ impl App {
         let Some(terminal_id) = self.state.workspaces[ws_idx].terminal_id(pane_id).cloned() else {
             return;
         };
-        let Some(authority) = self.offline_mailbox_authority.as_ref() else {
+        let sender_key = terminal_id.to_string();
+        let Some(authority) = self.offline_mailbox_authorities.get(&sender_key) else {
             return;
         };
-        if authority.sender_key != terminal_id.to_string() {
-            return;
-        }
-        let sender_store =
-            match crate::sender_authority::SenderAuthorityStore::open(&self.sender_authority_dir) {
-                Ok(store) => store,
-                Err(_) => return,
-            };
+        let sender_store = match crate::sender_authority::SenderAuthorityStore::for_sender(
+            &self.sender_authority_dir,
+            &sender_key,
+        ) {
+            Ok(store) => store,
+            Err(_) => return,
+        };
         if sender_store
             .invalidate_active(&authority.sender_key, authority.sender_generation)
             .is_ok()
         {
-            self.offline_mailbox_authority = None;
+            self.offline_mailbox_authorities.remove(&sender_key);
         }
     }
 
@@ -276,11 +337,13 @@ impl App {
         {
             return;
         }
-        let sender_store =
-            match crate::sender_authority::SenderAuthorityStore::open(&self.sender_authority_dir) {
-                Ok(store) => store,
-                Err(_) => return,
-            };
+        let sender_store = match crate::sender_authority::SenderAuthorityStore::for_sender(
+            &self.sender_authority_dir,
+            &terminal_id.to_string(),
+        ) {
+            Ok(store) => store,
+            Err(_) => return,
+        };
         let record = match sender_store.promote_active(&terminal_id.to_string(), process_generation)
         {
             Ok(record) => record,

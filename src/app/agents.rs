@@ -218,8 +218,11 @@ impl App {
         &self,
         sender_key: String,
     ) -> Result<u64, AgentStartError> {
-        let store = crate::sender_authority::SenderAuthorityStore::open(&self.sender_authority_dir)
-            .map_err(|err| AgentStartError::AuthorityPersistence(err.to_string()))?;
+        let store = crate::sender_authority::SenderAuthorityStore::for_sender(
+            &self.sender_authority_dir,
+            &sender_key,
+        )
+        .map_err(|err| AgentStartError::AuthorityPersistence(err.to_string()))?;
         let previous = store
             .recover()
             .map_err(|err| AgentStartError::AuthorityPersistence(err.to_string()))?;

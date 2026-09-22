@@ -77,6 +77,16 @@ pub struct ClaimResolution {
     pub outcome: ClaimResolutionOutcome,
 }
 
+/// Durable server-owned recipient policy. This is deliberately distinct from
+/// a transient sender/consumer execution binding.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MailboxGrant {
+    pub grant_id: String,
+    pub sender: RecipientKey,
+    pub recipient: RecipientKey,
+}
+
 /// Append-only stream. Records themselves are immutable; recovered state is a projection.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
@@ -85,6 +95,7 @@ pub enum MailboxRecord {
     Receipt { receipt: AdmissionReceipt },
     Claim { claim: Claim },
     Resolution { resolution: ClaimResolution },
+    Grant { grant: MailboxGrant },
 }
 
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
@@ -93,6 +104,7 @@ pub struct RecoveredMailbox {
     pub receipts: BTreeMap<String, AdmissionReceipt>,
     pub claims: BTreeMap<String, Claim>,
     pub resolutions: BTreeMap<String, ClaimResolution>,
+    pub grants: BTreeMap<String, MailboxGrant>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -148,6 +160,23 @@ impl MailboxStore {
             recovered.apply(record)?;
         }
         Ok(recovered)
+    }
+
+    pub fn provision_grant(&self, grant: MailboxGrant) -> Result<(), MailboxError> {
+        self.with_exclusive_lock(|| {
+            if grant.grant_id.is_empty() || grant.sender == grant.recipient {
+                return Err(MailboxError::InvalidRecord);
+            }
+            let recovered = self.load()?;
+            if let Some(existing) = recovered.grants.get(&grant.grant_id) {
+                return if existing == &grant {
+                    Ok(())
+                } else {
+                    Err(MailboxError::ConflictingDuplicate)
+                };
+            }
+            self.append_synced(&MailboxRecord::Grant { grant })
+        })
     }
 
     /// Offline sender admission: the server syncs the immutable head, then mints and syncs
@@ -376,6 +405,9 @@ impl RecoveredMailbox {
                 resolution.claim_id.clone(),
                 resolution,
             ),
+            MailboxRecord::Grant { grant } => {
+                insert_exact(&mut self.grants, grant.grant_id.clone(), grant)
+            }
         }
     }
 }

@@ -32,7 +32,7 @@ mod theme_sync;
 mod window_title;
 mod worktrees;
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::future::pending;
 use std::io::{self, Write};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -138,8 +138,8 @@ pub struct App {
     pub(crate) terminal_runtimes: crate::terminal::TerminalRuntimeRegistry,
     /// Session-scoped directory for durable server-owned sender authority.
     pub(crate) sender_authority_dir: std::path::PathBuf,
-    /// Present only after the headless server installs a verified local route.
-    pub(crate) offline_mailbox_authority: Option<mailbox::OfflineMailboxAuthority>,
+    /// Server-owned routes keyed by active sender execution identity.
+    pub(crate) offline_mailbox_authorities: BTreeMap<String, mailbox::OfflineMailboxAuthority>,
     pub event_tx: mpsc::Sender<AppEvent>,
     pub(crate) event_rx: mpsc::Receiver<AppEvent>,
     pub(crate) api_rx: tokio::sync::mpsc::UnboundedReceiver<crate::api::ApiRequestMessage>,
@@ -861,7 +861,7 @@ impl App {
             pixel_mouse_available: false,
             terminal_runtimes: restored_terminal_runtimes,
             sender_authority_dir: crate::session::data_dir(),
-            offline_mailbox_authority: None,
+            offline_mailbox_authorities: BTreeMap::new(),
             event_tx,
             event_rx,
             last_git_remote_status_refresh: Instant::now() - GIT_REMOTE_STATUS_REFRESH_INTERVAL,

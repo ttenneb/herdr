@@ -9,7 +9,7 @@ impl App {
         id: String,
         params: MailboxOfflineSubmitParams,
     ) -> String {
-        match self.offline_mailbox_authority_current() {
+        match self.offline_mailbox_authority_current(&params.caller) {
             Ok(true) => {}
             Ok(false) | Err(_) => {
                 return encode_error(
@@ -20,8 +20,8 @@ impl App {
             }
         }
         let authority = self
-            .offline_mailbox_authority
-            .as_mut()
+            .offline_mailbox_authorities
+            .get_mut(&params.caller)
             .expect("current route must remain installed during serialized dispatch");
         match authority.submit(params) {
             Ok(receipt) => encode_success(id, ResponseResult::MailboxOfflineSubmitted { receipt }),
@@ -61,7 +61,7 @@ impl App {
         id: String,
         params: crate::api::schema::MailboxClaimParams,
     ) -> String {
-        match self.offline_mailbox_authority_current() {
+        match self.offline_mailbox_authority_current(&params.caller) {
             Ok(true) => {}
             Ok(false) | Err(_) => {
                 return encode_error(
@@ -72,8 +72,8 @@ impl App {
             }
         }
         let authority = self
-            .offline_mailbox_authority
-            .as_ref()
+            .offline_mailbox_authorities
+            .get(&params.caller)
             .expect("current route must remain installed during serialized dispatch");
         match authority.claim(params) {
             Ok(claim) => encode_success(id, ResponseResult::MailboxClaimed { claim }),
@@ -104,7 +104,7 @@ impl App {
         id: String,
         params: crate::api::schema::MailboxResolveParams,
     ) -> String {
-        match self.offline_mailbox_authority_current() {
+        match self.offline_mailbox_authority_current(&params.caller) {
             Ok(true) => {}
             Ok(false) | Err(_) => {
                 return encode_error(
@@ -115,8 +115,8 @@ impl App {
             }
         }
         let authority = self
-            .offline_mailbox_authority
-            .as_ref()
+            .offline_mailbox_authorities
+            .get(&params.caller)
             .expect("current route must remain installed during serialized dispatch");
         match authority.resolve(params) {
             Ok(resolution) => encode_success(id, ResponseResult::MailboxResolved { resolution }),
@@ -216,8 +216,11 @@ mod tests {
             .clone();
         let directory = sender_directory();
         app.sender_authority_dir = directory.clone();
-        let store = crate::sender_authority::SenderAuthorityStore::open(&directory)
-            .expect("sender authority store");
+        let store = crate::sender_authority::SenderAuthorityStore::for_sender(
+            &directory,
+            &terminal_id.to_string(),
+        )
+        .expect("sender authority store");
         store
             .cas(
                 None,
@@ -298,8 +301,9 @@ mod tests {
     #[test]
     fn mailbox_authority_promotes_active_and_installs_generation_bound_capability() {
         let (mut app, _pane_id, sender_key, directory) = app_with_active_sender();
-        let sender_store = crate::sender_authority::SenderAuthorityStore::open(&directory)
-            .expect("sender authority store");
+        let sender_store =
+            crate::sender_authority::SenderAuthorityStore::for_sender(&directory, &sender_key)
+                .expect("sender authority store");
         assert_eq!(
             sender_store.load().expect("read sender authority"),
             Some(crate::sender_authority::SenderAuthorityRecord {
@@ -338,8 +342,9 @@ mod tests {
         let replay: ErrorResponse = serde_json::from_str(&replay_response).expect("replay error");
         assert_eq!(replay.error.code, "mailbox_replay_rejected");
 
-        let sender_store = crate::sender_authority::SenderAuthorityStore::open(&directory)
-            .expect("sender authority store");
+        let sender_store =
+            crate::sender_authority::SenderAuthorityStore::for_sender(&directory, &sender_key)
+                .expect("sender authority store");
         sender_store
             .cas(
                 Some(2),
@@ -365,8 +370,9 @@ mod tests {
     fn mailbox_authority_exit_invalidates_exact_active_generation() {
         let (mut app, pane_id, sender_key, directory) = app_with_active_sender();
         app.handle_internal_event(AppEvent::PaneDied { pane_id });
-        let sender_store = crate::sender_authority::SenderAuthorityStore::open(&directory)
-            .expect("sender authority store");
+        let sender_store =
+            crate::sender_authority::SenderAuthorityStore::for_sender(&directory, &sender_key)
+                .expect("sender authority store");
         assert_eq!(
             sender_store
                 .load()
@@ -442,8 +448,9 @@ mod tests {
             method: Method::MailboxOfflineSubmit(active_submit(sender_key.clone(), "f".repeat(64))),
         });
         assert!(serde_json::from_str::<SuccessResponse>(&submitted).is_ok());
-        let sender_store = crate::sender_authority::SenderAuthorityStore::open(&directory)
-            .expect("sender authority store");
+        let sender_store =
+            crate::sender_authority::SenderAuthorityStore::for_sender(&directory, &sender_key)
+                .expect("sender authority store");
         sender_store
             .cas(
                 Some(2),
@@ -487,10 +494,159 @@ mod tests {
         std::fs::remove_dir_all(directory).expect("remove mailbox directory");
     }
 
+    fn install_committed_active(app: &mut App, sender_key: &str, generation: u64) {
+        let store = crate::sender_authority::SenderAuthorityStore::for_sender(
+            &app.sender_authority_dir,
+            sender_key,
+        )
+        .expect("authority store");
+        store
+            .cas(
+                None,
+                crate::sender_authority::SenderAuthorityRecord {
+                    sender_key: sender_key.into(),
+                    process_generation: generation,
+                    phase: crate::sender_authority::SenderAuthorityPhase::Active,
+                    transition_revision: 1,
+                },
+            )
+            .expect("committed active record");
+        app.install_offline_mailbox_authority(
+            store.load().expect("read active").expect("active record"),
+        )
+        .expect("install active authority");
+    }
+
+    #[test]
+    fn cross_recipient_offline_delivery_survives_fresh_consumer_execution() {
+        let (mut app, _pane_id, sender_a, directory) = app_with_active_sender();
+        let recipient_b = RecipientKey {
+            recipient_id: "recipient-b".into(),
+            generation: "1".into(),
+        };
+        let grant_id = app
+            .provision_cross_recipient_mailbox_grant(&sender_a, recipient_b.clone())
+            .expect("server provisioned A to B grant");
+        let submitted = app.handle_api_request(Request {
+            id: "a-to-offline-b".into(),
+            method: Method::MailboxOfflineSubmit(submit(
+                sender_a.clone(),
+                grant_id.clone(),
+                recipient_b.clone(),
+                "a".repeat(64),
+            )),
+        });
+        let receipt: SuccessResponse = serde_json::from_str(&submitted).expect("receipt");
+        let ResponseResult::MailboxOfflineSubmitted { receipt } = receipt.result else {
+            panic!("expected durable receipt")
+        };
+        install_committed_active(&mut app, "recipient-b", 1);
+        let claimed = app.handle_api_request(Request {
+            id: "fresh-b-claim".into(),
+            method: Method::MailboxClaim(crate::api::schema::MailboxClaimParams {
+                caller: "recipient-b".into(),
+                grant_id: "offline:recipient-b:1".into(),
+                recipient: recipient_b.clone(),
+                claim: ClaimRequest {
+                    protocol: PROTOCOL.into(),
+                },
+            }),
+        });
+        let claimed: SuccessResponse = serde_json::from_str(&claimed).expect("claim");
+        let ResponseResult::MailboxClaimed { claim: Some(claim) } = claimed.result else {
+            panic!("expected B claim")
+        };
+        assert_eq!(claim.stable_id, receipt.stable_id);
+        assert_eq!(claim.digest, receipt.digest);
+        assert_eq!(claim.recipient, recipient_b);
+        drop(app);
+        std::fs::remove_dir_all(directory).expect("remove mailbox directory");
+    }
+
+    #[test]
+    fn cross_recipient_rejects_unprovisioned_sender_and_stale_consumer_execution() {
+        let (mut app, _pane_id, sender_a, directory) = app_with_active_sender();
+        let recipient_b = RecipientKey {
+            recipient_id: "recipient-b".into(),
+            generation: "1".into(),
+        };
+        let unauthorized = app.handle_api_request(Request {
+            id: "unauthorized".into(),
+            method: Method::MailboxOfflineSubmit(submit(
+                sender_a.clone(),
+                "offline:unauthorized:1".into(),
+                recipient_b.clone(),
+                "b".repeat(64),
+            )),
+        });
+        let unauthorized: ErrorResponse =
+            serde_json::from_str(&unauthorized).expect("unauthorized error");
+        assert_eq!(unauthorized.error.code, "mailbox_capability_mismatch");
+        let grant_id = app
+            .provision_cross_recipient_mailbox_grant(&sender_a, recipient_b.clone())
+            .expect("server provisioned grant");
+        assert!(
+            serde_json::from_str::<SuccessResponse>(&app.handle_api_request(Request {
+                id: "submit".into(),
+                method: Method::MailboxOfflineSubmit(submit(
+                    sender_a,
+                    grant_id,
+                    recipient_b.clone(),
+                    "c".repeat(64)
+                )),
+            }))
+            .is_ok()
+        );
+        install_committed_active(&mut app, "recipient-b", 1);
+        let b_store =
+            crate::sender_authority::SenderAuthorityStore::for_sender(&directory, "recipient-b")
+                .expect("B authority store");
+        b_store
+            .cas(
+                Some(1),
+                crate::sender_authority::SenderAuthorityRecord {
+                    sender_key: "recipient-b".into(),
+                    process_generation: 2,
+                    phase: crate::sender_authority::SenderAuthorityPhase::Active,
+                    transition_revision: 2,
+                },
+            )
+            .expect("replace B execution");
+        let stale = app.handle_api_request(Request {
+            id: "stale-b".into(),
+            method: Method::MailboxClaim(crate::api::schema::MailboxClaimParams {
+                caller: "recipient-b".into(),
+                grant_id: "offline:recipient-b:1".into(),
+                recipient: recipient_b.clone(),
+                claim: ClaimRequest {
+                    protocol: PROTOCOL.into(),
+                },
+            }),
+        });
+        let stale: ErrorResponse = serde_json::from_str(&stale).expect("stale B error");
+        assert_eq!(stale.error.code, "mailbox_authority_unavailable");
+        app.install_offline_mailbox_authority(b_store.load().expect("read B").expect("B active"))
+            .expect("fresh B authority");
+        let fresh = app.handle_api_request(Request {
+            id: "fresh-b".into(),
+            method: Method::MailboxClaim(crate::api::schema::MailboxClaimParams {
+                caller: "recipient-b".into(),
+                grant_id: "offline:recipient-b:2".into(),
+                recipient: recipient_b,
+                claim: ClaimRequest {
+                    protocol: PROTOCOL.into(),
+                },
+            }),
+        });
+        assert!(serde_json::from_str::<SuccessResponse>(&fresh).is_ok());
+        drop(app);
+        std::fs::remove_dir_all(directory).expect("remove mailbox directory");
+    }
+
     #[test]
     fn mailbox_authority_recovery_invalidates_unconfirmed_sender() {
         let directory = sender_directory();
-        let store = crate::sender_authority::SenderAuthorityStore::open(&directory)
+        let store = crate::sender_authority::SenderAuthorityStore::for_sender(&directory, "sender")
             .expect("sender authority store");
         store
             .cas(
