@@ -295,6 +295,122 @@ impl ChannelBinding {
     }
 }
 
+/// Server-owned facts for a mailbox channel. This type deliberately has no serde
+/// implementation and cannot be constructed from an API request or Pi attachment.
+///
+/// The API boundary must obtain `recipient` and `foreground_pi_pid` from its live
+/// terminal/agent registry, rather than from the client connection or mailbox wire data.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct TrustedMailboxChannelContext {
+    binding: ChannelBinding,
+}
+
+impl TrustedMailboxChannelContext {
+    /// Verifies a Unix-domain peer against OS credentials and the server-owned foreground
+    /// Pi process. `recipient`, `binding_id`, `foreground_pi_pid`, and `terminal_generation`
+    /// are trusted lifecycle state, never values decoded from a mailbox request.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn from_verified_local_socket(
+        socket_fd: std::os::fd::RawFd,
+        recipient: SessionGeneration,
+        binding_id: String,
+        foreground_pi_pid: u32,
+        terminal_generation: u64,
+    ) -> Result<Self, TransportError> {
+        let mut credential = std::mem::MaybeUninit::<libc::ucred>::zeroed();
+        let mut credential_len = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
+        // SAFETY: the caller owns a live Unix-domain socket descriptor; getsockopt writes
+        // exactly the supplied ucred buffer or fails without exposing uninitialized data.
+        let result = unsafe {
+            libc::getsockopt(
+                socket_fd,
+                libc::SOL_SOCKET,
+                libc::SO_PEERCRED,
+                credential.as_mut_ptr().cast(),
+                &mut credential_len,
+            )
+        };
+        if result != 0 || credential_len as usize != std::mem::size_of::<libc::ucred>() {
+            return Err(TransportError::ChannelPeerMismatch);
+        }
+        // SAFETY: the successful getsockopt call initialized the complete ucred value.
+        let credential = unsafe { credential.assume_init() };
+        let peer_pid =
+            u32::try_from(credential.pid).map_err(|_| TransportError::ChannelPeerMismatch)?;
+        let peer_uid = credential.uid;
+        let process_uid = unsafe { libc::geteuid() };
+        let peer_in_foreground_tree =
+            peer_pid == foreground_pi_pid || process_descends_from(peer_pid, foreground_pi_pid);
+        let binding = ChannelBinding::verified_local_socket(
+            binding_id,
+            recipient,
+            true,
+            peer_uid,
+            process_uid,
+            peer_pid,
+            foreground_pi_pid,
+            peer_in_foreground_tree,
+            terminal_generation,
+        )?;
+        Ok(Self { binding })
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    pub(crate) fn from_verified_local_socket(
+        _socket_fd: i32,
+        _recipient: SessionGeneration,
+        _binding_id: String,
+        _foreground_pi_pid: u32,
+        _terminal_generation: u64,
+    ) -> Result<Self, TransportError> {
+        Err(TransportError::ChannelUnsupported)
+    }
+
+    pub(crate) fn binding(&self) -> &ChannelBinding {
+        &self.binding
+    }
+
+    /// Produces a route only from this verified binding and the live manifest registry.
+    pub(crate) fn negotiate(
+        &self,
+        manifests: &ManifestRegistry,
+        now: u64,
+    ) -> Result<NegotiatedRoute, TransportError> {
+        manifests.negotiate(
+            &self.binding,
+            PROTOCOL_VERSION,
+            FIXTURE_DIGEST,
+            GATE_MAILBOX_VERSION,
+            now,
+        )
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn process_descends_from(mut child: u32, ancestor: u32) -> bool {
+    let mut seen = HashSet::new();
+    while child != 0 && seen.insert(child) {
+        if child == ancestor {
+            return true;
+        }
+        let Ok(stat) = std::fs::read_to_string(format!("/proc/{child}/stat")) else {
+            return false;
+        };
+        let Some(rest) = stat.get(stat.rfind(')').unwrap_or(0).saturating_add(2)..) else {
+            return false;
+        };
+        let Some(parent) = rest
+            .split_whitespace()
+            .nth(1)
+            .and_then(|value| value.parse().ok())
+        else {
+            return false;
+        };
+        child = parent;
+    }
+    false
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct RouteIdentity {
     recipient: SessionGeneration,
@@ -1695,6 +1811,65 @@ mod tests {
             true,
         )
         .unwrap()
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn trusted_mailbox_context_uses_os_peer_not_request_identity() {
+        use std::os::fd::AsRawFd as _;
+        use std::os::unix::net::UnixStream;
+
+        let (server, _client) = UnixStream::pair().unwrap();
+        let recipient = principal(70_002, 70_002);
+        let context = TrustedMailboxChannelContext::from_verified_local_socket(
+            server.as_raw_fd(),
+            recipient.clone(),
+            "server-bound-channel".into(),
+            std::process::id(),
+            recipient.generation,
+        )
+        .expect("the OS peer is the current process in this socket-pair test");
+        assert_eq!(context.binding().recipient(), &recipient);
+        let mut manifests = ManifestRegistry::default();
+        manifests
+            .register_atomic(manifest(9, context.binding()), context.binding(), 9)
+            .unwrap();
+        let route = context.negotiate(&manifests, 9).unwrap();
+        assert_eq!(route.identity().recipient(), &recipient);
+
+        // Spoofing a recipient generation in a request cannot affect the already-verified
+        // binding; a mismatched server lifecycle generation fails before route negotiation.
+        assert_eq!(
+            TrustedMailboxChannelContext::from_verified_local_socket(
+                server.as_raw_fd(),
+                recipient,
+                "server-bound-channel".into(),
+                std::process::id(),
+                999,
+            )
+            .unwrap_err(),
+            TransportError::ChannelGenerationMismatch
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn trusted_mailbox_context_rejects_a_spoofed_foreground_identity() {
+        use std::os::fd::AsRawFd as _;
+        use std::os::unix::net::UnixStream;
+
+        let (server, _client) = UnixStream::pair().unwrap();
+        assert_eq!(
+            TrustedMailboxChannelContext::from_verified_local_socket(
+                server.as_raw_fd(),
+                principal(70_002, 70_002),
+                "server-bound-channel".into(),
+                u32::MAX,
+                70_002,
+            )
+            .unwrap_err(),
+            TransportError::ChannelPeerMismatch
+        );
     }
     fn manifest(epoch: u64, channel: &ChannelBinding) -> LiveManifest {
         LiveManifest {
