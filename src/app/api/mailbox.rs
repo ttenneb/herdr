@@ -236,6 +236,10 @@ mod tests {
                 delivery_digest,
                 subject: "offline subject".into(),
                 body: "offline body".into(),
+                message_id: "message-1".into(),
+                kind: "report".into(),
+                priority: "normal".into(),
+                original_sequence: 1,
             },
         }
     }
@@ -616,6 +620,16 @@ mod tests {
         assert_eq!(snapshot.heads.len(), 1);
         assert_eq!(snapshot.heads[0].subject, "offline subject");
         assert_eq!(snapshot.heads[0].body, "offline body");
+        assert_eq!(snapshot.heads[0].recipient_generation, "1");
+        assert_eq!(snapshot.heads[0].sender, sender_a);
+        assert_eq!(snapshot.heads[0].target, "recipient-b");
+        assert_eq!(snapshot.heads[0].grant_id, grant_id);
+        assert_eq!(snapshot.heads[0].message_id, "message-1");
+        assert_eq!(snapshot.heads[0].kind, "report");
+        assert_eq!(snapshot.heads[0].priority, "normal");
+        assert_eq!(snapshot.heads[0].original_sequence, 1);
+        assert!(snapshot.heads[0].enqueue_epoch > 0);
+        assert!(snapshot.heads[0].accepted_at > 0);
         assert_eq!(snapshot.receipts, vec![receipt.clone()]);
         let claimed = app.handle_api_request(Request {
             id: "fresh-b-claim".into(),
@@ -634,7 +648,24 @@ mod tests {
         };
         assert_eq!(claim.stable_id, receipt.stable_id);
         assert_eq!(claim.digest, receipt.digest);
-        assert_eq!(claim.recipient, recipient_b);
+        assert_eq!(claim.recipient, recipient_b.clone());
+        let claimed_snapshot = app.handle_api_request(Request {
+            id: "claimed-snapshot".into(),
+            method: Method::MailboxSnapshot(mailbox_snapshot(
+                "recipient-b".into(),
+                "offline:recipient-b:1".into(),
+                recipient_b,
+            )),
+        });
+        let claimed_snapshot: SuccessResponse =
+            serde_json::from_str(&claimed_snapshot).expect("claimed snapshot");
+        let ResponseResult::MailboxSnapshot { snapshot } = claimed_snapshot.result else {
+            panic!("expected claimed snapshot")
+        };
+        assert_eq!(
+            snapshot.claim.as_ref().map(|claim| &claim.digest),
+            Some(&receipt.digest)
+        );
         drop(app);
         std::fs::remove_dir_all(directory).expect("remove mailbox directory");
     }

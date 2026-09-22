@@ -34,6 +34,24 @@ pub struct MailboxHead {
     pub recipient: RecipientKey,
     pub subject: String,
     pub body: String,
+    pub recipient_generation: String,
+    pub sender: String,
+    pub target: String,
+    pub grant_id: String,
+    pub message_id: String,
+    pub kind: String,
+    pub priority: String,
+    pub original_sequence: u64,
+    pub enqueue_epoch: u64,
+    pub accepted_at: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MailboxProvenance {
+    pub sender: String,
+    pub target: String,
+    pub grant_id: String,
+    pub accepted_at: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
@@ -181,10 +199,21 @@ impl MailboxStore {
 
     /// Offline sender admission: the server syncs the immutable head, then mints and syncs
     /// the exact receipt. Clients never provide the accepted receipt fields.
-    pub fn append_offline_head(&self, head: MailboxHead) -> Result<AdmissionReceipt, MailboxError> {
+    pub fn append_offline_head(
+        &self,
+        mut head: MailboxHead,
+    ) -> Result<AdmissionReceipt, MailboxError> {
         self.with_exclusive_lock(|| {
-            validate_head(&head)?;
             let recovered = self.load()?;
+            head.enqueue_epoch = recovered
+                .heads
+                .values()
+                .map(|existing| existing.enqueue_epoch)
+                .max()
+                .unwrap_or(0)
+                .checked_add(1)
+                .ok_or(MailboxError::InvalidRecord)?;
+            validate_head(&head)?;
             if let Some(existing) = recovered.heads.get(&head.stable_id) {
                 if existing != &head {
                     return Err(MailboxError::ConflictingDuplicate);
@@ -440,6 +469,16 @@ fn validate_head(head: &MailboxHead) -> Result<(), MailboxError> {
         || !valid_digest(&head.delivery_digest)
         || head.recipient.recipient_id.is_empty()
         || head.recipient.generation.is_empty()
+        || head.recipient_generation != head.recipient.generation
+        || head.sender.is_empty()
+        || head.target.is_empty()
+        || head.grant_id.is_empty()
+        || head.message_id.is_empty()
+        || head.kind.is_empty()
+        || head.priority.is_empty()
+        || head.original_sequence == 0
+        || head.enqueue_epoch == 0
+        || head.accepted_at == 0
     {
         return Err(MailboxError::InvalidRecord);
     }
@@ -494,6 +533,16 @@ mod tests {
             },
             subject: "subject".into(),
             body: "body".into(),
+            recipient_generation: "generation-1".into(),
+            sender: "sender".into(),
+            target: "recipient".into(),
+            grant_id: "grant".into(),
+            message_id: "message".into(),
+            kind: "report".into(),
+            priority: "normal".into(),
+            original_sequence: 1,
+            enqueue_epoch: 1,
+            accepted_at: 1,
         }
     }
     fn receipt(head: &MailboxHead) -> AdmissionReceipt {

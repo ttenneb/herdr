@@ -34,6 +34,10 @@ pub struct Submit {
     pub delivery_digest: String,
     pub subject: String,
     pub body: String,
+    pub message_id: String,
+    pub kind: String,
+    pub priority: String,
+    pub original_sequence: u64,
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -127,7 +131,11 @@ pub fn validate_request(request: &Request) -> Result<(), TransportError> {
                 || value.stable_id.is_empty()
                 || value.revision == 0
                 || value.digest.len() != 64
-                || value.delivery_digest.len() != 64 =>
+                || value.delivery_digest.len() != 64
+                || value.message_id.is_empty()
+                || value.kind.is_empty()
+                || value.priority.is_empty()
+                || value.original_sequence == 0 =>
         {
             Err(TransportError::InvalidSchema)
         }
@@ -156,6 +164,7 @@ pub fn validate_request(request: &Request) -> Result<(), TransportError> {
 pub fn submit_offline(
     store: &crate::mailbox::MailboxStore,
     recipient: RecipientKey,
+    provenance: crate::mailbox::MailboxProvenance,
     submit: Submit,
 ) -> Result<AdmissionReceipt, crate::mailbox::MailboxError> {
     let head = MailboxHead {
@@ -163,9 +172,19 @@ pub fn submit_offline(
         revision: submit.revision,
         digest: submit.digest,
         delivery_digest: submit.delivery_digest,
-        recipient,
+        recipient: recipient.clone(),
         subject: submit.subject,
         body: submit.body,
+        recipient_generation: recipient.generation.clone(),
+        sender: provenance.sender,
+        target: provenance.target,
+        grant_id: provenance.grant_id,
+        message_id: submit.message_id,
+        kind: submit.kind,
+        priority: submit.priority,
+        original_sequence: submit.original_sequence,
+        enqueue_epoch: 0,
+        accepted_at: provenance.accepted_at,
     };
     store.append_offline_head(head)
 }
@@ -230,6 +249,16 @@ mod tests {
             recipient: recipient(),
             subject: "x".into(),
             body: "y".into(),
+            recipient_generation: "g".into(),
+            sender: "sender".into(),
+            target: "r".into(),
+            grant_id: "grant".into(),
+            message_id: "message".into(),
+            kind: "report".into(),
+            priority: "normal".into(),
+            original_sequence: 1,
+            enqueue_epoch: 1,
+            accepted_at: 1,
         }
     }
     #[test]
@@ -247,9 +276,24 @@ mod tests {
             delivery_digest: h.delivery_digest.clone(),
             subject: h.subject.clone(),
             body: h.body.clone(),
+            message_id: h.message_id.clone(),
+            kind: h.kind.clone(),
+            priority: h.priority.clone(),
+            original_sequence: h.original_sequence,
         };
         assert!(validate_request(&Request::Submit(submit.clone())).is_ok());
-        let receipt = submit_offline(&store, recipient(), submit).unwrap();
+        let receipt = submit_offline(
+            &store,
+            recipient(),
+            crate::mailbox::MailboxProvenance {
+                sender: "sender".into(),
+                target: "r".into(),
+                grant_id: "grant".into(),
+                accepted_at: 1,
+            },
+            submit,
+        )
+        .unwrap();
         assert_eq!(receipt.delivery_digest, h.delivery_digest);
         assert_eq!(
             store.load().unwrap().receipts.get(&h.delivery_digest),

@@ -133,9 +133,19 @@ impl OfflineMailboxAuthority {
         {
             return Err(OfflineMailboxError::Replay);
         }
+        let accepted_at = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_err(|_| OfflineMailboxError::Store(crate::mailbox::MailboxError::InvalidRecord))?
+            .as_secs();
         let receipt = crate::mailbox_v1::submit_offline(
             &self.store,
             capability.recipient.clone(),
+            crate::mailbox::MailboxProvenance {
+                sender: self.sender_key.clone(),
+                target: capability.recipient.recipient_id.clone(),
+                grant_id: capability.grant_id.clone(),
+                accepted_at,
+            },
             params.submit,
         )
         .map_err(OfflineMailboxError::Store)?;
