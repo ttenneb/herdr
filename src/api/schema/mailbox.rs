@@ -35,3 +35,13 @@ pub struct MailboxResolveParams {
     #[serde(flatten)]
     pub resolve: crate::mailbox_v1::Resolve,
 }
+
+/// Read selectors for the server-owned stable-recipient mailbox projection.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct MailboxSnapshotParams {
+    pub caller: String,
+    pub grant_id: String,
+    pub recipient: crate::mailbox::RecipientKey,
+    pub protocol: String,
+}

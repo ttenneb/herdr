@@ -441,6 +441,7 @@ fn api_method_name(method: &Method) -> &'static str {
         Method::MailboxOfflineSubmit(_) => "mailbox.offline_submit",
         Method::MailboxClaim(_) => "mailbox.claim",
         Method::MailboxResolve(_) => "mailbox.resolve",
+        Method::MailboxSnapshot(_) => "mailbox.snapshot",
         Method::CollectionList(_) => "collection.list",
         Method::CollectionGet(_) => "collection.get",
         Method::CollectionCreate(_) => "collection.create",

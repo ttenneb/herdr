@@ -171,6 +171,8 @@ pub enum Method {
     MailboxClaim(MailboxClaimParams),
     #[serde(rename = "mailbox.resolve")]
     MailboxResolve(MailboxResolveParams),
+    #[serde(rename = "mailbox.snapshot")]
+    MailboxSnapshot(MailboxSnapshotParams),
     #[serde(rename = "collection.list")]
     CollectionList(CollectionListParams),
     #[serde(rename = "collection.get")]

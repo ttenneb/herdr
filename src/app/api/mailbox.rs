@@ -99,6 +99,53 @@ impl App {
         }
     }
 
+    pub(super) fn handle_mailbox_snapshot(
+        &mut self,
+        id: String,
+        params: crate::api::schema::MailboxSnapshotParams,
+    ) -> String {
+        match self.offline_mailbox_authority_current(&params.caller) {
+            Ok(true) => {}
+            Ok(false) | Err(_) => {
+                return encode_error(
+                    id,
+                    "mailbox_authority_unavailable",
+                    "the server has no current authenticated local mailbox sender route",
+                )
+            }
+        }
+        let authority = self
+            .offline_mailbox_authorities
+            .get(&params.caller)
+            .expect("current route must remain installed during serialized dispatch");
+        match authority.snapshot(params) {
+            Ok(snapshot) => encode_success(id, ResponseResult::MailboxSnapshot { snapshot }),
+            Err(crate::app::mailbox::OfflineMailboxError::CallerMismatch) => encode_error(
+                id,
+                "mailbox_caller_mismatch",
+                "caller selector does not match the authenticated local sender",
+            ),
+            Err(crate::app::mailbox::OfflineMailboxError::CapabilityMismatch) => encode_error(
+                id,
+                "mailbox_capability_mismatch",
+                "recipient or grant selector is outside the server-issued capability",
+            ),
+            Err(crate::app::mailbox::OfflineMailboxError::Transport(error)) => encode_error(
+                id,
+                error.code(),
+                "offline mailbox request validation rejected",
+            ),
+            Err(crate::app::mailbox::OfflineMailboxError::Store(error)) => {
+                encode_error(id, "mailbox_store_failed", error.to_string())
+            }
+            Err(_) => encode_error(
+                id,
+                "mailbox_snapshot_failed",
+                "offline mailbox snapshot rejected",
+            ),
+        }
+    }
+
     pub(super) fn handle_mailbox_resolve(
         &mut self,
         id: String,
@@ -278,6 +325,19 @@ mod tests {
             claim: ClaimRequest {
                 protocol: PROTOCOL.into(),
             },
+        }
+    }
+
+    fn mailbox_snapshot(
+        caller: String,
+        grant_id: String,
+        recipient: RecipientKey,
+    ) -> crate::api::schema::MailboxSnapshotParams {
+        crate::api::schema::MailboxSnapshotParams {
+            caller,
+            grant_id,
+            recipient,
+            protocol: PROTOCOL.into(),
         }
     }
 
@@ -541,6 +601,22 @@ mod tests {
             panic!("expected durable receipt")
         };
         install_committed_active(&mut app, "recipient-b", 1);
+        let snapshot = app.handle_api_request(Request {
+            id: "fresh-b-snapshot".into(),
+            method: Method::MailboxSnapshot(mailbox_snapshot(
+                "recipient-b".into(),
+                "offline:recipient-b:1".into(),
+                recipient_b.clone(),
+            )),
+        });
+        let snapshot: SuccessResponse = serde_json::from_str(&snapshot).expect("snapshot");
+        let ResponseResult::MailboxSnapshot { snapshot } = snapshot.result else {
+            panic!("expected B snapshot")
+        };
+        assert_eq!(snapshot.heads.len(), 1);
+        assert_eq!(snapshot.heads[0].subject, "offline subject");
+        assert_eq!(snapshot.heads[0].body, "offline body");
+        assert_eq!(snapshot.receipts, vec![receipt.clone()]);
         let claimed = app.handle_api_request(Request {
             id: "fresh-b-claim".into(),
             method: Method::MailboxClaim(crate::api::schema::MailboxClaimParams {
@@ -585,17 +661,18 @@ mod tests {
         let grant_id = app
             .provision_cross_recipient_mailbox_grant(&sender_a, recipient_b.clone())
             .expect("server provisioned grant");
+        let submitted = app.handle_api_request(Request {
+            id: "submit".into(),
+            method: Method::MailboxOfflineSubmit(submit(
+                sender_a,
+                grant_id,
+                recipient_b.clone(),
+                "c".repeat(64),
+            )),
+        });
         assert!(
-            serde_json::from_str::<SuccessResponse>(&app.handle_api_request(Request {
-                id: "submit".into(),
-                method: Method::MailboxOfflineSubmit(submit(
-                    sender_a,
-                    grant_id,
-                    recipient_b.clone(),
-                    "c".repeat(64)
-                )),
-            }))
-            .is_ok()
+            serde_json::from_str::<SuccessResponse>(&submitted).is_ok(),
+            "{submitted}"
         );
         install_committed_active(&mut app, "recipient-b", 1);
         let b_store =
@@ -625,6 +702,17 @@ mod tests {
         });
         let stale: ErrorResponse = serde_json::from_str(&stale).expect("stale B error");
         assert_eq!(stale.error.code, "mailbox_authority_unavailable");
+        let stale_snapshot = app.handle_api_request(Request {
+            id: "stale-b-snapshot".into(),
+            method: Method::MailboxSnapshot(mailbox_snapshot(
+                "recipient-b".into(),
+                "offline:recipient-b:1".into(),
+                recipient_b.clone(),
+            )),
+        });
+        let stale_snapshot: ErrorResponse =
+            serde_json::from_str(&stale_snapshot).expect("stale snapshot error");
+        assert_eq!(stale_snapshot.error.code, "mailbox_authority_unavailable");
         app.install_offline_mailbox_authority(b_store.load().expect("read B").expect("B active"))
             .expect("fresh B authority");
         let fresh = app.handle_api_request(Request {

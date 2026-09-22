@@ -42,7 +42,7 @@ pub struct Get {
     pub recipient: RecipientKey,
     pub delivery_digest: String,
 }
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct List {
     pub protocol: String,
@@ -78,7 +78,7 @@ pub enum Request {
     Resolve(Resolve),
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct Snapshot {
     pub heads: Vec<MailboxHead>,

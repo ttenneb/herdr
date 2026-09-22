@@ -164,6 +164,26 @@ impl OfflineMailboxAuthority {
             .map_err(OfflineMailboxError::Store)
     }
 
+    pub(crate) fn snapshot(
+        &self,
+        params: crate::api::schema::MailboxSnapshotParams,
+    ) -> Result<crate::mailbox_v1::Snapshot, OfflineMailboxError> {
+        crate::mailbox_v1::validate_request(&crate::mailbox_v1::Request::List(
+            crate::mailbox_v1::List {
+                protocol: params.protocol,
+                recipient: params.recipient.clone(),
+            },
+        ))
+        .map_err(OfflineMailboxError::Transport)?;
+        let capability =
+            self.capability_for(&params.caller, &params.grant_id, &params.recipient)?;
+        let recovered = self.store.load().map_err(OfflineMailboxError::Store)?;
+        Ok(crate::mailbox_v1::snapshot(
+            &recovered,
+            &capability.recipient,
+        ))
+    }
+
     pub(crate) fn resolve(
         &self,
         params: crate::api::schema::MailboxResolveParams,

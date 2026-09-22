@@ -1402,6 +1402,9 @@ impl App {
             Method::MailboxResolve(params) => {
                 return self.handle_mailbox_resolve(request.id, params)
             }
+            Method::MailboxSnapshot(params) => {
+                return self.handle_mailbox_snapshot(request.id, params)
+            }
             Method::AgentWait(_) => {
                 return responses::encode_error(
                     request.id,

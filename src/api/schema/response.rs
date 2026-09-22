@@ -135,6 +135,9 @@ pub enum ResponseResult {
     MailboxResolved {
         resolution: crate::mailbox::ClaimResolution,
     },
+    MailboxSnapshot {
+        snapshot: crate::mailbox_v1::Snapshot,
+    },
     AgentList {
         agents: Vec<AgentInfo>,
     },
