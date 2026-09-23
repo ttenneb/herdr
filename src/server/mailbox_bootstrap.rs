@@ -528,6 +528,28 @@ mod tests {
     }
 
     #[test]
+    fn shutting_down_listener_preserves_successor_ready_socket() {
+        let directory = unique_dir();
+        let first = listener(&directory);
+        let path = first.path().to_path_buf();
+        std::fs::remove_file(&path).expect("unlink first listener socket path");
+        let successor = MailboxBootstrapListener::bind_at(path.clone()).expect("bind successor");
+        assert!(
+            UnixStream::connect(&path).is_ok(),
+            "successor socket is ready"
+        );
+
+        drop(first);
+        assert!(
+            path.exists(),
+            "first listener shutdown must not remove successor socket"
+        );
+        drop(successor);
+        assert!(!path.exists(), "successor cleans up its own socket");
+        std::fs::remove_dir_all(directory).expect("remove test directory");
+    }
+
+    #[test]
     fn bootstrap_success_authenticates_all_mailbox_dispatches_with_server_scope() {
         let (mut app, directory, sender) = active_app();
         let mut listener = listener(&directory);
