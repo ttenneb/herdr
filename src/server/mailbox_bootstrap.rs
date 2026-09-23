@@ -144,7 +144,7 @@ impl MailboxBootstrapListener {
         Self::bind_at(mailbox_bootstrap_socket_path())
     }
 
-    fn bind_at(path: PathBuf) -> io::Result<Self> {
+    pub(crate) fn bind_at(path: PathBuf) -> io::Result<Self> {
         crate::server::socket_paths::prepare_socket_path(&path)?;
         let listener = UnixListener::bind(&path)?;
         crate::server::socket_paths::restrict_socket_permissions(&path)?;
@@ -278,6 +278,15 @@ impl MailboxBootstrapListener {
             Err(error) => failure(request_id, error),
         }
     }
+}
+
+/// The Headless owner calls this only after a listener was successfully bound.
+/// It publishes discovery to a future Pi child, never any mailbox authority.
+pub(crate) fn publish_owned_mailbox_bootstrap_discovery(
+    app: &mut App,
+    listener: &MailboxBootstrapListener,
+) {
+    app.publish_mailbox_bootstrap_discovery_address(listener.path());
 }
 
 impl Drop for MailboxBootstrapListener {

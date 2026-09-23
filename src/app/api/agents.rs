@@ -416,11 +416,25 @@ mod tests {
                 .as_nanos()
         ));
         app.sender_authority_dir = authority_dir.clone();
-        // This is the value HeadlessServer publishes immediately after binding
-        // its listener and before it can accept an agent.start request.
-        app.publish_mailbox_bootstrap_discovery_address(std::path::Path::new(
-            "/tmp/herdr-mailbox-bootstrap-ready.sock",
-        ));
+        // No listener means explicit unavailable discovery, even when a caller
+        // attempts to provide its own socket location.
+        assert_eq!(
+            app.pi_mailbox_bootstrap_launch_environment(&[
+                "HERDR_MAILBOX_BOOTSTRAP_ADDRESS=/tmp/attacker.sock".into(),
+            ]),
+            vec!["HERDR_MAILBOX_BOOTSTRAP_ADDRESS="]
+        );
+        // This is the exact Headless startup seam: bind the owned listener,
+        // publish its address, then form the Pi shell command. Pi extension
+        // initialization occurs only after that shell command starts Pi.
+        let listener_path = authority_dir.join("mailbox-bootstrap.sock");
+        let listener = crate::server::mailbox_bootstrap::MailboxBootstrapListener::bind_at(
+            listener_path.clone(),
+        )
+        .expect("bind owned mailbox bootstrap listener");
+        crate::server::mailbox_bootstrap::publish_owned_mailbox_bootstrap_discovery(
+            &mut app, &listener,
+        );
         let (runtime, mut input) = crate::terminal::TerminalRuntime::test_with_channel(80, 24);
         app.terminal_runtimes.insert(terminal_id, runtime);
 
@@ -444,10 +458,12 @@ mod tests {
                 .to_vec(),
         )
         .expect("shell command is UTF-8");
-        assert!(command.contains(
-            "HERDR_MAILBOX_BOOTSTRAP_ADDRESS=/tmp/herdr-mailbox-bootstrap-ready.sock pi"
-        ));
+        assert!(command.contains(&format!(
+            "HERDR_MAILBOX_BOOTSTRAP_ADDRESS={} pi",
+            listener_path.display()
+        )));
         assert!(!command.contains("/tmp/attacker.sock"));
+        drop(listener);
         std::fs::remove_dir_all(authority_dir).expect("remove authority directory");
     }
 
