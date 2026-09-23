@@ -19,6 +19,7 @@ mod git_refresh;
 mod ids;
 mod input;
 mod mailbox;
+pub(crate) use mailbox::{MailboxBootstrapError, MailboxBootstrapSession};
 pub(crate) mod pane_graphics;
 mod popup;
 mod runtime;
@@ -140,6 +141,14 @@ pub struct App {
     pub(crate) sender_authority_dir: std::path::PathBuf,
     /// Server-owned routes keyed by active sender execution identity.
     pub(crate) offline_mailbox_authorities: BTreeMap<String, mailbox::OfflineMailboxAuthority>,
+    /// Issued accepted-channel bindings. These are server process lifecycle state,
+    /// never client socket discovery or request selectors.
+    pub(crate) mailbox_bootstrap_bindings: BTreeMap<String, mailbox::MailboxBootstrapSession>,
+    pub(crate) next_mailbox_bootstrap_binding: u64,
+    /// Test-only live terminal facts. Production derives these from the runtime
+    /// foreground job and never accepts injected socket/PID data.
+    #[cfg(test)]
+    pub(crate) mailbox_bootstrap_test_candidates: Vec<mailbox::LiveMailboxBootstrapCandidate>,
     pub event_tx: mpsc::Sender<AppEvent>,
     pub(crate) event_rx: mpsc::Receiver<AppEvent>,
     pub(crate) api_rx: tokio::sync::mpsc::UnboundedReceiver<crate::api::ApiRequestMessage>,
@@ -862,6 +871,10 @@ impl App {
             terminal_runtimes: restored_terminal_runtimes,
             sender_authority_dir: crate::session::data_dir(),
             offline_mailbox_authorities: BTreeMap::new(),
+            mailbox_bootstrap_bindings: BTreeMap::new(),
+            next_mailbox_bootstrap_binding: 1,
+            #[cfg(test)]
+            mailbox_bootstrap_test_candidates: Vec::new(),
             event_tx,
             event_rx,
             last_git_remote_status_refresh: Instant::now() - GIT_REMOTE_STATUS_REFRESH_INTERVAL,

@@ -294,6 +294,11 @@ pub struct HeadlessServer {
     api_server: Option<api::ServerHandle>,
     #[cfg(unix)]
     client_listener: LocalListener,
+    /// Dedicated authenticated Pi mailbox bootstrap listener. Its pathname is
+    /// discovery only; App authenticates every accepted stream against live
+    /// terminal/runtime facts before it can dispatch mailbox work.
+    #[cfg(unix)]
+    mailbox_bootstrap_listener: Option<crate::server::mailbox_bootstrap::MailboxBootstrapListener>,
     client_socket_path: PathBuf,
     client_socket_identity: SocketFileIdentity,
     clients: HashMap<u64, ClientConnection>,
@@ -501,6 +506,9 @@ impl HeadlessServer {
         // Set non-blocking on Unix so we can poll it from the event loop.
         #[cfg(unix)]
         listener.set_nonblocking(ListenerNonblockingMode::Accept)?;
+        let mailbox_bootstrap_listener =
+            crate::server::mailbox_bootstrap::MailboxBootstrapListener::bind()?;
+        info!(path = %mailbox_bootstrap_listener.path().display(), "mailbox bootstrap socket listening");
 
         // Channel for server events from client threads.
         let (server_event_tx, server_event_rx) = mpsc::channel(64);
@@ -521,6 +529,8 @@ impl HeadlessServer {
             api_server,
             #[cfg(unix)]
             client_listener: listener,
+            #[cfg(unix)]
+            mailbox_bootstrap_listener: Some(mailbox_bootstrap_listener),
             client_socket_path: client_path,
             client_socket_identity,
             clients: HashMap::new(),
@@ -645,8 +655,10 @@ impl HeadlessServer {
             self.app.sync_focus_events();
             self.app.sync_session_save_schedule();
 
-            // 4. Accept new client connections.
+            // 4. Accept new client connections and authenticate any complete
+            // mailbox bootstrap frames without granting authority from socket discovery.
             self.accept_client_connections()?;
+            self.poll_mailbox_bootstrap_connections()?;
 
             // 5. Drain server events from client threads.
             if self.pane_graphics_runtime_active() {
@@ -1938,6 +1950,19 @@ impl HeadlessServer {
             &self.should_quit,
             &self.server_event_tx,
         )
+    }
+
+    #[cfg(unix)]
+    fn poll_mailbox_bootstrap_connections(&mut self) -> io::Result<()> {
+        if let Some(listener) = self.mailbox_bootstrap_listener.as_mut() {
+            listener.poll(&mut self.app)?;
+        }
+        Ok(())
+    }
+
+    #[cfg(windows)]
+    fn poll_mailbox_bootstrap_connections(&mut self) -> io::Result<()> {
+        Ok(())
     }
 
     /// Windows named-pipe clients can block in connect unless the server has a
@@ -5678,6 +5703,8 @@ mod tests {
             api_server: None,
             #[cfg(unix)]
             client_listener: listener,
+            #[cfg(unix)]
+            mailbox_bootstrap_listener: None,
             client_socket_path: socket_path,
             client_socket_identity,
             clients: HashMap::new(),

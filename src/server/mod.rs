@@ -10,6 +10,8 @@ pub(crate) mod geometry;
 pub(crate) mod handoff;
 pub mod headless;
 pub(crate) mod keybindings;
+#[cfg(unix)]
+pub(crate) mod mailbox_bootstrap;
 pub(crate) mod notifications;
 pub(crate) mod render_stream;
 pub mod socket_paths;

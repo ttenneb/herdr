@@ -1,10 +1,88 @@
-use crate::api::schema::{MailboxOfflineSubmitParams, ResponseResult};
-use crate::app::App;
+use crate::api::schema::{MailboxOfflineSubmitParams, ResponseResult, SuccessResponse};
+use crate::app::{App, MailboxBootstrapError, MailboxBootstrapSession};
+use serde_json::Value;
 
 use super::responses::{encode_error, encode_success};
 
 impl App {
-    pub(super) fn handle_mailbox_offline_submit(
+    /// Dispatches only the four mailbox operations for an already verified,
+    /// server-issued accepted-stream binding. Request payloads intentionally do
+    /// not carry caller, grant, or recipient selectors; this method installs the
+    /// descriptor scope after the exact Active generation recheck.
+    pub(crate) fn dispatch_mailbox_bootstrap(
+        &mut self,
+        session: &MailboxBootstrapSession,
+        method: &str,
+        params: Value,
+    ) -> Result<Value, MailboxBootstrapError> {
+        self.mailbox_bootstrap_session_current(session)?;
+        let id = "mailbox-bootstrap".to_owned();
+        let response = match method {
+            "mailbox.offline_submit" => {
+                let submit = serde_json::from_value(params)
+                    .map_err(|_| MailboxBootstrapError::InvalidRequest)?;
+                self.handle_mailbox_offline_submit(
+                    id,
+                    MailboxOfflineSubmitParams {
+                        caller: session.caller.clone(),
+                        grant_id: session.grant_id.clone(),
+                        recipient: session.recipient.clone(),
+                        submit,
+                    },
+                )
+            }
+            "mailbox.snapshot" => {
+                #[derive(serde::Deserialize)]
+                #[serde(rename_all = "camelCase", deny_unknown_fields)]
+                struct SnapshotParams {
+                    protocol: String,
+                }
+                let params: SnapshotParams = serde_json::from_value(params)
+                    .map_err(|_| MailboxBootstrapError::InvalidRequest)?;
+                self.handle_mailbox_snapshot(
+                    id,
+                    crate::api::schema::MailboxSnapshotParams {
+                        caller: session.caller.clone(),
+                        grant_id: session.grant_id.clone(),
+                        recipient: session.recipient.clone(),
+                        protocol: params.protocol,
+                    },
+                )
+            }
+            "mailbox.claim" => {
+                let claim = serde_json::from_value(params)
+                    .map_err(|_| MailboxBootstrapError::InvalidRequest)?;
+                self.handle_mailbox_claim(
+                    id,
+                    crate::api::schema::MailboxClaimParams {
+                        caller: session.caller.clone(),
+                        grant_id: session.grant_id.clone(),
+                        recipient: session.recipient.clone(),
+                        claim,
+                    },
+                )
+            }
+            "mailbox.resolve" => {
+                let resolve = serde_json::from_value(params)
+                    .map_err(|_| MailboxBootstrapError::InvalidRequest)?;
+                self.handle_mailbox_resolve(
+                    id,
+                    crate::api::schema::MailboxResolveParams {
+                        caller: session.caller.clone(),
+                        grant_id: session.grant_id.clone(),
+                        recipient: session.recipient.clone(),
+                        resolve,
+                    },
+                )
+            }
+            _ => return Err(MailboxBootstrapError::InvalidRequest),
+        };
+        let success: SuccessResponse =
+            serde_json::from_str(&response).map_err(|_| MailboxBootstrapError::InvalidRequest)?;
+        serde_json::to_value(success.result).map_err(|_| MailboxBootstrapError::InvalidRequest)
+    }
+
+    pub(crate) fn handle_mailbox_offline_submit(
         &mut self,
         id: String,
         params: MailboxOfflineSubmitParams,
@@ -56,7 +134,7 @@ impl App {
         }
     }
 
-    pub(super) fn handle_mailbox_claim(
+    pub(crate) fn handle_mailbox_claim(
         &mut self,
         id: String,
         params: crate::api::schema::MailboxClaimParams,
@@ -99,7 +177,7 @@ impl App {
         }
     }
 
-    pub(super) fn handle_mailbox_snapshot(
+    pub(crate) fn handle_mailbox_snapshot(
         &mut self,
         id: String,
         params: crate::api::schema::MailboxSnapshotParams,
@@ -146,7 +224,7 @@ impl App {
         }
     }
 
-    pub(super) fn handle_mailbox_resolve(
+    pub(crate) fn handle_mailbox_resolve(
         &mut self,
         id: String,
         params: crate::api::schema::MailboxResolveParams,

@@ -1,8 +1,10 @@
 use std::collections::BTreeMap;
+use std::os::fd::RawFd;
 
 use crate::api::schema::MailboxOfflineSubmitParams;
 use crate::app::App;
 use crate::direct_transport::TransportError;
+use crate::direct_transport::{SessionGeneration, TrustedMailboxChannelContext};
 
 /// Server-minted offline capability. Its grant and recipient identifiers are
 /// selectors on the wire; the exact sender key/generation remains server-owned.
@@ -21,6 +23,33 @@ pub(crate) struct OfflineMailboxAuthority {
     pub(crate) caller_selector: String,
     capabilities: BTreeMap<String, OfflineMailboxCapability>,
     pub(crate) store: crate::mailbox::MailboxStore,
+}
+
+/// A server-issued scope attached to one verified accepted Unix stream.
+/// The values are selected from the current Active record and are intentionally
+/// not decoded from bootstrap or dispatch frames.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct MailboxBootstrapSession {
+    pub(crate) caller: String,
+    pub(crate) recipient: crate::mailbox::RecipientKey,
+    pub(crate) grant_id: String,
+    pub(crate) active_execution_generation: u64,
+    pub(crate) binding_generation: String,
+    context: TrustedMailboxChannelContext,
+}
+
+impl MailboxBootstrapSession {
+    pub(crate) fn context(&self) -> &TrustedMailboxChannelContext {
+        &self.context
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum MailboxBootstrapError {
+    GrantMissing,
+    GrantRevoked,
+    PeerRejected,
+    InvalidRequest,
 }
 
 #[derive(Debug)]
@@ -347,6 +376,160 @@ impl App {
         }
     }
 
+    /// Accept a bootstrap stream only by verifying it against a current live
+    /// foreground Pi process and then re-reading the exact Active record before
+    /// publishing a server-selected binding.
+    pub(crate) fn accept_mailbox_bootstrap_stream(
+        &mut self,
+        socket_fd: RawFd,
+    ) -> Result<MailboxBootstrapSession, MailboxBootstrapError> {
+        let candidates = self.live_mailbox_bootstrap_candidates();
+        if candidates.is_empty() {
+            return Err(MailboxBootstrapError::GrantMissing);
+        }
+        for candidate in candidates {
+            let binding_generation =
+                format!("mailbox-binding-{}", self.next_mailbox_bootstrap_binding);
+            let recipient = SessionGeneration {
+                session: candidate.sender_key.clone(),
+                generation: candidate.process_generation,
+                delegation_id: crate::delegation::DelegationId::alloc()
+                    .map_err(|_| MailboxBootstrapError::GrantMissing)?,
+            };
+            let context = match TrustedMailboxChannelContext::from_verified_local_socket(
+                socket_fd,
+                recipient,
+                binding_generation.clone(),
+                candidate.foreground_pi_pid,
+                candidate.process_generation,
+            ) {
+                Ok(context) => context,
+                Err(_) => continue,
+            };
+            // The accepted FD was authenticated. Recheck the exact persisted
+            // Active execution now, before exposing its descriptor.
+            if !self
+                .exact_active_mailbox_authority(&candidate.sender_key, candidate.process_generation)
+            {
+                continue;
+            }
+            self.next_mailbox_bootstrap_binding = self
+                .next_mailbox_bootstrap_binding
+                .checked_add(1)
+                .ok_or(MailboxBootstrapError::GrantMissing)?;
+            let session = MailboxBootstrapSession {
+                caller: candidate.sender_key.clone(),
+                recipient: crate::mailbox::RecipientKey {
+                    recipient_id: candidate.sender_key.clone(),
+                    generation: "1".into(),
+                },
+                grant_id: format!(
+                    "offline:{}:{}",
+                    candidate.sender_key, candidate.process_generation
+                ),
+                active_execution_generation: candidate.process_generation,
+                binding_generation: binding_generation.clone(),
+                context,
+            };
+            self.mailbox_bootstrap_bindings
+                .insert(binding_generation, session.clone());
+            return Ok(session);
+        }
+        Err(MailboxBootstrapError::PeerRejected)
+    }
+
+    pub(crate) fn mailbox_bootstrap_session_current(
+        &self,
+        session: &MailboxBootstrapSession,
+    ) -> Result<(), MailboxBootstrapError> {
+        let Some(issued) = self
+            .mailbox_bootstrap_bindings
+            .get(&session.binding_generation)
+        else {
+            return Err(MailboxBootstrapError::GrantMissing);
+        };
+        if issued != session
+            || issued.context().binding().id() != session.binding_generation
+            || !self.exact_active_mailbox_authority(
+                &session.caller,
+                session.active_execution_generation,
+            )
+        {
+            return Err(MailboxBootstrapError::GrantRevoked);
+        }
+        Ok(())
+    }
+
+    fn exact_active_mailbox_authority(&self, sender_key: &str, generation: u64) -> bool {
+        let Some(authority) = self.offline_mailbox_authorities.get(sender_key) else {
+            return false;
+        };
+        if authority.sender_generation != generation {
+            return false;
+        }
+        crate::sender_authority::SenderAuthorityStore::for_sender(
+            &self.sender_authority_dir,
+            sender_key,
+        )
+        .and_then(|store| store.load())
+        .ok()
+        .flatten()
+        .is_some_and(|record| authority.matches_sender_record(&record))
+    }
+
+    fn live_mailbox_bootstrap_candidates(&self) -> Vec<LiveMailboxBootstrapCandidate> {
+        #[cfg(test)]
+        if !self.mailbox_bootstrap_test_candidates.is_empty() {
+            return self.mailbox_bootstrap_test_candidates.clone();
+        }
+        self.offline_mailbox_authorities
+            .values()
+            .filter_map(|authority| {
+                if !self.exact_active_mailbox_authority(
+                    &authority.sender_key,
+                    authority.sender_generation,
+                ) {
+                    return None;
+                }
+                let terminal_id = self
+                    .state
+                    .terminals
+                    .keys()
+                    .find(|terminal_id| terminal_id.to_string() == authority.sender_key)?;
+                let runtime = self.terminal_runtimes.get(terminal_id)?;
+                let job = crate::detect::foreground_job(runtime.child_pid()?)?;
+                let foreground_pi_pid = job
+                    .processes
+                    .iter()
+                    .find(|process| {
+                        crate::platform::process_agent_hint(process.pid)
+                            == Some(crate::detect::Agent::Pi)
+                    })
+                    .map(|process| process.pid)?;
+                Some(LiveMailboxBootstrapCandidate {
+                    sender_key: authority.sender_key.clone(),
+                    process_generation: authority.sender_generation,
+                    foreground_pi_pid,
+                })
+            })
+            .collect()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn install_mailbox_bootstrap_test_candidate(
+        &mut self,
+        sender_key: String,
+        process_generation: u64,
+        foreground_pi_pid: u32,
+    ) {
+        self.mailbox_bootstrap_test_candidates
+            .push(LiveMailboxBootstrapCandidate {
+                sender_key,
+                process_generation,
+                foreground_pi_pid,
+            });
+    }
+
     pub(crate) fn promote_and_install_offline_mailbox_authority(
         &mut self,
         pane_id: crate::layout::PaneId,
@@ -381,4 +564,11 @@ impl App {
         };
         let _ = self.install_offline_mailbox_authority(record);
     }
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct LiveMailboxBootstrapCandidate {
+    sender_key: String,
+    process_generation: u64,
+    foreground_pi_pid: u32,
 }
