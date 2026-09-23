@@ -507,6 +507,27 @@ mod tests {
     }
 
     #[test]
+    fn owned_listener_removes_its_socket_and_allows_clean_rebind() {
+        let directory = unique_dir();
+        let path = {
+            let listener = listener(&directory);
+            let path = listener.path().to_path_buf();
+            assert!(path.exists(), "listener owns its socket path");
+            path
+        };
+        assert!(
+            !path.exists(),
+            "dropped listener removes its owned socket path"
+        );
+
+        let rebound = MailboxBootstrapListener::bind_at(path.clone()).expect("rebind socket path");
+        assert!(path.exists(), "rebound listener owns its socket path");
+        drop(rebound);
+        assert!(!path.exists(), "rebound listener cleans up its socket path");
+        std::fs::remove_dir_all(directory).expect("remove test directory");
+    }
+
+    #[test]
     fn bootstrap_success_authenticates_all_mailbox_dispatches_with_server_scope() {
         let (mut app, directory, sender) = active_app();
         let mut listener = listener(&directory);
