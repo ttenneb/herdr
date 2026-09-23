@@ -610,9 +610,87 @@ mod tests {
     }
 
     #[test]
+    fn stale_pane_died_after_replacement_keeps_current_authority_and_claim() {
+        let (mut app, pane_id, sender_key, directory) = app_with_active_sender();
+        let submitted = app.handle_api_request(Request {
+            id: "submit".into(),
+            method: Method::MailboxOfflineSubmit(active_submit(sender_key.clone(), "c".repeat(64))),
+        });
+        assert!(serde_json::from_str::<SuccessResponse>(&submitted).is_ok());
+        let claimed = app.handle_api_request(Request {
+            id: "claim".into(),
+            method: Method::MailboxClaim(active_claim(sender_key.clone())),
+        });
+        let claimed: SuccessResponse = serde_json::from_str(&claimed).expect("claim response");
+        let ResponseResult::MailboxClaimed { claim: Some(claim) } = claimed.result else {
+            panic!("expected durable claim")
+        };
+
+        let sender_store =
+            crate::sender_authority::SenderAuthorityStore::for_sender(&directory, &sender_key)
+                .expect("sender authority store");
+        sender_store
+            .cas(
+                Some(2),
+                crate::sender_authority::SenderAuthorityRecord {
+                    sender_key: sender_key.clone(),
+                    process_generation: 2,
+                    phase: crate::sender_authority::SenderAuthorityPhase::Active,
+                    transition_revision: 3,
+                },
+            )
+            .expect("replace active sender generation");
+        app.state
+            .terminals
+            .values_mut()
+            .find(|terminal| terminal.id.to_string() == sender_key)
+            .expect("sender terminal")
+            .set_managed_agent_generation(2);
+        app.install_offline_mailbox_authority(
+            sender_store
+                .load()
+                .expect("read replacement")
+                .expect("active sender"),
+        )
+        .expect("install replacement authority");
+
+        // This event was queued by generation 1 before generation 2 became
+        // Active; it must not revoke the replacement authority or its claims.
+        app.handle_internal_event(AppEvent::PaneDied {
+            pane_id,
+            process_generation: Some(1),
+        });
+
+        assert!(app
+            .offline_mailbox_authority_current(&sender_key)
+            .expect("read current authority"));
+        let replay = app.handle_api_request(Request {
+            id: "claim-after-stale-exit".into(),
+            method: Method::MailboxClaim(crate::api::schema::MailboxClaimParams {
+                caller: sender_key.clone(),
+                grant_id: format!("offline:{sender_key}:2"),
+                recipient: active_recipient(&sender_key),
+                claim: ClaimRequest {
+                    protocol: PROTOCOL.into(),
+                },
+            }),
+        });
+        let replay: SuccessResponse = serde_json::from_str(&replay).expect("replay claim response");
+        assert_eq!(
+            replay.result,
+            ResponseResult::MailboxClaimed { claim: Some(claim) }
+        );
+        drop(app);
+        std::fs::remove_dir_all(directory).expect("remove mailbox directory");
+    }
+
+    #[test]
     fn mailbox_authority_exit_invalidates_exact_active_generation() {
         let (mut app, pane_id, sender_key, directory) = app_with_active_sender();
-        app.handle_internal_event(AppEvent::PaneDied { pane_id });
+        app.handle_internal_event(AppEvent::PaneDied {
+            pane_id,
+            process_generation: None,
+        });
         let sender_store =
             crate::sender_authority::SenderAuthorityStore::for_sender(&directory, &sender_key)
                 .expect("sender authority store");

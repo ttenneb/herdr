@@ -474,6 +474,7 @@ impl App {
     pub(crate) fn invalidate_offline_mailbox_authority_for_pane(
         &mut self,
         pane_id: crate::layout::PaneId,
+        process_generation: Option<u64>,
     ) {
         let Some((ws_idx, _)) = self.find_pane(pane_id) else {
             return;
@@ -485,6 +486,9 @@ impl App {
         let Some(authority) = self.offline_mailbox_authorities.get(&sender_key) else {
             return;
         };
+        if process_generation.is_some_and(|generation| generation != authority.sender_generation) {
+            return;
+        }
         let sender_store = match crate::sender_authority::SenderAuthorityStore::for_sender(
             &self.sender_authority_dir,
             &sender_key,

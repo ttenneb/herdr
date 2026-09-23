@@ -130,8 +130,12 @@ impl App {
             return Vec::new();
         }
 
-        if let AppEvent::PaneDied { pane_id } = &ev {
-            self.invalidate_offline_mailbox_authority_for_pane(*pane_id);
+        if let AppEvent::PaneDied {
+            pane_id,
+            process_generation,
+        } = &ev
+        {
+            self.invalidate_offline_mailbox_authority_for_pane(*pane_id, *process_generation);
         }
 
         if let AppEvent::AgentProcessDetected {
@@ -312,7 +316,7 @@ impl App {
             return Vec::new();
         }
 
-        if let AppEvent::PaneDied { pane_id } = &ev {
+        if let AppEvent::PaneDied { pane_id, .. } = &ev {
             if self
                 .state
                 .popup_pane
@@ -339,7 +343,7 @@ impl App {
             }
         }
 
-        let overlay_state = if let AppEvent::PaneDied { pane_id } = &ev {
+        let overlay_state = if let AppEvent::PaneDied { pane_id, .. } = &ev {
             self.overlay_panes.remove(pane_id).map(|overlay| {
                 let was_overlay_active =
                     self.state
@@ -363,7 +367,7 @@ impl App {
             None
         };
 
-        if let AppEvent::PaneDied { pane_id } = &ev {
+        if let AppEvent::PaneDied { pane_id, .. } = &ev {
             if let Some((ws_idx, _)) = self.find_pane(*pane_id) {
                 if let Some(public_pane_id) = self.public_pane_id(ws_idx, *pane_id) {
                     self.emit_event(crate::api::schema::EventEnvelope {
@@ -376,7 +380,7 @@ impl App {
                 }
             }
         }
-        let pane_exit_layout_target = if let AppEvent::PaneDied { pane_id } = &ev {
+        let pane_exit_layout_target = if let AppEvent::PaneDied { pane_id, .. } = &ev {
             self.find_pane(*pane_id).and_then(|(ws_idx, _)| {
                 self.layout_update_target_after_pane_removal(ws_idx, *pane_id)
             })
@@ -2320,6 +2324,7 @@ mod tests {
 
         app.handle_internal_event(AppEvent::PaneDied {
             pane_id: overlay_pane,
+            process_generation: None,
         });
 
         let overlay_tab = &app.state.workspaces[0].tabs[0];
@@ -2346,7 +2351,10 @@ mod tests {
         app.state.ensure_test_terminals();
         let tab_id = app.public_tab_id(0, 0).unwrap();
 
-        app.handle_internal_event(AppEvent::PaneDied { pane_id: dead_pane });
+        app.handle_internal_event(AppEvent::PaneDied {
+            pane_id: dead_pane,
+            process_generation: None,
+        });
 
         let events = event_hub.events_after(0);
         let pane_exited = events
@@ -2495,6 +2503,7 @@ mod tests {
 
         app.handle_internal_event(AppEvent::PaneDied {
             pane_id: overlay_pane,
+            process_generation: None,
         });
 
         let events = event_hub.events_after(0);
@@ -2520,6 +2529,7 @@ mod tests {
 
         app.handle_internal_event(AppEvent::PaneDied {
             pane_id: overlay_pane,
+            process_generation: None,
         });
 
         let tab = &app.state.workspaces[0].tabs[0];
@@ -2539,6 +2549,7 @@ mod tests {
 
         app.handle_internal_event(AppEvent::PaneDied {
             pane_id: overlay_pane,
+            process_generation: None,
         });
 
         let tab = &app.state.workspaces[0].tabs[0];
@@ -2577,7 +2588,10 @@ mod tests {
                 .expect("test session id should be valid"),
         });
 
-        app.handle_internal_event(AppEvent::PaneDied { pane_id });
+        app.handle_internal_event(AppEvent::PaneDied {
+            pane_id,
+            process_generation: None,
+        });
 
         assert!(
             app.find_pane(pane_id).is_some(),

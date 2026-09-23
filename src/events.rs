@@ -55,8 +55,12 @@ pub struct WorktreeRemoveResult {
 /// An event from a background task to the main loop.
 #[derive(Debug)]
 pub enum AppEvent {
-    /// A pane's child process exited.
-    PaneDied { pane_id: PaneId },
+    /// A pane child exited. Managed runtimes attach the generation observed
+    /// at exit so a delayed old-generation event cannot revoke its replacement.
+    PaneDied {
+        pane_id: PaneId,
+        process_generation: Option<u64>,
+    },
     /// Process detection identified an agent before its screen state was confirmed.
     AgentProcessDetected {
         pane_id: PaneId,

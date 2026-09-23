@@ -767,6 +767,7 @@ mod tests {
         let sender_pane = app.state.workspaces[0].tabs[0].root_pane.unwrap();
         app.handle_internal_event(crate::events::AppEvent::PaneDied {
             pane_id: sender_pane,
+            process_generation: None,
         });
         let rejected = exchange(
             &mut listener,
