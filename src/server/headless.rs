@@ -2588,6 +2588,16 @@ impl HeadlessServer {
     }
 
     fn handle_internal_event_with_forwarding_inner(&mut self, ev: AppEvent) -> bool {
+        if let AppEvent::PaneDied {
+            pane_id,
+            process_generation,
+        } = &ev
+        {
+            if self.app.is_stale_pane_exit(*pane_id, *process_generation) {
+                return false;
+            }
+        }
+
         match &ev {
             AppEvent::TerminalBell { pane_id, count } => {
                 if !self.send_to_foreground_client(ServerMessage::TerminalBell { count: *count }) {
@@ -7545,6 +7555,86 @@ next_tab = ""
         });
 
         assert!(changed);
+    }
+
+    #[test]
+    fn stale_pane_died_does_not_forward_exit_or_mutate_replacement_pane() {
+        let event_hub = api::EventHub::default();
+        let mut server = test_headless_server_with_event_hub(event_hub.clone());
+        let workspace = crate::workspace::Workspace::test_new("replacement");
+        let pane_id = workspace.tabs[0].root_pane.expect("test pane");
+        server.app.state.workspaces = vec![workspace];
+        server.app.state.ensure_test_terminals();
+        let terminal_id = server.app.state.workspaces[0]
+            .pane_state(pane_id)
+            .expect("pane")
+            .attached_terminal_id
+            .clone();
+        let terminal_id_string = terminal_id.to_string();
+        let terminal = server
+            .app
+            .state
+            .terminals
+            .get_mut(&terminal_id)
+            .expect("terminal");
+        terminal.set_managed_agent_generation(2);
+        terminal.set_detected_state(
+            Some(crate::detect::Agent::Pi),
+            crate::detect::AgentState::Working,
+        );
+        terminal.respawn_shell_on_exit = true;
+        let (writer, _control_rx, _render_rx) = test_client_writer();
+        assert!(server.handle_server_event(ServerEvent::ClientConnected {
+            client_id: 7,
+            cols: 80,
+            rows: 24,
+            cell_width_px: 0,
+            cell_height_px: 0,
+            render_encoding: RenderEncoding::TerminalAnsi,
+            keybindings: None,
+            direct_attach_requested: true,
+            direct_graphics: false,
+            writer,
+        }));
+        assert!(
+            server.handle_server_event(ServerEvent::ClientAttachTerminal {
+                client_id: 7,
+                terminal_id: terminal_id_string.clone(),
+                takeover: false,
+            })
+        );
+        let lifecycle_sequence = event_hub.current_sequence();
+
+        assert!(
+            !server.handle_internal_event_with_forwarding(AppEvent::PaneDied {
+                pane_id,
+                process_generation: Some(1),
+            })
+        );
+
+        assert!(server.app.find_pane(pane_id).is_some());
+        assert!(server.clients.contains_key(&7));
+        assert_eq!(
+            server.terminal_attach_owners.get(&terminal_id_string),
+            Some(&7)
+        );
+        let terminal = server
+            .app
+            .state
+            .terminals
+            .get(&terminal_id)
+            .expect("terminal");
+        assert!(terminal.accepts_managed_agent_generation(2));
+        assert_eq!(terminal.state, crate::detect::AgentState::Working);
+        assert!(terminal.respawn_shell_on_exit);
+        let lifecycle_events = event_hub.events_after(lifecycle_sequence);
+        assert!(!lifecycle_events
+            .iter()
+            .any(|(_, event)| matches!(event.event, api::schema::EventKind::PaneExited)));
+        assert!(!lifecycle_events.iter().any(|(_, event)| matches!(
+            event.data,
+            api::schema::EventData::PaneAgentDetected { released: true, .. }
+        )));
     }
 
     #[test]

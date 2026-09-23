@@ -654,13 +654,48 @@ mod tests {
         )
         .expect("install replacement authority");
 
+        let lifecycle_sequence = app.event_hub.current_sequence();
+        let terminal = app
+            .state
+            .terminals
+            .values_mut()
+            .find(|terminal| terminal.id.to_string() == sender_key)
+            .expect("sender terminal");
+        terminal.set_detected_state(Some(Agent::Pi), crate::detect::AgentState::Working);
+        terminal.respawn_shell_on_exit = true;
+
         // This event was queued by generation 1 before generation 2 became
-        // Active; it must not revoke the replacement authority or its claims.
+        // Active; it must not revoke the replacement authority or affect the
+        // live generation-2 pane lifecycle.
         app.handle_internal_event(AppEvent::PaneDied {
             pane_id,
             process_generation: Some(1),
         });
 
+        assert!(
+            app.find_pane(pane_id).is_some(),
+            "stale exit must not close pane"
+        );
+        let terminal = app
+            .state
+            .terminals
+            .values()
+            .find(|terminal| terminal.id.to_string() == sender_key)
+            .expect("sender terminal");
+        assert!(terminal.accepts_managed_agent_generation(2));
+        assert_eq!(terminal.state, crate::detect::AgentState::Working);
+        assert!(
+            terminal.respawn_shell_on_exit,
+            "stale exit must not consume respawn state"
+        );
+        let lifecycle_events = app.event_hub.events_after(lifecycle_sequence);
+        assert!(!lifecycle_events
+            .iter()
+            .any(|(_, event)| matches!(event.event, crate::api::schema::EventKind::PaneExited)));
+        assert!(!lifecycle_events.iter().any(|(_, event)| matches!(
+            event.data,
+            crate::api::schema::EventData::PaneAgentDetected { released: true, .. }
+        )));
         assert!(app
             .offline_mailbox_authority_current(&sender_key)
             .expect("read current authority"));
@@ -689,7 +724,7 @@ mod tests {
         let (mut app, pane_id, sender_key, directory) = app_with_active_sender();
         app.handle_internal_event(AppEvent::PaneDied {
             pane_id,
-            process_generation: None,
+            process_generation: Some(1),
         });
         let sender_store =
             crate::sender_authority::SenderAuthorityStore::for_sender(&directory, &sender_key)

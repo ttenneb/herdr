@@ -117,10 +117,40 @@ impl App {
         let _ = self.handle_internal_event_with_pane_updates(ev);
     }
 
+    pub(crate) fn is_stale_pane_exit(
+        &self,
+        pane_id: crate::layout::PaneId,
+        process_generation: Option<u64>,
+    ) -> bool {
+        let Some(process_generation) = process_generation else {
+            return false;
+        };
+        let Some((ws_idx, _)) = self.find_pane(pane_id) else {
+            return false;
+        };
+        let Some(terminal_id) = self.state.workspaces[ws_idx].terminal_id(pane_id) else {
+            return false;
+        };
+        self.state
+            .terminals
+            .get(terminal_id)
+            .is_some_and(|terminal| !terminal.accepts_managed_agent_generation(process_generation))
+    }
+
     pub(crate) fn handle_internal_event_with_pane_updates(
         &mut self,
         ev: AppEvent,
     ) -> Vec<crate::app::actions::PaneStateUpdate> {
+        if let AppEvent::PaneDied {
+            pane_id,
+            process_generation,
+        } = &ev
+        {
+            if self.is_stale_pane_exit(*pane_id, *process_generation) {
+                return Vec::new();
+            }
+        }
+
         if let AppEvent::TerminalBell { count, .. } = ev {
             if let Err(err) =
                 crate::terminal_effects::write_terminal_bells(&mut std::io::stdout(), count)
