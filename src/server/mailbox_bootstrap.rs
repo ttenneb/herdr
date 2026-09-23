@@ -426,6 +426,22 @@ mod tests {
             }),
         );
         assert_eq!(submit["ok"], true);
+        let edit = exchange(
+            &mut listener,
+            &mut app,
+            &mut client,
+            json!({
+                "method": "mailbox.edit", "requestId": "edit-1",
+                "bindingGeneration": binding,
+                "params": {
+                    "protocol": crate::mailbox_v1::PROTOCOL,
+                    "stableId": "stable-1", "revision": 1, "digest": "a".repeat(64),
+                    "subject": "edited subject", "body": "edited body"
+                }
+            }),
+        );
+        assert_eq!(edit["ok"], true);
+        assert_eq!(edit["result"]["snapshot"]["heads"][0]["revision"], 2);
         let snapshot = exchange(
             &mut listener,
             &mut app,

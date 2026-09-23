@@ -54,6 +54,27 @@ pub struct MailboxProvenance {
     pub accepted_at: u64,
 }
 
+/// Exact server-side compare-and-swap input for the one editable, unclaimed
+/// head. The caller supplies only its observed version and human text intent;
+/// the store mints the next revision and digest.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MailboxHeadEdit {
+    pub stable_id: String,
+    pub revision: u64,
+    pub digest: String,
+    pub subject: String,
+    pub body: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MailboxHeadEditRecord {
+    expected_stable_id: String,
+    expected_revision: u64,
+    expected_digest: String,
+    head: MailboxHead,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct AdmissionReceipt {
@@ -110,6 +131,7 @@ pub struct MailboxGrant {
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum MailboxRecord {
     Head { head: MailboxHead },
+    HeadEdit { edit: MailboxHeadEditRecord },
     Receipt { receipt: AdmissionReceipt },
     Claim { claim: Claim },
     Resolution { resolution: ClaimResolution },
@@ -133,6 +155,8 @@ pub enum MailboxError {
     ClaimAlreadyExists,
     ClaimAlreadyResolved,
     MissingClaim,
+    EditConflict,
+    HeadClaimed,
     Io(String),
     CorruptRecord,
 }
@@ -274,6 +298,66 @@ impl MailboxStore {
             }
             // The preceding append_synced performed File::sync_all before this receipt is written.
             self.append_synced(&MailboxRecord::Receipt { receipt })
+        })
+    }
+
+    /// Atomically replaces only an unclaimed head whose complete observed version
+    /// matches. The append is fsynced before the refreshed authoritative head is
+    /// returned. Sender, recipient, grant, message and delivery provenance remain
+    /// immutable; only the human subject/body and server-minted version change.
+    pub fn edit_unclaimed_head(&self, edit: MailboxHeadEdit) -> Result<MailboxHead, MailboxError> {
+        self.with_exclusive_lock(|| {
+            if edit.stable_id.is_empty()
+                || edit.revision == 0
+                || !valid_digest(&edit.digest)
+                || edit.subject.is_empty()
+                || edit.body.is_empty()
+            {
+                return Err(MailboxError::InvalidRecord);
+            }
+            let recovered = self.load()?;
+            let current = recovered
+                .heads
+                .get(&edit.stable_id)
+                .cloned()
+                .ok_or(MailboxError::EditConflict)?;
+            if current.revision != edit.revision || current.digest != edit.digest {
+                return Err(MailboxError::EditConflict);
+            }
+            if recovered.claims.contains_key(&edit.stable_id) {
+                return Err(MailboxError::HeadClaimed);
+            }
+            let revision = current
+                .revision
+                .checked_add(1)
+                .ok_or(MailboxError::InvalidRecord)?;
+            let digest = edit_digest(
+                &current.stable_id,
+                revision,
+                &current.digest,
+                &edit.subject,
+                &edit.body,
+            );
+            let next = MailboxHead {
+                revision,
+                digest,
+                subject: edit.subject,
+                body: edit.body,
+                ..current.clone()
+            };
+            validate_head(&next)?;
+            let record = MailboxHeadEditRecord {
+                expected_stable_id: current.stable_id.clone(),
+                expected_revision: current.revision,
+                expected_digest: current.digest,
+                head: next.clone(),
+            };
+            self.append_synced(&MailboxRecord::HeadEdit { edit: record })?;
+            self.load()?
+                .heads
+                .get(&next.stable_id)
+                .cloned()
+                .ok_or(MailboxError::CorruptRecord)
         })
     }
 
@@ -423,6 +507,7 @@ impl RecoveredMailbox {
             MailboxRecord::Head { head } => {
                 insert_exact(&mut self.heads, head.stable_id.clone(), head)
             }
+            MailboxRecord::HeadEdit { edit } => self.apply_head_edit(edit),
             MailboxRecord::Receipt { receipt } => {
                 insert_exact(&mut self.receipts, receipt.delivery_digest.clone(), receipt)
             }
@@ -439,6 +524,72 @@ impl RecoveredMailbox {
             }
         }
     }
+
+    fn apply_head_edit(&mut self, edit: MailboxHeadEditRecord) -> Result<(), MailboxError> {
+        let current = self
+            .heads
+            .get(&edit.expected_stable_id)
+            .cloned()
+            .ok_or(MailboxError::CorruptRecord)?;
+        if current.revision != edit.expected_revision
+            || current.digest != edit.expected_digest
+            || self.claims.contains_key(&edit.expected_stable_id)
+            || edit.head.stable_id != current.stable_id
+            || edit.head.revision
+                != current
+                    .revision
+                    .checked_add(1)
+                    .ok_or(MailboxError::CorruptRecord)?
+            || edit.head.delivery_digest != current.delivery_digest
+            || edit.head.recipient != current.recipient
+            || edit.head.recipient_generation != current.recipient_generation
+            || edit.head.sender != current.sender
+            || edit.head.target != current.target
+            || edit.head.grant_id != current.grant_id
+            || edit.head.message_id != current.message_id
+            || edit.head.kind != current.kind
+            || edit.head.priority != current.priority
+            || edit.head.original_sequence != current.original_sequence
+            || edit.head.enqueue_epoch != current.enqueue_epoch
+            || edit.head.accepted_at != current.accepted_at
+            || edit.head.subject.is_empty()
+            || edit.head.body.is_empty()
+            || edit.head.digest
+                != edit_digest(
+                    &current.stable_id,
+                    edit.head.revision,
+                    &current.digest,
+                    &edit.head.subject,
+                    &edit.head.body,
+                )
+        {
+            return Err(MailboxError::CorruptRecord);
+        }
+        self.heads.insert(edit.head.stable_id.clone(), edit.head);
+        Ok(())
+    }
+}
+
+fn edit_digest(
+    stable_id: &str,
+    revision: u64,
+    previous_digest: &str,
+    subject: &str,
+    body: &str,
+) -> String {
+    use sha2::{Digest as _, Sha256};
+    let mut hasher = Sha256::new();
+    for value in [
+        stable_id.as_bytes(),
+        &revision.to_be_bytes(),
+        previous_digest.as_bytes(),
+        subject.as_bytes(),
+        body.as_bytes(),
+    ] {
+        hasher.update((value.len() as u64).to_be_bytes());
+        hasher.update(value);
+    }
+    format!("{:x}", hasher.finalize())
 }
 
 fn insert_exact<T: PartialEq>(

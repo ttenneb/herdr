@@ -55,6 +55,7 @@ pub(crate) fn request_changes_ui(request: &Request) -> bool {
             | Method::MailboxClaim(_)
             | Method::MailboxResolve(_)
             | Method::MailboxSnapshot(_)
+            | Method::MailboxEdit(_)
             | Method::PaneSplit(_)
             | Method::PaneSwap(_)
             | Method::PaneMove(_)

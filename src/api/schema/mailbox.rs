@@ -45,3 +45,15 @@ pub struct MailboxSnapshotParams {
     pub recipient: crate::mailbox::RecipientKey,
     pub protocol: String,
 }
+
+/// Untrusted edit intent. The caller/grant/recipient selectors are constrained
+/// by the current server-issued mailbox scope; `edit` must CAS the exact head.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct MailboxEditParams {
+    pub caller: String,
+    pub grant_id: String,
+    pub recipient: crate::mailbox::RecipientKey,
+    #[serde(flatten)]
+    pub edit: crate::mailbox_v1::Edit,
+}

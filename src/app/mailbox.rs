@@ -227,6 +227,25 @@ impl OfflineMailboxAuthority {
         ))
     }
 
+    pub(crate) fn edit(
+        &self,
+        params: crate::api::schema::MailboxEditParams,
+    ) -> Result<crate::mailbox_v1::Snapshot, OfflineMailboxError> {
+        crate::mailbox_v1::validate_request(&crate::mailbox_v1::Request::Edit(params.edit.clone()))
+            .map_err(OfflineMailboxError::Transport)?;
+        let capability =
+            self.capability_for(&params.caller, &params.grant_id, &params.recipient)?;
+        crate::mailbox_v1::edit_unclaimed(&self.store, params.edit)
+            .map_err(OfflineMailboxError::Store)?;
+        // Read from the durable stream after the edit's sync before responding;
+        // callers receive server authority rather than an optimistic local edit.
+        let recovered = self.store.load().map_err(OfflineMailboxError::Store)?;
+        Ok(crate::mailbox_v1::snapshot(
+            &recovered,
+            &capability.recipient,
+        ))
+    }
+
     pub(crate) fn resolve(
         &self,
         params: crate::api::schema::MailboxResolveParams,

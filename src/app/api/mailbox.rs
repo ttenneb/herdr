@@ -62,6 +62,19 @@ impl App {
                     },
                 )
             }
+            "mailbox.edit" => {
+                let edit = serde_json::from_value(params)
+                    .map_err(|_| MailboxBootstrapError::InvalidRequest)?;
+                self.handle_mailbox_edit(
+                    id,
+                    crate::api::schema::MailboxEditParams {
+                        caller: session.caller.clone(),
+                        grant_id: session.grant_id.clone(),
+                        recipient: session.recipient.clone(),
+                        edit,
+                    },
+                )
+            }
             "mailbox.resolve" => {
                 let resolve = serde_json::from_value(params)
                     .map_err(|_| MailboxBootstrapError::InvalidRequest)?;
@@ -221,6 +234,61 @@ impl App {
                 "mailbox_snapshot_failed",
                 "offline mailbox snapshot rejected",
             ),
+        }
+    }
+
+    pub(crate) fn handle_mailbox_edit(
+        &mut self,
+        id: String,
+        params: crate::api::schema::MailboxEditParams,
+    ) -> String {
+        match self.offline_mailbox_authority_current(&params.caller) {
+            Ok(true) => {}
+            Ok(false) | Err(_) => {
+                return encode_error(
+                    id,
+                    "mailbox_authority_unavailable",
+                    "the server has no current authenticated local mailbox sender route",
+                )
+            }
+        }
+        let authority = self
+            .offline_mailbox_authorities
+            .get(&params.caller)
+            .expect("current route must remain installed during serialized dispatch");
+        match authority.edit(params) {
+            Ok(snapshot) => encode_success(id, ResponseResult::MailboxEdited { snapshot }),
+            Err(crate::app::mailbox::OfflineMailboxError::CallerMismatch) => encode_error(
+                id,
+                "mailbox_caller_mismatch",
+                "caller selector does not match the authenticated local sender",
+            ),
+            Err(crate::app::mailbox::OfflineMailboxError::CapabilityMismatch) => encode_error(
+                id,
+                "mailbox_capability_mismatch",
+                "recipient or grant selector is outside the server-issued capability",
+            ),
+            Err(crate::app::mailbox::OfflineMailboxError::Transport(error)) => {
+                encode_error(id, error.code(), "offline mailbox edit validation rejected")
+            }
+            Err(crate::app::mailbox::OfflineMailboxError::Store(
+                crate::mailbox::MailboxError::EditConflict,
+            )) => encode_error(
+                id,
+                "mailbox_edit_conflict",
+                "stableId, revision, or digest no longer matches the authoritative head",
+            ),
+            Err(crate::app::mailbox::OfflineMailboxError::Store(
+                crate::mailbox::MailboxError::HeadClaimed,
+            )) => encode_error(
+                id,
+                "mailbox_edit_claimed",
+                "the mailbox head is already claimed and immutable",
+            ),
+            Err(crate::app::mailbox::OfflineMailboxError::Store(error)) => {
+                encode_error(id, "mailbox_store_failed", error.to_string())
+            }
+            Err(_) => encode_error(id, "mailbox_edit_failed", "offline mailbox edit rejected"),
         }
     }
 
@@ -423,6 +491,28 @@ mod tests {
         }
     }
 
+    fn active_edit(
+        sender_key: String,
+        revision: u64,
+        digest: String,
+        subject: &str,
+        body: &str,
+    ) -> crate::api::schema::MailboxEditParams {
+        crate::api::schema::MailboxEditParams {
+            caller: sender_key.clone(),
+            grant_id: format!("offline:{sender_key}:1"),
+            recipient: active_recipient(&sender_key),
+            edit: crate::mailbox_v1::Edit {
+                protocol: PROTOCOL.into(),
+                stable_id: "stable-1".into(),
+                revision,
+                digest,
+                subject: subject.into(),
+                body: body.into(),
+            },
+        }
+    }
+
     fn active_resolve(
         sender_key: String,
         claim_id: String,
@@ -529,6 +619,111 @@ mod tests {
         });
         let error: ErrorResponse = serde_json::from_str(&response).expect("exit error");
         assert_eq!(error.error.code, "mailbox_authority_unavailable");
+        drop(app);
+        std::fs::remove_dir_all(directory).expect("remove mailbox directory");
+    }
+
+    #[test]
+    fn mailbox_edit_cas_returns_a_fsynced_authoritative_refreshed_head() {
+        let (mut app, _pane_id, sender_key, directory) = app_with_active_sender();
+        let submitted = app.handle_api_request(Request {
+            id: "submit".into(),
+            method: Method::MailboxOfflineSubmit(active_submit(sender_key.clone(), "e".repeat(64))),
+        });
+        assert!(serde_json::from_str::<SuccessResponse>(&submitted).is_ok());
+        let edited = app.handle_api_request(Request {
+            id: "edit".into(),
+            method: Method::MailboxEdit(active_edit(
+                sender_key.clone(),
+                1,
+                "a".repeat(64),
+                "edited subject",
+                "edited body",
+            )),
+        });
+        let edited: SuccessResponse = serde_json::from_str(&edited).expect("edit response");
+        let ResponseResult::MailboxEdited { snapshot } = edited.result else {
+            panic!("expected authoritative edit snapshot")
+        };
+        assert_eq!(snapshot.heads.len(), 1);
+        let head = &snapshot.heads[0];
+        assert_eq!(head.revision, 2);
+        assert_ne!(head.digest, "a".repeat(64));
+        assert_eq!(head.subject, "edited subject");
+        assert_eq!(head.body, "edited body");
+        assert_eq!(head.sender, sender_key);
+        assert_eq!(head.target, sender_key);
+        assert_eq!(head.grant_id, format!("offline:{sender_key}:1"));
+        assert_eq!(head.message_id, "message-1");
+        let durable = crate::mailbox::MailboxStore::open(&directory)
+            .expect("open durable mailbox")
+            .load()
+            .expect("reload durable mailbox");
+        assert_eq!(durable.heads["stable-1"], *head);
+        drop(app);
+        std::fs::remove_dir_all(directory).expect("remove mailbox directory");
+    }
+
+    #[test]
+    fn mailbox_edit_rejects_stale_exact_version() {
+        let (mut app, _pane_id, sender_key, directory) = app_with_active_sender();
+        let submitted = app.handle_api_request(Request {
+            id: "submit".into(),
+            method: Method::MailboxOfflineSubmit(active_submit(sender_key.clone(), "1".repeat(64))),
+        });
+        assert!(serde_json::from_str::<SuccessResponse>(&submitted).is_ok());
+        let first = app.handle_api_request(Request {
+            id: "first-edit".into(),
+            method: Method::MailboxEdit(active_edit(
+                sender_key.clone(),
+                1,
+                "a".repeat(64),
+                "subject two",
+                "body two",
+            )),
+        });
+        assert!(serde_json::from_str::<SuccessResponse>(&first).is_ok());
+        let stale = app.handle_api_request(Request {
+            id: "stale-edit".into(),
+            method: Method::MailboxEdit(active_edit(
+                sender_key,
+                1,
+                "a".repeat(64),
+                "stale subject",
+                "stale body",
+            )),
+        });
+        let stale: ErrorResponse = serde_json::from_str(&stale).expect("stale edit error");
+        assert_eq!(stale.error.code, "mailbox_edit_conflict");
+        drop(app);
+        std::fs::remove_dir_all(directory).expect("remove mailbox directory");
+    }
+
+    #[test]
+    fn mailbox_edit_rejects_post_claim_head() {
+        let (mut app, _pane_id, sender_key, directory) = app_with_active_sender();
+        let submitted = app.handle_api_request(Request {
+            id: "submit".into(),
+            method: Method::MailboxOfflineSubmit(active_submit(sender_key.clone(), "2".repeat(64))),
+        });
+        assert!(serde_json::from_str::<SuccessResponse>(&submitted).is_ok());
+        let claimed = app.handle_api_request(Request {
+            id: "claim".into(),
+            method: Method::MailboxClaim(active_claim(sender_key.clone())),
+        });
+        assert!(serde_json::from_str::<SuccessResponse>(&claimed).is_ok());
+        let rejected = app.handle_api_request(Request {
+            id: "claimed-edit".into(),
+            method: Method::MailboxEdit(active_edit(
+                sender_key,
+                1,
+                "a".repeat(64),
+                "late subject",
+                "late body",
+            )),
+        });
+        let rejected: ErrorResponse = serde_json::from_str(&rejected).expect("claimed edit error");
+        assert_eq!(rejected.error.code, "mailbox_edit_claimed");
         drop(app);
         std::fs::remove_dir_all(directory).expect("remove mailbox directory");
     }

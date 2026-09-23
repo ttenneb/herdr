@@ -138,6 +138,9 @@ pub enum ResponseResult {
     MailboxSnapshot {
         snapshot: crate::mailbox_v1::Snapshot,
     },
+    MailboxEdited {
+        snapshot: crate::mailbox_v1::Snapshot,
+    },
     AgentList {
         agents: Vec<AgentInfo>,
     },

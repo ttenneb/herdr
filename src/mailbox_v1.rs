@@ -65,6 +65,18 @@ pub struct Resolve {
     pub claim_id: String,
     pub outcome: ResolveOutcome,
 }
+/// Untrusted human edit intent paired with the exact server-issued head version
+/// observed by the editor. The server, not Pi, mints the next revision/digest.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct Edit {
+    pub protocol: String,
+    pub stable_id: String,
+    pub revision: u64,
+    pub digest: String,
+    pub subject: String,
+    pub body: String,
+}
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum ResolveOutcome {
@@ -80,6 +92,7 @@ pub enum Request {
     List(List),
     Claim(ClaimRequest),
     Resolve(Resolve),
+    Edit(Edit),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
@@ -102,10 +115,11 @@ pub fn snapshot(recovered: &RecoveredMailbox, recipient: &RecipientKey) -> Snaps
         .receipts
         .values()
         .filter(|receipt| {
-            recovered
-                .heads
-                .get(&receipt.stable_id)
-                .is_some_and(|head| &head.recipient == recipient)
+            recovered.heads.get(&receipt.stable_id).is_some_and(|head| {
+                &head.recipient == recipient
+                    && receipt.revision == head.revision
+                    && receipt.digest == head.digest
+            })
         })
         .cloned()
         .collect();
@@ -155,8 +169,35 @@ pub fn validate_request(request: &Request) -> Result<(), TransportError> {
         Request::Resolve(value) if value.protocol != PROTOCOL || value.claim_id.is_empty() => {
             Err(TransportError::InvalidSchema)
         }
+        Request::Edit(value)
+            if value.protocol != PROTOCOL
+                || value.stable_id.is_empty()
+                || value.revision == 0
+                || value.digest.len() != 64
+                || value.subject.is_empty()
+                || value.body.is_empty() =>
+        {
+            Err(TransportError::InvalidSchema)
+        }
         _ => Ok(()),
     }
+}
+
+/// Server-side exact CAS. The authenticated route supplies scope separately;
+/// the wire DTO cannot select a recipient, grant, or next revision/digest.
+pub fn edit_unclaimed(
+    store: &crate::mailbox::MailboxStore,
+    edit: Edit,
+) -> Result<MailboxHead, crate::mailbox::MailboxError> {
+    validate_request(&Request::Edit(edit.clone()))
+        .map_err(|_| crate::mailbox::MailboxError::InvalidRecord)?;
+    store.edit_unclaimed_head(crate::mailbox::MailboxHeadEdit {
+        stable_id: edit.stable_id,
+        revision: edit.revision,
+        digest: edit.digest,
+        subject: edit.subject,
+        body: edit.body,
+    })
 }
 
 /// Server-side offline admission. The authenticated sender route supplies `recipient`; the

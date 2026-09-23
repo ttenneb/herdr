@@ -1405,6 +1405,7 @@ impl App {
             Method::MailboxSnapshot(params) => {
                 return self.handle_mailbox_snapshot(request.id, params)
             }
+            Method::MailboxEdit(params) => return self.handle_mailbox_edit(request.id, params),
             Method::AgentWait(_) => {
                 return responses::encode_error(
                     request.id,
