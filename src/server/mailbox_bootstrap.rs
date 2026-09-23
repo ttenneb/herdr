@@ -329,8 +329,20 @@ mod tests {
             api_rx,
             crate::api::EventHub::default(),
         );
+        app.state.workspaces = vec![crate::workspace::Workspace::test_new("sender")];
+        app.state.ensure_test_terminals();
+        app.state.active = Some(0);
+        app.state.selected = 0;
+        app.state.mode = crate::app::Mode::Terminal;
+        let pane_id = app.state.workspaces[0].tabs[0]
+            .root_pane
+            .expect("sender pane");
+        let terminal_id = app.state.workspaces[0]
+            .terminal_id(pane_id)
+            .expect("sender terminal")
+            .clone();
         let directory = unique_dir();
-        let sender = "pi-terminal".to_owned();
+        let sender = terminal_id.to_string();
         app.sender_authority_dir = directory.clone();
         let store = crate::sender_authority::SenderAuthorityStore::for_sender(&directory, &sender)
             .expect("authority store");
@@ -340,14 +352,59 @@ mod tests {
                 crate::sender_authority::SenderAuthorityRecord {
                     sender_key: sender.clone(),
                     process_generation: 1,
-                    phase: crate::sender_authority::SenderAuthorityPhase::Active,
+                    phase: crate::sender_authority::SenderAuthorityPhase::Preparing,
                     transition_revision: 1,
                 },
             )
-            .expect("persist Active record");
-        app.install_offline_mailbox_authority(store.load().unwrap().unwrap())
-            .expect("install Active authority");
-        app.install_mailbox_bootstrap_test_candidate(sender.clone(), 1, std::process::id());
+            .expect("persist preparing record");
+        let terminal = app
+            .state
+            .terminals
+            .get_mut(&terminal_id)
+            .expect("sender terminal state");
+        terminal.begin_managed_agent(
+            "sender".into(),
+            crate::detect::Agent::Pi,
+            std::time::Instant::now(),
+            Duration::from_secs(3),
+            Duration::from_secs(30),
+        );
+        terminal.set_managed_agent_generation(1);
+        app.handle_internal_event(crate::events::AppEvent::AgentProcessDetected {
+            pane_id,
+            agent: crate::detect::Agent::Pi,
+            process_generation: 1,
+            observed_at: std::time::Instant::now(),
+        });
+        app.handle_internal_event(crate::events::AppEvent::StateChanged {
+            pane_id,
+            agent: Some(crate::detect::Agent::Pi),
+            state: crate::detect::AgentState::Idle,
+            visible_blocker: false,
+            visible_working: false,
+            process_exited: false,
+            observed_at: std::time::Instant::now(),
+        });
+        let pid = std::process::id();
+        app.install_mailbox_bootstrap_test_foreground_job(
+            terminal_id,
+            crate::platform::ForegroundJob {
+                process_group_id: pid,
+                processes: vec![crate::platform::ForegroundProcess {
+                    pid,
+                    name: "node".into(),
+                    argv0: None,
+                    argv: Some(vec![
+                        "node".into(),
+                        "/opt/pi/node_modules/@earendil-works/pi-coding-agent/dist/cli.js".into(),
+                    ]),
+                    cmdline: Some(
+                        "node /opt/pi/node_modules/@earendil-works/pi-coding-agent/dist/cli.js"
+                            .into(),
+                    ),
+                }],
+            },
+        );
         (app, directory, sender)
     }
 
@@ -402,7 +459,10 @@ mod tests {
         let descriptor = bootstrap(&mut listener, &mut app, &mut client);
         assert_eq!(descriptor["ok"], true);
         assert_eq!(descriptor["result"]["caller"], sender);
-        assert_eq!(descriptor["result"]["grantId"], "offline:pi-terminal:1");
+        assert_eq!(
+            descriptor["result"]["grantId"],
+            format!("offline:{sender}:1")
+        );
         assert_eq!(descriptor["result"]["requestIdPolicy"], "correlation_only");
         let binding = descriptor["result"]["bindingGeneration"]
             .as_str()
@@ -494,6 +554,24 @@ mod tests {
     }
 
     #[test]
+    fn managed_pi_lifecycle_candidate_bootstraps_without_agent_environment_hint() {
+        let (mut app, directory, sender) = active_app();
+        let mut listener = listener(&directory);
+        let mut client = UnixStream::connect(listener.path()).expect("connect bootstrap socket");
+        client
+            .set_read_timeout(Some(Duration::from_secs(1)))
+            .expect("set read timeout");
+
+        let descriptor = bootstrap(&mut listener, &mut app, &mut client);
+        assert_eq!(descriptor["ok"], true);
+        assert_eq!(descriptor["result"]["caller"], sender);
+        assert_eq!(descriptor["result"]["activeExecutionGeneration"], 1);
+
+        drop(listener);
+        std::fs::remove_dir_all(directory).expect("remove test directory");
+    }
+
+    #[test]
     fn bootstrap_without_active_sender_is_unavailable() {
         let (_api_tx, api_rx) = tokio::sync::mpsc::unbounded_channel();
         let mut app = App::new(
@@ -530,12 +608,12 @@ mod tests {
             .expect("authority store");
         store
             .cas(
-                Some(1),
+                Some(2),
                 crate::sender_authority::SenderAuthorityRecord {
                     sender_key: sender,
                     process_generation: 2,
                     phase: crate::sender_authority::SenderAuthorityPhase::Active,
-                    transition_revision: 2,
+                    transition_revision: 3,
                 },
             )
             .expect("replace active generation");

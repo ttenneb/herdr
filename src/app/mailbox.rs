@@ -554,10 +554,6 @@ impl App {
     }
 
     fn live_mailbox_bootstrap_candidates(&self) -> Vec<LiveMailboxBootstrapCandidate> {
-        #[cfg(test)]
-        if !self.mailbox_bootstrap_test_candidates.is_empty() {
-            return self.mailbox_bootstrap_test_candidates.clone();
-        }
         self.offline_mailbox_authorities
             .values()
             .filter_map(|authority| {
@@ -572,16 +568,28 @@ impl App {
                     .terminals
                     .keys()
                     .find(|terminal_id| terminal_id.to_string() == authority.sender_key)?;
-                let runtime = self.terminal_runtimes.get(terminal_id)?;
-                let job = crate::detect::foreground_job(runtime.child_pid()?)?;
-                let foreground_pi_pid = job
-                    .processes
-                    .iter()
-                    .find(|process| {
-                        crate::platform::process_agent_hint(process.pid)
-                            == Some(crate::detect::Agent::Pi)
+                let terminal = self.state.terminals.get(terminal_id)?;
+                // The Active record is necessary but not sufficient: it must
+                // still belong to this exact managed Pi launch.
+                if terminal.managed_agent_kind() != Some(crate::detect::Agent::Pi)
+                    || !terminal.accepts_managed_agent_generation(authority.sender_generation)
+                {
+                    return None;
+                }
+                let job = self.mailbox_bootstrap_foreground_job(terminal_id)?;
+                let foreground_pi_pid = crate::detect::identify_agent_process_in_job(&job)
+                    .and_then(|(agent, process)| {
+                        (agent == crate::detect::Agent::Pi).then_some(process.pid)
                     })
-                    .map(|process| process.pid)?;
+                    // Preserve the explicit per-process launch marker as a
+                    // fallback for wrappers whose argv cannot be classified.
+                    .or_else(|| {
+                        job.processes.iter().find_map(|process| {
+                            (crate::platform::process_agent_hint(process.pid)
+                                == Some(crate::detect::Agent::Pi))
+                            .then_some(process.pid)
+                        })
+                    })?;
                 Some(LiveMailboxBootstrapCandidate {
                     sender_key: authority.sender_key.clone(),
                     process_generation: authority.sender_generation,
@@ -591,19 +599,26 @@ impl App {
             .collect()
     }
 
+    fn mailbox_bootstrap_foreground_job(
+        &self,
+        terminal_id: &crate::terminal::TerminalId,
+    ) -> Option<crate::platform::ForegroundJob> {
+        #[cfg(test)]
+        if let Some(job) = self.mailbox_bootstrap_test_foreground_jobs.get(terminal_id) {
+            return Some(job.clone());
+        }
+        let runtime = self.terminal_runtimes.get(terminal_id)?;
+        crate::detect::foreground_job(runtime.child_pid()?)
+    }
+
     #[cfg(test)]
-    pub(crate) fn install_mailbox_bootstrap_test_candidate(
+    pub(crate) fn install_mailbox_bootstrap_test_foreground_job(
         &mut self,
-        sender_key: String,
-        process_generation: u64,
-        foreground_pi_pid: u32,
+        terminal_id: crate::terminal::TerminalId,
+        job: crate::platform::ForegroundJob,
     ) {
-        self.mailbox_bootstrap_test_candidates
-            .push(LiveMailboxBootstrapCandidate {
-                sender_key,
-                process_generation,
-                foreground_pi_pid,
-            });
+        self.mailbox_bootstrap_test_foreground_jobs
+            .insert(terminal_id, job);
     }
 
     pub(crate) fn promote_and_install_offline_mailbox_authority(

@@ -148,10 +148,11 @@ pub struct App {
     /// Discovery address published only by a ready Headless-owned listener.
     /// It is injected into Pi launches but is never mailbox authority.
     pub(crate) mailbox_bootstrap_discovery_address: Option<String>,
-    /// Test-only live terminal facts. Production derives these from the runtime
-    /// foreground job and never accepts injected socket/PID data.
+    /// Test-only foreground-job observations. Production always reads the
+    /// terminal runtime; tests retain the same authority and candidate path.
     #[cfg(test)]
-    pub(crate) mailbox_bootstrap_test_candidates: Vec<mailbox::LiveMailboxBootstrapCandidate>,
+    pub(crate) mailbox_bootstrap_test_foreground_jobs:
+        HashMap<crate::terminal::TerminalId, crate::platform::ForegroundJob>,
     pub event_tx: mpsc::Sender<AppEvent>,
     pub(crate) event_rx: mpsc::Receiver<AppEvent>,
     pub(crate) api_rx: tokio::sync::mpsc::UnboundedReceiver<crate::api::ApiRequestMessage>,
@@ -878,7 +879,7 @@ impl App {
             next_mailbox_bootstrap_binding: 1,
             mailbox_bootstrap_discovery_address: None,
             #[cfg(test)]
-            mailbox_bootstrap_test_candidates: Vec::new(),
+            mailbox_bootstrap_test_foreground_jobs: HashMap::new(),
             event_tx,
             event_rx,
             last_git_remote_status_refresh: Instant::now() - GIT_REMOTE_STATUS_REFRESH_INTERVAL,

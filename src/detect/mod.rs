@@ -240,7 +240,14 @@ pub fn identify_agent(process_name: &str) -> Option<Agent> {
     parse_agent_label(process_name)
 }
 
-pub fn identify_agent_in_job(job: &crate::platform::ForegroundJob) -> Option<(Agent, String)> {
+/// Identify the concrete foreground process that represents a known agent.
+///
+/// Callers which must authenticate a process tree use the returned PID rather
+/// than re-reading optional environment hints. The group leader remains
+/// preferred when it is itself a recognized agent, matching display detection.
+pub fn identify_agent_process_in_job(
+    job: &crate::platform::ForegroundJob,
+) -> Option<(Agent, &crate::platform::ForegroundProcess)> {
     if let Some(process) = job
         .processes
         .iter()
@@ -248,11 +255,11 @@ pub fn identify_agent_in_job(job: &crate::platform::ForegroundJob) -> Option<(Ag
     {
         let candidate = normalized_process_name(process);
         if let Some(agent) = identify_agent(&candidate) {
-            return Some((agent, candidate));
+            return Some((agent, process));
         }
     }
 
-    let mut best: Option<(u8, Agent, String)> = None;
+    let mut best: Option<(u8, Agent, &crate::platform::ForegroundProcess)> = None;
 
     for process in &job.processes {
         let candidate = normalized_process_name(process);
@@ -263,11 +270,16 @@ pub fn identify_agent_in_job(job: &crate::platform::ForegroundJob) -> Option<(Ag
 
         match &best {
             Some((best_score, _, _)) if *best_score >= score => {}
-            _ => best = Some((score, agent, candidate)),
+            _ => best = Some((score, agent, process)),
         }
     }
 
-    best.map(|(_, agent, name)| (agent, name))
+    best.map(|(_, agent, process)| (agent, process))
+}
+
+pub fn identify_agent_in_job(job: &crate::platform::ForegroundJob) -> Option<(Agent, String)> {
+    identify_agent_process_in_job(job)
+        .map(|(agent, process)| (agent, normalized_process_name(process)))
 }
 
 /// Detect the state of an agent from the live terminal tail snapshot.
