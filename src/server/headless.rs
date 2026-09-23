@@ -481,6 +481,11 @@ fn spawn_windows_client_accept_thread(
     });
 }
 
+#[cfg(unix)]
+fn publish_ready_mailbox_bootstrap_discovery(app: &mut app::App, listener_path: &Path) {
+    app.publish_mailbox_bootstrap_discovery_address(listener_path);
+}
+
 impl HeadlessServer {
     /// Creates and starts the headless server.
     ///
@@ -508,6 +513,10 @@ impl HeadlessServer {
         listener.set_nonblocking(ListenerNonblockingMode::Accept)?;
         let mailbox_bootstrap_listener =
             crate::server::mailbox_bootstrap::MailboxBootstrapListener::bind()?;
+        // Publish only after this HeadlessServer owns a successfully bound,
+        // permission-restricted listener. Managed Pi launch happens later, so
+        // extension initialization sees an explicit discovery value or none.
+        publish_ready_mailbox_bootstrap_discovery(&mut app, mailbox_bootstrap_listener.path());
         info!(path = %mailbox_bootstrap_listener.path().display(), "mailbox bootstrap socket listening");
 
         // Channel for server events from client threads.
@@ -5656,6 +5665,27 @@ mod tests {
                 pty: PtyRenderState::Hidden,
             }),
             RetainedRenderPlan::HiddenPty
+        );
+    }
+
+    #[test]
+    fn ready_headless_listener_publishes_discovery_before_pi_launch() {
+        let config = crate::config::Config::default();
+        let (_api_tx, api_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = crate::app::App::new(&config, true, None, api_rx, api::EventHub::default());
+        assert_eq!(
+            app.pi_mailbox_bootstrap_launch_environment(&[
+                "HERDR_MAILBOX_BOOTSTRAP_ADDRESS=/tmp/untrusted.sock".into(),
+            ]),
+            vec!["HERDR_MAILBOX_BOOTSTRAP_ADDRESS="]
+        );
+        publish_ready_mailbox_bootstrap_discovery(
+            &mut app,
+            std::path::Path::new("/tmp/herdr-bootstrap-ready.sock"),
+        );
+        assert_eq!(
+            app.pi_mailbox_bootstrap_launch_environment(&[]),
+            vec!["HERDR_MAILBOX_BOOTSTRAP_ADDRESS=/tmp/herdr-bootstrap-ready.sock"]
         );
     }
 

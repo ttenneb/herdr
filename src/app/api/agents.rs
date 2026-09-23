@@ -398,6 +398,60 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn headless_published_discovery_is_injected_before_pi_extension_initialization() {
+        let mut app = app_with_agent();
+        let pane_id = app.state.workspaces[0].tabs[0]
+            .root_pane
+            .expect("root pane");
+        let terminal_id = app.state.workspaces[0]
+            .terminal_id(pane_id)
+            .expect("terminal id")
+            .clone();
+        let authority_dir = std::env::temp_dir().join(format!(
+            "herdr-agent-start-bootstrap-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock after epoch")
+                .as_nanos()
+        ));
+        app.sender_authority_dir = authority_dir.clone();
+        // This is the value HeadlessServer publishes immediately after binding
+        // its listener and before it can accept an agent.start request.
+        app.publish_mailbox_bootstrap_discovery_address(std::path::Path::new(
+            "/tmp/herdr-mailbox-bootstrap-ready.sock",
+        ));
+        let (runtime, mut input) = crate::terminal::TerminalRuntime::test_with_channel(80, 24);
+        app.terminal_runtimes.insert(terminal_id, runtime);
+
+        let response = app.handle_agent_start(
+            "start".into(),
+            crate::api::schema::AgentStartParams {
+                name: "reviewer".into(),
+                kind: "pi".into(),
+                pane_id: app.public_pane_id(0, pane_id).expect("public pane"),
+                args: Vec::new(),
+                // A client cannot replace host discovery with an attacker path.
+                env: vec!["HERDR_MAILBOX_BOOTSTRAP_ADDRESS=/tmp/attacker.sock".into()],
+                timeout_ms: None,
+            },
+        );
+        assert!(serde_json::from_str::<SuccessResponse>(&response).is_ok());
+        let command = String::from_utf8(
+            input
+                .try_recv()
+                .expect("Pi command follows host-owned discovery injection")
+                .to_vec(),
+        )
+        .expect("shell command is UTF-8");
+        assert!(command.contains(
+            "HERDR_MAILBOX_BOOTSTRAP_ADDRESS=/tmp/herdr-mailbox-bootstrap-ready.sock pi"
+        ));
+        assert!(!command.contains("/tmp/attacker.sock"));
+        std::fs::remove_dir_all(authority_dir).expect("remove authority directory");
+    }
+
+    #[tokio::test]
     async fn agent_start_persists_generation_before_input_and_rejects_stale_detection() {
         let mut app = app_with_agent();
         let pane_id = app.state.workspaces[0].tabs[0]

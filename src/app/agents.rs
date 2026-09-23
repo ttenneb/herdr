@@ -283,8 +283,17 @@ impl App {
         let shell_name = available_shell_name(runtime)
             .ok_or_else(|| AgentStartError::TargetBusy(params.pane_id.clone()))?;
 
-        let command = crate::platform::interactive_shell_command(&argv, &params.env, &shell_name)
-            .ok_or(AgentStartError::InvalidArgument)?;
+        // Headless publishes the discovery address before any managed Pi launch.
+        // It is a host-owned environment input only; the listener authenticates
+        // the accepted stream and Active sender generation after connection.
+        let launch_environment = if kind == crate::detect::Agent::Pi {
+            self.pi_mailbox_bootstrap_launch_environment(&params.env)
+        } else {
+            params.env.clone()
+        };
+        let command =
+            crate::platform::interactive_shell_command(&argv, &launch_environment, &shell_name)
+                .ok_or(AgentStartError::InvalidArgument)?;
         let bytes = crate::app::api_helpers::encode_api_submission(runtime, &command);
         let timeout = self.agent_start_timeout(&params)?;
         // This write-ahead intent is the last fallible step before mutating

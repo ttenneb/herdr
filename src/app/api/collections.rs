@@ -1111,6 +1111,14 @@ impl App {
             Ok(env) => env,
             Err((code, message)) => return encode_error(id, &code, message),
         };
+        // Collection helpers may launch Pi directly rather than through
+        // `agent.start`; give them the same host-owned ready/unavailable
+        // discovery value before Pi loads extensions.
+        let extra_env = if kind == crate::detect::Agent::Pi {
+            self.pi_mailbox_bootstrap_pane_environment(extra_env)
+        } else {
+            extra_env
+        };
         let (_, estimated_cols) = self.state.estimate_pane_size();
         let collection_cols = self.state.workspaces[ws_idx].tabs[tab_idx]
             .layout

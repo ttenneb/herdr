@@ -6,6 +6,10 @@ use crate::app::App;
 use crate::direct_transport::TransportError;
 use crate::direct_transport::{SessionGeneration, TrustedMailboxChannelContext};
 
+/// Host-owned discovery input for Pi extension bootstrap. The address grants no
+/// scope or authority; the accepted server stream authenticates both separately.
+pub(crate) const PI_MAILBOX_BOOTSTRAP_ADDRESS_ENV: &str = "HERDR_MAILBOX_BOOTSTRAP_ADDRESS";
+
 /// Server-minted offline capability. Its grant and recipient identifiers are
 /// selectors on the wire; the exact sender key/generation remains server-owned.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -374,6 +378,59 @@ impl App {
         {
             self.offline_mailbox_authorities.remove(&sender_key);
         }
+    }
+
+    /// Publishes discovery only after Headless owns a bound listener. A blank
+    /// value is injected for Pi when unavailable so inherited/user values cannot
+    /// become an authority substitute.
+    pub(crate) fn publish_mailbox_bootstrap_discovery_address(
+        &mut self,
+        listener_path: &std::path::Path,
+    ) {
+        self.mailbox_bootstrap_discovery_address = listener_path
+            .is_absolute()
+            .then(|| listener_path.display().to_string());
+    }
+
+    pub(crate) fn pi_mailbox_bootstrap_launch_environment(
+        &self,
+        requested: &[String],
+    ) -> Vec<String> {
+        let mut environment = requested
+            .iter()
+            .filter(|entry| {
+                entry
+                    .split_once('=')
+                    .is_none_or(|(name, _)| name != PI_MAILBOX_BOOTSTRAP_ADDRESS_ENV)
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        // Always override inherited or client-provided discovery. Empty means
+        // explicitly unavailable; Pi must not synthesize a local fallback.
+        environment.push(format!(
+            "{PI_MAILBOX_BOOTSTRAP_ADDRESS_ENV}={}",
+            self.mailbox_bootstrap_discovery_address
+                .as_deref()
+                .unwrap_or_default()
+        ));
+        environment
+    }
+
+    pub(crate) fn pi_mailbox_bootstrap_pane_environment(
+        &self,
+        requested: Vec<(String, String)>,
+    ) -> Vec<(String, String)> {
+        let mut environment = requested
+            .into_iter()
+            .filter(|(name, _)| name != PI_MAILBOX_BOOTSTRAP_ADDRESS_ENV)
+            .collect::<Vec<_>>();
+        environment.push((
+            PI_MAILBOX_BOOTSTRAP_ADDRESS_ENV.into(),
+            self.mailbox_bootstrap_discovery_address
+                .clone()
+                .unwrap_or_default(),
+        ));
+        environment
     }
 
     /// Accept a bootstrap stream only by verifying it against a current live

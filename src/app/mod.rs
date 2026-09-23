@@ -145,6 +145,9 @@ pub struct App {
     /// never client socket discovery or request selectors.
     pub(crate) mailbox_bootstrap_bindings: BTreeMap<String, mailbox::MailboxBootstrapSession>,
     pub(crate) next_mailbox_bootstrap_binding: u64,
+    /// Discovery address published only by a ready Headless-owned listener.
+    /// It is injected into Pi launches but is never mailbox authority.
+    pub(crate) mailbox_bootstrap_discovery_address: Option<String>,
     /// Test-only live terminal facts. Production derives these from the runtime
     /// foreground job and never accepts injected socket/PID data.
     #[cfg(test)]
@@ -873,6 +876,7 @@ impl App {
             offline_mailbox_authorities: BTreeMap::new(),
             mailbox_bootstrap_bindings: BTreeMap::new(),
             next_mailbox_bootstrap_binding: 1,
+            mailbox_bootstrap_discovery_address: None,
             #[cfg(test)]
             mailbox_bootstrap_test_candidates: Vec::new(),
             event_tx,
