@@ -5,7 +5,7 @@ use serde_json::Value;
 use super::responses::{encode_error, encode_success};
 
 impl App {
-    /// Dispatches only the four mailbox operations for an already verified,
+    /// Dispatches only the mailbox operations for an already verified,
     /// server-issued accepted-stream binding. Request payloads intentionally do
     /// not carry caller, grant, or recipient selectors; this method installs the
     /// descriptor scope after the exact Active generation recheck.
@@ -30,6 +30,17 @@ impl App {
                         submit,
                     },
                 )
+            }
+            "mailbox.provision_recipient" => {
+                #[derive(serde::Deserialize)]
+                #[serde(rename_all = "camelCase", deny_unknown_fields)]
+                struct ProvisionRecipientParams {
+                    target: String,
+                }
+                let params: ProvisionRecipientParams = serde_json::from_value(params)
+                    .map_err(|_| MailboxBootstrapError::InvalidRequest)?;
+                let grant = self.provision_mailbox_bootstrap_recipient(session, &params.target)?;
+                encode_success(id, ResponseResult::MailboxGrantProvisioned { grant })
             }
             "mailbox.snapshot" => {
                 #[derive(serde::Deserialize)]

@@ -408,6 +408,64 @@ mod tests {
         (app, directory, sender)
     }
 
+    fn active_managed_recipient(app: &mut App, directory: &Path) -> (String, String) {
+        app.state
+            .workspaces
+            .push(crate::workspace::Workspace::test_new("recipient"));
+        app.state.ensure_test_terminals();
+        let ws_idx = app.state.workspaces.len() - 1;
+        let pane_id = app.state.workspaces[ws_idx].tabs[0]
+            .root_pane
+            .expect("recipient pane");
+        let terminal_id = app.state.workspaces[ws_idx]
+            .terminal_id(pane_id)
+            .expect("recipient terminal")
+            .clone();
+        let sender = terminal_id.to_string();
+        let store = crate::sender_authority::SenderAuthorityStore::for_sender(directory, &sender)
+            .expect("recipient authority store");
+        store
+            .cas(
+                None,
+                crate::sender_authority::SenderAuthorityRecord {
+                    sender_key: sender.clone(),
+                    process_generation: 1,
+                    phase: crate::sender_authority::SenderAuthorityPhase::Preparing,
+                    transition_revision: 1,
+                },
+            )
+            .expect("persist recipient preparing record");
+        let terminal = app
+            .state
+            .terminals
+            .get_mut(&terminal_id)
+            .expect("recipient terminal state");
+        terminal.begin_managed_agent(
+            "recipient".into(),
+            crate::detect::Agent::Pi,
+            std::time::Instant::now(),
+            Duration::from_secs(3),
+            Duration::from_secs(30),
+        );
+        terminal.set_managed_agent_generation(1);
+        app.handle_internal_event(crate::events::AppEvent::AgentProcessDetected {
+            pane_id,
+            agent: crate::detect::Agent::Pi,
+            process_generation: 1,
+            observed_at: std::time::Instant::now(),
+        });
+        app.handle_internal_event(crate::events::AppEvent::StateChanged {
+            pane_id,
+            agent: Some(crate::detect::Agent::Pi),
+            state: crate::detect::AgentState::Idle,
+            visible_blocker: false,
+            visible_working: false,
+            process_exited: false,
+            observed_at: std::time::Instant::now(),
+        });
+        (sender, "recipient".into())
+    }
+
     fn listener(directory: &Path) -> MailboxBootstrapListener {
         std::fs::create_dir_all(directory).expect("create test directory");
         MailboxBootstrapListener::bind_at(directory.join("mailbox.sock")).expect("bind listener")
@@ -567,6 +625,196 @@ mod tests {
         assert_eq!(descriptor["result"]["caller"], sender);
         assert_eq!(descriptor["result"]["activeExecutionGeneration"], 1);
 
+        drop(listener);
+        std::fs::remove_dir_all(directory).expect("remove test directory");
+    }
+
+    #[test]
+    fn bootstrap_provisions_a_current_managed_recipient_and_admits_cross_submit() {
+        let (mut app, directory, sender) = active_app();
+        let (recipient, recipient_target) = active_managed_recipient(&mut app, &directory);
+        let mut listener = listener(&directory);
+        let mut client = UnixStream::connect(listener.path()).expect("connect bootstrap socket");
+        client
+            .set_read_timeout(Some(Duration::from_secs(1)))
+            .expect("set read timeout");
+        let descriptor = bootstrap(&mut listener, &mut app, &mut client);
+        let binding = descriptor["result"]["bindingGeneration"]
+            .as_str()
+            .expect("binding generation");
+        let provisioned = exchange(
+            &mut listener,
+            &mut app,
+            &mut client,
+            json!({
+                "method": "mailbox.provision_recipient", "requestId": "provision-1",
+                "bindingGeneration": binding,
+                "params": {"target": recipient_target}
+            }),
+        );
+        assert_eq!(provisioned["ok"], true);
+        assert_eq!(provisioned["result"]["type"], "mailbox_grant_provisioned");
+        let grant_id = provisioned["result"]["grant"]["grantId"]
+            .as_str()
+            .expect("server-minted grant")
+            .to_owned();
+        assert_eq!(grant_id, format!("mailbox:{sender}:1:{recipient}:1"));
+        assert_eq!(
+            provisioned["result"]["grant"]["sender"]["recipientId"],
+            sender
+        );
+        assert_eq!(
+            provisioned["result"]["grant"]["recipient"]["recipientId"],
+            recipient
+        );
+
+        let submitted = app.handle_mailbox_offline_submit(
+            "cross-submit".into(),
+            crate::api::schema::MailboxOfflineSubmitParams {
+                caller: sender.clone(),
+                grant_id,
+                recipient: crate::mailbox::RecipientKey {
+                    recipient_id: recipient.clone(),
+                    generation: "1".into(),
+                },
+                submit: crate::mailbox_v1::Submit {
+                    protocol: crate::mailbox_v1::PROTOCOL.into(),
+                    stable_id: "a-to-b".into(),
+                    revision: 1,
+                    digest: "a".repeat(64),
+                    delivery_digest: "b".repeat(64),
+                    subject: "cross-recipient".into(),
+                    body: "body".into(),
+                    message_id: "cross-message".into(),
+                    kind: "report".into(),
+                    priority: "normal".into(),
+                    original_sequence: 1,
+                },
+            },
+        );
+        let submitted: crate::api::schema::SuccessResponse =
+            serde_json::from_str(&submitted).expect("cross-recipient admitted");
+        assert!(matches!(
+            submitted.result,
+            crate::api::schema::ResponseResult::MailboxOfflineSubmitted { .. }
+        ));
+        let durable = crate::mailbox::MailboxStore::open(&directory)
+            .expect("open durable mailbox")
+            .load()
+            .expect("read durable mailbox");
+        assert!(durable
+            .grants
+            .contains_key(&format!("mailbox:{sender}:1:{recipient}:1")));
+
+        drop(listener);
+        std::fs::remove_dir_all(directory).expect("remove test directory");
+    }
+
+    #[test]
+    fn bootstrap_provision_rejects_inactive_sender() {
+        let (mut app, directory, _sender) = active_app();
+        let (_recipient, recipient_target) = active_managed_recipient(&mut app, &directory);
+        let mut listener = listener(&directory);
+        let mut client = UnixStream::connect(listener.path()).expect("connect bootstrap socket");
+        client
+            .set_read_timeout(Some(Duration::from_secs(1)))
+            .unwrap();
+        let descriptor = bootstrap(&mut listener, &mut app, &mut client);
+        let binding = descriptor["result"]["bindingGeneration"].as_str().unwrap();
+        let sender_pane = app.state.workspaces[0].tabs[0].root_pane.unwrap();
+        app.handle_internal_event(crate::events::AppEvent::PaneDied {
+            pane_id: sender_pane,
+        });
+        let rejected = exchange(
+            &mut listener,
+            &mut app,
+            &mut client,
+            json!({
+                "method": "mailbox.provision_recipient", "bindingGeneration": binding,
+                "params": {"target": recipient_target}
+            }),
+        );
+        assert_eq!(rejected["ok"], false);
+        assert_eq!(rejected["error"]["code"], "grant_revoked");
+        drop(listener);
+        std::fs::remove_dir_all(directory).expect("remove test directory");
+    }
+
+    #[test]
+    fn bootstrap_provision_rejects_stale_sender_generation() {
+        let (mut app, directory, sender) = active_app();
+        let (_recipient, recipient_target) = active_managed_recipient(&mut app, &directory);
+        let mut listener = listener(&directory);
+        let mut client = UnixStream::connect(listener.path()).expect("connect bootstrap socket");
+        client
+            .set_read_timeout(Some(Duration::from_secs(1)))
+            .unwrap();
+        let descriptor = bootstrap(&mut listener, &mut app, &mut client);
+        let binding = descriptor["result"]["bindingGeneration"].as_str().unwrap();
+        let store = crate::sender_authority::SenderAuthorityStore::for_sender(&directory, &sender)
+            .expect("sender authority store");
+        store
+            .cas(
+                Some(2),
+                crate::sender_authority::SenderAuthorityRecord {
+                    sender_key: sender,
+                    process_generation: 2,
+                    phase: crate::sender_authority::SenderAuthorityPhase::Active,
+                    transition_revision: 3,
+                },
+            )
+            .expect("replace sender generation");
+        let rejected = exchange(
+            &mut listener,
+            &mut app,
+            &mut client,
+            json!({
+                "method": "mailbox.provision_recipient", "bindingGeneration": binding,
+                "params": {"target": recipient_target}
+            }),
+        );
+        assert_eq!(rejected["ok"], false);
+        assert_eq!(rejected["error"]["code"], "grant_revoked");
+        drop(listener);
+        std::fs::remove_dir_all(directory).expect("remove test directory");
+    }
+
+    #[test]
+    fn bootstrap_provision_rejects_mismatched_recipient_generation() {
+        let (mut app, directory, _sender) = active_app();
+        let (recipient, recipient_target) = active_managed_recipient(&mut app, &directory);
+        let mut listener = listener(&directory);
+        let mut client = UnixStream::connect(listener.path()).expect("connect bootstrap socket");
+        client
+            .set_read_timeout(Some(Duration::from_secs(1)))
+            .unwrap();
+        let descriptor = bootstrap(&mut listener, &mut app, &mut client);
+        let binding = descriptor["result"]["bindingGeneration"].as_str().unwrap();
+        let store =
+            crate::sender_authority::SenderAuthorityStore::for_sender(&directory, &recipient)
+                .expect("recipient authority store");
+        store
+            .cas(
+                Some(2),
+                crate::sender_authority::SenderAuthorityRecord {
+                    sender_key: recipient,
+                    process_generation: 2,
+                    phase: crate::sender_authority::SenderAuthorityPhase::Active,
+                    transition_revision: 3,
+                },
+            )
+            .expect("replace recipient generation");
+        let rejected = exchange(
+            &mut listener,
+            &mut app,
+            &mut client,
+            json!({
+                "method": "mailbox.provision_recipient", "bindingGeneration": binding,
+                "params": {"target": recipient_target}
+            }),
+        );
+        assert_eq!(rejected["ok"], false);
+        assert_eq!(rejected["error"]["code"], "grant_revoked");
         drop(listener);
         std::fs::remove_dir_all(directory).expect("remove test directory");
     }

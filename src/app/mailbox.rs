@@ -370,6 +370,107 @@ impl App {
         Ok(grant_id)
     }
 
+    /// Provisions a cross-recipient grant only for an accepted, current Pi
+    /// bootstrap channel. The stream session supplies A; the request can name
+    /// only a currently managed recipient target, never a caller, grant, or
+    /// durable recipient selector.
+    pub(crate) fn provision_mailbox_bootstrap_recipient(
+        &mut self,
+        session: &MailboxBootstrapSession,
+        recipient_target: &str,
+    ) -> Result<crate::mailbox::MailboxGrant, MailboxBootstrapError> {
+        self.mailbox_bootstrap_session_current(session)?;
+        let sender_terminal_id = self
+            .state
+            .terminals
+            .keys()
+            .find(|terminal_id| terminal_id.to_string() == session.caller)
+            .ok_or(MailboxBootstrapError::GrantRevoked)?;
+        let sender_terminal = self
+            .state
+            .terminals
+            .get(sender_terminal_id)
+            .ok_or(MailboxBootstrapError::GrantRevoked)?;
+        if sender_terminal.managed_agent_kind() != Some(crate::detect::Agent::Pi)
+            || !sender_terminal
+                .accepts_managed_agent_generation(session.active_execution_generation)
+            || !self.exact_active_mailbox_authority(
+                &session.caller,
+                session.active_execution_generation,
+            )
+        {
+            return Err(MailboxBootstrapError::GrantRevoked);
+        }
+
+        let recipient = self
+            .resolve_agent_target(recipient_target)
+            .map_err(|_| MailboxBootstrapError::InvalidRequest)?;
+        let recipient_terminal_id = self
+            .state
+            .workspaces
+            .get(recipient.ws_idx)
+            .and_then(|workspace| workspace.terminal_id(recipient.pane_id))
+            .ok_or(MailboxBootstrapError::InvalidRequest)?;
+        if recipient_terminal_id == sender_terminal_id {
+            return Err(MailboxBootstrapError::InvalidRequest);
+        }
+        let recipient_terminal = self
+            .state
+            .terminals
+            .get(recipient_terminal_id)
+            .ok_or(MailboxBootstrapError::InvalidRequest)?;
+        let recipient_generation = crate::sender_authority::SenderAuthorityStore::for_sender(
+            &self.sender_authority_dir,
+            &recipient_terminal_id.to_string(),
+        )
+        .map_err(|_| MailboxBootstrapError::GrantMissing)?
+        .load()
+        .map_err(|_| MailboxBootstrapError::GrantMissing)?
+        .filter(|record| {
+            record.authoritative()
+                && recipient_terminal.managed_agent_kind().is_some()
+                && recipient_terminal.accepts_managed_agent_generation(record.process_generation)
+                && self.exact_active_mailbox_authority(
+                    &recipient_terminal_id.to_string(),
+                    record.process_generation,
+                )
+        })
+        .map(|record| record.process_generation)
+        .ok_or(MailboxBootstrapError::GrantRevoked)?;
+
+        let recipient = crate::mailbox::RecipientKey {
+            recipient_id: recipient_terminal_id.to_string(),
+            // Recipient identity is stable across active executions; the
+            // matching Active record above is the separate execution guard.
+            generation: "1".into(),
+        };
+        let grant_id = self
+            .provision_cross_recipient_mailbox_grant(&session.caller, recipient.clone())
+            .map_err(|error| match error {
+                OfflineMailboxInstallError::SenderRecordMismatch
+                | OfflineMailboxInstallError::SenderRecordUnavailable => {
+                    MailboxBootstrapError::GrantRevoked
+                }
+                OfflineMailboxInstallError::Store(_)
+                | OfflineMailboxInstallError::MailboxStore(_) => {
+                    MailboxBootstrapError::GrantMissing
+                }
+            })?;
+        // Keep the execution check material to this route even though the
+        // durable recipient selector intentionally remains stable.
+        if !self.exact_active_mailbox_authority(&recipient.recipient_id, recipient_generation) {
+            return Err(MailboxBootstrapError::GrantRevoked);
+        }
+        Ok(crate::mailbox::MailboxGrant {
+            grant_id,
+            sender: crate::mailbox::RecipientKey {
+                recipient_id: session.caller.clone(),
+                generation: "1".into(),
+            },
+            recipient,
+        })
+    }
+
     pub(crate) fn invalidate_offline_mailbox_authority_for_pane(
         &mut self,
         pane_id: crate::layout::PaneId,

@@ -129,6 +129,9 @@ pub enum ResponseResult {
     MailboxOfflineSubmitted {
         receipt: crate::mailbox::AdmissionReceipt,
     },
+    MailboxGrantProvisioned {
+        grant: crate::mailbox::MailboxGrant,
+    },
     MailboxClaimed {
         claim: Option<crate::mailbox::Claim>,
     },

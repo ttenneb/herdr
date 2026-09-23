@@ -118,7 +118,7 @@ pub struct ClaimResolution {
 
 /// Durable server-owned recipient policy. This is deliberately distinct from
 /// a transient sender/consumer execution binding.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct MailboxGrant {
     pub grant_id: String,
