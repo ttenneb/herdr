@@ -18,9 +18,12 @@ impl App {
         self.mailbox_bootstrap_session_current(session)?;
         let id = "mailbox-bootstrap".to_owned();
         let response = match method {
-            "mailbox.offline_submit" => {
-                let submit = serde_json::from_value(params)
+            "mailbox.offline_submit" | "report_submit" => {
+                let submit: crate::mailbox_v1::Submit = serde_json::from_value(params)
                     .map_err(|_| MailboxBootstrapError::InvalidRequest)?;
+                if method == "report_submit" && submit.kind != "report" {
+                    return Err(MailboxBootstrapError::InvalidRequest);
+                }
                 self.handle_mailbox_offline_submit(
                     id,
                     MailboxOfflineSubmitParams {

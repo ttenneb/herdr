@@ -35,6 +35,8 @@ pub(crate) fn mailbox_bootstrap_socket_path() -> PathBuf {
 #[serde(rename_all = "camelCase")]
 pub(crate) struct MailboxBootstrapDescriptor {
     pub protocol_version: u16,
+    /// The typed, server-scoped report path available on this accepted stream.
+    pub report_submit: ReportSubmitAdvertisement,
     pub endpoint: String,
     pub caller: String,
     pub recipient: crate::mailbox::RecipientKey,
@@ -44,10 +46,21 @@ pub(crate) struct MailboxBootstrapDescriptor {
     pub request_id_policy: &'static str,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct ReportSubmitAdvertisement {
+    pub method: &'static str,
+    pub protocol: &'static str,
+}
+
 impl MailboxBootstrapDescriptor {
     fn from_session(session: &MailboxBootstrapSession, endpoint: &Path) -> Self {
         Self {
             protocol_version: MAILBOX_BOOTSTRAP_PROTOCOL_VERSION,
+            report_submit: ReportSubmitAdvertisement {
+                method: "report_submit",
+                protocol: crate::mailbox_v1::PROTOCOL,
+            },
             endpoint: endpoint.display().to_string(),
             caller: session.caller.clone(),
             recipient: session.recipient.clone(),
@@ -655,6 +668,229 @@ mod tests {
     }
 
     #[test]
+    fn report_submit_is_advertised_and_returns_a_durable_connected_receipt() {
+        let (mut app, directory, sender) = active_app();
+        let mut listener = listener(&directory);
+        let mut client = UnixStream::connect(listener.path()).expect("connect bootstrap socket");
+        client
+            .set_read_timeout(Some(Duration::from_secs(1)))
+            .expect("set read timeout");
+        let descriptor = bootstrap(&mut listener, &mut app, &mut client);
+        assert_eq!(descriptor["ok"], true);
+        assert_eq!(
+            descriptor["result"]["reportSubmit"],
+            json!({"method": "report_submit", "protocol": crate::mailbox_v1::PROTOCOL})
+        );
+        let binding = descriptor["result"]["bindingGeneration"]
+            .as_str()
+            .expect("binding generation");
+
+        let submitted = exchange(
+            &mut listener,
+            &mut app,
+            &mut client,
+            json!({
+                "method": "report_submit", "requestId": "report-1",
+                "bindingGeneration": binding,
+                "params": {
+                    "protocol": crate::mailbox_v1::PROTOCOL,
+                    "stableId": "report-1", "revision": 1,
+                    "digest": "a".repeat(64), "deliveryDigest": "b".repeat(64),
+                    "subject": "report", "body": "body", "messageId": "message-1",
+                    "kind": "report", "priority": "normal", "originalSequence": 1
+                }
+            }),
+        );
+        assert_eq!(submitted["ok"], true);
+        assert_eq!(submitted["result"]["receipt"]["status"], "admitted");
+        let non_report = exchange(
+            &mut listener,
+            &mut app,
+            &mut client,
+            json!({
+                "method": "report_submit", "requestId": "not-a-report",
+                "bindingGeneration": binding,
+                "params": {
+                    "protocol": crate::mailbox_v1::PROTOCOL,
+                    "stableId": "not-report", "revision": 1,
+                    "digest": "c".repeat(64), "deliveryDigest": "d".repeat(64),
+                    "subject": "assignment", "body": "body", "messageId": "message-2",
+                    "kind": "assignment", "priority": "normal", "originalSequence": 2
+                }
+            }),
+        );
+        assert_eq!(non_report["ok"], false);
+        assert_eq!(non_report["error"]["code"], "invalid_request");
+        let recovered = crate::mailbox::MailboxStore::open(&directory)
+            .expect("open mailbox")
+            .load()
+            .expect("read mailbox");
+        assert!(recovered.receipts.contains_key(&"b".repeat(64)));
+        assert_eq!(
+            recovered.heads["report-1"].recipient,
+            crate::mailbox::RecipientKey {
+                recipient_id: sender,
+                generation: "1".into(),
+            }
+        );
+
+        drop(listener);
+        std::fs::remove_dir_all(directory).expect("remove test directory");
+    }
+
+    #[test]
+    fn report_submit_preserves_old_journal_for_current_successor_and_rejects_stale_routes() {
+        let (mut app, directory, sender) = active_app();
+        let logical_recipient = crate::mailbox::RecipientKey {
+            recipient_id: sender.clone(),
+            generation: "1".into(),
+        };
+        let legacy = app.handle_mailbox_offline_submit(
+            "legacy".into(),
+            crate::api::schema::MailboxOfflineSubmitParams {
+                caller: sender.clone(),
+                grant_id: format!("offline:{sender}:1"),
+                recipient: logical_recipient.clone(),
+                submit: crate::mailbox_v1::Submit {
+                    protocol: crate::mailbox_v1::PROTOCOL.into(),
+                    stable_id: "legacy-head".into(),
+                    revision: 1,
+                    digest: "c".repeat(64),
+                    delivery_digest: "d".repeat(64),
+                    subject: "legacy report".into(),
+                    body: "legacy body".into(),
+                    message_id: "legacy-message".into(),
+                    kind: "report".into(),
+                    priority: "normal".into(),
+                    original_sequence: 1,
+                },
+            },
+        );
+        assert!(serde_json::from_str::<crate::api::schema::SuccessResponse>(&legacy).is_ok());
+
+        let sender_store =
+            crate::sender_authority::SenderAuthorityStore::for_sender(&directory, &sender)
+                .expect("sender authority store");
+        sender_store
+            .cas(
+                Some(2),
+                crate::sender_authority::SenderAuthorityRecord {
+                    sender_key: sender.clone(),
+                    process_generation: 2,
+                    phase: crate::sender_authority::SenderAuthorityPhase::Active,
+                    transition_revision: 3,
+                },
+            )
+            .expect("install successor record");
+        app.state
+            .terminals
+            .values_mut()
+            .find(|terminal| terminal.id.to_string() == sender)
+            .expect("sender terminal")
+            .set_managed_agent_generation(2);
+        app.install_offline_mailbox_authority(
+            sender_store
+                .load()
+                .expect("read successor record")
+                .expect("active successor record"),
+        )
+        .expect("install successor authority");
+
+        let mut listener = listener(&directory);
+        let mut client = UnixStream::connect(listener.path()).expect("connect bootstrap socket");
+        client
+            .set_read_timeout(Some(Duration::from_secs(1)))
+            .expect("set read timeout");
+        let descriptor = bootstrap(&mut listener, &mut app, &mut client);
+        let binding = descriptor["result"]["bindingGeneration"]
+            .as_str()
+            .expect("successor binding")
+            .to_owned();
+        assert_eq!(descriptor["result"]["recipient"], json!(logical_recipient));
+
+        let unrelated = exchange(
+            &mut listener,
+            &mut app,
+            &mut client,
+            json!({
+                "method": "report_submit", "requestId": "unrelated-route",
+                "bindingGeneration": "mailbox-binding-unrelated",
+                "params": {}
+            }),
+        );
+        assert_eq!(unrelated["ok"], false);
+        assert_eq!(unrelated["error"]["code"], "grant_revoked");
+
+        let snapshot = exchange(
+            &mut listener,
+            &mut app,
+            &mut client,
+            json!({
+                "method": "mailbox.snapshot", "requestId": "old-journal",
+                "bindingGeneration": binding,
+                "params": {"protocol": crate::mailbox_v1::PROTOCOL}
+            }),
+        );
+        assert_eq!(snapshot["ok"], true);
+        assert_eq!(
+            snapshot["result"]["snapshot"]["heads"][0]["stableId"],
+            "legacy-head"
+        );
+
+        let admitted = exchange(
+            &mut listener,
+            &mut app,
+            &mut client,
+            json!({
+                "method": "report_submit", "requestId": "successor-report",
+                "bindingGeneration": binding,
+                "params": {
+                    "protocol": crate::mailbox_v1::PROTOCOL,
+                    "stableId": "successor-head", "revision": 1,
+                    "digest": "e".repeat(64), "deliveryDigest": "f".repeat(64),
+                    "subject": "successor report", "body": "body", "messageId": "successor-message",
+                    "kind": "report", "priority": "normal", "originalSequence": 2
+                }
+            }),
+        );
+        assert_eq!(admitted["ok"], true);
+        assert_eq!(admitted["result"]["receipt"]["status"], "admitted");
+
+        sender_store
+            .cas(
+                Some(3),
+                crate::sender_authority::SenderAuthorityRecord {
+                    sender_key: sender,
+                    process_generation: 3,
+                    phase: crate::sender_authority::SenderAuthorityPhase::Active,
+                    transition_revision: 4,
+                },
+            )
+            .expect("replace successor record");
+        let revoked = exchange(
+            &mut listener,
+            &mut app,
+            &mut client,
+            json!({
+                "method": "report_submit", "requestId": "revoked-successor",
+                "bindingGeneration": binding,
+                "params": {
+                    "protocol": crate::mailbox_v1::PROTOCOL,
+                    "stableId": "revoked-head", "revision": 1,
+                    "digest": "1".repeat(64), "deliveryDigest": "2".repeat(64),
+                    "subject": "revoked", "body": "body", "messageId": "revoked-message",
+                    "kind": "report", "priority": "normal", "originalSequence": 3
+                }
+            }),
+        );
+        assert_eq!(revoked["ok"], false);
+        assert_eq!(revoked["error"]["code"], "grant_revoked");
+
+        drop(listener);
+        std::fs::remove_dir_all(directory).expect("remove test directory");
+    }
+
+    #[test]
     fn managed_pi_lifecycle_candidate_bootstraps_without_agent_environment_hint() {
         let (mut app, directory, sender) = active_app();
         let mut listener = listener(&directory);
@@ -887,7 +1123,7 @@ mod tests {
     }
 
     #[test]
-    fn replacement_revokes_known_binding_before_dispatch() {
+    fn replacement_revokes_stale_report_submit_binding_before_dispatch() {
         let (mut app, directory, sender) = active_app();
         let mut listener = listener(&directory);
         let mut client = UnixStream::connect(listener.path()).expect("connect bootstrap socket");
@@ -914,9 +1150,15 @@ mod tests {
             &mut app,
             &mut client,
             json!({
-                "method": "mailbox.snapshot", "requestId": "stale-1",
+                "method": "report_submit", "requestId": "stale-1",
                 "bindingGeneration": binding,
-                "params": {"protocol": crate::mailbox_v1::PROTOCOL}
+                "params": {
+                    "protocol": crate::mailbox_v1::PROTOCOL,
+                    "stableId": "stale-report", "revision": 1,
+                    "digest": "a".repeat(64), "deliveryDigest": "b".repeat(64),
+                    "subject": "stale", "body": "body", "messageId": "stale-message",
+                    "kind": "report", "priority": "normal", "originalSequence": 1
+                }
             }),
         );
         assert_eq!(response["ok"], false);
