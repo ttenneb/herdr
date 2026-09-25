@@ -782,6 +782,62 @@ mod tests {
     }
 
     #[test]
+    fn route_ready_replaced_lock_quarantines_marker_until_exclusive_resync() {
+        let (mut app, directory, _sender) = active_app();
+        active_managed_recipient(&mut app, &directory);
+        let child_pane = app.state.workspaces[0].tabs[0].root_pane.unwrap();
+        let parent_pane = app.state.workspaces[1].tabs[0].root_pane.unwrap();
+        let parent = app
+            .state
+            .delegations
+            .create(Some(parent_pane), None, None)
+            .unwrap();
+        let child = app
+            .state
+            .delegations
+            .create(Some(child_pane), Some(parent), None)
+            .unwrap();
+        ready_test_route(&mut app, &directory, child, parent);
+        let original_epoch = app.ready_delegation_routes[&child].epoch.clone();
+        let lock_path = directory.join(".session-writer.lock");
+        std::fs::remove_file(&lock_path).unwrap();
+        let replacement_owner =
+            crate::persist::SessionWriter::acquire(&app.session_save_path).unwrap();
+        let denied = try_ready_test_route(&mut app, &directory, child, parent);
+        let quarantined = !app.ready_delegation_routes.contains_key(&child);
+        drop(replacement_owner);
+        let retry = try_ready_test_route(&mut app, &directory, child, parent);
+        let renewed_epoch = app
+            .ready_delegation_routes
+            .get(&child)
+            .map(|route| route.epoch.clone());
+        let owns_replacement = app
+            .session_writer
+            .as_ref()
+            .is_some_and(|writer| writer.validate(&app.session_save_path).is_ok());
+        drop(app);
+        std::fs::remove_dir_all(directory).unwrap();
+        assert_eq!(
+            denied["error"]["code"], "route_persistence_failed",
+            "replaced lock cannot receive an idempotent ready acknowledgment: {denied}"
+        );
+        assert!(
+            quarantined,
+            "old marker must be quarantined while exclusive ownership is lost"
+        );
+        assert_eq!(retry["result"]["type"], "delegation_route_ready", "{retry}");
+        assert!(
+            owns_replacement,
+            "fresh acknowledgment requires owning the replacement lock"
+        );
+        assert_ne!(
+            renewed_epoch.as_deref(),
+            Some(original_epoch.as_str()),
+            "new lease requires a fresh route epoch"
+        );
+    }
+
+    #[test]
     fn background_snapshot_started_before_child_cannot_undo_ready_edge() {
         let (mut app, directory, _sender) = active_app();
         active_managed_recipient(&mut app, &directory);

@@ -140,6 +140,16 @@ impl App {
                     .join()
                     .map_err(|_| std::io::Error::other("prior session writer panicked"))?;
             }
+            // The old inode can remain locked after the pathname is replaced.
+            // It conveys no ownership of the new lock: release it only after
+            // the previous background writer has joined, then acquire anew.
+            if self
+                .session_writer
+                .as_ref()
+                .is_some_and(|writer| writer.validate(&self.session_save_path).is_err())
+            {
+                self.session_writer.take();
+            }
             if self.session_writer.is_none() {
                 self.session_writer = Some(crate::persist::SessionWriter::acquire(
                     &self.session_save_path,

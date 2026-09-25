@@ -72,11 +72,20 @@ impl App {
                 "exact active child and parent Pi sessions are required",
             );
         };
+        // A same-shape marker is not an acknowledgment if its exclusive
+        // directory lease was unlinked or replaced. Quarantine every route
+        // before attempting a fresh durable save under new ownership.
         if !self
             .session_writer_healthy
             .load(std::sync::atomic::Ordering::Acquire)
+            || !self
+                .session_writer
+                .as_ref()
+                .is_some_and(|writer| writer.validate(&self.session_save_path).is_ok())
         {
-            self.ready_delegation_routes.remove(&child);
+            self.session_writer_healthy
+                .store(false, std::sync::atomic::Ordering::Release);
+            self.ready_delegation_routes.clear();
         }
         if let Some(existing) = self.ready_delegation_routes.get(&child) {
             let mut same = shape.clone();
