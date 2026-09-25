@@ -911,6 +911,60 @@ mod tests {
     }
 
     #[test]
+    fn snapshot_distinguishes_fresh_admitted_settled_and_new_held_after_reload() {
+        use crate::mailbox_v1::{snapshot, HeadLifecycle};
+        let store = temporary_store();
+        let old = head();
+        let recipient = old.recipient.clone();
+        store.append_offline_head(old.clone()).unwrap();
+        let fresh = snapshot(&store.load().unwrap(), &recipient).unwrap();
+        assert_eq!(fresh.head_states.len(), 1);
+        assert_eq!(fresh.head_states[0].lifecycle, HeadLifecycle::Held);
+        assert!(fresh.head_states[0].claim_id.is_none());
+        assert!(fresh.claim.is_none());
+        let claimed = store.claim_next(&recipient).unwrap().unwrap();
+        let claimed_snapshot = snapshot(&store.load().unwrap(), &recipient).unwrap();
+        assert_eq!(
+            claimed_snapshot.head_states[0].lifecycle,
+            HeadLifecycle::Claimed
+        );
+        assert_eq!(claimed_snapshot.claim, Some(claimed.clone()));
+        store
+            .resolve_claim(&claimed.claim_id, ClaimResolutionOutcome::Admitted)
+            .unwrap();
+        let admitted = snapshot(&store.load().unwrap(), &recipient).unwrap();
+        assert_eq!(admitted.head_states[0].lifecycle, HeadLifecycle::Admitted);
+        assert_eq!(admitted.claim, Some(claimed.clone()));
+        store
+            .resolve_claim(&claimed.claim_id, ClaimResolutionOutcome::Settled)
+            .unwrap();
+        let reopened = MailboxStore::open(store.stream_path.parent().unwrap()).unwrap();
+        let settled = snapshot(&reopened.load().unwrap(), &recipient).unwrap();
+        assert_eq!(settled.head_states[0].lifecycle, HeadLifecycle::Settled);
+        assert_eq!(
+            settled.head_states[0].claim_id.as_deref(),
+            Some(claimed.claim_id.as_str())
+        );
+        assert!(settled.claim.is_none());
+        assert_eq!(settled.heads.len(), 1);
+        assert_eq!(settled.receipts.len(), 1);
+        let mut new = head();
+        new.stable_id = "a-new-lexically-first".into();
+        new.digest = "c".repeat(64);
+        new.delivery_digest = "d".repeat(64);
+        reopened.append_offline_head(new).unwrap();
+        let mixed = snapshot(&reopened.load().unwrap(), &recipient).unwrap();
+        assert_eq!(mixed.heads.len(), 2);
+        assert_eq!(mixed.receipts.len(), 2);
+        assert_eq!(mixed.head_states.len(), 2);
+        assert_eq!(mixed.head_states[0].stable_id, "a-new-lexically-first");
+        assert_eq!(mixed.head_states[0].lifecycle, HeadLifecycle::Held);
+        assert_eq!(mixed.head_states[1].stable_id, old.stable_id);
+        assert_eq!(mixed.head_states[1].lifecycle, HeadLifecycle::Settled);
+        assert!(mixed.claim.is_none());
+    }
+
+    #[test]
     fn old_single_stage_journals_reload_and_conflicting_resolution_replay_fails_closed() {
         let admitted_only = temporary_store();
         let old_head = head();
@@ -927,9 +981,12 @@ mod tests {
             old_reload.claim_next(&old_head.recipient).unwrap(),
             Some(old_claim.clone())
         );
+        let old_snapshot =
+            crate::mailbox_v1::snapshot(&old_reload.load().unwrap(), &old_head.recipient).unwrap();
+        assert_eq!(old_snapshot.claim, Some(old_claim));
         assert_eq!(
-            crate::mailbox_v1::snapshot(&old_reload.load().unwrap(), &old_head.recipient).claim,
-            Some(old_claim)
+            old_snapshot.head_states[0].lifecycle,
+            crate::mailbox_v1::HeadLifecycle::Admitted
         );
 
         let store = temporary_store();
@@ -945,10 +1002,15 @@ mod tests {
             ClaimResolutionOutcome::Settled
         );
         assert_eq!(reopened.claim_next(&high.recipient).unwrap(), None);
+        let settled_snapshot =
+            crate::mailbox_v1::snapshot(&reopened.load().unwrap(), &high.recipient).unwrap();
+        assert_eq!(settled_snapshot.claim, None);
         assert_eq!(
-            crate::mailbox_v1::snapshot(&reopened.load().unwrap(), &high.recipient).claim,
-            None
+            settled_snapshot.head_states[0].lifecycle,
+            crate::mailbox_v1::HeadLifecycle::Settled
         );
+        assert_eq!(settled_snapshot.heads.len(), 1);
+        assert_eq!(settled_snapshot.receipts.len(), 1);
         store
             .append_synced(&MailboxRecord::Resolution {
                 resolution: ClaimResolution {

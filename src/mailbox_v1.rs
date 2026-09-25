@@ -10,7 +10,10 @@ use crate::direct_transport::{
     AuthorityContext, DeliveryRecord, Effect, GrantAuthority, GrantTicket, ManifestRegistry,
     MessageKind, NegotiatedRoute, SenderDeliveryJournal, SessionGeneration, TransportError,
 };
-use crate::mailbox::{AdmissionReceipt, Claim, MailboxHead, RecipientKey, RecoveredMailbox};
+use crate::mailbox::{
+    AdmissionReceipt, Claim, ClaimResolutionOutcome, MailboxError, MailboxHead, RecipientKey,
+    RecoveredMailbox,
+};
 
 pub const PROTOCOL: &str = "mailbox.v1";
 
@@ -98,14 +101,41 @@ pub enum Request {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct Snapshot {
+    /// Retained heads and receipts remain available for immutable artifact
+    /// validation. Use headStates, not heads alone, for active work.
     pub heads: Vec<MailboxHead>,
     pub receipts: Vec<AdmissionReceipt>,
+    /// Required authoritative state for every head, in the same order as heads.
+    pub head_states: Vec<HeadState>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub claim: Option<Claim>,
 }
 
-pub fn snapshot(recovered: &RecoveredMailbox, recipient: &RecipientKey) -> Snapshot {
-    let heads = recovered
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum HeadLifecycle {
+    Held,
+    Claimed,
+    Admitted,
+    Settled,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct HeadState {
+    pub stable_id: String,
+    pub revision: u64,
+    pub digest: String,
+    pub lifecycle: HeadLifecycle,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub claim_id: Option<String>,
+}
+
+pub fn snapshot(
+    recovered: &RecoveredMailbox,
+    recipient: &RecipientKey,
+) -> Result<Snapshot, MailboxError> {
+    let heads: Vec<MailboxHead> = recovered
         .heads
         .values()
         .filter(|head| &head.recipient == recipient)
@@ -123,27 +153,72 @@ pub fn snapshot(recovered: &RecoveredMailbox, recipient: &RecipientKey) -> Snaps
         })
         .cloned()
         .collect();
-    // A settled claim remains in the journal for replay, but is no longer the
-    // consumer's current work. Admission alone does not settle it.
-    let claim = recovered
-        .claims
-        .values()
-        .find(|claim| {
-            &claim.recipient == recipient
-                && !matches!(
-                    recovered.resolutions.get(&claim.claim_id),
-                    Some(crate::mailbox::ClaimResolution {
-                        outcome: crate::mailbox::ClaimResolutionOutcome::Settled,
-                        ..
-                    })
-                )
+    // Reject inconsistent joins rather than interpreting an orphan or wrong
+    // version as held or settled. A claim ID reused by another head would
+    // otherwise project one settlement onto two separate artifacts.
+    let mut claim_ids = std::collections::HashSet::new();
+    for claim in recovered.claims.values() {
+        if !claim_ids.insert(&claim.claim_id) {
+            return Err(MailboxError::CorruptRecord);
+        }
+    }
+    for (key, resolution) in &recovered.resolutions {
+        if key != &resolution.claim_id || !claim_ids.contains(key) {
+            return Err(MailboxError::CorruptRecord);
+        }
+    }
+    for (key, claim) in &recovered.claims {
+        let selected_head = recovered.heads.get(key);
+        if &claim.recipient != recipient
+            && !selected_head.is_some_and(|head| &head.recipient == recipient)
+        {
+            continue;
+        }
+        let head = selected_head.ok_or(MailboxError::CorruptRecord)?;
+        if key != &claim.stable_id
+            || claim.recipient != head.recipient
+            || claim.revision != head.revision
+            || claim.digest != head.digest
+            || recovered
+                .resolutions
+                .get(&claim.claim_id)
+                .is_some_and(|resolution| resolution.claim_id != claim.claim_id)
+        {
+            return Err(MailboxError::CorruptRecord);
+        }
+    }
+    let head_states: Vec<HeadState> = heads
+        .iter()
+        .map(|head: &MailboxHead| {
+            let claim = recovered.claims.get(&head.stable_id);
+            let resolution = claim.and_then(|claim| recovered.resolutions.get(&claim.claim_id));
+            let lifecycle = match (claim, resolution.map(|resolution| resolution.outcome)) {
+                (None, _) => HeadLifecycle::Held,
+                (Some(_), None) => HeadLifecycle::Claimed,
+                (Some(_), Some(ClaimResolutionOutcome::Admitted)) => HeadLifecycle::Admitted,
+                (Some(_), Some(ClaimResolutionOutcome::Settled)) => HeadLifecycle::Settled,
+            };
+            HeadState {
+                stable_id: head.stable_id.clone(),
+                revision: head.revision,
+                digest: head.digest.clone(),
+                lifecycle,
+                claim_id: claim.map(|claim| claim.claim_id.clone()),
+            }
         })
-        .cloned();
-    Snapshot {
+        .collect();
+    let claim = head_states.iter().find_map(|state| {
+        (state.lifecycle != HeadLifecycle::Held && state.lifecycle != HeadLifecycle::Settled)
+            .then(|| recovered.claims.get(&state.stable_id))
+            .flatten()
+            .cloned()
+    });
+    Ok(Snapshot {
         heads,
         receipts,
+        head_states,
         claim,
-    }
+    })
 }
 
 pub fn validate_request(request: &Request) -> Result<(), TransportError> {
@@ -352,6 +427,87 @@ mod tests {
             Some(&receipt)
         );
         let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn snapshot_rejects_mismatched_head_claim_and_resolution_joins() {
+        use crate::mailbox::{ClaimResolution, ClaimResolutionOutcome, MailboxError};
+        let head = head();
+        let mut recovered = RecoveredMailbox::default();
+        recovered.heads.insert(head.stable_id.clone(), head.clone());
+        let exact = Claim {
+            claim_id: "claim-s".into(),
+            recipient: head.recipient.clone(),
+            stable_id: head.stable_id.clone(),
+            revision: head.revision,
+            digest: head.digest.clone(),
+        };
+        let mut mismatched = exact.clone();
+        mismatched.digest = "f".repeat(64);
+        recovered.claims.insert(head.stable_id.clone(), mismatched);
+        assert_eq!(
+            snapshot(&recovered, &head.recipient),
+            Err(MailboxError::CorruptRecord)
+        );
+        recovered
+            .claims
+            .insert(head.stable_id.clone(), exact.clone());
+        recovered.resolutions.insert(
+            exact.claim_id.clone(),
+            ClaimResolution {
+                claim_id: "different-claim".into(),
+                outcome: ClaimResolutionOutcome::Settled,
+            },
+        );
+        assert_eq!(
+            snapshot(&recovered, &head.recipient),
+            Err(MailboxError::CorruptRecord)
+        );
+        recovered.resolutions.clear();
+        recovered.claims.insert("wrong-map-key".into(), exact);
+        recovered.claims.remove(&head.stable_id);
+        assert_eq!(
+            snapshot(&recovered, &head.recipient),
+            Err(MailboxError::CorruptRecord)
+        );
+        recovered.claims.clear();
+        let mut second = head.clone();
+        second.stable_id = "second".into();
+        second.delivery_digest = "c".repeat(64);
+        recovered
+            .heads
+            .insert(second.stable_id.clone(), second.clone());
+        recovered.claims.insert(
+            head.stable_id.clone(),
+            Claim {
+                claim_id: "duplicate".into(),
+                stable_id: head.stable_id.clone(),
+                recipient: head.recipient.clone(),
+                revision: head.revision,
+                digest: head.digest.clone(),
+            },
+        );
+        recovered.claims.insert(
+            second.stable_id.clone(),
+            Claim {
+                claim_id: "duplicate".into(),
+                stable_id: second.stable_id.clone(),
+                recipient: second.recipient.clone(),
+                revision: second.revision,
+                digest: second.digest.clone(),
+            },
+        );
+        recovered.resolutions.insert(
+            "duplicate".into(),
+            ClaimResolution {
+                claim_id: "duplicate".into(),
+                outcome: ClaimResolutionOutcome::Settled,
+            },
+        );
+        assert_eq!(
+            snapshot(&recovered, &head.recipient),
+            Err(MailboxError::CorruptRecord)
+        );
     }
 
     #[test]

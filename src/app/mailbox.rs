@@ -234,10 +234,8 @@ impl OfflineMailboxAuthority {
         let capability =
             self.capability_for(&params.caller, &params.grant_id, &params.recipient)?;
         let recovered = self.store.load().map_err(OfflineMailboxError::Store)?;
-        Ok(crate::mailbox_v1::snapshot(
-            &recovered,
-            &capability.recipient,
-        ))
+        crate::mailbox_v1::snapshot(&recovered, &capability.recipient)
+            .map_err(OfflineMailboxError::Store)
     }
 
     pub(crate) fn edit(
@@ -253,10 +251,8 @@ impl OfflineMailboxAuthority {
         // Read from the durable stream after the edit's sync before responding;
         // callers receive server authority rather than an optimistic local edit.
         let recovered = self.store.load().map_err(OfflineMailboxError::Store)?;
-        Ok(crate::mailbox_v1::snapshot(
-            &recovered,
-            &capability.recipient,
-        ))
+        crate::mailbox_v1::snapshot(&recovered, &capability.recipient)
+            .map_err(OfflineMailboxError::Store)
     }
 
     pub(crate) fn resolve(

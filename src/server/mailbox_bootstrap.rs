@@ -784,6 +784,7 @@ mod tests {
                     generation: "1".into()
                 }
             )
+            .unwrap()
             .heads
             .len(),
             1

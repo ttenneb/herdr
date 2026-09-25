@@ -947,18 +947,33 @@ mod tests {
             let ResponseResult::MailboxSnapshot { snapshot } = response.result else {
                 panic!("expected snapshot")
             };
-            snapshot.claim
+            snapshot
         };
-        assert_eq!(snapshot(&mut app), Some(high.clone()));
+        let admitted_snapshot = snapshot(&mut app);
+        assert_eq!(admitted_snapshot.claim, Some(high.clone()));
+        assert_eq!(
+            admitted_snapshot.head_states[0].lifecycle,
+            crate::mailbox_v1::HeadLifecycle::Admitted
+        );
         let settled = resolve(&mut app, ResolveOutcome::Settled);
         assert!(
             serde_json::from_str::<SuccessResponse>(&settled).is_ok(),
             "{settled}"
         );
-        assert_eq!(snapshot(&mut app), None);
+        let settled_snapshot = snapshot(&mut app);
+        assert_eq!(settled_snapshot.claim, None);
+        assert_eq!(settled_snapshot.heads.len(), 2);
+        assert_eq!(settled_snapshot.receipts.len(), 2);
+        let wire = serde_json::to_value(&settled_snapshot).unwrap();
+        assert_eq!(wire["headStates"][0]["stableId"], "a-high");
+        assert_eq!(wire["headStates"][0]["claimId"], high.claim_id);
+        assert_eq!(wire["headStates"][0]["lifecycle"], "settled");
+        assert_eq!(wire["headStates"][1]["stableId"], "z-normal");
+        assert_eq!(wire["headStates"][1]["lifecycle"], "held");
+        assert!(wire["headStates"][1].get("claimId").is_none());
         let normal = claim(&mut app, "after-settled");
         assert_eq!(normal.stable_id, "z-normal");
-        assert_eq!(snapshot(&mut app), Some(normal.clone()));
+        assert_eq!(snapshot(&mut app).claim, Some(normal.clone()));
         assert_eq!(claim(&mut app, "normal-replay"), normal);
         let backwards: ErrorResponse =
             serde_json::from_str(&resolve(&mut app, ResolveOutcome::Admitted)).unwrap();
