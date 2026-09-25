@@ -33,8 +33,13 @@ pub(crate) fn process_birth_identity(_pid: u32) -> Option<ProcessBirthIdentity> 
 }
 
 #[cfg(not(target_os = "linux"))]
-pub(crate) fn current_boot_ticks() -> Option<u64> {
+pub(crate) fn first_post_launch_birth_tick() -> Option<u64> {
     None
+}
+
+#[cfg(not(target_os = "linux"))]
+pub(crate) fn wait_until_birth_tick(_tick: u64) -> bool {
+    false
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

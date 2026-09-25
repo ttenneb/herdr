@@ -326,17 +326,32 @@ impl App {
                 .ok_or(AgentStartError::InvalidArgument)?;
         let bytes = crate::app::api_helpers::encode_api_submission(runtime, &command);
         let timeout = self.agent_start_timeout(&params)?;
-        // This write-ahead intent is the last fallible step before mutating
-        // launch state or sending bytes to the terminal.
+        // Persist the new generation before mutating launch state or sending
+        // bytes. A failed clock wait below aborts without submitting input.
         let process_generation =
             self.allocate_sender_authority_generation(terminal_id.to_string())?;
 
-        // Capture the earliest process birth tick before writing the command.
-        // A pre-existing Pi in this pane cannot become this launch's identity.
+        // A process born in this coarse kernel tick is ambiguous. Sample the
+        // strict cutoff, then wait for that tick before submitting the command
+        // so even a fast legitimate Pi is not penalized by the cutoff.
         let managed_pi_launch = (kind == crate::detect::Agent::Pi)
-            .then(|| explicit_pi_session_path(&argv).zip(crate::platform::current_boot_ticks()))
+            .then(|| {
+                explicit_pi_session_path(&argv).zip(crate::platform::first_post_launch_birth_tick())
+            })
             .flatten();
         self.managed_pi_launches.remove(&terminal_id);
+        if let Some((_, cutoff)) = managed_pi_launch.as_ref() {
+            if !crate::platform::wait_until_birth_tick(*cutoff) {
+                return Err(AgentStartError::AuthorityPersistence(
+                    "process birth clock did not advance before launch".into(),
+                ));
+            }
+            // The wait must not turn a previously shell-only pane into a
+            // launch against a newly foregrounded Pi.
+            if available_shell_name(runtime).as_deref() != Some(shell_name.as_str()) {
+                return Err(AgentStartError::TargetBusy(params.pane_id));
+            }
+        }
         let now = Instant::now();
         let terminal = self
             .state

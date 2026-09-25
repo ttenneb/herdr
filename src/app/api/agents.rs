@@ -431,7 +431,8 @@ mod tests {
         let pane = app.state.workspaces[0].tabs[0].root_pane.unwrap();
         let terminal_id = app.state.workspaces[0].terminal_id(pane).unwrap().clone();
         let key = terminal_id.to_string();
-        let floor = crate::platform::current_boot_ticks().unwrap();
+        let floor = crate::platform::first_post_launch_birth_tick().unwrap();
+        assert!(crate::platform::wait_until_birth_tick(floor));
         let mut command = std::process::Command::new("node");
         command
             .arg("-e")
@@ -558,10 +559,10 @@ mod tests {
         std::fs::set_permissions(&session, std::fs::Permissions::from_mode(0o644)).unwrap();
         assert!(get(&mut app).is_none(), "private file remains mandatory");
         std::fs::set_permissions(&session, std::fs::Permissions::from_mode(0o600)).unwrap();
-        // A successor generation must not bind the old still-live foreground
-        // Pi, even though it has the same terminal and an Active record.
-        std::thread::sleep(Duration::from_millis(25));
-        let next_floor = crate::platform::current_boot_ticks().unwrap();
+        // Adversarial replacement in the same kernel tick: a preexisting Pi
+        // has this very PID and start tick. The server's strict post-launch
+        // cutoff must exclude it even with a new Active generation.
+        let next_floor = birth.start_ticks.checked_add(1).unwrap();
         assert!(next_floor > birth.start_ticks);
         store
             .cas(

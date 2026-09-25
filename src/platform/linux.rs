@@ -469,8 +469,19 @@ pub(crate) fn process_birth_identity(pid: u32) -> Option<super::ProcessBirthIden
     })
 }
 
-/// Earliest acceptable birth tick for a process launched by a managed start.
-pub(crate) fn current_boot_ticks() -> Option<u64> {
+/// Smallest kernel birth tick safe for a process launched after this instant.
+/// Kept separate so the same-tick boundary can be tested deterministically.
+fn first_post_launch_birth_tick_at(seconds: u64, nanoseconds: u64, hz: u64) -> Option<u64> {
+    if nanoseconds >= 1_000_000_000 || hz == 0 {
+        return None;
+    }
+    seconds
+        .checked_mul(hz)?
+        .checked_add(nanoseconds.checked_mul(hz)? / 1_000_000_000)?
+        .checked_add(1)
+}
+
+pub(crate) fn first_post_launch_birth_tick() -> Option<u64> {
     let mut now: libc::timespec = unsafe { std::mem::zeroed() };
     if unsafe { libc::clock_gettime(libc::CLOCK_BOOTTIME, &mut now) } != 0 {
         return None;
@@ -479,15 +490,26 @@ pub(crate) fn current_boot_ticks() -> Option<u64> {
     if now.tv_sec < 0 || now.tv_nsec < 0 || hz <= 0 {
         return None;
     }
-    u64::try_from(now.tv_sec)
-        .ok()?
-        .checked_mul(u64::try_from(hz).ok()?)?
-        .checked_add(
-            u64::try_from(now.tv_nsec)
-                .ok()?
-                .checked_mul(u64::try_from(hz).ok()?)?
-                / 1_000_000_000,
-        )
+    first_post_launch_birth_tick_at(
+        u64::try_from(now.tv_sec).ok()?,
+        u64::try_from(now.tv_nsec).ok()?,
+        u64::try_from(hz).ok()?,
+    )
+}
+
+/// A same-tick process cannot be distinguished from one born just before
+/// launch. Wait to send the command until the next kernel birth tick so a
+/// legitimate fast Pi can still pass the conservative cutoff.
+pub(crate) fn wait_until_birth_tick(tick: u64) -> bool {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(50);
+    loop {
+        match first_post_launch_birth_tick() {
+            Some(next) if next > tick => return true,
+            None => return false,
+            _ if std::time::Instant::now() >= deadline => return false,
+            _ => std::thread::sleep(std::time::Duration::from_millis(1)),
+        }
+    }
 }
 
 fn process_argv(pid: u32) -> Option<Vec<String>> {
@@ -948,6 +970,23 @@ mod tests {
         assert!(text_indicates_wsl("4.4.0-19041-Microsoft"));
         assert!(!text_indicates_wsl("6.8.0-64-generic"));
         assert!(!text_indicates_wsl(""));
+    }
+
+    #[test]
+    fn preexisting_pi_born_earlier_in_the_same_kernel_tick_cannot_bind() {
+        // A managed start at 100s + 1ns occurs after a process born earlier
+        // in tick 10_000 (100 Hz). /proc exposes only tick 10_000 for both.
+        // Requiring tick 10_001 excludes the preexisting Pi; the server
+        // waits into that tick before writing the new launch command.
+        let cutoff = first_post_launch_birth_tick_at(100, 1, 100).unwrap();
+        assert_eq!(cutoff, 10_001);
+        let preexisting = super::super::ProcessBirthIdentity {
+            pid: 3024552,
+            start_ticks: 10_000,
+        };
+        assert!(preexisting.start_ticks < cutoff);
+        assert!(10_001 >= cutoff);
+        assert_eq!(first_post_launch_birth_tick_at(u64::MAX, 1, 100), None);
     }
 
     #[test]
