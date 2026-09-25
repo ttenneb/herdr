@@ -169,6 +169,10 @@ pub enum ResponseResult {
     DelegationInfo {
         delegation: DelegationInfo,
     },
+    DelegationRouteReady {
+        delegation: DelegationInfo,
+        route_epoch: String,
+    },
     DelegationTree {
         delegations: Vec<DelegationTreeEntry>,
     },

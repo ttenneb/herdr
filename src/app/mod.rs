@@ -8,6 +8,8 @@ pub(crate) mod actions;
 mod agent_resume;
 pub(crate) mod agent_view;
 mod agents;
+#[cfg(test)]
+pub(crate) use agents::ManagedPiLaunch;
 pub(crate) use agents::{AGENT_START_SETTLE_DELAY, MAX_AGENT_START_TIMEOUT};
 mod api;
 pub(crate) mod api_helpers;
@@ -155,6 +157,9 @@ pub struct App {
     #[cfg(test)]
     pub(crate) mailbox_bootstrap_test_foreground_jobs:
         HashMap<crate::terminal::TerminalId, crate::platform::ForegroundJob>,
+    #[cfg(test)]
+    pub(crate) mailbox_bootstrap_test_process_births:
+        HashMap<u32, crate::platform::ProcessBirthIdentity>,
     pub event_tx: mpsc::Sender<AppEvent>,
     pub(crate) event_rx: mpsc::Receiver<AppEvent>,
     pub(crate) api_rx: tokio::sync::mpsc::UnboundedReceiver<crate::api::ApiRequestMessage>,
@@ -192,6 +197,11 @@ pub struct App {
     pub(crate) selection_highlight_clear_deadline: Option<Instant>,
     pub(crate) session_save_deadline: Option<Instant>,
     pub(crate) session_save_thread: Option<std::thread::JoinHandle<()>>,
+    pub(crate) session_save_path: std::path::PathBuf,
+    pub(crate) session_writer: Option<Arc<crate::persist::SessionWriter>>,
+    pub(crate) session_writer_healthy: Arc<AtomicBool>,
+    pub(crate) ready_delegation_routes:
+        HashMap<crate::delegation::DelegationId, mailbox::ReadyDelegationRoute>,
     /// Runtime cancellation signals for provider processes. These stay out of
     /// `AppState` so pure state and rendering never own process lifecycle.
     pub(crate) plugin_choice_provider_cancellations:
@@ -883,6 +893,8 @@ impl App {
             mailbox_bootstrap_discovery_address: None,
             #[cfg(test)]
             mailbox_bootstrap_test_foreground_jobs: HashMap::new(),
+            #[cfg(test)]
+            mailbox_bootstrap_test_process_births: HashMap::new(),
             event_tx,
             event_rx,
             last_git_remote_status_refresh: Instant::now() - GIT_REMOTE_STATUS_REFRESH_INTERVAL,
@@ -910,6 +922,10 @@ impl App {
             pending_agent_resume_deadline: None,
             session_save_deadline: None,
             session_save_thread: None,
+            session_save_path: crate::session::data_dir().join("session.json"),
+            session_writer: None,
+            session_writer_healthy: Arc::new(AtomicBool::new(true)),
+            ready_delegation_routes: HashMap::new(),
             plugin_choice_provider_cancellations: HashMap::new(),
             detached_process_children: Vec::new(),
             tab_bar_status_generation: 0,

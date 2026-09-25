@@ -31,7 +31,12 @@ impl App {
             .is_some_and(std::thread::JoinHandle::is_finished)
         {
             if let Some(thread) = self.session_save_thread.take() {
-                let _ = thread.join();
+                if thread.join().is_err() {
+                    self.session_writer_healthy
+                        .store(false, std::sync::atomic::Ordering::Release);
+                    self.ready_delegation_routes.clear();
+                    tracing::warn!("session writer panicked; report routes quarantined");
+                }
             }
         }
     }
@@ -78,21 +83,34 @@ impl App {
 
         let job = self.capture_session_save_job();
         self.session_save_deadline = None;
+        let path = self.session_save_path.clone();
+        let writer = self.session_writer.clone();
+        let health = self.session_writer_healthy.clone();
         match std::thread::Builder::new()
             .name("herdr-session-save".into())
-            .spawn(move || run_session_save_job(job))
+            .spawn(move || run_session_save_job(job, &path, writer.as_ref(), &health))
         {
             Ok(thread) => self.session_save_thread = Some(thread),
             Err(err) => {
                 tracing::warn!(err = %err, "failed to spawn session save thread; saving inline");
-                run_session_save_job(self.capture_session_save_job());
+                run_session_save_job(
+                    self.capture_session_save_job(),
+                    &self.session_save_path,
+                    self.session_writer.as_ref(),
+                    &self.session_writer_healthy,
+                );
             }
         }
     }
 
     pub(crate) fn save_session_now(&mut self) {
         if let Some(thread) = self.session_save_thread.take() {
-            let _ = thread.join();
+            if thread.join().is_err() {
+                self.session_writer_healthy
+                    .store(false, std::sync::atomic::Ordering::Release);
+                self.ready_delegation_routes.clear();
+                tracing::warn!("session writer panicked; report routes quarantined");
+            }
         }
 
         if self.no_session {
@@ -100,16 +118,69 @@ impl App {
             return;
         }
 
-        run_session_save_job(self.capture_session_save_job());
+        run_session_save_job(
+            self.capture_session_save_job(),
+            &self.session_save_path,
+            self.session_writer.as_ref(),
+            &self.session_writer_healthy,
+        );
         self.session_save_deadline = None;
+    }
+
+    /// The only promotion barrier for a report route. No old background
+    /// snapshot can follow this write, and other processes cannot acquire the
+    /// directory writer while this App retains the lease.
+    pub(crate) fn durably_save_delegation_edge(&mut self) -> std::io::Result<()> {
+        let result = (|| -> std::io::Result<()> {
+            if self.no_session {
+                return Err(std::io::Error::other("session persistence disabled"));
+            }
+            if let Some(thread) = self.session_save_thread.take() {
+                thread
+                    .join()
+                    .map_err(|_| std::io::Error::other("prior session writer panicked"))?;
+            }
+            if self.session_writer.is_none() {
+                self.session_writer = Some(crate::persist::SessionWriter::acquire(
+                    &self.session_save_path,
+                )?);
+            }
+            let SessionSaveJob::Save { snapshot, .. } = self.capture_session_save_job() else {
+                return Err(std::io::Error::other("no session workspaces to persist"));
+            };
+            crate::persist::save_snapshot_ordered(
+                &self.session_save_path,
+                &snapshot,
+                self.session_writer.as_ref().expect("writer acquired"),
+            )?;
+            Ok(())
+        })();
+        if result.is_err() {
+            self.session_writer_healthy
+                .store(false, std::sync::atomic::Ordering::Release);
+            self.ready_delegation_routes.clear();
+        } else {
+            self.session_writer_healthy
+                .store(true, std::sync::atomic::Ordering::Release);
+        }
+        result
     }
 }
 
-fn run_session_save_job(job: SessionSaveJob) {
-    match job {
-        SessionSaveJob::Clear => crate::persist::clear(),
+fn run_session_save_job(
+    job: SessionSaveJob,
+    path: &std::path::Path,
+    writer: Option<&std::sync::Arc<crate::persist::SessionWriter>>,
+    health: &std::sync::atomic::AtomicBool,
+) {
+    let result = match job {
+        SessionSaveJob::Clear => crate::persist::clear_ordered(path, writer),
         SessionSaveJob::Save { snapshot, history } => {
-            crate::persist::save(&snapshot, history.as_ref());
+            crate::persist::save_ordered(path, &snapshot, history.as_ref(), writer)
         }
+    };
+    if let Err(err) = result {
+        health.store(false, std::sync::atomic::Ordering::Release);
+        crate::logging::session_save_failed(path, &err.to_string());
     }
 }

@@ -13,6 +13,7 @@ pub(super) fn run_delegation_command(args: &[String]) -> std::io::Result<i32> {
             .map(|delegation_id| Method::DelegationRoot(DelegationTarget { delegation_id })),
         "descendants" => one(&args[1..])
             .map(|delegation_id| Method::DelegationDescendants(DelegationTarget { delegation_id })),
+        "route-ready" => parse_route_ready(&args[1..]).map(Method::DelegationRouteReady),
         "reparent" => parse_reparent(&args[1..]).map(Method::DelegationReparent),
         "reorder" => parse_reorder(&args[1..]).map(Method::DelegationReorder),
         "help" | "--help" | "-h" => return usage(0),
@@ -49,6 +50,17 @@ fn parse_create(args: &[String]) -> Result<DelegationCreateParams, String> {
         parent_id,
         purpose,
     })
+}
+fn parse_route_ready(args: &[String]) -> Result<DelegationRouteReadyParams, String> {
+    match args {
+        [child, flag, parent] if flag == "--expected-parent" => Ok(DelegationRouteReadyParams {
+            child_delegation_id: child.clone(),
+            expected_parent_delegation_id: parent.clone(),
+        }),
+        _ => Err(
+            "usage: herdr delegation route-ready <child-id> --expected-parent <parent-id>".into(),
+        ),
+    }
 }
 fn parse_reparent(args: &[String]) -> Result<DelegationReparentParams, String> {
     let delegation_id = args.first().cloned().ok_or("missing delegation_id")?;
@@ -89,7 +101,7 @@ fn one(args: &[String]) -> Result<String, String> {
     }
 }
 fn usage(code: i32) -> std::io::Result<i32> {
-    eprintln!("herdr delegation commands: create, get, tree, root, descendants, reparent, reorder");
+    eprintln!("herdr delegation commands: create, get, tree, root, descendants, route-ready, reparent, reorder");
     Ok(code)
 }
 
@@ -112,6 +124,10 @@ mod tests {
         ]))
         .expect("create");
         assert_eq!(create.parent_id.as_deref(), Some("d1"));
+        let ready =
+            parse_route_ready(&strings(&["d2", "--expected-parent", "d1"])).expect("route-ready");
+        assert_eq!(ready.child_delegation_id, "d2");
+        assert_eq!(ready.expected_parent_delegation_id, "d1");
         assert_eq!(
             parse_reparent(&strings(&["d2", "--root"]))
                 .expect("root")
@@ -156,5 +172,7 @@ mod tests {
         assert!(parse_reparent(&strings(&["d2", "--root", "--parent", "d1"])).is_err());
         assert!(parse_reorder(&strings(&["d2", "--first", "--last"])).is_err());
         assert!(parse_create(&strings(&["--pane"])).is_err());
+        assert!(parse_route_ready(&strings(&["d2", "--parent", "d1"])).is_err());
+        assert!(parse_route_ready(&strings(&["d2", "--expected-parent", "d1", "extra"])).is_err());
     }
 }

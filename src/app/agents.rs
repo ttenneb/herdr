@@ -531,6 +531,17 @@ impl App {
     /// at its Active-generation transition. A pre-existing process, including
     /// one left in the foreground during a replacement, cannot satisfy the
     /// launch birth floor. No snapshot or client report can create this record.
+    pub(crate) fn managed_pi_process_birth(
+        &self,
+        pid: u32,
+    ) -> Option<crate::platform::ProcessBirthIdentity> {
+        #[cfg(test)]
+        if let Some(identity) = self.mailbox_bootstrap_test_process_births.get(&pid) {
+            return Some(*identity);
+        }
+        crate::platform::process_birth_identity(pid)
+    }
+
     pub(crate) fn bind_active_managed_pi_process(
         &mut self,
         terminal_id: &crate::terminal::TerminalId,
@@ -551,7 +562,7 @@ impl App {
         else {
             return;
         };
-        let Some(birth) = crate::platform::process_birth_identity(process.pid) else {
+        let Some(birth) = self.managed_pi_process_birth(process.pid) else {
             return;
         };
         if birth.start_ticks < floor {
@@ -567,7 +578,7 @@ impl App {
     /// Derive Pi's identity on demand so no stopped or replaced process can
     /// leave a reusable cached path in agent get. The caller supplies only a
     /// target for lookup; neither the target nor a reported session is authority.
-    fn trusted_managed_pi_session(
+    pub(crate) fn trusted_managed_pi_session(
         &self,
         terminal: &crate::terminal::TerminalState,
     ) -> Option<crate::api::schema::AgentSessionInfo> {
@@ -593,7 +604,7 @@ impl App {
         }
         let launch = self.managed_pi_launches.get(&terminal.id)?;
         if launch.generation != record.process_generation
-            || launch.process? != crate::platform::process_birth_identity(process.pid)?
+            || launch.process? != self.managed_pi_process_birth(process.pid)?
         {
             return None;
         }

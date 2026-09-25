@@ -1,7 +1,7 @@
 use crate::api::schema::{
     DelegationCreateParams, DelegationInfo, DelegationReorderParams, DelegationReparentParams,
-    DelegationSiblingPosition, DelegationTarget, DelegationTreeEntry, EventData, EventEnvelope,
-    EventKind, ResponseResult,
+    DelegationRouteReadyParams, DelegationSiblingPosition, DelegationTarget, DelegationTreeEntry,
+    EventData, EventEnvelope, EventKind, ResponseResult,
 };
 use crate::app::App;
 use crate::delegation::{DelegationId, DelegationRecord, SiblingPosition};
@@ -49,6 +49,83 @@ impl App {
         });
         self.emit_all_workspace_attention_updated();
         encode_success(id, ResponseResult::DelegationInfo { delegation })
+    }
+
+    pub(super) fn handle_delegation_route_ready(
+        &mut self,
+        id: String,
+        params: DelegationRouteReadyParams,
+    ) -> String {
+        let child = match parse_id(&params.child_delegation_id) {
+            Ok(id) => id,
+            Err(message) => return encode_error(id, "invalid_delegation_id", message),
+        };
+        let parent = match parse_id(&params.expected_parent_delegation_id) {
+            Ok(id) => id,
+            Err(message) => return encode_error(id, "invalid_delegation_id", message),
+        };
+        let Some(mut shape) = self.ready_route_shape(child, parent) else {
+            self.ready_delegation_routes.remove(&child);
+            return encode_error(
+                id,
+                "route_not_ready",
+                "exact active child and parent Pi sessions are required",
+            );
+        };
+        if !self
+            .session_writer_healthy
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            self.ready_delegation_routes.remove(&child);
+        }
+        if let Some(existing) = self.ready_delegation_routes.get(&child) {
+            let mut same = shape.clone();
+            same.epoch = existing.epoch.clone();
+            if &same == existing {
+                let delegation = self.delegation_info(
+                    self.state
+                        .delegations
+                        .get(child)
+                        .expect("ready child exists"),
+                );
+                return encode_success(
+                    id,
+                    ResponseResult::DelegationRouteReady {
+                        delegation,
+                        route_epoch: existing.epoch.clone(),
+                    },
+                );
+            }
+        }
+        self.ready_delegation_routes.remove(&child);
+        let Some(epoch) = crate::platform::random_route_epoch() else {
+            return encode_error(id, "route_not_ready", "server route epoch unavailable");
+        };
+        if let Err(err) = self.durably_save_delegation_edge() {
+            return encode_error(id, "route_persistence_failed", err.to_string());
+        }
+        let Some(mut current) = self.ready_route_shape(child, parent) else {
+            return encode_error(id, "route_not_ready", "edge changed during durable save");
+        };
+        if current != shape {
+            return encode_error(id, "route_not_ready", "edge changed during durable save");
+        }
+        shape.epoch = epoch.clone();
+        current.epoch = epoch.clone();
+        self.ready_delegation_routes.insert(child, current);
+        let delegation = self.delegation_info(
+            self.state
+                .delegations
+                .get(child)
+                .expect("ready child exists"),
+        );
+        encode_success(
+            id,
+            ResponseResult::DelegationRouteReady {
+                delegation,
+                route_epoch: epoch,
+            },
+        )
     }
 
     pub(super) fn handle_delegation_get(&self, id: String, target: DelegationTarget) -> String {
@@ -155,6 +232,7 @@ impl App {
             .get(delegation_id)
             .and_then(|record| record.parent_id)
             .map(|value| value.to_string());
+        self.ready_delegation_routes.remove(&delegation_id);
         if let Err(err) = self.state.delegations.reparent(delegation_id, parent_id) {
             return delegation_error(id, err);
         }

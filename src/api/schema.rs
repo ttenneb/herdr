@@ -213,6 +213,8 @@ pub enum Method {
     DelegationRoot(DelegationTarget),
     #[serde(rename = "delegation.descendants")]
     DelegationDescendants(DelegationTarget),
+    #[serde(rename = "delegation.route_ready")]
+    DelegationRouteReady(DelegationRouteReadyParams),
     #[serde(rename = "delegation.reparent")]
     DelegationReparent(DelegationReparentParams),
     #[serde(rename = "delegation.reorder")]

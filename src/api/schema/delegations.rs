@@ -16,6 +16,12 @@ pub struct DelegationCreateParams {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct DelegationRouteReadyParams {
+    pub child_delegation_id: String,
+    pub expected_parent_delegation_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct DelegationReparentParams {
     pub delegation_id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]

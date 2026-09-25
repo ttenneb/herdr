@@ -48,6 +48,24 @@ pub(crate) struct MailboxBootstrapSession {
     context: TrustedMailboxChannelContext,
 }
 
+/// Ephemeral readiness earned only by a durably acknowledged graph snapshot.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ReadyDelegationRoute {
+    pub(crate) child: crate::delegation::DelegationId,
+    pub(crate) parent: crate::delegation::DelegationId,
+    pub(crate) child_pane: crate::layout::PaneId,
+    pub(crate) parent_pane: crate::layout::PaneId,
+    pub(crate) child_terminal: crate::terminal::TerminalId,
+    pub(crate) parent_terminal: crate::terminal::TerminalId,
+    pub(crate) child_generation: u64,
+    pub(crate) parent_generation: u64,
+    pub(crate) child_session: crate::api::schema::AgentSessionInfo,
+    pub(crate) parent_session: crate::api::schema::AgentSessionInfo,
+    pub(crate) child_revision: u64,
+    pub(crate) parent_revision: u64,
+    pub(crate) epoch: String,
+}
+
 /// Frozen to the exact delegation edge and parent execution at stream accept.
 /// Only the server derives these fields; a request supplies just a typed report.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -58,6 +76,7 @@ pub(crate) struct BoundParentReportRoute {
     child_delegation: crate::delegation::DelegationId,
     parent_delegation: crate::delegation::DelegationId,
     parent_pane: crate::layout::PaneId,
+    route_epoch: String,
 }
 
 impl MailboxBootstrapSession {
@@ -393,11 +412,75 @@ impl App {
         Ok(grant_id)
     }
 
+    pub(crate) fn ready_route_shape(
+        &self,
+        child_id: crate::delegation::DelegationId,
+        parent_id: crate::delegation::DelegationId,
+    ) -> Option<ReadyDelegationRoute> {
+        let child = self.state.delegations.get(child_id)?;
+        let parent = self.state.delegations.get(parent_id)?;
+        if child.parent_id != Some(parent_id) || child.tombstone || parent.tombstone {
+            return None;
+        }
+        let child_pane = child.pane_id?;
+        let parent_pane = parent.pane_id?;
+        if child_pane == parent_pane {
+            return None;
+        }
+        let (child_ws, _) = self.find_pane(child_pane)?;
+        let (parent_ws, _) = self.find_pane(parent_pane)?;
+        let child_terminal = self.state.workspaces[child_ws]
+            .terminal_id(child_pane)?
+            .clone();
+        let parent_terminal = self.state.workspaces[parent_ws]
+            .terminal_id(parent_pane)?
+            .clone();
+        if child_terminal == parent_terminal {
+            return None;
+        }
+        let child_generation = self.active_pi_sender_generation(&child_terminal.to_string())?;
+        let parent_generation = self.active_pi_sender_generation(&parent_terminal.to_string())?;
+        if !self.exact_active_mailbox_authority(&child_terminal.to_string(), child_generation)
+            || !self.exact_active_mailbox_authority(&parent_terminal.to_string(), parent_generation)
+        {
+            return None;
+        }
+        let child_session =
+            self.trusted_managed_pi_session(self.state.terminals.get(&child_terminal)?)?;
+        let parent_session =
+            self.trusted_managed_pi_session(self.state.terminals.get(&parent_terminal)?)?;
+        Some(ReadyDelegationRoute {
+            child: child_id,
+            parent: parent_id,
+            child_pane,
+            parent_pane,
+            child_terminal,
+            parent_terminal,
+            child_generation,
+            parent_generation,
+            child_session,
+            parent_session,
+            child_revision: self.state.delegations.route_revision(child_id),
+            parent_revision: self.state.delegations.route_revision(parent_id),
+            epoch: String::new(),
+        })
+    }
+
     fn bound_parent_report_candidate(
         &self,
         sender_key: &str,
         sender_generation: u64,
     ) -> Option<BoundParentReportRoute> {
+        if !self
+            .session_writer_healthy
+            .load(std::sync::atomic::Ordering::Acquire)
+            || !self
+                .session_writer
+                .as_ref()
+                .is_some_and(|writer| writer.validate(&self.session_save_path).is_ok())
+        {
+            return None;
+        }
         let (child, child_terminal) =
             self.state
                 .delegations
@@ -410,6 +493,12 @@ impl App {
                     (terminal.to_string() == sender_key).then_some((record, terminal))
                 })?;
         let parent_delegation = child.parent_id?;
+        let ready = self.ready_delegation_routes.get(&child.id)?;
+        let mut current = self.ready_route_shape(child.id, parent_delegation)?;
+        current.epoch = ready.epoch.clone();
+        if &current != ready {
+            return None;
+        }
         let parent = self.state.delegations.get(parent_delegation)?;
         let parent_pane = parent.pane_id?;
         if parent.tombstone
@@ -467,14 +556,15 @@ impl App {
             // Separate grant namespace: a bound-parent grant is never an
             // unrestricted cross-recipient capability on the generic API.
             grant_id: format!(
-                "bound-parent-report:{sender_key}:1:{}:1",
-                recipient.recipient_id
+                "bound-parent-report:{sender_key}:1:{}:1:{}",
+                recipient.recipient_id, ready.epoch
             ),
             recipient,
             parent_generation,
             child_delegation: child.id,
             parent_delegation,
             parent_pane,
+            route_epoch: ready.epoch.clone(),
         })
     }
 

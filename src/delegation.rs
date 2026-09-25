@@ -240,6 +240,8 @@ struct PersistedDelegations {
 #[derive(Debug, Clone, Default)]
 pub struct Delegations {
     records: HashMap<DelegationId, DelegationRecord>,
+    // Ephemeral ABA guard. Restored routes must be re-attested, not resumed.
+    route_revisions: HashMap<DelegationId, u64>,
 }
 
 impl Serialize for Delegations {
@@ -329,7 +331,10 @@ impl Delegations {
         }
         validate_acyclic(&map)?;
 
-        let mut result = Self { records: map };
+        let mut result = Self {
+            records: map,
+            route_revisions: HashMap::new(),
+        };
         result.normalize_all_siblings();
         Ok(result)
     }
@@ -387,13 +392,25 @@ impl Delegations {
                 break;
             }
         }
-        let mut result = Self { records: map };
+        let mut result = Self {
+            records: map,
+            route_revisions: HashMap::new(),
+        };
         result.normalize_all_siblings();
         result
     }
 
     pub fn records(&self) -> &HashMap<DelegationId, DelegationRecord> {
         &self.records
+    }
+
+    pub(crate) fn route_revision(&self, id: DelegationId) -> u64 {
+        self.route_revisions.get(&id).copied().unwrap_or(0)
+    }
+
+    fn advance_route_revision(&mut self, id: DelegationId) {
+        let revision = self.route_revisions.entry(id).or_insert(0);
+        *revision = revision.saturating_add(1);
     }
 
     pub fn get(&self, id: DelegationId) -> Option<&DelegationRecord> {
@@ -458,6 +475,7 @@ impl Delegations {
             record.pane_id = Some(pane_id);
             record.tombstone = false;
         }
+        self.advance_route_revision(id);
         Ok(())
     }
 
@@ -488,6 +506,7 @@ impl Delegations {
             }
             record.pane_id = Some(new_pane_id);
         }
+        self.advance_route_revision(id);
         Ok(id)
     }
 
@@ -521,6 +540,7 @@ impl Delegations {
             record.parent_id = parent_id;
             record.sibling_rank = new_rank;
         }
+        self.advance_route_revision(id);
         self.normalize_siblings(old_parent);
         self.normalize_siblings(parent_id);
         Ok(())
@@ -663,6 +683,7 @@ impl Delegations {
             record.pane_id = None;
             record.tombstone = true;
         }
+        self.advance_route_revision(id);
         Some(id)
     }
 

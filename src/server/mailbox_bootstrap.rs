@@ -451,7 +451,54 @@ mod tests {
                 }],
             },
         );
+        install_trusted_test_pi(&mut app, &directory, &sender, std::process::id());
         (app, directory, sender)
+    }
+
+    fn install_trusted_test_pi(app: &mut App, directory: &Path, sender: &str, pid: u32) {
+        use std::os::unix::fs::PermissionsExt;
+        let terminal_id = app
+            .state
+            .terminals
+            .keys()
+            .find(|id| id.to_string() == sender)
+            .unwrap()
+            .clone();
+        let path = directory.join(format!("{sender}.jsonl"));
+        std::fs::write(
+            &path,
+            b"{\"type\":\"session\",\"version\":3,\"id\":\"test\",\"cwd\":\"/tmp\"}\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let real = crate::platform::process_birth_identity(std::process::id()).unwrap();
+        let birth = crate::platform::ProcessBirthIdentity {
+            pid,
+            start_ticks: real.start_ticks,
+        };
+        app.mailbox_bootstrap_test_process_births.insert(pid, birth);
+        app.managed_pi_launches.insert(
+            terminal_id.clone(),
+            crate::app::ManagedPiLaunch {
+                generation: 1,
+                session_path: path.display().to_string(),
+                earliest_birth_ticks: birth.start_ticks,
+                process: Some(birth),
+            },
+        );
+        app.install_mailbox_bootstrap_test_foreground_job(
+            terminal_id,
+            crate::platform::ForegroundJob {
+                process_group_id: birth.pid,
+                processes: vec![crate::platform::ForegroundProcess {
+                    pid: birth.pid,
+                    name: "pi".into(),
+                    argv0: None,
+                    argv: Some(vec!["pi".into()]),
+                    cmdline: Some("pi".into()),
+                }],
+            },
+        );
     }
 
     fn active_managed_recipient(app: &mut App, directory: &Path) -> (String, String) {
@@ -509,7 +556,41 @@ mod tests {
             process_exited: false,
             observed_at: std::time::Instant::now(),
         });
+        install_trusted_test_pi(app, directory, &sender, std::process::id() + 1);
         (sender, "recipient".into())
+    }
+
+    fn try_ready_test_route(
+        app: &mut App,
+        directory: &Path,
+        child: crate::delegation::DelegationId,
+        parent: crate::delegation::DelegationId,
+    ) -> serde_json::Value {
+        app.no_session = false;
+        app.session_save_path = directory.join("session.json");
+        serde_json::from_str(&app.handle_api_request(crate::api::schema::Request {
+            id: "route-ready".into(),
+            method: crate::api::schema::Method::DelegationRouteReady(
+                crate::api::schema::DelegationRouteReadyParams {
+                    child_delegation_id: child.to_string(),
+                    expected_parent_delegation_id: parent.to_string(),
+                },
+            ),
+        }))
+        .unwrap()
+    }
+
+    fn ready_test_route(
+        app: &mut App,
+        directory: &Path,
+        child: crate::delegation::DelegationId,
+        parent: crate::delegation::DelegationId,
+    ) {
+        let response = try_ready_test_route(app, directory, child, parent);
+        assert_eq!(
+            response["result"]["type"], "delegation_route_ready",
+            "{response}"
+        );
     }
 
     fn listener(directory: &Path) -> MailboxBootstrapListener {
@@ -701,6 +782,178 @@ mod tests {
     }
 
     #[test]
+    fn background_snapshot_started_before_child_cannot_undo_ready_edge() {
+        let (mut app, directory, _sender) = active_app();
+        active_managed_recipient(&mut app, &directory);
+        let child_pane = app.state.workspaces[0].tabs[0].root_pane.unwrap();
+        let parent_pane = app.state.workspaces[1].tabs[0].root_pane.unwrap();
+        let parent = app
+            .state
+            .delegations
+            .create(Some(parent_pane), None, None)
+            .unwrap();
+        app.no_session = false;
+        app.session_save_path = directory.join("session.json");
+        app.start_background_session_save(); // captured a graph with no child
+        let child = app
+            .state
+            .delegations
+            .create(Some(child_pane), Some(parent), None)
+            .unwrap();
+        ready_test_route(&mut app, &directory, child, parent); // joins old writer before sync
+        let snapshot: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&app.session_save_path).unwrap()).unwrap();
+        assert!(
+            snapshot["delegations"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|record| record["id"] == child.to_string()),
+            "older in-flight snapshot must not follow acknowledgement"
+        );
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn bound_parent_route_requires_durable_ready_and_fresh_stream_after_aba() {
+        let (mut app, directory, _sender) = active_app();
+        active_managed_recipient(&mut app, &directory);
+        let child_pane = app.state.workspaces[0].tabs[0].root_pane.unwrap();
+        let parent_pane = app.state.workspaces[1].tabs[0].root_pane.unwrap();
+        let parent = app
+            .state
+            .delegations
+            .create(Some(parent_pane), None, None)
+            .unwrap();
+        let child = app
+            .state
+            .delegations
+            .create(Some(child_pane), Some(parent), None)
+            .unwrap();
+        let mut listener = listener(&directory);
+        let mut old = UnixStream::connect(listener.path()).unwrap();
+        old.set_read_timeout(Some(Duration::from_secs(1))).unwrap();
+        let before = bootstrap(&mut listener, &mut app, &mut old);
+        assert!(
+            before["result"]["parentReport"].is_null(),
+            "visible graph is not route authority"
+        );
+        app.no_session = false;
+        app.session_save_path = directory.join("session.json");
+        let competing = crate::persist::SessionWriter::acquire(&app.session_save_path).unwrap();
+        let denied = try_ready_test_route(&mut app, &directory, child, parent);
+        assert_eq!(denied["error"]["code"], "route_persistence_failed");
+        drop(competing);
+        for stage in [
+            crate::persist::DurableStep::Write,
+            crate::persist::DurableStep::FileSync,
+            crate::persist::DurableStep::Rename,
+            crate::persist::DurableStep::DirectorySync,
+        ] {
+            crate::persist::inject_durable_failure(Some(stage));
+            let uncertain = try_ready_test_route(&mut app, &directory, child, parent);
+            crate::persist::inject_durable_failure(None);
+            assert_eq!(
+                uncertain["error"]["code"], "route_persistence_failed",
+                "{stage:?}"
+            );
+            assert!(
+                !app.ready_delegation_routes.contains_key(&child),
+                "{stage:?} cannot activate route"
+            );
+        }
+        let mut still_unready = UnixStream::connect(listener.path()).unwrap();
+        still_unready
+            .set_read_timeout(Some(Duration::from_secs(1)))
+            .unwrap();
+        assert!(
+            bootstrap(&mut listener, &mut app, &mut still_unready)["result"]["parentReport"]
+                .is_null()
+        );
+        ready_test_route(&mut app, &directory, child, parent);
+        let acknowledged_epoch = app.ready_delegation_routes[&child].epoch.clone();
+        ready_test_route(&mut app, &directory, child, parent);
+        assert_eq!(
+            app.ready_delegation_routes[&child].epoch, acknowledged_epoch,
+            "lost response retry is idempotent"
+        );
+        let mut ready = UnixStream::connect(listener.path()).unwrap();
+        ready
+            .set_read_timeout(Some(Duration::from_secs(1)))
+            .unwrap();
+        let issued = bootstrap(&mut listener, &mut app, &mut ready);
+        let first_grant = issued["result"]["parentReport"]["grantId"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let old_binding = before["result"]["bindingGeneration"].as_str().unwrap();
+        let old_attempt = exchange(
+            &mut listener,
+            &mut app,
+            &mut old,
+            json!({
+                "method":"report_submit_parent","bindingGeneration":old_binding,"params":{
+                    "protocol":crate::mailbox_v1::PROTOCOL,"stableId":"retroactive","revision":1,
+                    "digest":"a".repeat(64),"deliveryDigest":"b".repeat(64),"subject":"report",
+                    "body":"body","messageId":"retroactive-message","kind":"report","priority":"normal","originalSequence":1
+                }
+            }),
+        );
+        assert!(
+            old_attempt["error"]["code"] == "grant_missing"
+                || old_attempt["error"]["code"] == "grant_revoked"
+        );
+        app.state.delegations.reparent(child, None).unwrap();
+        app.state.delegations.reparent(child, Some(parent)).unwrap();
+        let binding = issued["result"]["bindingGeneration"].as_str().unwrap();
+        let stale = exchange(
+            &mut listener,
+            &mut app,
+            &mut ready,
+            json!({
+                "method":"report_submit_parent","bindingGeneration":binding,"params":{
+                    "protocol":crate::mailbox_v1::PROTOCOL,"stableId":"stale-aba","revision":1,
+                    "digest":"c".repeat(64),"deliveryDigest":"d".repeat(64),"subject":"report",
+                    "body":"body","messageId":"stale-aba-message","kind":"report","priority":"normal","originalSequence":2
+                }
+            }),
+        );
+        assert_eq!(stale["error"]["code"], "grant_revoked");
+        ready_test_route(&mut app, &directory, child, parent);
+        let mut newer = UnixStream::connect(listener.path()).unwrap();
+        newer
+            .set_read_timeout(Some(Duration::from_secs(1)))
+            .unwrap();
+        let new_descriptor = bootstrap(&mut listener, &mut app, &mut newer);
+        assert_ne!(
+            new_descriptor["result"]["parentReport"]["grantId"],
+            first_grant
+        );
+        let unrelated_parent = app.state.delegations.create(None, None, None).unwrap();
+        let wrong = try_ready_test_route(&mut app, &directory, child, unrelated_parent);
+        assert_eq!(wrong["error"]["code"], "route_not_ready");
+        let mut no_wrong_parent = UnixStream::connect(listener.path()).unwrap();
+        no_wrong_parent
+            .set_read_timeout(Some(Duration::from_secs(1)))
+            .unwrap();
+        assert!(
+            bootstrap(&mut listener, &mut app, &mut no_wrong_parent)["result"]["parentReport"]
+                .is_null()
+        );
+        ready_test_route(&mut app, &directory, child, parent);
+        app.state.delegations.tombstone_pane(child_pane);
+        let mut tombstoned = UnixStream::connect(listener.path()).unwrap();
+        tombstoned
+            .set_read_timeout(Some(Duration::from_secs(1)))
+            .unwrap();
+        assert!(
+            bootstrap(&mut listener, &mut app, &mut tombstoned)["result"]["parentReport"].is_null()
+        );
+        drop(listener);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
     fn bound_parent_report_route_is_durable_and_rejects_selectors_non_reports_and_stale_parent() {
         let (mut app, directory, sender) = active_app();
         let (parent, _) = active_managed_recipient(&mut app, &directory);
@@ -711,10 +964,12 @@ mod tests {
             .delegations
             .create(Some(parent_pane), None, None)
             .unwrap();
-        app.state
+        let child_id = app
+            .state
             .delegations
             .create(Some(child_pane), Some(parent_id), None)
             .unwrap();
+        ready_test_route(&mut app, &directory, child_id, parent_id);
         let mut listener = listener(&directory);
         let mut client = UnixStream::connect(listener.path()).unwrap();
         client
@@ -882,6 +1137,7 @@ mod tests {
             .delegations
             .create(Some(child_pane), Some(parent_id), None)
             .unwrap();
+        ready_test_route(&mut app, &directory, child_id, parent_id);
         let mut listener = listener(&directory);
         let mut client = UnixStream::connect(listener.path()).unwrap();
         client
@@ -974,10 +1230,12 @@ mod tests {
             .delegations
             .create(Some(parent_pane), None, None)
             .unwrap();
-        app.state
+        let child_id = app
+            .state
             .delegations
             .create(Some(child_pane), Some(parent_id), None)
             .unwrap();
+        ready_test_route(&mut app, &directory, child_id, parent_id);
         let old = app.handle_mailbox_offline_submit(
             "old".into(),
             crate::api::schema::MailboxOfflineSubmitParams {
@@ -1078,9 +1336,9 @@ mod tests {
             .set_read_timeout(Some(Duration::from_secs(1)))
             .unwrap();
         let descriptor = bootstrap(&mut listener, &mut restarted, &mut client);
-        assert_eq!(
-            descriptor["result"]["parentReport"]["recipient"]["recipientId"],
-            parent
+        assert!(
+            descriptor["result"]["parentReport"].is_null(),
+            "restored graph alone cannot revive route readiness"
         );
         let binding = descriptor["result"]["bindingGeneration"].as_str().unwrap();
         let old_snapshot = exchange(

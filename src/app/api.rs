@@ -1493,6 +1493,9 @@ impl App {
             Method::DelegationCreate(params) => {
                 return self.handle_delegation_create(request.id, params)
             }
+            Method::DelegationRouteReady(params) => {
+                return self.handle_delegation_route_ready(request.id, params)
+            }
             Method::DelegationGet(target) => return self.handle_delegation_get(request.id, target),
             Method::DelegationTree(_) => return self.handle_delegation_tree(request.id),
             Method::DelegationRoot(target) => {

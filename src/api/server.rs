@@ -458,6 +458,7 @@ fn api_method_name(method: &Method) -> &'static str {
         Method::CollectionHelperAbort(_) => "collection.helper_abort",
         Method::CollectionClose(_) => "collection.close",
         Method::DelegationCreate(_) => "delegation.create",
+        Method::DelegationRouteReady(_) => "delegation.route_ready",
         Method::DelegationGet(_) => "delegation.get",
         Method::DelegationTree(_) => "delegation.tree",
         Method::DelegationRoot(_) => "delegation.root",

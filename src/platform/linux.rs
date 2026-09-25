@@ -481,6 +481,16 @@ fn first_post_launch_birth_tick_at(seconds: u64, nanoseconds: u64, hz: u64) -> O
         .checked_add(1)
 }
 
+pub(crate) fn random_route_epoch() -> Option<String> {
+    use std::io::Read;
+    let mut bytes = [0u8; 16];
+    std::fs::File::open("/dev/urandom")
+        .ok()?
+        .read_exact(&mut bytes)
+        .ok()?;
+    Some(bytes.iter().map(|byte| format!("{byte:02x}")).collect())
+}
+
 pub(crate) fn first_post_launch_birth_tick() -> Option<u64> {
     let mut now: libc::timespec = unsafe { std::mem::zeroed() };
     if unsafe { libc::clock_gettime(libc::CLOCK_BOOTTIME, &mut now) } != 0 {

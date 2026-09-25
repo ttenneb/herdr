@@ -1,6 +1,154 @@
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 
 use tracing::warn;
+
+/// An exclusive lease for one physical session directory. Background and
+/// synchronous writers share this file description and serialize within it;
+/// another server cannot overwrite a route-ready snapshot while it is held.
+pub(crate) struct SessionWriter {
+    _lock: std::fs::File,
+    order: Mutex<()>,
+    #[cfg(unix)]
+    physical: PathBuf,
+    #[cfg(unix)]
+    directory_identity: (u64, u64),
+    #[cfg(unix)]
+    lock_identity: (u64, u64),
+}
+
+impl SessionWriter {
+    #[cfg(unix)]
+    pub(crate) fn acquire(path: &Path) -> std::io::Result<Arc<Self>> {
+        use std::os::fd::AsRawFd;
+        use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
+        let target = resolve_write_target(path)?;
+        let parent = target
+            .parent()
+            .ok_or_else(|| std::io::Error::other("session parent missing"))?;
+        ensure_parent_durable(parent)?;
+        let physical = std::fs::canonicalize(parent)?;
+        // The directory entry itself must survive a crash, not just the
+        // session.json rename within it.
+        std::fs::File::open(
+            physical
+                .parent()
+                .ok_or_else(|| std::io::Error::other("session directory ancestor missing"))?,
+        )?
+        .sync_all()?;
+        let meta = std::fs::metadata(&physical)?;
+        if meta.uid() != unsafe { libc::geteuid() } || meta.permissions().mode() & 0o022 != 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "session directory is not exclusively owned",
+            ));
+        }
+        let lock_path = physical.join(".session-writer.lock");
+        let lock = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(&lock_path)?;
+        let lock_meta = lock.metadata()?;
+        if !lock_meta.is_file()
+            || lock_meta.uid() != unsafe { libc::geteuid() }
+            || lock_meta.mode() & 0o077 != 0
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "session writer lock is not private",
+            ));
+        }
+        if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(Arc::new(Self {
+            _lock: lock,
+            order: Mutex::new(()),
+            physical,
+            directory_identity: (meta.dev(), meta.ino()),
+            lock_identity: (lock_meta.dev(), lock_meta.ino()),
+        }))
+    }
+
+    #[cfg(unix)]
+    pub(crate) fn validate(&self, path: &Path) -> std::io::Result<()> {
+        use std::os::unix::fs::MetadataExt;
+        let target = resolve_write_target(path)?;
+        let parent = std::fs::canonicalize(
+            target
+                .parent()
+                .ok_or_else(|| std::io::Error::other("session parent missing"))?,
+        )?;
+        let dir = std::fs::metadata(&parent)?;
+        let lock = std::fs::symlink_metadata(self.physical.join(".session-writer.lock"))?;
+        let own = self._lock.metadata()?;
+        if parent != self.physical
+            || (dir.dev(), dir.ino()) != self.directory_identity
+            || (lock.dev(), lock.ino()) != self.lock_identity
+            || (own.dev(), own.ino()) != self.lock_identity
+            || !lock.is_file()
+        {
+            return Err(std::io::Error::other(
+                "session directory writer lease replaced",
+            ));
+        }
+        Ok(())
+    }
+
+    #[cfg(not(unix))]
+    pub(crate) fn validate(&self, _path: &Path) -> std::io::Result<()> {
+        Err(std::io::Error::other("session writer unsupported"))
+    }
+
+    #[cfg(not(unix))]
+    pub(crate) fn acquire(_path: &Path) -> std::io::Result<Arc<Self>> {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "durable session writer is unavailable",
+        ))
+    }
+}
+
+fn ensure_parent_durable(path: &Path) -> std::io::Result<()> {
+    if path.exists() {
+        return Ok(());
+    }
+    let parent = path
+        .parent()
+        .ok_or_else(|| std::io::Error::other("session directory parent missing"))?;
+    ensure_parent_durable(parent)?;
+    std::fs::create_dir(path)?;
+    std::fs::File::open(parent)?.sync_all()?;
+    Ok(())
+}
+
+static NEXT_SESSION_TEMP: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DurableStep {
+    Write,
+    FileSync,
+    Rename,
+    DirectorySync,
+}
+#[cfg(test)]
+thread_local! { static DURABLE_FAIL: std::cell::Cell<Option<DurableStep>> = const { std::cell::Cell::new(None) }; }
+#[cfg(test)]
+pub(crate) fn inject_durable_failure(step: Option<DurableStep>) {
+    DURABLE_FAIL.with(|fail| fail.set(step));
+}
+
+#[cfg(test)]
+fn maybe_fail(step: DurableStep) -> std::io::Result<()> {
+    if DURABLE_FAIL.with(|fail| fail.get()) == Some(step) {
+        return Err(std::io::Error::other(format!("injected {step:?} failure")));
+    }
+    Ok(())
+}
 
 use super::snapshot::{
     parse_history_snapshot, parse_snapshot, snapshot_file_version, SessionHistorySnapshot,
@@ -42,7 +190,112 @@ fn resolve_write_target(path: &Path) -> std::io::Result<PathBuf> {
 }
 
 pub(super) fn save_to_path(path: &Path, snapshot: &SessionSnapshot) -> std::io::Result<()> {
-    save_json_to_path(path, snapshot)
+    save_session_durable_to_path(path, snapshot)
+}
+
+fn save_session_durable_to_path(path: &Path, snapshot: &SessionSnapshot) -> std::io::Result<()> {
+    use std::io::Write;
+    let target = resolve_write_target(path)?;
+    let parent = target
+        .parent()
+        .ok_or_else(|| std::io::Error::other("session parent missing"))?;
+    ensure_parent_durable(parent)?;
+    let json = serde_json::to_vec_pretty(snapshot)?;
+    let nonce = NEXT_SESSION_TEMP.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let tmp = parent.join(format!(".session-{}-{nonce}.tmp", std::process::id()));
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600).custom_flags(libc::O_NOFOLLOW);
+    }
+    let mut file = options.open(&tmp)?;
+    let write_result = (|| -> std::io::Result<()> {
+        #[cfg(test)]
+        maybe_fail(DurableStep::Write)?;
+        file.write_all(&json)?;
+        #[cfg(test)]
+        maybe_fail(DurableStep::FileSync)?;
+        file.sync_all()?;
+        #[cfg(test)]
+        maybe_fail(DurableStep::Rename)?;
+        std::fs::rename(&tmp, &target)?;
+        #[cfg(test)]
+        maybe_fail(DurableStep::DirectorySync)?;
+        std::fs::File::open(parent)?.sync_all()?;
+        Ok(())
+    })();
+    if write_result.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    write_result
+}
+
+pub(crate) fn save_snapshot_ordered(
+    path: &Path,
+    snapshot: &SessionSnapshot,
+    writer: &Arc<SessionWriter>,
+) -> std::io::Result<()> {
+    let _order = writer
+        .order
+        .lock()
+        .map_err(|_| std::io::Error::other("session writer poisoned"))?;
+    writer.validate(path)?;
+    save_session_durable_to_path(path, snapshot)
+}
+
+pub(crate) fn save_ordered(
+    path: &Path,
+    snapshot: &SessionSnapshot,
+    history: Option<&SessionHistorySnapshot>,
+    writer: Option<&Arc<SessionWriter>>,
+) -> std::io::Result<()> {
+    let acquired;
+    let writer = match writer {
+        Some(writer) => writer,
+        None => {
+            acquired = SessionWriter::acquire(path)?;
+            &acquired
+        }
+    };
+    let _order = writer
+        .order
+        .lock()
+        .map_err(|_| std::io::Error::other("session writer poisoned"))?;
+    writer.validate(path)?;
+    save_to_paths(
+        path,
+        &path.with_file_name("session-history.json"),
+        snapshot,
+        history,
+    )
+}
+
+pub(crate) fn clear_ordered(
+    path: &Path,
+    writer: Option<&Arc<SessionWriter>>,
+) -> std::io::Result<()> {
+    let acquired;
+    let writer = match writer {
+        Some(writer) => writer,
+        None => {
+            acquired = SessionWriter::acquire(path)?;
+            &acquired
+        }
+    };
+    let _order = writer
+        .order
+        .lock()
+        .map_err(|_| std::io::Error::other("session writer poisoned"))?;
+    writer.validate(path)?;
+    clear_path(path)?;
+    std::fs::File::open(
+        path.parent()
+            .ok_or_else(|| std::io::Error::other("session parent missing"))?,
+    )?
+    .sync_all()?;
+    clear_path(&path.with_file_name("session-history.json"))
 }
 
 fn save_json_to_path<T: serde::Serialize>(path: &Path, snapshot: &T) -> std::io::Result<()> {
@@ -81,26 +334,6 @@ pub(super) fn clear_path(path: &Path) -> std::io::Result<()> {
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(err) => Err(err),
     }
-}
-
-pub fn save(snapshot: &SessionSnapshot, history: Option<&SessionHistorySnapshot>) {
-    let path = session_path();
-    let history_path = session_history_path();
-    if let Err(err) = save_to_paths(&path, &history_path, snapshot, history) {
-        crate::logging::session_save_failed(&path, &err.to_string());
-        return;
-    }
-    crate::logging::session_saved(&path, snapshot.workspaces.len());
-}
-
-pub fn clear() {
-    let path = session_path();
-    if let Err(err) = clear_path(&path) {
-        crate::logging::session_clear_failed(&path, &err.to_string());
-        return;
-    }
-    clear_history();
-    crate::logging::session_cleared(&path);
 }
 
 pub fn clear_history() {
@@ -229,6 +462,80 @@ mod tests {
                 }],
             }],
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn durable_session_barrier_propagates_every_write_stage_failure() {
+        let path = temp_session_path("durable-faults");
+        for step in [
+            DurableStep::Write,
+            DurableStep::FileSync,
+            DurableStep::Rename,
+            DurableStep::DirectorySync,
+        ] {
+            inject_durable_failure(Some(step));
+            let result = save_to_path(&path, &empty_snapshot());
+            inject_durable_failure(None);
+            assert!(result.is_err(), "{step:?} must not acknowledge durability");
+            assert!(!path
+                .parent()
+                .unwrap()
+                .read_dir()
+                .unwrap()
+                .filter_map(Result::ok)
+                .any(|entry| entry.file_name().to_string_lossy().ends_with(".tmp")));
+        }
+        save_to_path(&path, &empty_snapshot()).unwrap();
+        assert!(path.is_file());
+        std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn exclusive_session_writer_denies_competing_stale_saver() {
+        let path = temp_session_path("exclusive-writer");
+        let lease = SessionWriter::acquire(&path).unwrap();
+        assert!(SessionWriter::acquire(&path).is_err());
+        let mut durable = empty_snapshot();
+        durable.selected = 7;
+        save_snapshot_ordered(&path, &durable, &lease).unwrap();
+        let mut stale = empty_snapshot();
+        stale.selected = 1;
+        let stale_path = path.clone();
+        let stale_attempt =
+            std::thread::spawn(move || save_ordered(&stale_path, &stale, None, None));
+        assert!(
+            stale_attempt.join().unwrap().is_err(),
+            "concurrent older snapshot must not overwrite acknowledged edge"
+        );
+        let saved: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(saved["selected"], 7);
+        assert!(
+            clear_ordered(&path, None).is_err(),
+            "competing clear cannot remove the acknowledged edge"
+        );
+        assert!(path.exists());
+        clear_ordered(&path, Some(&lease)).unwrap();
+        assert!(!path.exists());
+        drop(lease);
+        std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn removed_writer_lock_quarantines_old_lease() {
+        let path = temp_session_path("replaced-lock");
+        let old = SessionWriter::acquire(&path).unwrap();
+        std::fs::remove_file(path.parent().unwrap().join(".session-writer.lock")).unwrap();
+        let new = SessionWriter::acquire(&path).unwrap();
+        assert!(old.validate(&path).is_err());
+        assert!(save_snapshot_ordered(&path, &empty_snapshot(), &old).is_err());
+        save_snapshot_ordered(&path, &empty_snapshot(), &new).unwrap();
+        drop(old);
+        drop(new);
+        std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
     }
 
     #[test]

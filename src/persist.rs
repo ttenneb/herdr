@@ -9,7 +9,10 @@ pub mod plugin_registry;
 mod restore;
 mod snapshot;
 
-pub use self::io::{clear, clear_history, load, load_history, save};
+pub use self::io::{clear_history, load, load_history};
+pub(crate) use self::io::{clear_ordered, save_ordered, save_snapshot_ordered, SessionWriter};
+#[cfg(test)]
+pub(crate) use self::io::{inject_durable_failure, DurableStep};
 pub use self::restore::restore;
 #[cfg(unix)]
 pub use self::restore::{handoff_pane_aliases, restore_handoff};
