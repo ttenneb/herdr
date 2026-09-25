@@ -40,6 +40,11 @@ pub(crate) struct MailboxBootstrapSession {
     pub(crate) active_execution_generation: u64,
     pub(crate) binding_generation: String,
     pub(crate) parent_report: Option<BoundParentReportRoute>,
+    pub(crate) history_only: bool,
+    history_edge: Option<(
+        crate::delegation::DelegationId,
+        Option<crate::delegation::DelegationId>,
+    )>,
     context: TrustedMailboxChannelContext,
 }
 
@@ -731,7 +736,13 @@ impl App {
             };
             // The accepted FD was authenticated. Recheck the exact persisted
             // Active execution now, before exposing its descriptor.
-            if !self
+            if candidate.history_only {
+                if self.active_pi_sender_generation(&candidate.sender_key)
+                    != Some(candidate.process_generation)
+                {
+                    continue;
+                }
+            } else if !self
                 .exact_active_mailbox_authority(&candidate.sender_key, candidate.process_generation)
             {
                 continue;
@@ -740,8 +751,14 @@ impl App {
                 .next_mailbox_bootstrap_binding
                 .checked_add(1)
                 .ok_or(MailboxBootstrapError::GrantMissing)?;
-            let parent_report = self
-                .bound_parent_report_candidate(&candidate.sender_key, candidate.process_generation);
+            let parent_report = (!candidate.history_only)
+                .then(|| {
+                    self.bound_parent_report_candidate(
+                        &candidate.sender_key,
+                        candidate.process_generation,
+                    )
+                })
+                .flatten();
             if let Some(route) = &parent_report {
                 self.provision_cross_recipient_mailbox_grant_with_id(
                     &candidate.sender_key,
@@ -753,14 +770,20 @@ impl App {
             let session = MailboxBootstrapSession {
                 caller: candidate.sender_key.clone(),
                 parent_report,
+                history_only: candidate.history_only,
+                history_edge: self.history_delegation_edge(&candidate.sender_key),
                 recipient: crate::mailbox::RecipientKey {
                     recipient_id: candidate.sender_key.clone(),
                     generation: "1".into(),
                 },
-                grant_id: format!(
-                    "offline:{}:{}",
-                    candidate.sender_key, candidate.process_generation
-                ),
+                grant_id: if candidate.history_only {
+                    String::new()
+                } else {
+                    format!(
+                        "offline:{}:{}",
+                        candidate.sender_key, candidate.process_generation
+                    )
+                },
                 active_execution_generation: candidate.process_generation,
                 binding_generation: binding_generation.clone(),
                 context,
@@ -784,10 +807,16 @@ impl App {
         };
         if issued != session
             || issued.context().binding().id() != session.binding_generation
-            || !self.exact_active_mailbox_authority(
-                &session.caller,
-                session.active_execution_generation,
-            )
+            || (session.history_only
+                && (self.active_pi_sender_generation(&session.caller)
+                    != Some(session.active_execution_generation)
+                    || self.history_delegation_edge(&session.caller) != session.history_edge
+                    || !self.history_foreground_matches(session)))
+            || (!session.history_only
+                && !self.exact_active_mailbox_authority(
+                    &session.caller,
+                    session.active_execution_generation,
+                ))
         {
             return Err(MailboxBootstrapError::GrantRevoked);
         }
@@ -811,28 +840,142 @@ impl App {
         .is_some_and(|record| authority.matches_sender_record(&record))
     }
 
-    fn live_mailbox_bootstrap_candidates(&self) -> Vec<LiveMailboxBootstrapCandidate> {
-        self.offline_mailbox_authorities
+    fn active_pi_sender_generation(&self, sender_key: &str) -> Option<u64> {
+        let terminal_id = self
+            .state
+            .terminals
+            .keys()
+            .find(|terminal_id| terminal_id.to_string() == sender_key)?;
+        let terminal = self.state.terminals.get(terminal_id)?;
+        let record = crate::sender_authority::SenderAuthorityStore::for_sender(
+            &self.sender_authority_dir,
+            sender_key,
+        )
+        .ok()?
+        .load()
+        .ok()??;
+        (record.authoritative()
+            && record.sender_key == sender_key
+            && terminal.managed_agent_kind() == Some(crate::detect::Agent::Pi)
+            && terminal.accepts_managed_agent_generation(record.process_generation))
+        .then_some(record.process_generation)
+    }
+
+    fn history_delegation_edge(
+        &self,
+        sender_key: &str,
+    ) -> Option<(
+        crate::delegation::DelegationId,
+        Option<crate::delegation::DelegationId>,
+    )> {
+        self.state
+            .delegations
+            .records()
             .values()
-            .filter_map(|authority| {
-                if !self.exact_active_mailbox_authority(
-                    &authority.sender_key,
-                    authority.sender_generation,
-                ) {
-                    return None;
-                }
-                let terminal_id = self
-                    .state
-                    .terminals
-                    .keys()
-                    .find(|terminal_id| terminal_id.to_string() == authority.sender_key)?;
-                let terminal = self.state.terminals.get(terminal_id)?;
-                // The Active record is necessary but not sufficient: it must
-                // still belong to this exact managed Pi launch.
-                if terminal.managed_agent_kind() != Some(crate::detect::Agent::Pi)
-                    || !terminal.accepts_managed_agent_generation(authority.sender_generation)
-                {
-                    return None;
+            .find_map(|record| {
+                let pane = record.pane_id?;
+                let (ws_idx, _) = self.find_pane(pane)?;
+                (self.state.workspaces[ws_idx].terminal_id(pane)?.to_string() == sender_key)
+                    .then_some((record.id, record.parent_id))
+            })
+    }
+
+    fn history_foreground_matches(&self, session: &MailboxBootstrapSession) -> bool {
+        self.state
+            .terminals
+            .keys()
+            .find(|terminal_id| terminal_id.to_string() == session.caller)
+            .and_then(|terminal_id| self.mailbox_bootstrap_foreground_job(terminal_id))
+            .is_some_and(|job| {
+                job.processes
+                    .iter()
+                    .any(|process| process.pid == session.context.foreground_pi_pid())
+            })
+    }
+
+    pub(crate) fn mailbox_bootstrap_history_snapshot(
+        &self,
+        session: &MailboxBootstrapSession,
+        protocol: &str,
+    ) -> Result<crate::mailbox_v1::Snapshot, MailboxBootstrapError> {
+        self.mailbox_bootstrap_session_current(session)?;
+        if protocol != crate::mailbox_v1::PROTOCOL {
+            return Err(MailboxBootstrapError::InvalidRequest);
+        }
+        if self.history_delegation_edge(&session.caller) != session.history_edge
+            || self.active_pi_sender_generation(&session.caller)
+                != Some(session.active_execution_generation)
+            || !self.history_foreground_matches(session)
+        {
+            return Err(MailboxBootstrapError::GrantRevoked);
+        }
+        let store = crate::mailbox::MailboxStore::open(&self.sender_authority_dir)
+            .map_err(|_| MailboxBootstrapError::GrantMissing)?;
+        let mut snapshot = crate::mailbox_v1::snapshot(
+            &store
+                .load()
+                .map_err(|_| MailboxBootstrapError::GrantMissing)?,
+            &session.recipient,
+        )
+        .map_err(|_| MailboxBootstrapError::GrantMissing)?;
+        let settled: std::collections::HashSet<_> = snapshot
+            .head_states
+            .iter()
+            .filter(|state| state.lifecycle == crate::mailbox_v1::HeadLifecycle::Settled)
+            .map(|state| state.stable_id.clone())
+            .collect();
+        // The view cannot authorize current work: it carries only exact terminal
+        // heads and their receipts, not a claim or any unresolved head.
+        snapshot
+            .heads
+            .retain(|head| settled.contains(&head.stable_id));
+        snapshot
+            .receipts
+            .retain(|receipt| settled.contains(&receipt.stable_id));
+        snapshot
+            .head_states
+            .retain(|state| settled.contains(&state.stable_id));
+        snapshot.claim = None;
+        if snapshot.heads.iter().any(|head| {
+            !snapshot.receipts.iter().any(|receipt| {
+                receipt.stable_id == head.stable_id
+                    && receipt.revision == head.revision
+                    && receipt.digest == head.digest
+                    && receipt.delivery_digest == head.delivery_digest
+            })
+        }) {
+            return Err(MailboxBootstrapError::GrantMissing);
+        }
+        Ok(snapshot)
+    }
+
+    fn live_mailbox_bootstrap_candidates(&self) -> Vec<LiveMailboxBootstrapCandidate> {
+        self.state
+            .terminals
+            .keys()
+            .filter_map(|terminal_id| {
+                let sender_key = terminal_id.to_string();
+                // Persisted Active generation, managed terminal generation and
+                // foreground process must all match before any history scope.
+                let process_generation = self.active_pi_sender_generation(&sender_key)?;
+                let history_only =
+                    !self.exact_active_mailbox_authority(&sender_key, process_generation);
+                if history_only {
+                    let recipient = crate::mailbox::RecipientKey {
+                        recipient_id: sender_key.clone(),
+                        generation: "1".into(),
+                    };
+                    let store =
+                        crate::mailbox::MailboxStore::open(&self.sender_authority_dir).ok()?;
+                    let snapshot =
+                        crate::mailbox_v1::snapshot(&store.load().ok()?, &recipient).ok()?;
+                    if !snapshot
+                        .head_states
+                        .iter()
+                        .any(|state| state.lifecycle == crate::mailbox_v1::HeadLifecycle::Settled)
+                    {
+                        return None;
+                    }
                 }
                 let job = self.mailbox_bootstrap_foreground_job(terminal_id)?;
                 let foreground_pi_pid = crate::detect::identify_agent_process_in_job(&job)
@@ -849,9 +992,10 @@ impl App {
                         })
                     })?;
                 Some(LiveMailboxBootstrapCandidate {
-                    sender_key: authority.sender_key.clone(),
-                    process_generation: authority.sender_generation,
+                    sender_key,
+                    process_generation,
                     foreground_pi_pid,
+                    history_only,
                 })
             })
             .collect()
@@ -920,4 +1064,5 @@ pub(crate) struct LiveMailboxBootstrapCandidate {
     sender_key: String,
     process_generation: u64,
     foreground_pi_pid: u32,
+    history_only: bool,
 }

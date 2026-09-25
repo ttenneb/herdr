@@ -16,6 +16,21 @@ impl App {
         params: Value,
     ) -> Result<Value, MailboxBootstrapError> {
         self.mailbox_bootstrap_session_current(session)?;
+        if method == "mailbox.history_snapshot" {
+            #[derive(serde::Deserialize)]
+            #[serde(rename_all = "camelCase", deny_unknown_fields)]
+            struct HistorySnapshotParams {
+                protocol: String,
+            }
+            let params: HistorySnapshotParams = serde_json::from_value(params)
+                .map_err(|_| MailboxBootstrapError::InvalidRequest)?;
+            let snapshot = self.mailbox_bootstrap_history_snapshot(session, &params.protocol)?;
+            return serde_json::to_value(ResponseResult::MailboxSnapshot { snapshot })
+                .map_err(|_| MailboxBootstrapError::InvalidRequest);
+        }
+        if session.history_only {
+            return Err(MailboxBootstrapError::GrantRevoked);
+        }
         let id = "mailbox-bootstrap".to_owned();
         let response = match method {
             "mailbox.offline_submit" | "report_submit" => {

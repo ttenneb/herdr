@@ -36,7 +36,12 @@ pub(crate) fn mailbox_bootstrap_socket_path() -> PathBuf {
 pub(crate) struct MailboxBootstrapDescriptor {
     pub protocol_version: u16,
     /// The typed, server-scoped report path available on this accepted stream.
-    pub report_submit: ReportSubmitAdvertisement,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub report_submit: Option<ReportSubmitAdvertisement>,
+    /// Read-only terminal history for this exact current Pi execution. It
+    /// cannot expose pending heads or mint a grant for old work.
+    pub history_snapshot: ReportSubmitAdvertisement,
+    pub history_only: bool,
     /// Offered only when the server can validate an exact active delegation
     /// parent. Admission here is a durable mailbox receipt, not Pi Gate
     /// admission or the parent's acceptance of the report.
@@ -71,10 +76,15 @@ impl MailboxBootstrapDescriptor {
     fn from_session(session: &MailboxBootstrapSession, endpoint: &Path) -> Self {
         Self {
             protocol_version: MAILBOX_BOOTSTRAP_PROTOCOL_VERSION,
-            report_submit: ReportSubmitAdvertisement {
+            report_submit: (!session.history_only).then_some(ReportSubmitAdvertisement {
                 method: "report_submit",
                 protocol: crate::mailbox_v1::PROTOCOL,
+            }),
+            history_snapshot: ReportSubmitAdvertisement {
+                method: "mailbox.history_snapshot",
+                protocol: crate::mailbox_v1::PROTOCOL,
             },
+            history_only: session.history_only,
             parent_report: session
                 .parent_report
                 .as_ref()
@@ -1282,6 +1292,25 @@ mod tests {
             .expect("successor binding")
             .to_owned();
         assert_eq!(descriptor["result"]["recipient"], json!(logical_recipient));
+        assert_eq!(descriptor["result"]["historyOnly"], false);
+        assert_eq!(
+            descriptor["result"]["reportSubmit"]["method"],
+            "report_submit"
+        );
+        let terminal_history = exchange(
+            &mut listener,
+            &mut app,
+            &mut client,
+            json!({
+                "method":"mailbox.history_snapshot", "bindingGeneration":binding,
+                "params":{"protocol":crate::mailbox_v1::PROTOCOL}
+            }),
+        );
+        assert_eq!(terminal_history["ok"], true);
+        assert!(terminal_history["result"]["snapshot"]["heads"]
+            .as_array()
+            .unwrap()
+            .is_empty());
 
         let unrelated = exchange(
             &mut listener,
@@ -1363,6 +1392,230 @@ mod tests {
 
         drop(listener);
         std::fs::remove_dir_all(directory).expect("remove test directory");
+    }
+
+    #[test]
+    fn successor_without_mutating_grant_reads_only_exact_settled_history_on_same_terminal() {
+        let (mut app, directory, sender) = active_app();
+        let recipient = crate::mailbox::RecipientKey {
+            recipient_id: sender.clone(),
+            generation: "1".into(),
+        };
+        let store = crate::mailbox::MailboxStore::open(&directory).unwrap();
+        for (stable_id, digest, delivery_digest) in
+            [("old-settled", "a", "b"), ("old-unresolved", "c", "d")]
+        {
+            let response = app.handle_mailbox_offline_submit(
+                "seed".into(),
+                crate::api::schema::MailboxOfflineSubmitParams {
+                    caller: sender.clone(),
+                    grant_id: format!("offline:{sender}:1"),
+                    recipient: recipient.clone(),
+                    submit: crate::mailbox_v1::Submit {
+                        protocol: crate::mailbox_v1::PROTOCOL.into(),
+                        stable_id: stable_id.into(),
+                        revision: 1,
+                        digest: digest.repeat(64),
+                        delivery_digest: delivery_digest.repeat(64),
+                        subject: "old".into(),
+                        body: "old body".into(),
+                        message_id: stable_id.into(),
+                        kind: "report".into(),
+                        priority: "normal".into(),
+                        original_sequence: 1,
+                    },
+                },
+            );
+            assert!(serde_json::from_str::<crate::api::schema::SuccessResponse>(&response).is_ok());
+        }
+        let settled = store.claim_next(&recipient).unwrap().unwrap();
+        assert_eq!(settled.stable_id, "old-settled");
+        store
+            .resolve_claim(
+                &settled.claim_id,
+                crate::mailbox::ClaimResolutionOutcome::Settled,
+            )
+            .unwrap();
+        let parent_pane = app.state.workspaces[0].tabs[0].root_pane.unwrap();
+        let parent_edge = app.state.delegations.create(None, None, None).unwrap();
+        let child_edge = app
+            .state
+            .delegations
+            .create(Some(parent_pane), Some(parent_edge), None)
+            .unwrap();
+        let sender_store =
+            crate::sender_authority::SenderAuthorityStore::for_sender(&directory, &sender).unwrap();
+        sender_store
+            .cas(
+                Some(2),
+                crate::sender_authority::SenderAuthorityRecord {
+                    sender_key: sender.clone(),
+                    process_generation: 2,
+                    phase: crate::sender_authority::SenderAuthorityPhase::Preparing,
+                    transition_revision: 3,
+                },
+            )
+            .unwrap();
+        sender_store.promote_active(&sender, 2).unwrap();
+        app.state
+            .terminals
+            .values_mut()
+            .find(|terminal| terminal.id.to_string() == sender)
+            .unwrap()
+            .set_managed_agent_generation(2);
+        // Simulate the actual RED boundary: durable gen2 is Active and the
+        // foreground Pi is current, but App missed installing a mutating grant.
+        assert!(!app.offline_mailbox_authority_current(&sender).unwrap());
+        let mut listener = listener(&directory);
+        let mut client = UnixStream::connect(listener.path()).unwrap();
+        client
+            .set_read_timeout(Some(Duration::from_secs(1)))
+            .unwrap();
+        let descriptor = bootstrap(&mut listener, &mut app, &mut client);
+        assert_eq!(descriptor["ok"], true);
+        assert_eq!(descriptor["result"]["historyOnly"], true);
+        assert_eq!(
+            descriptor["result"]["historySnapshot"],
+            json!({
+                "method":"mailbox.history_snapshot","protocol":crate::mailbox_v1::PROTOCOL
+            })
+        );
+        assert!(descriptor["result"].get("reportSubmit").is_none());
+        assert_eq!(descriptor["result"]["grantId"], "");
+        let binding = descriptor["result"]["bindingGeneration"].as_str().unwrap();
+        let history = exchange(
+            &mut listener,
+            &mut app,
+            &mut client,
+            json!({
+                "method":"mailbox.history_snapshot","bindingGeneration":binding,
+                "params":{"protocol":crate::mailbox_v1::PROTOCOL}
+            }),
+        );
+        assert_eq!(history["ok"], true);
+        let snapshot = &history["result"]["snapshot"];
+        assert_eq!(snapshot["heads"].as_array().unwrap().len(), 1);
+        assert_eq!(snapshot["heads"][0]["stableId"], "old-settled");
+        assert_eq!(snapshot["receipts"].as_array().unwrap().len(), 1);
+        assert_eq!(snapshot["headStates"][0]["lifecycle"], "settled");
+        assert!(snapshot.get("claim").is_none());
+        for method in [
+            "report_submit",
+            "mailbox.offline_submit",
+            "mailbox.snapshot",
+            "mailbox.claim",
+            "mailbox.edit",
+            "mailbox.resolve",
+        ] {
+            let denied = exchange(
+                &mut listener,
+                &mut app,
+                &mut client,
+                json!({
+                    "method":method,"bindingGeneration":binding,"params":{}
+                }),
+            );
+            assert_eq!(
+                denied["error"]["code"], "grant_revoked",
+                "{method}: {denied}"
+            );
+        }
+        let forged = exchange(
+            &mut listener,
+            &mut app,
+            &mut client,
+            json!({
+                "method":"mailbox.history_snapshot","bindingGeneration":"unrelated","params":{"protocol":crate::mailbox_v1::PROTOCOL}
+            }),
+        );
+        assert_eq!(forged["error"]["code"], "grant_revoked");
+        let selector = exchange(
+            &mut listener,
+            &mut app,
+            &mut client,
+            json!({
+                "method":"mailbox.history_snapshot", "bindingGeneration":binding,
+                "params":{"protocol":crate::mailbox_v1::PROTOCOL,
+                    "recipient":{"recipientId":"unrelated","generation":"1"}}
+            }),
+        );
+        assert_eq!(selector["error"]["code"], "invalid_request");
+        app.state.delegations.reparent(child_edge, None).unwrap();
+        let revoked = exchange(
+            &mut listener,
+            &mut app,
+            &mut client,
+            json!({
+                "method":"mailbox.history_snapshot","bindingGeneration":binding,"params":{"protocol":crate::mailbox_v1::PROTOCOL}
+            }),
+        );
+        assert_eq!(revoked["error"]["code"], "grant_revoked");
+        app.state
+            .delegations
+            .reparent(child_edge, Some(parent_edge))
+            .unwrap();
+        sender_store
+            .cas(
+                Some(4),
+                crate::sender_authority::SenderAuthorityRecord {
+                    sender_key: sender.clone(),
+                    process_generation: 3,
+                    phase: crate::sender_authority::SenderAuthorityPhase::Active,
+                    transition_revision: 5,
+                },
+            )
+            .unwrap();
+        app.state
+            .terminals
+            .values_mut()
+            .find(|terminal| terminal.id.to_string() == sender)
+            .unwrap()
+            .set_managed_agent_generation(3);
+        let stale = exchange(
+            &mut listener,
+            &mut app,
+            &mut client,
+            json!({
+                "method":"mailbox.history_snapshot","bindingGeneration":binding,
+                "params":{"protocol":crate::mailbox_v1::PROTOCOL}
+            }),
+        );
+        assert_eq!(stale["error"]["code"], "grant_revoked");
+        sender_store
+            .cas(
+                Some(5),
+                crate::sender_authority::SenderAuthorityRecord {
+                    sender_key: "unrelated".into(),
+                    process_generation: 4,
+                    phase: crate::sender_authority::SenderAuthorityPhase::Active,
+                    transition_revision: 6,
+                },
+            )
+            .unwrap();
+        app.state
+            .terminals
+            .values_mut()
+            .find(|terminal| terminal.id.to_string() == sender)
+            .unwrap()
+            .set_managed_agent_generation(4);
+        let mut unrelated_client = UnixStream::connect(listener.path()).unwrap();
+        unrelated_client
+            .set_read_timeout(Some(Duration::from_secs(1)))
+            .unwrap();
+        let unrelated_bootstrap = bootstrap(&mut listener, &mut app, &mut unrelated_client);
+        assert_eq!(unrelated_bootstrap["error"]["code"], "grant_missing");
+        let recovered = crate::mailbox::MailboxStore::open(&directory)
+            .unwrap()
+            .load()
+            .unwrap();
+        assert_eq!(recovered.heads.len(), 2);
+        assert_eq!(recovered.receipts.len(), 2);
+        assert_eq!(
+            recovered.resolutions[&settled.claim_id].outcome,
+            crate::mailbox::ClaimResolutionOutcome::Settled
+        );
+        drop(listener);
+        std::fs::remove_dir_all(directory).unwrap();
     }
 
     #[test]
