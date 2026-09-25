@@ -130,12 +130,27 @@ pub struct MailboxGrant {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum MailboxRecord {
-    Head { head: MailboxHead },
-    HeadEdit { edit: MailboxHeadEditRecord },
-    Receipt { receipt: AdmissionReceipt },
-    Claim { claim: Claim },
-    Resolution { resolution: ClaimResolution },
-    Grant { grant: MailboxGrant },
+    Head {
+        head: MailboxHead,
+    },
+    HeadEdit {
+        edit: MailboxHeadEditRecord,
+    },
+    Receipt {
+        receipt: AdmissionReceipt,
+    },
+    Claim {
+        claim: Claim,
+    },
+    Resolution {
+        resolution: ClaimResolution,
+    },
+    Grant {
+        grant: MailboxGrant,
+    },
+    ChildReport {
+        event: crate::child_report::ChildReportEvent,
+    },
 }
 
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
@@ -145,6 +160,10 @@ pub struct RecoveredMailbox {
     pub claims: BTreeMap<String, Claim>,
     pub resolutions: BTreeMap<String, ClaimResolution>,
     pub grants: BTreeMap<String, MailboxGrant>,
+    /// Full identity and provider coverage are required before a missing status.
+    pub child_report_events: Vec<crate::child_report::ChildReportEvent>,
+    /// Count of durably replayed records, including other mailbox events.
+    pub record_cursor: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -202,6 +221,28 @@ impl MailboxStore {
             recovered.apply(record)?;
         }
         Ok(recovered)
+    }
+
+    /// Additive child-local Todo/report observation; only authenticated App
+    /// dispatch may call this. The Pi producer is a separate required contract.
+    /// The return cursor is durable and stable across recovery, not an ACK to Pi.
+    pub fn append_child_report_event(
+        &self,
+        event: crate::child_report::ChildReportEvent,
+    ) -> Result<u64, MailboxError> {
+        self.with_exclusive_lock(|| {
+            let recovered = self.load()?;
+            match crate::child_report::validate_next(&recovered.child_report_events, &event) {
+                Ok(false) => return Ok(recovered.record_cursor),
+                Err(()) => return Err(MailboxError::ConflictingDuplicate),
+                Ok(true) => {}
+            }
+            self.append_synced(&MailboxRecord::ChildReport { event })?;
+            recovered
+                .record_cursor
+                .checked_add(1)
+                .ok_or(MailboxError::InvalidRecord)
+        })
     }
 
     pub fn provision_grant(&self, grant: MailboxGrant) -> Result<(), MailboxError> {
@@ -487,6 +528,7 @@ impl MailboxStore {
     }
 
     fn append_synced(&self, record: &MailboxRecord) -> Result<(), MailboxError> {
+        let newly_created = !self.stream_path.exists();
         let mut stream = OpenOptions::new()
             .create(true)
             .append(true)
@@ -495,6 +537,14 @@ impl MailboxStore {
             .map_err(|error| MailboxError::Io(error.to_string()))?;
         stream.write_all(b"\n")?;
         stream.sync_all()?;
+        if newly_created {
+            File::open(
+                self.stream_path
+                    .parent()
+                    .ok_or(MailboxError::InvalidRecord)?,
+            )?
+            .sync_all()?;
+        }
         Ok(())
     }
 
@@ -516,19 +566,50 @@ impl MailboxStore {
                 ));
             }
         }
+        if !self.owns_exclusive_lock(&lock) {
+            return Err(MailboxError::Io("mailbox writer lease was replaced".into()));
+        }
         let result = operation();
+        let still_owned = self.owns_exclusive_lock(&lock);
         #[cfg(unix)]
         unsafe {
             use std::os::fd::AsRawFd;
             libc::flock(lock.as_raw_fd(), libc::LOCK_UN);
         }
+        if !still_owned {
+            return Err(MailboxError::Io("mailbox writer lease was replaced".into()));
+        }
         result
+    }
+
+    #[cfg(unix)]
+    fn owns_exclusive_lock(&self, lock: &File) -> bool {
+        use std::os::unix::fs::MetadataExt;
+        let Ok(opened) = lock.metadata() else {
+            return false;
+        };
+        let Ok(path) = std::fs::symlink_metadata(&self.lock_path) else {
+            return false;
+        };
+        opened.is_file()
+            && path.is_file()
+            && opened.dev() == path.dev()
+            && opened.ino() == path.ino()
+            && opened.uid() == unsafe { libc::geteuid() }
+            && opened.nlink() == 1
+    }
+
+    #[cfg(not(unix))]
+    fn owns_exclusive_lock(&self, _lock: &File) -> bool {
+        // Preserve the existing mailbox policy; #119 gates trusted Pi route
+        // identity independently and this additive feature cannot bypass it.
+        true
     }
 }
 
 impl RecoveredMailbox {
     fn apply(&mut self, record: MailboxRecord) -> Result<(), MailboxError> {
-        match record {
+        let result = match record {
             MailboxRecord::Head { head } => {
                 insert_exact(&mut self.heads, head.stable_id.clone(), head)
             }
@@ -568,7 +649,22 @@ impl RecoveredMailbox {
             MailboxRecord::Grant { grant } => {
                 insert_exact(&mut self.grants, grant.grant_id.clone(), grant)
             }
-        }
+            MailboxRecord::ChildReport { event } => {
+                match crate::child_report::validate_next(&self.child_report_events, &event) {
+                    Ok(true) => {
+                        self.child_report_events.push(event);
+                        Ok(())
+                    }
+                    Ok(false) | Err(()) => Err(MailboxError::CorruptRecord),
+                }
+            }
+        };
+        result?;
+        self.record_cursor = self
+            .record_cursor
+            .checked_add(1)
+            .ok_or(MailboxError::CorruptRecord)?;
+        Ok(())
     }
 
     fn apply_head_edit(&mut self, edit: MailboxHeadEditRecord) -> Result<(), MailboxError> {
@@ -718,6 +814,23 @@ mod tests {
         ));
         MailboxStore::open(path).unwrap()
     }
+    #[cfg(unix)]
+    #[test]
+    fn replaced_mailbox_lock_never_acknowledges_an_exclusive_operation() {
+        let store = temporary_store();
+        let result: Result<(), MailboxError> = store.with_exclusive_lock(|| {
+            let old = store.lock_path.with_extension("old");
+            std::fs::rename(&store.lock_path, old)?;
+            let _replacement = OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&store.lock_path)?;
+            Ok(())
+        });
+        assert!(matches!(result, Err(MailboxError::Io(_))));
+        std::fs::remove_dir_all(store.lock_path.parent().unwrap()).unwrap();
+    }
+
     fn head() -> MailboxHead {
         MailboxHead {
             stable_id: "recipient\0sender\0message".into(),

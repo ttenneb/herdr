@@ -1010,6 +1010,116 @@ mod tests {
     }
 
     #[test]
+    fn parent_read_only_child_disposition_is_exact_and_cursor_scoped() {
+        let (mut app, directory, child) = active_app();
+        let (parent, _) = active_managed_recipient(&mut app, &directory);
+        let child_pane = app.state.workspaces[0].tabs[0].root_pane.unwrap();
+        let parent_pane = app.state.workspaces[1].tabs[0].root_pane.unwrap();
+        let parent_id = app
+            .state
+            .delegations
+            .create(Some(parent_pane), None, None)
+            .unwrap();
+        let child_id = app
+            .state
+            .delegations
+            .create(Some(child_pane), Some(parent_id), None)
+            .unwrap();
+        // The test process is the parent Pi peer. The child still has a
+        // separately trusted exact live birth, but cannot claim this socket.
+        install_trusted_test_pi(&mut app, &directory, &child, std::process::id() + 2);
+        install_trusted_test_pi(&mut app, &directory, &parent, std::process::id());
+        ready_test_route(&mut app, &directory, child_id, parent_id);
+        let mut listener = listener(&directory);
+        let mut client = UnixStream::connect(listener.path()).unwrap();
+        client
+            .set_read_timeout(Some(Duration::from_secs(1)))
+            .unwrap();
+        let descriptor = bootstrap(&mut listener, &mut app, &mut client);
+        assert_eq!(descriptor["result"]["caller"], parent);
+        let binding = descriptor["result"]["bindingGeneration"].as_str().unwrap();
+        let params = json!({"protocol":crate::mailbox_v1::PROTOCOL,
+                            "childDelegationId":child_id.to_string()});
+        let first = exchange(
+            &mut listener,
+            &mut app,
+            &mut client,
+            json!({
+                "method":"delegation.child_report_disposition",
+                "bindingGeneration":binding,"params":params
+            }),
+        );
+        assert_eq!(
+            first["result"]["disposition"]["kind"], "unknown_unattested",
+            "{first}"
+        );
+        let cursor = first["result"]["disposition"]["cursor"].as_u64().unwrap();
+        let again = exchange(
+            &mut listener,
+            &mut app,
+            &mut client,
+            json!({
+                "method":"delegation.child_report_disposition",
+                "bindingGeneration":binding,
+                "params":{"protocol":crate::mailbox_v1::PROTOCOL,
+                          "childDelegationId":child_id.to_string(),"afterCursor":cursor}
+            }),
+        );
+        assert_eq!(again["result"]["changed"], false);
+        let future = exchange(
+            &mut listener,
+            &mut app,
+            &mut client,
+            json!({
+                "method":"delegation.child_report_disposition",
+                "bindingGeneration":binding,
+                "params":{"protocol":crate::mailbox_v1::PROTOCOL,
+                          "childDelegationId":child_id.to_string(),"afterCursor":cursor + 1}
+            }),
+        );
+        assert_eq!(future["error"]["code"], "invalid_request");
+        let unrelated = exchange(
+            &mut listener,
+            &mut app,
+            &mut client,
+            json!({
+                "method":"delegation.child_report_disposition",
+                "bindingGeneration":binding,
+                "params":{"protocol":crate::mailbox_v1::PROTOCOL,"childDelegationId":"d999999"}
+            }),
+        );
+        assert_eq!(unrelated["error"]["code"], "grant_revoked");
+        // Replacement revokes even a read-only stream; an old parent never
+        // receives current-child completion information after its generation.
+        crate::sender_authority::SenderAuthorityStore::for_sender(&directory, &parent)
+            .unwrap()
+            .cas(
+                Some(2),
+                crate::sender_authority::SenderAuthorityRecord {
+                    sender_key: parent.clone(),
+                    process_generation: 2,
+                    phase: crate::sender_authority::SenderAuthorityPhase::Active,
+                    transition_revision: 3,
+                },
+            )
+            .unwrap();
+        let stale = exchange(
+            &mut listener,
+            &mut app,
+            &mut client,
+            json!({
+                "method":"delegation.child_report_disposition",
+                "bindingGeneration":binding,
+                "params":{"protocol":crate::mailbox_v1::PROTOCOL,"childDelegationId":child_id.to_string()}
+            }),
+        );
+        assert_eq!(stale["error"]["code"], "grant_revoked");
+        drop(client);
+        drop(listener);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
     fn bound_parent_report_route_is_durable_and_rejects_selectors_non_reports_and_stale_parent() {
         let (mut app, directory, sender) = active_app();
         let (parent, _) = active_managed_recipient(&mut app, &directory);
@@ -1041,6 +1151,18 @@ mod tests {
             parent
         );
         let binding = descriptor["result"]["bindingGeneration"].as_str().unwrap();
+        let wrong_parent = exchange(
+            &mut listener,
+            &mut app,
+            &mut client,
+            json!({
+                "method":"delegation.child_report_disposition",
+                "bindingGeneration":binding,
+                "params":{"protocol":crate::mailbox_v1::PROTOCOL,
+                          "childDelegationId":child_id.to_string()}
+            }),
+        );
+        assert_eq!(wrong_parent["error"]["code"], "grant_revoked");
         let submit = json!({
             "protocol": crate::mailbox_v1::PROTOCOL, "stableId": "parent-report",
             "revision": 1, "digest": "a".repeat(64), "deliveryDigest": "b".repeat(64),
@@ -1097,6 +1219,22 @@ mod tests {
             parent
         );
         assert_eq!(recovered.heads["parent-report"].sender, sender);
+        // A report from the authenticated bound stream durably preannounces
+        // its exact route attempt before the admitted head and receipt.
+        assert_eq!(recovered.child_report_events.len(), 1);
+        assert!(matches!(
+            &recovered.child_report_events[0],
+            crate::child_report::ChildReportEvent::Attempt {
+                route, attempt_id, delivery_digest
+            } if attempt_id == "parent-message"
+                && delivery_digest == &"b".repeat(64)
+                && route.child_delegation_id == child_id.to_string()
+                && route.parent_delegation_id == parent_id.to_string()
+                && route.child_terminal_id == sender
+                && route.parent_terminal_id == parent
+                && crate::child_report::project(route, &recovered).kind
+                    == crate::child_report::ReportDispositionKind::AdmittedExactReport
+        ));
         assert_eq!(
             crate::mailbox_v1::snapshot(
                 &recovered,

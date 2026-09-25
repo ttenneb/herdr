@@ -59,6 +59,7 @@ mod api;
 mod app;
 mod build_info;
 mod checksum;
+mod child_report;
 mod cli;
 mod client;
 mod config;

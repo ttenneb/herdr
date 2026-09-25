@@ -607,6 +607,90 @@ impl App {
         Ok(route.clone())
     }
 
+    /// Only the server selects these fields from its already revalidated
+    /// accepted child stream; a wire frame can never supply an identity.
+    pub(crate) fn child_report_route_identity(
+        &self,
+        session: &MailboxBootstrapSession,
+        route: &BoundParentReportRoute,
+    ) -> Option<crate::child_report::RouteIdentity> {
+        let ready = self.ready_delegation_routes.get(&route.child_delegation)?;
+        if ready.parent != route.parent_delegation
+            || ready.epoch != route.route_epoch
+            || ready.child_terminal.to_string() != session.caller
+            || ready.child_generation != session.active_execution_generation
+        {
+            return None;
+        }
+        self.ready_report_identity(ready)
+    }
+
+    fn ready_report_identity(
+        &self,
+        ready: &ReadyDelegationRoute,
+    ) -> Option<crate::child_report::RouteIdentity> {
+        let child_ws = self.find_pane(ready.child_pane)?.0;
+        let parent_ws = self.find_pane(ready.parent_pane)?.0;
+        Some(crate::child_report::RouteIdentity {
+            child_delegation_id: ready.child.to_string(),
+            parent_delegation_id: ready.parent.to_string(),
+            child_pane_id: self.public_pane_id(child_ws, ready.child_pane)?,
+            parent_pane_id: self.public_pane_id(parent_ws, ready.parent_pane)?,
+            child_terminal_id: ready.child_terminal.to_string(),
+            parent_terminal_id: ready.parent_terminal.to_string(),
+            child_process_generation: ready.child_generation,
+            parent_process_generation: ready.parent_generation,
+            child_session: ready.child_session.clone(),
+            parent_session: ready.parent_session.clone(),
+            child_route_revision: ready.child_revision,
+            parent_route_revision: ready.parent_revision,
+            route_epoch: ready.epoch.clone(),
+        })
+    }
+
+    /// Parent-scoped, read-only observation. A local CLI selector alone is
+    /// insufficient: the accepted stream must be the current parent Pi.
+    pub(crate) fn child_report_disposition_for_parent(
+        &self,
+        session: &MailboxBootstrapSession,
+        child: crate::delegation::DelegationId,
+    ) -> Result<crate::child_report::ReportDisposition, MailboxBootstrapError> {
+        self.mailbox_bootstrap_session_current(session)?;
+        if !self
+            .session_writer_healthy
+            .load(std::sync::atomic::Ordering::Acquire)
+            || !self
+                .session_writer
+                .as_ref()
+                .is_some_and(|writer| writer.validate(&self.session_save_path).is_ok())
+        {
+            return Err(MailboxBootstrapError::GrantRevoked);
+        }
+        let ready = self
+            .ready_delegation_routes
+            .get(&child)
+            .ok_or(MailboxBootstrapError::GrantRevoked)?;
+        if ready.parent_terminal.to_string() != session.caller
+            || ready.parent_generation != session.active_execution_generation
+        {
+            return Err(MailboxBootstrapError::GrantRevoked);
+        }
+        let mut current = self
+            .ready_route_shape(ready.child, ready.parent)
+            .ok_or(MailboxBootstrapError::GrantRevoked)?;
+        current.epoch = ready.epoch.clone();
+        if &current != ready {
+            return Err(MailboxBootstrapError::GrantRevoked);
+        }
+        let identity = self
+            .ready_report_identity(ready)
+            .ok_or(MailboxBootstrapError::GrantRevoked)?;
+        let recovered = crate::mailbox::MailboxStore::open(&self.sender_authority_dir)
+            .and_then(|store| store.load())
+            .map_err(|_| MailboxBootstrapError::GrantMissing)?;
+        Ok(crate::child_report::project(&identity, &recovered))
+    }
+
     /// Provisions a cross-recipient grant only for an accepted, current Pi
     /// bootstrap channel. The stream session supplies A; the request can name
     /// only a currently managed recipient target, never a caller, grant, or

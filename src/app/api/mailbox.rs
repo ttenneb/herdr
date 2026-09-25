@@ -28,6 +28,36 @@ impl App {
             return serde_json::to_value(ResponseResult::MailboxSnapshot { snapshot })
                 .map_err(|_| MailboxBootstrapError::InvalidRequest);
         }
+        if method == "delegation.child_report_disposition" {
+            #[derive(serde::Deserialize)]
+            #[serde(rename_all = "camelCase", deny_unknown_fields)]
+            struct DispositionParams {
+                protocol: String,
+                child_delegation_id: String,
+                #[serde(default)]
+                after_cursor: Option<u64>,
+            }
+            let params: DispositionParams = serde_json::from_value(params)
+                .map_err(|_| MailboxBootstrapError::InvalidRequest)?;
+            if params.protocol != crate::mailbox_v1::PROTOCOL {
+                return Err(MailboxBootstrapError::InvalidRequest);
+            }
+            let child: crate::delegation::DelegationId = params
+                .child_delegation_id
+                .parse()
+                .map_err(|_| MailboxBootstrapError::InvalidRequest)?;
+            let disposition = self.child_report_disposition_for_parent(session, child)?;
+            if params
+                .after_cursor
+                .is_some_and(|cursor| cursor > disposition.cursor)
+            {
+                return Err(MailboxBootstrapError::InvalidRequest);
+            }
+            let changed = params
+                .after_cursor
+                .is_none_or(|cursor| disposition.cursor > cursor);
+            return Ok(serde_json::json!({ "disposition": disposition, "changed": changed }));
+        }
         if session.history_only {
             return Err(MailboxBootstrapError::GrantRevoked);
         }
@@ -56,6 +86,24 @@ impl App {
                     return Err(MailboxBootstrapError::InvalidRequest);
                 }
                 let route = self.bound_parent_report_current(session)?;
+                let identity = self
+                    .child_report_route_identity(session, &route)
+                    .ok_or(MailboxBootstrapError::GrantRevoked)?;
+                // An actual accepted-stream submission is an attempt, not a
+                // completion. Persist the intent before mailbox admission so
+                // a crash between the two remains visibly uncertain.
+                let authority = self
+                    .offline_mailbox_authorities
+                    .get(&session.caller)
+                    .ok_or(MailboxBootstrapError::GrantRevoked)?;
+                authority
+                    .store
+                    .append_child_report_event(crate::child_report::ChildReportEvent::Attempt {
+                        route: identity,
+                        attempt_id: submit.message_id.clone(),
+                        delivery_digest: submit.delivery_digest.clone(),
+                    })
+                    .map_err(|_| MailboxBootstrapError::GrantMissing)?;
                 self.handle_mailbox_server_scoped_submit(
                     id,
                     MailboxOfflineSubmitParams {
