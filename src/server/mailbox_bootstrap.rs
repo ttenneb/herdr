@@ -67,6 +67,10 @@ pub(crate) struct ReportSubmitAdvertisement {
 #[serde(rename_all = "camelCase")]
 pub(crate) struct ParentReportAdvertisement {
     pub method: &'static str,
+    pub prepared_method: &'static str,
+    pub coverage_method: &'static str,
+    /// A durable observation is not a trusted all-path closure certificate.
+    pub coverage_qualified: bool,
     pub protocol: &'static str,
     pub recipient: crate::mailbox::RecipientKey,
     pub grant_id: String,
@@ -90,6 +94,9 @@ impl MailboxBootstrapDescriptor {
                 .as_ref()
                 .map(|route| ParentReportAdvertisement {
                     method: "report_submit_parent",
+                    prepared_method: "report_prepared",
+                    coverage_method: "report_coverage",
+                    coverage_qualified: false,
                     protocol: crate::mailbox_v1::PROTOCOL,
                     recipient: route.recipient.clone(),
                     grant_id: route.grant_id.clone(),
@@ -1147,6 +1154,14 @@ mod tests {
             "report_submit_parent"
         );
         assert_eq!(
+            descriptor["result"]["parentReport"]["preparedMethod"],
+            "report_prepared"
+        );
+        assert_eq!(
+            descriptor["result"]["parentReport"]["coverageQualified"],
+            false
+        );
+        assert_eq!(
             descriptor["result"]["parentReport"]["recipient"]["recipientId"],
             parent
         );
@@ -1201,6 +1216,71 @@ mod tests {
             }),
         );
         assert_eq!(rejected["error"]["code"], "invalid_request");
+        let unprepared = exchange(
+            &mut listener,
+            &mut app,
+            &mut client,
+            json!({
+                "method":"report_submit_parent", "bindingGeneration":binding, "params":submit
+            }),
+        );
+        assert_eq!(unprepared["error"]["code"], "grant_missing");
+        let preparation = json!({
+            "protocol":crate::mailbox_v1::PROTOCOL,
+            "localRoot":"local-root","localRevision":1,"reportId":"report-one",
+            "reportDigest":"a".repeat(64),"stableId":"parent-report",
+            "submitRevision":1,"submitDigest":"a".repeat(64),
+            "deliveryDigest":"b".repeat(64),"messageId":"parent-message"
+        });
+        let prepared = exchange(
+            &mut listener,
+            &mut app,
+            &mut client,
+            json!({
+                "method":"report_prepared","bindingGeneration":binding,"params":preparation
+            }),
+        );
+        assert_eq!(prepared["result"]["type"], "report_prepared", "{prepared}");
+        let duplicate = exchange(
+            &mut listener,
+            &mut app,
+            &mut client,
+            json!({
+                "method":"report_prepared","bindingGeneration":binding,"params":preparation
+            }),
+        );
+        assert_eq!(duplicate["result"]["cursor"], prepared["result"]["cursor"]);
+        let stale_binding = exchange(
+            &mut listener,
+            &mut app,
+            &mut client,
+            json!({
+                "method":"report_prepared","bindingGeneration":"forged","params":preparation
+            }),
+        );
+        assert_eq!(stale_binding["error"]["code"], "grant_revoked");
+        let mut forged_route = preparation.clone();
+        forged_route["parentTerminalId"] = json!(parent);
+        let rejected = exchange(
+            &mut listener,
+            &mut app,
+            &mut client,
+            json!({
+                "method":"report_prepared","bindingGeneration":binding,"params":forged_route
+            }),
+        );
+        assert_eq!(rejected["error"]["code"], "invalid_request");
+        let mut conflict = preparation.clone();
+        conflict["reportDigest"] = json!("f".repeat(64));
+        let rejected = exchange(
+            &mut listener,
+            &mut app,
+            &mut client,
+            json!({
+                "method":"report_prepared","bindingGeneration":binding,"params":conflict
+            }),
+        );
+        assert_eq!(rejected["error"]["code"], "invalid_request");
         let admitted = exchange(
             &mut listener,
             &mut app,
@@ -1221,19 +1301,19 @@ mod tests {
         assert_eq!(recovered.heads["parent-report"].sender, sender);
         // A report from the authenticated bound stream durably preannounces
         // its exact route attempt before the admitted head and receipt.
-        assert_eq!(recovered.child_report_events.len(), 1);
+        assert_eq!(recovered.child_report_events.len(), 2);
         assert!(matches!(
-            &recovered.child_report_events[0],
-            crate::child_report::ChildReportEvent::Attempt {
-                route, attempt_id, delivery_digest
-            } if attempt_id == "parent-message"
-                && delivery_digest == &"b".repeat(64)
-                && route.child_delegation_id == child_id.to_string()
-                && route.parent_delegation_id == parent_id.to_string()
-                && route.child_terminal_id == sender
-                && route.parent_terminal_id == parent
-                && crate::child_report::project(route, &recovered).kind
-                    == crate::child_report::ReportDispositionKind::AdmittedExactReport
+            &recovered.child_report_events[1],
+            crate::child_report::ChildReportEvent::PreparedAttempt { preparation }
+                if preparation.report_id == "report-one"
+                    && preparation.message_id == "parent-message"
+                    && preparation.delivery_digest == "b".repeat(64)
+                    && preparation.route.child_delegation_id == child_id.to_string()
+                    && preparation.route.parent_delegation_id == parent_id.to_string()
+                    && preparation.route.child_terminal_id == sender
+                    && preparation.route.parent_terminal_id == parent
+                    && crate::child_report::project(&preparation.route, &recovered).kind
+                        == crate::child_report::ReportDispositionKind::InFlightOrUncertain
         ));
         assert_eq!(
             crate::mailbox_v1::snapshot(
@@ -1248,6 +1328,24 @@ mod tests {
             .len(),
             1
         );
+        let coverage = exchange(
+            &mut listener,
+            &mut app,
+            &mut client,
+            json!({
+                "method":"report_coverage","bindingGeneration":binding,
+                "params":{"protocol":crate::mailbox_v1::PROTOCOL,
+                          "localRoot":"local-root","localRevision":1}
+            }),
+        );
+        assert_eq!(coverage["result"]["coverageQualified"], false, "{coverage}");
+        let barrier = crate::mailbox::MailboxStore::existing(&directory)
+            .load()
+            .unwrap();
+        assert!(barrier.child_report_events.iter().any(|e| matches!(e,
+            crate::child_report::ChildReportEvent::CoverageBarrier {
+                through_cursor,qualification:crate::child_report::CoverageQualification::ObservedOnly,..
+            } if *through_cursor < barrier.record_cursor)));
         let parent_store =
             crate::sender_authority::SenderAuthorityStore::for_sender(&directory, &parent).unwrap();
         parent_store
@@ -1466,6 +1564,20 @@ mod tests {
             .unwrap()
             .to_owned();
         let binding = descriptor["result"]["bindingGeneration"].as_str().unwrap();
+        let prepared = exchange(
+            &mut listener,
+            &mut app,
+            &mut client,
+            json!({
+                "method":"report_prepared","bindingGeneration":binding,
+                "params":{"protocol":crate::mailbox_v1::PROTOCOL,
+                    "localRoot":"root","localRevision":1,"reportId":"report-new",
+                    "reportDigest":"3".repeat(64),"stableId":"new-parent",
+                    "submitRevision":1,"submitDigest":"3".repeat(64),
+                    "deliveryDigest":"4".repeat(64),"messageId":"new-message"}
+            }),
+        );
+        assert_eq!(prepared["result"]["type"], "report_prepared", "{prepared}");
         let admitted = exchange(
             &mut listener,
             &mut app,
@@ -1535,6 +1647,19 @@ mod tests {
             "restored graph alone cannot revive route readiness"
         );
         let binding = descriptor["result"]["bindingGeneration"].as_str().unwrap();
+        let stale_preparation = exchange(
+            &mut listener,
+            &mut restarted,
+            &mut client,
+            json!({
+                "method":"report_prepared","bindingGeneration":binding,
+                "params":{"protocol":crate::mailbox_v1::PROTOCOL,"localRoot":"root",
+                    "localRevision":1,"reportId":"report-new","reportDigest":"3".repeat(64),
+                    "stableId":"new-parent","submitRevision":1,"submitDigest":"3".repeat(64),
+                    "deliveryDigest":"4".repeat(64),"messageId":"new-message"}
+            }),
+        );
+        assert_eq!(stale_preparation["error"]["code"], "grant_missing");
         let old_snapshot = exchange(
             &mut listener,
             &mut restarted,

@@ -79,6 +79,93 @@ impl App {
                     },
                 )
             }
+            "report_prepared" => {
+                let params: crate::child_report::PrepareParams = serde_json::from_value(params)
+                    .map_err(|_| MailboxBootstrapError::InvalidRequest)?;
+                let route = self.bound_parent_report_current(session)?;
+                let identity = self
+                    .child_report_route_identity(session, &route)
+                    .ok_or(MailboxBootstrapError::GrantRevoked)?;
+                let preparation = params
+                    .bind(identity)
+                    .ok_or(MailboxBootstrapError::InvalidRequest)?;
+                let authority = self
+                    .offline_mailbox_authorities
+                    .get(&session.caller)
+                    .ok_or(MailboxBootstrapError::GrantRevoked)?;
+                let cursor = authority
+                    .store
+                    .append_child_report_event(crate::child_report::ChildReportEvent::Prepared {
+                        preparation: preparation.clone(),
+                    })
+                    .map_err(child_report_store_error)?;
+                if !authority
+                    .store
+                    .load()
+                    .map_err(|_| MailboxBootstrapError::GrantMissing)?
+                    .child_report_events
+                    .contains(&crate::child_report::ChildReportEvent::Prepared { preparation })
+                {
+                    return Err(MailboxBootstrapError::GrantMissing);
+                }
+                self.bound_parent_report_current(session)?;
+                return Ok(
+                    serde_json::json!({"type":"report_prepared", "cursor":cursor,
+                                            "routeEpoch":route.route_epoch()}),
+                );
+            }
+            "report_coverage" => {
+                #[derive(serde::Deserialize)]
+                #[serde(rename_all = "camelCase", deny_unknown_fields)]
+                struct CoverageParams {
+                    protocol: String,
+                    local_root: String,
+                    local_revision: u64,
+                }
+                let params: CoverageParams = serde_json::from_value(params)
+                    .map_err(|_| MailboxBootstrapError::InvalidRequest)?;
+                if params.protocol != crate::mailbox_v1::PROTOCOL
+                    || params.local_root.is_empty()
+                    || params.local_root.len() > 128
+                    || params.local_revision == 0
+                {
+                    return Err(MailboxBootstrapError::InvalidRequest);
+                }
+                let route = self.bound_parent_report_current(session)?;
+                let identity = self
+                    .child_report_route_identity(session, &route)
+                    .ok_or(MailboxBootstrapError::GrantRevoked)?;
+                let authority = self
+                    .offline_mailbox_authorities
+                    .get(&session.caller)
+                    .ok_or(MailboxBootstrapError::GrantRevoked)?;
+                let cursor = authority
+                    .store
+                    .append_child_report_event(
+                        crate::child_report::ChildReportEvent::CoverageBarrier {
+                            route: identity,
+                            local_root: params.local_root,
+                            local_revision: params.local_revision,
+                            through_cursor: 0,
+                            qualification: crate::child_report::CoverageQualification::ObservedOnly,
+                        },
+                    )
+                    .map_err(child_report_store_error)?;
+                if authority
+                    .store
+                    .load()
+                    .map_err(|_| MailboxBootstrapError::GrantMissing)?
+                    .record_cursor
+                    < cursor
+                {
+                    return Err(MailboxBootstrapError::GrantMissing);
+                }
+                self.bound_parent_report_current(session)?;
+                return Ok(
+                    serde_json::json!({"type":"report_coverage", "cursor":cursor,
+                                            "routeEpoch":route.route_epoch(), "coverageQualified":false}),
+                );
+            }
             "report_submit_parent" => {
                 let submit: crate::mailbox_v1::Submit = serde_json::from_value(params)
                     .map_err(|_| MailboxBootstrapError::InvalidRequest)?;
@@ -89,21 +176,41 @@ impl App {
                 let identity = self
                     .child_report_route_identity(session, &route)
                     .ok_or(MailboxBootstrapError::GrantRevoked)?;
-                // An actual accepted-stream submission is an attempt, not a
-                // completion. Persist the intent before mailbox admission so
-                // a crash between the two remains visibly uncertain.
+                // Only a durable exact preparation allows a bound-parent send.
+                // Legacy self/cross grants continue on their own untracked paths.
                 let authority = self
                     .offline_mailbox_authorities
                     .get(&session.caller)
                     .ok_or(MailboxBootstrapError::GrantRevoked)?;
+                let recovered = authority
+                    .store
+                    .load()
+                    .map_err(|_| MailboxBootstrapError::GrantMissing)?;
+                let prepared: Vec<_> = recovered
+                    .child_report_events
+                    .iter()
+                    .filter_map(|event| match event {
+                        crate::child_report::ChildReportEvent::Prepared { preparation }
+                            if preparation.route == identity
+                                && preparation.matches_submit(&submit) =>
+                        {
+                            Some(preparation.clone())
+                        }
+                        _ => None,
+                    })
+                    .collect();
+                if prepared.len() != 1 {
+                    return Err(MailboxBootstrapError::GrantMissing);
+                }
                 authority
                     .store
-                    .append_child_report_event(crate::child_report::ChildReportEvent::Attempt {
-                        route: identity,
-                        attempt_id: submit.message_id.clone(),
-                        delivery_digest: submit.delivery_digest.clone(),
-                    })
-                    .map_err(|_| MailboxBootstrapError::GrantMissing)?;
+                    .append_child_report_event(
+                        crate::child_report::ChildReportEvent::PreparedAttempt {
+                            preparation: prepared[0].clone(),
+                        },
+                    )
+                    .map_err(child_report_store_error)?;
+                self.bound_parent_report_current(session)?;
                 self.handle_mailbox_server_scoped_submit(
                     id,
                     MailboxOfflineSubmitParams {
@@ -205,6 +312,36 @@ impl App {
                 "mailbox_capability_mismatch",
                 "bound-parent report grants require their accepted stream",
             );
+        }
+        if params.submit.kind == "report"
+            && self.offline_mailbox_authority_current(&params.caller).ok() == Some(true)
+        {
+            if let Some(route) = self
+                .legacy_child_parent_report_identity(&params.caller, &params.recipient.recipient_id)
+            {
+                let Some(authority) = self.offline_mailbox_authorities.get(&params.caller) else {
+                    return encode_error(
+                        id,
+                        "mailbox_authority_unavailable",
+                        "sender route unavailable",
+                    );
+                };
+                if authority
+                    .store
+                    .append_child_report_event(crate::child_report::ChildReportEvent::Bypass {
+                        route,
+                        path: crate::child_report::ReportBypassPath::GenericOffline,
+                        message_id: params.submit.message_id.clone(),
+                    })
+                    .is_err()
+                {
+                    return encode_error(
+                        id,
+                        "mailbox_store_failed",
+                        "legacy report visibility could not be made durable",
+                    );
+                }
+            }
         }
         self.handle_mailbox_server_scoped_submit(id, params)
     }
@@ -451,6 +588,16 @@ impl App {
                 "offline mailbox resolve rejected",
             ),
         }
+    }
+}
+
+fn child_report_store_error(error: crate::mailbox::MailboxError) -> MailboxBootstrapError {
+    match error {
+        crate::mailbox::MailboxError::InvalidRecord
+        | crate::mailbox::MailboxError::ConflictingDuplicate => {
+            MailboxBootstrapError::InvalidRequest
+        }
+        _ => MailboxBootstrapError::GrantMissing,
     }
 }
 

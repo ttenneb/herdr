@@ -211,6 +211,38 @@ impl App {
             }
         }
 
+        if envelope.kind == crate::api::schema::HandoffKind::Report {
+            if let Some(route) = self.legacy_child_parent_report_identity(
+                &envelope.sender.terminal_id,
+                &envelope.recipient.terminal_id,
+            ) {
+                if route.child_session == envelope.sender.agent_session
+                    && route.parent_session == envelope.recipient.agent_session
+                    && route.child_pane_id == envelope.sender.pane_id
+                    && route.parent_pane_id == envelope.recipient.pane_id
+                {
+                    let store = crate::mailbox::MailboxStore::open(&self.sender_authority_dir);
+                    if store
+                        .and_then(|store| {
+                            store.append_child_report_event(
+                                crate::child_report::ChildReportEvent::Bypass {
+                                    route,
+                                    path: crate::child_report::ReportBypassPath::HandoffPty,
+                                    message_id: envelope.message_id.clone(),
+                                },
+                            )
+                        })
+                        .is_err()
+                    {
+                        return encode_error(
+                            id,
+                            "report_visibility_failed",
+                            "legacy report path could not be recorded before delivery",
+                        );
+                    }
+                }
+            }
+        }
         let prompt = envelope.prompt_text();
         let (text, enter) = crate::app::api_helpers::encode_api_submission_parts(runtime, &prompt);
         let result = runtime.try_send_prompt_transaction(

@@ -1,5 +1,7 @@
 # Delegated-child missing-report disposition (#121, source contract)
 
+**Revision note:** This records the #121 checkpoint. The subsequent #129 source work adds a compulsory fsynced `report_prepared`/prepared-attempt barrier for typed bound-parent sends and a **nonqualifying** observed-only coverage endpoint. See [the #129 entrypoint and qualification contract](child-report-prepared.md). Neither checkpoint supplies the trusted canonical Todo producer or all-path coverage needed to assert `missing_after_done_no_admitted_receipt` in production.
+
 This is a server-owned **read-only observation**, never a Todo transition, Pi Gate admission, report submission, or parent acceptance. `agent_status=done` means only unseen idle. An empty `mailbox.history_snapshot` is settled-only history and proves nothing about an outstanding report.
 
 ## Required producer and route

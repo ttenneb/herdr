@@ -201,10 +201,16 @@ pub struct MailboxStore {
 impl MailboxStore {
     pub fn open(directory: impl AsRef<Path>) -> Result<Self, MailboxError> {
         std::fs::create_dir_all(directory.as_ref())?;
-        Ok(Self {
+        Ok(Self::existing(directory))
+    }
+
+    /// Constructor for a read-only projection. Unlike `open`, even a missing
+    /// directory is never created by a parent disposition query.
+    pub fn existing(directory: impl AsRef<Path>) -> Self {
+        Self {
             stream_path: directory.as_ref().join(RECORD_STREAM_FILE),
             lock_path: directory.as_ref().join(LOCK_FILE),
-        })
+        }
     }
 
     pub fn load(&self) -> Result<RecoveredMailbox, MailboxError> {
@@ -228,10 +234,42 @@ impl MailboxStore {
     /// The return cursor is durable and stable across recovery, not an ACK to Pi.
     pub fn append_child_report_event(
         &self,
-        event: crate::child_report::ChildReportEvent,
+        mut event: crate::child_report::ChildReportEvent,
     ) -> Result<u64, MailboxError> {
         self.with_exclusive_lock(|| {
             let recovered = self.load()?;
+            if let crate::child_report::ChildReportEvent::CoverageBarrier {
+                route, local_root, local_revision, qualification, ..
+            } = &event {
+                if let Some(earlier) = recovered.child_report_events.iter().find_map(|prior| match prior {
+                    crate::child_report::ChildReportEvent::CoverageBarrier {
+                        route: prior_route, local_root: root, local_revision: revision,
+                        qualification: prior_qualification, ..
+                    } if prior_route == route && root == local_root && revision == local_revision =>
+                        Some(prior_qualification),
+                    _ => None,
+                }) {
+                    return if earlier == qualification { Ok(recovered.record_cursor) }
+                        else { Err(MailboxError::ConflictingDuplicate) };
+                }
+                if recovered.child_report_events.iter().any(|prior| {
+                    prior.route() == route && matches!(prior,
+                        crate::child_report::ChildReportEvent::Attempt { .. }
+                            | crate::child_report::ChildReportEvent::Coverage { .. }
+                            | crate::child_report::ChildReportEvent::Bypass { .. })
+                }) || recovered.heads.values().any(|head| {
+                    head.kind == "report" && head.sender == route.child_terminal_id
+                        && head.target == route.parent_terminal_id
+                        && !recovered.child_report_events.iter().any(|prior| matches!(prior,
+                            crate::child_report::ChildReportEvent::PreparedAttempt { preparation }
+                                if &preparation.route == route && preparation.delivery_digest == head.delivery_digest))
+                }) {
+                    return Err(MailboxError::InvalidRecord);
+                }
+            }
+            if let crate::child_report::ChildReportEvent::CoverageBarrier { through_cursor, .. } = &mut event {
+                *through_cursor = recovered.record_cursor;
+            }
             match crate::child_report::validate_next(&recovered.child_report_events, &event) {
                 Ok(false) => return Ok(recovered.record_cursor),
                 Err(()) => return Err(MailboxError::ConflictingDuplicate),
@@ -279,6 +317,16 @@ impl MailboxStore {
                 .checked_add(1)
                 .ok_or(MailboxError::InvalidRecord)?;
             validate_head(&head)?;
+            if head.grant_id.starts_with("bound-parent-report:")
+                && !recovered.child_report_events.iter().any(|event| {
+                    matches!(event,
+                        crate::child_report::ChildReportEvent::PreparedAttempt { preparation }
+                            if crate::child_report::matches_prepared_head(preparation,&head)
+                    )
+                })
+            {
+                return Err(MailboxError::InvalidRecord);
+            }
             if let Some(existing) = recovered.heads.get(&head.stable_id) {
                 if existing != &head {
                     return Err(MailboxError::ConflictingDuplicate);
@@ -814,6 +862,35 @@ mod tests {
         ));
         MailboxStore::open(path).unwrap()
     }
+    #[test]
+    fn read_only_existing_store_does_not_create_an_absent_directory() {
+        let path = std::env::temp_dir().join(format!(
+            "herdr-129-read-only-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        assert!(!path.exists());
+        let store = MailboxStore::existing(&path);
+        assert_eq!(store.load().unwrap(), RecoveredMailbox::default());
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn bound_parent_head_cannot_bypass_the_prepared_attempt_gate() {
+        let store = temporary_store();
+        let mut head = head();
+        head.grant_id = "bound-parent-report:unprepared".into();
+        assert_eq!(
+            store.append_offline_head(head),
+            Err(MailboxError::InvalidRecord)
+        );
+        assert!(store.load().unwrap().heads.is_empty());
+        std::fs::remove_dir_all(store.lock_path.parent().unwrap()).unwrap();
+    }
+
     #[cfg(unix)]
     #[test]
     fn replaced_mailbox_lock_never_acknowledges_an_exclusive_operation() {

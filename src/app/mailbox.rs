@@ -79,6 +79,12 @@ pub(crate) struct BoundParentReportRoute {
     route_epoch: String,
 }
 
+impl BoundParentReportRoute {
+    pub(crate) fn route_epoch(&self) -> &str {
+        &self.route_epoch
+    }
+}
+
 impl MailboxBootstrapSession {
     pub(crate) fn context(&self) -> &TrustedMailboxChannelContext {
         &self.context
@@ -685,10 +691,42 @@ impl App {
         let identity = self
             .ready_report_identity(ready)
             .ok_or(MailboxBootstrapError::GrantRevoked)?;
-        let recovered = crate::mailbox::MailboxStore::open(&self.sender_authority_dir)
-            .and_then(|store| store.load())
+        let recovered = crate::mailbox::MailboxStore::existing(&self.sender_authority_dir)
+            .load()
             .map_err(|_| MailboxBootstrapError::GrantMissing)?;
         Ok(crate::child_report::project(&identity, &recovered))
+    }
+
+    /// Detect only a verified current child→parent edge for legacy generic
+    /// paths. This cannot confer bound-report authority on those paths; it
+    /// exists solely to make any such report permanently uncertain.
+    pub(crate) fn legacy_child_parent_report_identity(
+        &self,
+        sender_terminal: &str,
+        recipient_terminal: &str,
+    ) -> Option<crate::child_report::RouteIdentity> {
+        if !self
+            .session_writer_healthy
+            .load(std::sync::atomic::Ordering::Acquire)
+            || !self
+                .session_writer
+                .as_ref()
+                .is_some_and(|writer| writer.validate(&self.session_save_path).is_ok())
+        {
+            return None;
+        }
+        self.ready_delegation_routes.values().find_map(|ready| {
+            if ready.child_terminal.to_string() != sender_terminal
+                || ready.parent_terminal.to_string() != recipient_terminal
+            {
+                return None;
+            }
+            let mut current = self.ready_route_shape(ready.child, ready.parent)?;
+            current.epoch = ready.epoch.clone();
+            (&current == ready)
+                .then(|| self.ready_report_identity(ready))
+                .flatten()
+        })
     }
 
     /// Provisions a cross-recipient grant only for an accepted, current Pi
