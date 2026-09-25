@@ -41,7 +41,7 @@ impl App {
                     return Err(MailboxBootstrapError::InvalidRequest);
                 }
                 let route = self.bound_parent_report_current(session)?;
-                self.handle_mailbox_offline_submit(
+                self.handle_mailbox_server_scoped_submit(
                     id,
                     MailboxOfflineSubmitParams {
                         caller: session.caller.clone(),
@@ -127,6 +127,26 @@ impl App {
     }
 
     pub(crate) fn handle_mailbox_offline_submit(
+        &mut self,
+        id: String,
+        params: MailboxOfflineSubmitParams,
+    ) -> String {
+        // Durable bound-parent grants remain in old journals, but cannot be
+        // exercised through the generic selector-bearing API, even after a
+        // delegation reparent, parent replacement, or server restart. Older
+        // `mailbox:` grants cannot be classified: typed and explicitly
+        // provisioned grants previously used the identical durable ID.
+        if params.grant_id.starts_with("bound-parent-report:") {
+            return encode_error(
+                id,
+                "mailbox_capability_mismatch",
+                "bound-parent report grants require their accepted stream",
+            );
+        }
+        self.handle_mailbox_server_scoped_submit(id, params)
+    }
+
+    fn handle_mailbox_server_scoped_submit(
         &mut self,
         id: String,
         params: MailboxOfflineSubmitParams,

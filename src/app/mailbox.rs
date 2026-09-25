@@ -351,6 +351,19 @@ impl App {
         sender_key: &str,
         recipient: crate::mailbox::RecipientKey,
     ) -> Result<String, OfflineMailboxInstallError> {
+        let grant_id = format!(
+            "mailbox:{sender_key}:1:{}:{}",
+            recipient.recipient_id, recipient.generation
+        );
+        self.provision_cross_recipient_mailbox_grant_with_id(sender_key, recipient, grant_id)
+    }
+
+    fn provision_cross_recipient_mailbox_grant_with_id(
+        &mut self,
+        sender_key: &str,
+        recipient: crate::mailbox::RecipientKey,
+        grant_id: String,
+    ) -> Result<String, OfflineMailboxInstallError> {
         if !self.offline_mailbox_authority_current(sender_key)? {
             return Err(OfflineMailboxInstallError::SenderRecordMismatch);
         }
@@ -358,10 +371,6 @@ impl App {
             recipient_id: sender_key.into(),
             generation: "1".into(),
         };
-        let grant_id = format!(
-            "mailbox:{}:{}:{}:{}",
-            sender.recipient_id, sender.generation, recipient.recipient_id, recipient.generation
-        );
         let store = crate::mailbox::MailboxStore::open(&self.sender_authority_dir)
             .map_err(OfflineMailboxInstallError::MailboxStore)?;
         store
@@ -454,7 +463,12 @@ impl App {
             generation: "1".into(),
         };
         Some(BoundParentReportRoute {
-            grant_id: format!("mailbox:{sender_key}:1:{}:1", recipient.recipient_id),
+            // Separate grant namespace: a bound-parent grant is never an
+            // unrestricted cross-recipient capability on the generic API.
+            grant_id: format!(
+                "bound-parent-report:{sender_key}:1:{}:1",
+                recipient.recipient_id
+            ),
             recipient,
             parent_generation,
             child_delegation: child.id,
@@ -733,9 +747,10 @@ impl App {
             let parent_report = self
                 .bound_parent_report_candidate(&candidate.sender_key, candidate.process_generation);
             if let Some(route) = &parent_report {
-                self.provision_cross_recipient_mailbox_grant(
+                self.provision_cross_recipient_mailbox_grant_with_id(
                     &candidate.sender_key,
                     route.recipient.clone(),
+                    route.grant_id.clone(),
                 )
                 .map_err(|_| MailboxBootstrapError::GrantMissing)?;
             }

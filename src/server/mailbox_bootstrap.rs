@@ -815,14 +815,50 @@ mod tests {
             }),
         );
         assert_eq!(rejected["error"]["code"], "grant_revoked");
+        let stale_generic = app.handle_mailbox_offline_submit(
+            "stale-generic".into(),
+            crate::api::schema::MailboxOfflineSubmitParams {
+                caller: sender.clone(),
+                grant_id: descriptor["result"]["parentReport"]["grantId"]
+                    .as_str()
+                    .unwrap()
+                    .into(),
+                recipient: crate::mailbox::RecipientKey {
+                    recipient_id: parent_store.load().unwrap().unwrap().sender_key,
+                    generation: "1".into(),
+                },
+                submit: crate::mailbox_v1::Submit {
+                    protocol: crate::mailbox_v1::PROTOCOL.into(),
+                    stable_id: "stale-generic".into(),
+                    revision: 1,
+                    digest: "5".repeat(64),
+                    delivery_digest: "6".repeat(64),
+                    subject: "report".into(),
+                    body: "body".into(),
+                    message_id: "stale-generic-message".into(),
+                    kind: "report".into(),
+                    priority: "normal".into(),
+                    original_sequence: 2,
+                },
+            },
+        );
+        let stale_generic: crate::api::schema::ErrorResponse = serde_json::from_str(&stale_generic)
+            .expect("stale parent grant must not admit generic API request");
+        assert_eq!(stale_generic.error.code, "mailbox_capability_mismatch");
+        assert!(!crate::mailbox::MailboxStore::open(&directory)
+            .unwrap()
+            .load()
+            .unwrap()
+            .heads
+            .contains_key("stale-generic"));
         drop(listener);
         std::fs::remove_dir_all(directory).unwrap();
     }
 
     #[test]
     fn bound_parent_report_reparent_revokes_old_stream_without_retargeting() {
-        let (mut app, directory, _sender) = active_app();
-        let (_parent, _) = active_managed_recipient(&mut app, &directory);
+        let (mut app, directory, sender) = active_app();
+        let (parent, _) = active_managed_recipient(&mut app, &directory);
         let child_pane = app.state.workspaces[0].tabs[0].root_pane.unwrap();
         let parent_pane = app.state.workspaces[1].tabs[0].root_pane.unwrap();
         let parent_id = app
@@ -863,6 +899,55 @@ mod tests {
             .unwrap()
             .heads
             .is_empty());
+        let recipient = crate::mailbox::RecipientKey {
+            recipient_id: parent,
+            generation: "1".into(),
+        };
+        let generic = |grant_id: String, stable_id: &str, digest: &str, delivery_digest: &str| {
+            crate::api::schema::MailboxOfflineSubmitParams {
+                caller: sender.clone(),
+                grant_id,
+                recipient: recipient.clone(),
+                submit: crate::mailbox_v1::Submit {
+                    protocol: crate::mailbox_v1::PROTOCOL.into(),
+                    stable_id: stable_id.into(),
+                    revision: 1,
+                    digest: digest.repeat(64),
+                    delivery_digest: delivery_digest.repeat(64),
+                    subject: "report".into(),
+                    body: "body".into(),
+                    message_id: stable_id.into(),
+                    kind: "report".into(),
+                    priority: "normal".into(),
+                    original_sequence: 2,
+                },
+            }
+        };
+        let bound_grant = descriptor["result"]["parentReport"]["grantId"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let blocked = app.handle_mailbox_offline_submit(
+            "stale".into(),
+            generic(bound_grant.clone(), "stale-generic", "a", "b"),
+        );
+        let blocked: crate::api::schema::ErrorResponse = serde_json::from_str(&blocked).unwrap();
+        assert_eq!(blocked.error.code, "mailbox_capability_mismatch");
+        let explicit_grant = app
+            .provision_cross_recipient_mailbox_grant(&sender, recipient.clone())
+            .unwrap();
+        assert_ne!(explicit_grant, bound_grant);
+        let admitted = app.handle_mailbox_offline_submit(
+            "explicit".into(),
+            generic(explicit_grant, "explicit", "c", "d"),
+        );
+        assert!(serde_json::from_str::<crate::api::schema::SuccessResponse>(&admitted).is_ok());
+        let recovered = crate::mailbox::MailboxStore::open(&directory)
+            .unwrap()
+            .load()
+            .unwrap();
+        assert!(!recovered.heads.contains_key("stale-generic"));
+        assert_eq!(recovered.heads["explicit"].recipient, recipient);
         drop(listener);
         std::fs::remove_dir_all(directory).unwrap();
     }
@@ -913,6 +998,10 @@ mod tests {
             .set_read_timeout(Some(Duration::from_secs(1)))
             .unwrap();
         let descriptor = bootstrap(&mut listener, &mut app, &mut client);
+        let old_bound_grant = descriptor["result"]["parentReport"]["grantId"]
+            .as_str()
+            .unwrap()
+            .to_owned();
         let binding = descriptor["result"]["bindingGeneration"].as_str().unwrap();
         let admitted = exchange(
             &mut listener,
@@ -996,6 +1085,33 @@ mod tests {
             old_snapshot["result"]["snapshot"]["heads"][0]["stableId"],
             "old-local"
         );
+        let stale_generic = restarted.handle_mailbox_offline_submit(
+            "old-grant".into(),
+            crate::api::schema::MailboxOfflineSubmitParams {
+                caller: sender.clone(),
+                grant_id: old_bound_grant,
+                recipient: crate::mailbox::RecipientKey {
+                    recipient_id: parent.clone(),
+                    generation: "1".into(),
+                },
+                submit: crate::mailbox_v1::Submit {
+                    protocol: crate::mailbox_v1::PROTOCOL.into(),
+                    stable_id: "post-restart-generic".into(),
+                    revision: 1,
+                    digest: "5".repeat(64),
+                    delivery_digest: "6".repeat(64),
+                    subject: "report".into(),
+                    body: "body".into(),
+                    message_id: "post-restart-message".into(),
+                    kind: "report".into(),
+                    priority: "normal".into(),
+                    original_sequence: 3,
+                },
+            },
+        );
+        let stale_generic: crate::api::schema::ErrorResponse =
+            serde_json::from_str(&stale_generic).unwrap();
+        assert_eq!(stale_generic.error.code, "mailbox_capability_mismatch");
         let parent_snapshot = restarted.handle_mailbox_snapshot(
             "parent".into(),
             crate::api::schema::MailboxSnapshotParams {
@@ -1012,6 +1128,13 @@ mod tests {
         assert_eq!(
             parent_snapshot["result"]["snapshot"]["heads"][0]["stableId"],
             "new-parent"
+        );
+        assert_eq!(
+            parent_snapshot["result"]["snapshot"]["heads"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1
         );
         drop(listener);
         std::fs::remove_dir_all(directory).unwrap();
