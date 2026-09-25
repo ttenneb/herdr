@@ -66,6 +66,34 @@ pub enum LocalTodoState {
     Done,
 }
 
+/// A current accepted child Pi stream supplies only its local canonical Todo
+/// selectors. No caller, parent, session, process or epoch is wire-selectable.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct TodoStateParams {
+    pub protocol: String,
+    pub local_root: String,
+    pub local_revision: u64,
+    pub state_digest: String,
+    pub state: LocalTodoState,
+}
+
+impl TodoStateParams {
+    pub fn bind(self, route: RouteIdentity) -> Option<ChildReportEvent> {
+        if self.protocol != crate::mailbox_v1::PROTOCOL {
+            return None;
+        }
+        let event = ChildReportEvent::TodoState {
+            route,
+            local_root: self.local_root,
+            local_revision: self.local_revision,
+            state_digest: self.state_digest,
+            state: self.state,
+        };
+        event.valid().then_some(event)
+    }
+}
+
 /// The accepted Pi stream supplies only Todo-local and immutable report
 /// selectors. Caller, parent, grant, session, generation and epoch are never
 /// accepted from the wire.
@@ -241,7 +269,12 @@ impl ChildReportEvent {
                 local_revision,
                 state_digest,
                 ..
-            } => !local_root.is_empty() && *local_revision > 0 && valid_digest(state_digest),
+            } => {
+                !local_root.is_empty()
+                    && local_root.len() <= 128
+                    && *local_revision > 0
+                    && valid_digest(state_digest)
+            }
             Self::Attempt {
                 attempt_id,
                 delivery_digest,
@@ -500,7 +533,7 @@ pub fn validate_next(events: &[ChildReportEvent], next: &ChildReportEvent) -> Re
                     local_revision: rev_b,
                     ..
                 },
-            ) if a == b && root_a == root_b && rev_a >= rev_b => return Err(()),
+            ) if a == b && (root_a != root_b || rev_a >= rev_b) => return Err(()),
             (
                 ChildReportEvent::Attempt {
                     route: a,
@@ -853,6 +886,84 @@ mod tests {
             project(&r, &m).kind,
             ReportDispositionKind::InFlightOrUncertain
         );
+    }
+
+    #[test]
+    fn todo_state_ingress_replays_exact_and_rejects_root_revision_and_digest_conflicts() {
+        use crate::mailbox::{MailboxError, MailboxStore};
+        let path = std::env::temp_dir().join(format!(
+            "herdr-132-todo-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let store = MailboxStore::open(&path).unwrap();
+        let r = route();
+        let wire = serde_json::json!({"protocol":crate::mailbox_v1::PROTOCOL,
+            "localRoot":"canonical","localRevision":1,"stateDigest":"a".repeat(64),
+            "state":"not_done"});
+        let params: TodoStateParams = serde_json::from_value(wire.clone()).unwrap();
+        let first = params.bind(r.clone()).unwrap();
+        assert_eq!(store.append_child_report_event(first.clone()).unwrap(), 1);
+        assert_eq!(
+            MailboxStore::existing(&path)
+                .append_child_report_event(first.clone())
+                .unwrap(),
+            1
+        );
+        let mut conflicting = wire.clone();
+        conflicting["stateDigest"] = serde_json::json!("b".repeat(64));
+        let conflict = serde_json::from_value::<TodoStateParams>(conflicting)
+            .unwrap()
+            .bind(r.clone())
+            .unwrap();
+        assert_eq!(
+            store.append_child_report_event(conflict),
+            Err(MailboxError::ConflictingDuplicate)
+        );
+        let mut changed_root = wire.clone();
+        changed_root["localRoot"] = serde_json::json!("replacement-root");
+        changed_root["localRevision"] = serde_json::json!(2);
+        let root_conflict = serde_json::from_value::<TodoStateParams>(changed_root)
+            .unwrap()
+            .bind(r.clone())
+            .unwrap();
+        assert_eq!(
+            store.append_child_report_event(root_conflict),
+            Err(MailboxError::ConflictingDuplicate)
+        );
+        let mut route_selector = wire.clone();
+        route_selector["parentSession"] = serde_json::json!("forged");
+        assert!(serde_json::from_value::<TodoStateParams>(route_selector).is_err());
+        let mut invalid = wire.clone();
+        invalid["stateDigest"] = serde_json::json!("A".repeat(64));
+        assert!(serde_json::from_value::<TodoStateParams>(invalid)
+            .unwrap()
+            .bind(r.clone())
+            .is_none());
+        let mut second = wire;
+        second["localRevision"] = serde_json::json!(2);
+        second["stateDigest"] = serde_json::json!("b".repeat(64));
+        second["state"] = serde_json::json!("done");
+        let done = serde_json::from_value::<TodoStateParams>(second)
+            .unwrap()
+            .bind(r.clone())
+            .unwrap();
+        assert_eq!(store.append_child_report_event(done.clone()).unwrap(), 2);
+        assert_eq!(
+            store.append_child_report_event(first),
+            Err(MailboxError::ConflictingDuplicate)
+        );
+        let recovered = MailboxStore::existing(&path).load().unwrap();
+        assert_eq!(recovered.record_cursor, 2);
+        assert_eq!(recovered.child_report_events[1], done);
+        assert_eq!(
+            project(&r, &recovered).kind,
+            ReportDispositionKind::InFlightOrUncertain
+        );
+        std::fs::remove_dir_all(path).unwrap();
     }
 
     #[test]

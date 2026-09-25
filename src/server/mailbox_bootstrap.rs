@@ -67,6 +67,7 @@ pub(crate) struct ReportSubmitAdvertisement {
 #[serde(rename_all = "camelCase")]
 pub(crate) struct ParentReportAdvertisement {
     pub method: &'static str,
+    pub todo_state_method: &'static str,
     pub prepared_method: &'static str,
     pub coverage_method: &'static str,
     /// A durable observation is not a trusted all-path closure certificate.
@@ -94,6 +95,7 @@ impl MailboxBootstrapDescriptor {
                 .as_ref()
                 .map(|route| ParentReportAdvertisement {
                     method: "report_submit_parent",
+                    todo_state_method: "todo_state",
                     prepared_method: "report_prepared",
                     coverage_method: "report_coverage",
                     coverage_qualified: false,
@@ -1045,6 +1047,17 @@ mod tests {
         let descriptor = bootstrap(&mut listener, &mut app, &mut client);
         assert_eq!(descriptor["result"]["caller"], parent);
         let binding = descriptor["result"]["bindingGeneration"].as_str().unwrap();
+        let wrong_child = exchange(
+            &mut listener,
+            &mut app,
+            &mut client,
+            json!({
+                "method":"todo_state","bindingGeneration":binding,
+                "params":{"protocol":crate::mailbox_v1::PROTOCOL,"localRoot":"root",
+                          "localRevision":1,"stateDigest":"a".repeat(64),"state":"done"}
+            }),
+        );
+        assert_eq!(wrong_child["error"]["code"], "grant_missing");
         let params = json!({"protocol":crate::mailbox_v1::PROTOCOL,
                             "childDelegationId":child_id.to_string()});
         let first = exchange(
@@ -1127,6 +1140,344 @@ mod tests {
     }
 
     #[test]
+    fn child_todo_state_requires_current_bound_stream_and_never_qualifies_missing() {
+        let (mut app, directory, child) = active_app();
+        let (parent, _) = active_managed_recipient(&mut app, &directory);
+        let child_pane = app.state.workspaces[0].tabs[0].root_pane.unwrap();
+        let parent_pane = app.state.workspaces[1].tabs[0].root_pane.unwrap();
+        let parent_id = app
+            .state
+            .delegations
+            .create(Some(parent_pane), None, None)
+            .unwrap();
+        let child_id = app
+            .state
+            .delegations
+            .create(Some(child_pane), Some(parent_id), None)
+            .unwrap();
+        let mut listener = listener(&directory);
+        let mut early = UnixStream::connect(listener.path()).unwrap();
+        early
+            .set_read_timeout(Some(Duration::from_secs(1)))
+            .unwrap();
+        let before = bootstrap(&mut listener, &mut app, &mut early);
+        assert!(before["result"]["parentReport"].is_null());
+        let early_binding = before["result"]["bindingGeneration"].as_str().unwrap();
+        let not_done = json!({"protocol":crate::mailbox_v1::PROTOCOL,"localRoot":"child-root",
+                              "localRevision":1,"stateDigest":"a".repeat(64),"state":"not_done"});
+        let denied = exchange(
+            &mut listener,
+            &mut app,
+            &mut early,
+            json!({
+                "method":"todo_state","bindingGeneration":early_binding,"params":not_done
+            }),
+        );
+        assert_eq!(denied["error"]["code"], "grant_missing");
+        ready_test_route(&mut app, &directory, child_id, parent_id);
+        let retroactive = exchange(
+            &mut listener,
+            &mut app,
+            &mut early,
+            json!({
+                "method":"todo_state","bindingGeneration":early_binding,"params":not_done
+            }),
+        );
+        assert!(
+            retroactive["error"]["code"] == "grant_missing"
+                || retroactive["error"]["code"] == "grant_revoked",
+            "{retroactive}"
+        );
+        let mut current = UnixStream::connect(listener.path()).unwrap();
+        current
+            .set_read_timeout(Some(Duration::from_secs(1)))
+            .unwrap();
+        let issued = bootstrap(&mut listener, &mut app, &mut current);
+        assert_eq!(
+            issued["result"]["parentReport"]["todoStateMethod"],
+            "todo_state"
+        );
+        let binding = issued["result"]["bindingGeneration"].as_str().unwrap();
+        let request = |params: serde_json::Value| {
+            json!({
+                "method":"todo_state","bindingGeneration":binding,"params":params
+            })
+        };
+        let first = exchange(
+            &mut listener,
+            &mut app,
+            &mut current,
+            request(not_done.clone()),
+        );
+        assert_eq!(first["result"]["type"], "todo_state", "{first}");
+        let cursor = first["result"]["cursor"].as_u64().unwrap();
+        let epoch = first["result"]["routeEpoch"].as_str().unwrap().to_owned();
+        let duplicate = exchange(
+            &mut listener,
+            &mut app,
+            &mut current,
+            request(not_done.clone()),
+        );
+        assert_eq!(duplicate["result"]["cursor"], cursor);
+        let recorded = crate::mailbox::MailboxStore::existing(&directory)
+            .load()
+            .unwrap();
+        let exact_route = recorded
+            .child_report_events
+            .iter()
+            .find_map(|event| match event {
+                crate::child_report::ChildReportEvent::TodoState {
+                    route,
+                    local_root,
+                    local_revision,
+                    state_digest,
+                    state,
+                } if local_root == "child-root" => {
+                    assert_eq!(
+                        (*local_revision, state_digest.as_str()),
+                        (1, "a".repeat(64).as_str())
+                    );
+                    assert_eq!(*state, crate::child_report::LocalTodoState::NotDone);
+                    Some(route.clone())
+                }
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(exact_route.child_delegation_id, child_id.to_string());
+        assert_eq!(exact_route.parent_delegation_id, parent_id.to_string());
+        assert_eq!(exact_route.child_terminal_id, child);
+        assert_eq!(exact_route.parent_terminal_id, parent);
+        assert_eq!(exact_route.child_session.source, "herdr:pi");
+        assert_eq!(exact_route.parent_session.source, "herdr:pi");
+        assert!(
+            exact_route.child_process_generation > 0 && exact_route.parent_process_generation > 0
+        );
+        assert_eq!(exact_route.route_epoch, epoch);
+        for (label, mut bad) in [
+            ("conflict-digest", not_done.clone()),
+            ("conflict-state", not_done.clone()),
+            ("changed-root", not_done.clone()),
+            ("zero-revision", not_done.clone()),
+            ("wrong-protocol", not_done.clone()),
+            ("invalid-digest", not_done.clone()),
+            ("invalid-state", not_done.clone()),
+            ("forged-parent", not_done.clone()),
+        ] {
+            match label {
+                "conflict-digest" => bad["stateDigest"] = json!("b".repeat(64)),
+                "conflict-state" => bad["state"] = json!("done"),
+                "changed-root" => bad["localRoot"] = json!("other-root"),
+                "zero-revision" => bad["localRevision"] = json!(0),
+                "wrong-protocol" => bad["protocol"] = json!("other"),
+                "invalid-digest" => bad["stateDigest"] = json!("A".repeat(64)),
+                "invalid-state" => bad["state"] = json!("idle"),
+                "forged-parent" => bad["parentTerminalId"] = json!(parent),
+                _ => unreachable!(),
+            }
+            let rejected = exchange(&mut listener, &mut app, &mut current, request(bad));
+            assert_eq!(
+                rejected["error"]["code"], "invalid_request",
+                "{label}: {rejected}"
+            );
+        }
+        let forged_binding = exchange(
+            &mut listener,
+            &mut app,
+            &mut current,
+            json!({
+                "method":"todo_state","bindingGeneration":"forged","params":not_done
+            }),
+        );
+        assert_eq!(forged_binding["error"]["code"], "grant_revoked");
+        let mut done = not_done.clone();
+        done["localRevision"] = json!(2);
+        done["stateDigest"] = json!("b".repeat(64));
+        done["state"] = json!("done");
+        let accepted = exchange(&mut listener, &mut app, &mut current, request(done.clone()));
+        assert!(
+            accepted["result"]["cursor"].as_u64().unwrap() > cursor,
+            "{accepted}"
+        );
+        let rollback = exchange(
+            &mut listener,
+            &mut app,
+            &mut current,
+            request(not_done.clone()),
+        );
+        assert_eq!(rollback["error"]["code"], "invalid_request");
+        let observed = exchange(
+            &mut listener,
+            &mut app,
+            &mut current,
+            json!({
+                "method":"report_coverage","bindingGeneration":binding,
+                "params":{"protocol":crate::mailbox_v1::PROTOCOL,"localRoot":"child-root","localRevision":2}
+            }),
+        );
+        assert_eq!(observed["result"]["coverageQualified"], false, "{observed}");
+        let recovered = crate::mailbox::MailboxStore::existing(&directory)
+            .load()
+            .unwrap();
+        assert_eq!(
+            crate::child_report::project(&exact_route, &recovered).kind,
+            crate::child_report::ReportDispositionKind::InFlightOrUncertain
+        );
+        let stable_cursor = recovered.record_cursor;
+        app.state.delegations.reparent(child_id, None).unwrap();
+        let stale = exchange(&mut listener, &mut app, &mut current, request(done));
+        assert_eq!(stale["error"]["code"], "grant_revoked");
+        assert_eq!(
+            crate::mailbox::MailboxStore::existing(&directory)
+                .load()
+                .unwrap()
+                .record_cursor,
+            stable_cursor
+        );
+        app.state
+            .delegations
+            .reparent(child_id, Some(parent_id))
+            .unwrap();
+        ready_test_route(&mut app, &directory, child_id, parent_id);
+        let still_stale = exchange(
+            &mut listener,
+            &mut app,
+            &mut current,
+            request(not_done.clone()),
+        );
+        assert_eq!(still_stale["error"]["code"], "grant_revoked");
+        let mut renewed = UnixStream::connect(listener.path()).unwrap();
+        renewed
+            .set_read_timeout(Some(Duration::from_secs(1)))
+            .unwrap();
+        let descriptor = bootstrap(&mut listener, &mut app, &mut renewed);
+        let new_binding = descriptor["result"]["bindingGeneration"].as_str().unwrap();
+        let fresh = exchange(
+            &mut listener,
+            &mut app,
+            &mut renewed,
+            json!({
+                "method":"todo_state","bindingGeneration":new_binding,"params":not_done
+            }),
+        );
+        assert_eq!(fresh["result"]["type"], "todo_state", "{fresh}");
+        assert_ne!(fresh["result"]["routeEpoch"], epoch);
+        let latest = crate::mailbox::MailboxStore::existing(&directory)
+            .load()
+            .unwrap();
+        let current_route = latest
+            .child_report_events
+            .iter()
+            .rev()
+            .find_map(|event| match event {
+                crate::child_report::ChildReportEvent::TodoState { route, .. }
+                    if route.route_epoch != epoch =>
+                {
+                    Some(route)
+                }
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(
+            crate::child_report::project(current_route, &latest).kind,
+            crate::child_report::ReportDispositionKind::NotDone,
+            "old done claim cannot become current after reconnect"
+        );
+        crate::sender_authority::SenderAuthorityStore::for_sender(&directory, &parent)
+            .unwrap()
+            .cas(
+                Some(2),
+                crate::sender_authority::SenderAuthorityRecord {
+                    sender_key: parent.clone(),
+                    process_generation: 2,
+                    phase: crate::sender_authority::SenderAuthorityPhase::Active,
+                    transition_revision: 3,
+                },
+            )
+            .unwrap();
+        let replaced = exchange(
+            &mut listener,
+            &mut app,
+            &mut renewed,
+            json!({
+                "method":"todo_state","bindingGeneration":new_binding,
+                "params":{"protocol":crate::mailbox_v1::PROTOCOL,"localRoot":"child-root",
+                          "localRevision":2,"stateDigest":"b".repeat(64),"state":"done"}
+            }),
+        );
+        assert_eq!(replaced["error"]["code"], "grant_revoked");
+        assert_eq!(
+            crate::mailbox::MailboxStore::existing(&directory)
+                .load()
+                .unwrap()
+                .record_cursor,
+            latest.record_cursor
+        );
+        drop(renewed);
+        drop(current);
+        drop(early);
+        drop(listener);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn child_todo_state_does_not_acknowledge_failed_journal_append() {
+        use std::os::unix::fs::PermissionsExt;
+        let (mut app, directory, _) = active_app();
+        active_managed_recipient(&mut app, &directory);
+        let child_pane = app.state.workspaces[0].tabs[0].root_pane.unwrap();
+        let parent_pane = app.state.workspaces[1].tabs[0].root_pane.unwrap();
+        let parent = app
+            .state
+            .delegations
+            .create(Some(parent_pane), None, None)
+            .unwrap();
+        let child = app
+            .state
+            .delegations
+            .create(Some(child_pane), Some(parent), None)
+            .unwrap();
+        ready_test_route(&mut app, &directory, child, parent);
+        let mut listener = listener(&directory);
+        let mut current = UnixStream::connect(listener.path()).unwrap();
+        current
+            .set_read_timeout(Some(Duration::from_secs(1)))
+            .unwrap();
+        let descriptor = bootstrap(&mut listener, &mut app, &mut current);
+        let binding = descriptor["result"]["bindingGeneration"].as_str().unwrap();
+        let before = crate::mailbox::MailboxStore::existing(&directory)
+            .load()
+            .unwrap()
+            .record_cursor;
+        let stream = directory.join(crate::mailbox::RECORD_STREAM_FILE);
+        let original = std::fs::metadata(&stream).unwrap().permissions();
+        std::fs::set_permissions(&stream, std::fs::Permissions::from_mode(0o400)).unwrap();
+        let denied = exchange(
+            &mut listener,
+            &mut app,
+            &mut current,
+            json!({
+                "method":"todo_state","bindingGeneration":binding,
+                "params":{"protocol":crate::mailbox_v1::PROTOCOL,"localRoot":"root",
+                          "localRevision":1,"stateDigest":"a".repeat(64),"state":"done"}
+            }),
+        );
+        std::fs::set_permissions(&stream, original).unwrap();
+        assert_eq!(denied["error"]["code"], "grant_missing", "{denied}");
+        let recovered = crate::mailbox::MailboxStore::existing(&directory)
+            .load()
+            .unwrap();
+        assert_eq!(recovered.record_cursor, before);
+        assert!(!recovered.child_report_events.iter().any(|event| matches!(
+            event,
+            crate::child_report::ChildReportEvent::TodoState { .. }
+        )));
+        drop(current);
+        drop(listener);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
     fn bound_parent_report_route_is_durable_and_rejects_selectors_non_reports_and_stale_parent() {
         let (mut app, directory, sender) = active_app();
         let (parent, _) = active_managed_recipient(&mut app, &directory);
@@ -1152,6 +1503,10 @@ mod tests {
         assert_eq!(
             descriptor["result"]["parentReport"]["method"],
             "report_submit_parent"
+        );
+        assert_eq!(
+            descriptor["result"]["parentReport"]["todoStateMethod"],
+            "todo_state"
         );
         assert_eq!(
             descriptor["result"]["parentReport"]["preparedMethod"],

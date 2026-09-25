@@ -79,6 +79,38 @@ impl App {
                     },
                 )
             }
+            "todo_state" => {
+                let params: crate::child_report::TodoStateParams =
+                    serde_json::from_value(params)
+                        .map_err(|_| MailboxBootstrapError::InvalidRequest)?;
+                let route = self.bound_parent_report_current(session)?;
+                let identity = self
+                    .child_report_route_identity(session, &route)
+                    .ok_or(MailboxBootstrapError::GrantRevoked)?;
+                let event = params
+                    .bind(identity)
+                    .ok_or(MailboxBootstrapError::InvalidRequest)?;
+                let authority = self
+                    .offline_mailbox_authorities
+                    .get(&session.caller)
+                    .ok_or(MailboxBootstrapError::GrantRevoked)?;
+                let cursor = authority
+                    .store
+                    .append_child_report_event(event.clone())
+                    .map_err(child_report_store_error)?;
+                let recovered = authority
+                    .store
+                    .load()
+                    .map_err(|_| MailboxBootstrapError::GrantMissing)?;
+                if recovered.record_cursor < cursor
+                    || !recovered.child_report_events.contains(&event)
+                {
+                    return Err(MailboxBootstrapError::GrantMissing);
+                }
+                self.bound_parent_report_current(session)?;
+                return Ok(serde_json::json!({"type":"todo_state", "cursor":cursor,
+                                            "routeEpoch":route.route_epoch()}));
+            }
             "report_prepared" => {
                 let params: crate::child_report::PrepareParams = serde_json::from_value(params)
                     .map_err(|_| MailboxBootstrapError::InvalidRequest)?;

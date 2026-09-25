@@ -1,5 +1,7 @@
 # #129 compulsory prepared report barrier: source interface and test freeze
 
+The later #132 source slice adds a current-child [Todo-state journal ingress](child-todo-state-ingress.md). The Pi owner's canonical producer and all-path-qualified coverage remain unverified; a durable `done` ACK does not change `coverageQualified:false` or establish missing-after-done.
+
 Consumer: stabilization TPM independent source review, then Pi Todo owner #127. This is source-only Herdr work; no live Pi/server, provider, installed default, protected journal, beta cutover or Pi-owner worktree write.
 
 ## Entrypoint matrix and default disposition
