@@ -17,6 +17,36 @@ const INVALID_AGENT_NAME_MESSAGE: &str = "agent name must start with a lowercase
 const MAX_AGENT_ENVIRONMENT_ITEMS: usize = 16;
 const MAX_AGENT_ENVIRONMENT_BYTES: usize = 16 * 1024;
 
+/// Not a pane launch command or persisted resume hint. Created only after a
+/// committed managed Pi start, and bound to a new foreground process on Active.
+#[derive(Debug, Clone)]
+pub(crate) struct ManagedPiLaunch {
+    pub(crate) generation: u64,
+    pub(crate) session_path: String,
+    pub(crate) earliest_birth_ticks: u64,
+    pub(crate) process: Option<crate::platform::ProcessBirthIdentity>,
+}
+
+fn explicit_pi_session_path(argv: &[String]) -> Option<String> {
+    let mut path = None;
+    let mut args = argv.iter();
+    while let Some(arg) = args.next() {
+        let value = if arg == "--session" {
+            Some(args.next()?.as_str())
+        } else {
+            arg.strip_prefix("--session=")
+        };
+        if let Some(value) = value {
+            if path.replace(value).is_some() {
+                return None;
+            }
+        }
+    }
+    let value = path?;
+    crate::agent_resume::AgentSessionRef::path(value)?;
+    (std::path::Path::new(value).extension()? == "jsonl").then(|| value.to_string())
+}
+
 fn valid_agent_environment(values: &[String]) -> bool {
     if values.len() > MAX_AGENT_ENVIRONMENT_ITEMS
         || values.iter().map(String::len).sum::<usize>() > MAX_AGENT_ENVIRONMENT_BYTES
@@ -301,6 +331,12 @@ impl App {
         let process_generation =
             self.allocate_sender_authority_generation(terminal_id.to_string())?;
 
+        // Capture the earliest process birth tick before writing the command.
+        // A pre-existing Pi in this pane cannot become this launch's identity.
+        let managed_pi_launch = (kind == crate::detect::Agent::Pi)
+            .then(|| explicit_pi_session_path(&argv).zip(crate::platform::current_boot_ticks()))
+            .flatten();
+        self.managed_pi_launches.remove(&terminal_id);
         let now = Instant::now();
         let terminal = self
             .state
@@ -314,6 +350,17 @@ impl App {
             terminal.clear_agent_name();
             runtime.set_managed_agent_generation(0);
             return Err(AgentStartError::InputFailed(err.to_string()));
+        }
+        if let Some((session_path, earliest_birth_ticks)) = managed_pi_launch {
+            self.managed_pi_launches.insert(
+                terminal_id.clone(),
+                ManagedPiLaunch {
+                    generation: process_generation,
+                    session_path,
+                    earliest_birth_ticks,
+                    process: None,
+                },
+            );
         }
         self.acknowledge_terminal_input(&terminal_id);
         self.state.mark_session_dirty();
@@ -465,6 +512,43 @@ impl App {
         }
     }
 
+    /// Bind the successful server-owned start to the exact Pi process observed
+    /// at its Active-generation transition. A pre-existing process, including
+    /// one left in the foreground during a replacement, cannot satisfy the
+    /// launch birth floor. No snapshot or client report can create this record.
+    pub(crate) fn bind_active_managed_pi_process(
+        &mut self,
+        terminal_id: &crate::terminal::TerminalId,
+        generation: u64,
+    ) {
+        let Some(launch) = self.managed_pi_launches.get(terminal_id) else {
+            return;
+        };
+        if launch.generation != generation || launch.process.is_some() {
+            return;
+        }
+        let floor = launch.earliest_birth_ticks;
+        let Some(job) = self.mailbox_bootstrap_foreground_job(terminal_id) else {
+            return;
+        };
+        let Some((crate::detect::Agent::Pi, process)) =
+            crate::detect::identify_agent_process_in_job(&job)
+        else {
+            return;
+        };
+        let Some(birth) = crate::platform::process_birth_identity(process.pid) else {
+            return;
+        };
+        if birth.start_ticks < floor {
+            return;
+        }
+        if let Some(launch) = self.managed_pi_launches.get_mut(terminal_id) {
+            if launch.generation == generation && launch.process.is_none() {
+                launch.process = Some(birth);
+            }
+        }
+    }
+
     /// Derive Pi's identity on demand so no stopped or replaced process can
     /// leave a reusable cached path in agent get. The caller supplies only a
     /// target for lookup; neither the target nor a reported session is authority.
@@ -492,26 +576,25 @@ impl App {
         if agent != crate::detect::Agent::Pi || process.pid == 0 {
             return None;
         }
-        let argv = process.argv.as_deref()?;
-        let mut session_path = None;
-        let mut args = argv.iter();
-        while let Some(arg) = args.next() {
-            let value = if arg == "--session" {
-                Some(args.next()?.as_str())
-            } else {
-                arg.strip_prefix("--session=")
-            };
-            if let Some(value) = value {
-                // Even identical duplicate options are ambiguous: do not
-                // guess which session Pi will actually select.
-                if session_path.replace(value).is_some() {
-                    return None;
-                }
-            }
+        let launch = self.managed_pi_launches.get(&terminal.id)?;
+        if launch.generation != record.process_generation
+            || launch.process? != crate::platform::process_birth_identity(process.pid)?
+        {
+            return None;
         }
-        let path = std::path::Path::new(session_path?);
-        let value = path.to_str()?;
-        crate::agent_resume::AgentSessionRef::path(value)?;
+        let argv = process.argv.as_deref()?;
+        // Pi's process.title can erase its argv, as observed in #90. If argv
+        // still exposes a selector, it must agree exactly with the committed
+        // launch; a malformed or conflicting selector always fails closed.
+        if argv
+            .iter()
+            .any(|arg| arg == "--session" || arg.starts_with("--session="))
+            && explicit_pi_session_path(argv).as_deref() != Some(&launch.session_path)
+        {
+            return None;
+        }
+        let value = &launch.session_path;
+        let path = std::path::Path::new(value);
         if !crate::platform::verified_pi_session_jsonl(path) {
             return None;
         }
@@ -519,7 +602,7 @@ impl App {
             source: "herdr:pi".into(),
             agent: "pi".into(),
             kind: crate::agent_resume::AgentSessionRefKind::Path,
-            value: value.into(),
+            value: value.clone(),
         })
     }
 
@@ -535,6 +618,7 @@ impl App {
             return None;
         }
         let pane = self.pane_info(ws_idx, pane_id)?;
+        let pi_label = pane.agent.as_deref() == Some("pi");
         Some(crate::api::schema::AgentInfo {
             terminal_id: pane.terminal_id,
             name: terminal.agent_name.clone(),
@@ -549,7 +633,11 @@ impl App {
             tokens: pane.tokens,
             // Managed Pi identity is derived from this execution, not from a
             // pane-scoped report that any local API client could have supplied.
-            agent_session: if terminal.managed_agent_kind() == Some(crate::detect::Agent::Pi) {
+            agent_session: if terminal.managed_agent_kind() == Some(crate::detect::Agent::Pi)
+                || pi_label
+            {
+                // A stopped managed Pi must not fall back to a stale pane
+                // report merely because its managed name was cleared.
                 self.trusted_managed_pi_session(terminal)
             } else {
                 pane.agent_session

@@ -630,6 +630,15 @@ impl App {
             return;
         };
         let sender_key = terminal_id.to_string();
+        if self
+            .managed_pi_launches
+            .get(&terminal_id)
+            .is_some_and(|launch| {
+                process_generation.is_none_or(|generation| generation == launch.generation)
+            })
+        {
+            self.managed_pi_launches.remove(&terminal_id);
+        }
         let Some(authority) = self.offline_mailbox_authorities.get(&sender_key) else {
             return;
         };
@@ -1055,6 +1064,9 @@ impl App {
             Ok(record) => record,
             Err(_) => return,
         };
+        if agent == crate::detect::Agent::Pi {
+            self.bind_active_managed_pi_process(&terminal_id, process_generation);
+        }
         let _ = self.install_offline_mailbox_authority(record);
     }
 }

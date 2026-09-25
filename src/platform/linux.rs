@@ -449,6 +449,47 @@ fn process_pgrp_and_comm_from_stat(stat: &str) -> Option<(i32, String)> {
     Some((pgrp, comm))
 }
 
+/// Kernel starttime (field 22 of /proc/pid/stat) plus PID, reread at each
+/// identity check. Zombied processes cannot attest a running managed Pi.
+pub(crate) fn process_birth_identity(pid: u32) -> Option<super::ProcessBirthIdentity> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    let fields: Vec<&str> = stat
+        .get(stat.rfind(')')? + 2..)?
+        .split_whitespace()
+        .collect();
+    if fields
+        .first()
+        .is_none_or(|state| *state == "Z" || *state == "X")
+    {
+        return None;
+    }
+    Some(super::ProcessBirthIdentity {
+        pid,
+        start_ticks: fields.get(19)?.parse().ok()?,
+    })
+}
+
+/// Earliest acceptable birth tick for a process launched by a managed start.
+pub(crate) fn current_boot_ticks() -> Option<u64> {
+    let mut now: libc::timespec = unsafe { std::mem::zeroed() };
+    if unsafe { libc::clock_gettime(libc::CLOCK_BOOTTIME, &mut now) } != 0 {
+        return None;
+    }
+    let hz = unsafe { libc::sysconf(libc::_SC_CLK_TCK) };
+    if now.tv_sec < 0 || now.tv_nsec < 0 || hz <= 0 {
+        return None;
+    }
+    u64::try_from(now.tv_sec)
+        .ok()?
+        .checked_mul(u64::try_from(hz).ok()?)?
+        .checked_add(
+            u64::try_from(now.tv_nsec)
+                .ok()?
+                .checked_mul(u64::try_from(hz).ok()?)?
+                / 1_000_000_000,
+        )
+}
+
 fn process_argv(pid: u32) -> Option<Vec<String>> {
     let bytes = std::fs::read(format!("/proc/{pid}/cmdline")).ok()?;
     if bytes.is_empty() {

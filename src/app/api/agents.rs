@@ -397,7 +397,232 @@ mod tests {
         app
     }
 
-    #[cfg(unix)]
+    // This is the observed #90 process shape, produced by Node's real Linux
+    // process.title behavior and inspected through the same /proc job reader.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn titled_pi_uses_only_generation_bound_server_launch_provenance() {
+        use std::os::unix::{fs::PermissionsExt, process::CommandExt};
+        struct ChildGuard(std::process::Child);
+        impl Drop for ChildGuard {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+        let mut app = app_with_agent();
+        let directory = std::env::temp_dir().join(format!(
+            "herdr-titled-pi-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&directory).unwrap();
+        app.sender_authority_dir = directory.clone();
+        let session = directory.join("owned.jsonl");
+        std::fs::write(
+            &session,
+            b"{\"type\":\"session\",\"version\":3,\"id\":\"owned\",\"cwd\":\"/tmp\"}\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&session, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let pane = app.state.workspaces[0].tabs[0].root_pane.unwrap();
+        let terminal_id = app.state.workspaces[0].terminal_id(pane).unwrap().clone();
+        let key = terminal_id.to_string();
+        let floor = crate::platform::current_boot_ticks().unwrap();
+        let mut command = std::process::Command::new("node");
+        command
+            .arg("-e")
+            .arg("process.title='pi';setInterval(()=>{},1000)")
+            .arg("--")
+            .arg("--session")
+            .arg(&session)
+            .process_group(0);
+        let child = ChildGuard(command.spawn().unwrap());
+        let mut job = None;
+        for _ in 0..100 {
+            let observed = crate::platform::foreground_group_leader_job(child.0.id());
+            if observed
+                .as_ref()
+                .and_then(|job| job.processes.first())
+                .and_then(|process| process.argv.as_deref())
+                == Some(&["pi".to_string()][..])
+            {
+                job = observed;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let job = job.expect("live Node process changed /proc argv to [pi]");
+        let birth = crate::platform::process_birth_identity(child.0.id()).unwrap();
+        assert!(birth.start_ticks >= floor);
+        assert_eq!(
+            crate::detect::identify_agent_process_in_job(&job)
+                .unwrap()
+                .0,
+            Agent::Pi
+        );
+        app.install_mailbox_bootstrap_test_foreground_job(terminal_id.clone(), job);
+        let store =
+            crate::sender_authority::SenderAuthorityStore::for_sender(&directory, &key).unwrap();
+        store
+            .cas(
+                None,
+                crate::sender_authority::SenderAuthorityRecord {
+                    sender_key: key,
+                    process_generation: 1,
+                    phase: crate::sender_authority::SenderAuthorityPhase::Preparing,
+                    transition_revision: 1,
+                },
+            )
+            .unwrap();
+        app.state
+            .terminals
+            .get_mut(&terminal_id)
+            .unwrap()
+            .begin_managed_agent(
+                "titled".into(),
+                Agent::Pi,
+                std::time::Instant::now(),
+                Duration::from_secs(3),
+                Duration::from_secs(30),
+            );
+        app.state
+            .terminals
+            .get_mut(&terminal_id)
+            .unwrap()
+            .set_managed_agent_generation(1);
+        // The original --session selector was committed by the server; /proc
+        // only shows pi. Pane launch_argv remains unused and unavailable.
+        app.managed_pi_launches.insert(
+            terminal_id.clone(),
+            crate::app::agents::ManagedPiLaunch {
+                generation: 1,
+                session_path: session.display().to_string(),
+                earliest_birth_ticks: floor,
+                process: None,
+            },
+        );
+        app.handle_internal_event(AppEvent::AgentProcessDetected {
+            pane_id: pane,
+            agent: Agent::Pi,
+            process_generation: 1,
+            observed_at: std::time::Instant::now(),
+        });
+        app.handle_internal_event(AppEvent::StateChanged {
+            pane_id: pane,
+            agent: Some(Agent::Pi),
+            state: AgentState::Idle,
+            visible_blocker: false,
+            visible_working: false,
+            process_exited: false,
+            observed_at: std::time::Instant::now(),
+        });
+        let target = app.public_pane_id(0, pane).unwrap();
+        let get = |app: &mut App| {
+            let response = app.handle_agent_get(
+                "titled".into(),
+                AgentTarget {
+                    target: target.clone(),
+                },
+            );
+            let result: SuccessResponse = serde_json::from_str(&response).unwrap();
+            let ResponseResult::AgentInfo { agent } = result.result else {
+                panic!("agent get")
+            };
+            agent.agent_session
+        };
+        assert_eq!(
+            get(&mut app)
+                .expect("server-owned session despite titled argv")
+                .value,
+            session.display().to_string()
+        );
+        app.managed_pi_launches
+            .get_mut(&terminal_id)
+            .unwrap()
+            .process
+            .as_mut()
+            .unwrap()
+            .start_ticks += 1;
+        assert!(
+            get(&mut app).is_none(),
+            "same PID with changed birth must fail closed"
+        );
+        app.managed_pi_launches
+            .get_mut(&terminal_id)
+            .unwrap()
+            .process = Some(birth);
+        std::fs::set_permissions(&session, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(get(&mut app).is_none(), "private file remains mandatory");
+        std::fs::set_permissions(&session, std::fs::Permissions::from_mode(0o600)).unwrap();
+        // A successor generation must not bind the old still-live foreground
+        // Pi, even though it has the same terminal and an Active record.
+        std::thread::sleep(Duration::from_millis(25));
+        let next_floor = crate::platform::current_boot_ticks().unwrap();
+        assert!(next_floor > birth.start_ticks);
+        store
+            .cas(
+                Some(2),
+                crate::sender_authority::SenderAuthorityRecord {
+                    sender_key: terminal_id.to_string(),
+                    process_generation: 2,
+                    phase: crate::sender_authority::SenderAuthorityPhase::Preparing,
+                    transition_revision: 3,
+                },
+            )
+            .unwrap();
+        app.state
+            .terminals
+            .get_mut(&terminal_id)
+            .unwrap()
+            .set_managed_agent_generation(2);
+        app.managed_pi_launches.insert(
+            terminal_id.clone(),
+            crate::app::agents::ManagedPiLaunch {
+                generation: 2,
+                session_path: session.display().to_string(),
+                earliest_birth_ticks: next_floor,
+                process: None,
+            },
+        );
+        app.handle_internal_event(AppEvent::AgentProcessDetected {
+            pane_id: pane,
+            agent: Agent::Pi,
+            process_generation: 2,
+            observed_at: std::time::Instant::now(),
+        });
+        assert!(app
+            .managed_pi_launches
+            .get(&terminal_id)
+            .unwrap()
+            .process
+            .is_none());
+        assert!(
+            get(&mut app).is_none(),
+            "old process cannot bind replacement generation"
+        );
+        // A newly restored server can carry the same pane and Active authority,
+        // but not the ephemeral server-owned launch provenance.
+        let mut restored = app_with_agent();
+        restored.sender_authority_dir = directory.clone();
+        std::mem::swap(&mut restored.state, &mut app.state);
+        std::mem::swap(
+            &mut restored.mailbox_bootstrap_test_foreground_jobs,
+            &mut app.mailbox_bootstrap_test_foreground_jobs,
+        );
+        assert!(restored.managed_pi_launches.is_empty());
+        assert!(
+            get(&mut restored).is_none(),
+            "restore cannot resurrect a managed launch"
+        );
+        drop(child);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
     #[test]
     fn agent_get_trusts_exact_managed_pi_session_paths_and_revokes_stale_executions() {
         use std::os::unix::fs::PermissionsExt;
@@ -461,21 +686,6 @@ mod tests {
                 .get_mut(&terminal_id)
                 .unwrap()
                 .set_managed_agent_generation(1);
-            app.handle_internal_event(AppEvent::AgentProcessDetected {
-                pane_id: pane,
-                agent: Agent::Pi,
-                process_generation: 1,
-                observed_at: std::time::Instant::now(),
-            });
-            app.handle_internal_event(AppEvent::StateChanged {
-                pane_id: pane,
-                agent: Some(Agent::Pi),
-                state: AgentState::Idle,
-                visible_blocker: false,
-                visible_working: false,
-                process_exited: false,
-                observed_at: std::time::Instant::now(),
-            });
             let job = |session: &std::path::Path| crate::platform::ForegroundJob {
                 process_group_id: std::process::id(),
                 processes: vec![crate::platform::ForegroundProcess {
@@ -492,6 +702,31 @@ mod tests {
                 }],
             };
             app.install_mailbox_bootstrap_test_foreground_job(terminal_id.clone(), job(&session));
+            let birth = crate::platform::process_birth_identity(std::process::id()).unwrap();
+            app.managed_pi_launches.insert(
+                terminal_id.clone(),
+                crate::app::agents::ManagedPiLaunch {
+                    generation: 1,
+                    session_path: session.display().to_string(),
+                    earliest_birth_ticks: birth.start_ticks,
+                    process: None,
+                },
+            );
+            app.handle_internal_event(AppEvent::AgentProcessDetected {
+                pane_id: pane,
+                agent: Agent::Pi,
+                process_generation: 1,
+                observed_at: std::time::Instant::now(),
+            });
+            app.handle_internal_event(AppEvent::StateChanged {
+                pane_id: pane,
+                agent: Some(Agent::Pi),
+                state: AgentState::Idle,
+                visible_blocker: false,
+                visible_working: false,
+                process_exited: false,
+                observed_at: std::time::Instant::now(),
+            });
             let target = app.public_pane_id(ws_idx, pane).unwrap();
             let get = |app: &mut App| {
                 let response = app.handle_agent_get(
@@ -587,9 +822,10 @@ mod tests {
             ],
         };
         app.install_mailbox_bootstrap_test_foreground_job(child_terminal.clone(), wrong_process);
-        assert!(
-            get_child(&mut app).is_none(),
-            "another process's argv is not Pi's session"
+        assert_eq!(
+            get_child(&mut app).unwrap().value,
+            child_session.display().to_string(),
+            "another process's argv cannot replace the bound Pi launch session"
         );
         let link = directory.join("link.jsonl");
         std::os::unix::fs::symlink(&child_session, &link).unwrap();
@@ -609,10 +845,18 @@ mod tests {
             }],
         };
         app.install_mailbox_bootstrap_test_foreground_job(child_terminal.clone(), job_for(&link));
+        app.managed_pi_launches
+            .get_mut(&child_terminal)
+            .unwrap()
+            .session_path = link.display().to_string();
         assert!(
             get_child(&mut app).is_none(),
-            "symlink path must not claim identity"
+            "even a matching server launch cannot validate a symlink path"
         );
+        app.managed_pi_launches
+            .get_mut(&child_terminal)
+            .unwrap()
+            .session_path = child_session.display().to_string();
         app.install_mailbox_bootstrap_test_foreground_job(
             child_terminal.clone(),
             job_for(&child_session),
@@ -669,13 +913,24 @@ mod tests {
             .get_mut(&child_terminal)
             .unwrap()
             .set_managed_agent_generation(2);
+        app.install_mailbox_bootstrap_test_foreground_job(child_terminal.clone(), job_for(&next));
+        app.managed_pi_launches.insert(
+            child_terminal.clone(),
+            crate::app::agents::ManagedPiLaunch {
+                generation: 2,
+                session_path: next.display().to_string(),
+                earliest_birth_ticks: crate::platform::process_birth_identity(std::process::id())
+                    .unwrap()
+                    .start_ticks,
+                process: None,
+            },
+        );
         app.handle_internal_event(AppEvent::AgentProcessDetected {
             pane_id: child_pane,
             agent: Agent::Pi,
             process_generation: 2,
             observed_at: std::time::Instant::now(),
         });
-        app.install_mailbox_bootstrap_test_foreground_job(child_terminal.clone(), job_for(&next));
         assert_eq!(
             get_child(&mut app).unwrap().value,
             next.display().to_string()
@@ -685,7 +940,86 @@ mod tests {
             get_child(&mut app).is_none(),
             "stopped execution cannot retain identity"
         );
+        let stopped = app.state.terminals.get_mut(&child_terminal).unwrap();
+        stopped.persisted_agent_session = Some(crate::agent_resume::PersistedAgentSession {
+            source: "herdr:pi".into(),
+            agent: "pi".into(),
+            session_ref: crate::agent_resume::AgentSessionRef::path(next.display().to_string())
+                .unwrap(),
+        });
+        stopped.clear_agent_name();
+        assert!(
+            get_child(&mut app).is_none(),
+            "stopped Pi cannot fall back to an old pane report"
+        );
         std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn managed_start_commits_only_one_valid_selector_after_successful_input() {
+        let path = std::env::temp_dir()
+            .join("herdr-managed-commit.jsonl")
+            .display()
+            .to_string();
+        for (args, close_input, expect_committed) in [
+            (vec!["--session".into(), path.clone()], false, true),
+            (
+                vec![
+                    "--session".into(),
+                    path.clone(),
+                    "--session".into(),
+                    "/tmp/forged.jsonl".into(),
+                ],
+                false,
+                false,
+            ),
+            (vec!["--session".into(), path.clone()], true, false),
+        ] {
+            let mut app = app_with_agent();
+            let pane = app.state.workspaces[0].tabs[0].root_pane.unwrap();
+            let terminal = app.state.workspaces[0].terminal_id(pane).unwrap().clone();
+            let authority_dir = std::env::temp_dir().join(format!(
+                "herdr-managed-commit-{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            ));
+            app.sender_authority_dir = authority_dir.clone();
+            let (runtime, input) = crate::terminal::TerminalRuntime::test_with_channel(80, 24);
+            app.terminal_runtimes.insert(terminal.clone(), runtime);
+            if close_input {
+                drop(input);
+            }
+            let response = app.handle_agent_start(
+                "start".into(),
+                crate::api::schema::AgentStartParams {
+                    name: "owner".into(),
+                    kind: "pi".into(),
+                    pane_id: app.public_pane_id(0, pane).unwrap(),
+                    args,
+                    env: Vec::new(),
+                    timeout_ms: None,
+                },
+            );
+            assert_eq!(
+                serde_json::from_str::<SuccessResponse>(&response).is_ok(),
+                !close_input
+            );
+            let committed = app.managed_pi_launches.get(&terminal);
+            assert_eq!(committed.is_some(), expect_committed);
+            if let Some(launch) = committed {
+                assert_eq!(launch.session_path, path);
+                assert_eq!(launch.generation, 1);
+                assert!(
+                    launch.process.is_none(),
+                    "birth must bind only after Active observation"
+                );
+            }
+            std::fs::remove_dir_all(authority_dir).unwrap();
+        }
     }
 
     #[tokio::test]

@@ -158,6 +158,19 @@ impl App {
         if let Err(err) = self.state.delegations.reparent(delegation_id, parent_id) {
             return delegation_error(id, err);
         }
+        // A route change must not carry the old managed Pi identity forward.
+        if let Some(pane_id) = self
+            .state
+            .delegations
+            .get(delegation_id)
+            .and_then(|d| d.pane_id)
+        {
+            if let Some((ws_idx, _)) = self.find_pane(pane_id) {
+                if let Some(terminal_id) = self.state.workspaces[ws_idx].terminal_id(pane_id) {
+                    self.managed_pi_launches.remove(terminal_id);
+                }
+            }
+        }
         self.state.mark_session_dirty();
         self.schedule_session_save();
         let delegation = self.delegation_info(
@@ -315,7 +328,7 @@ mod tests {
         let child = request(
             &mut app,
             Method::DelegationCreate(DelegationCreateParams {
-                pane_id: Some(child_pane),
+                pane_id: Some(child_pane.clone()),
                 parent_id: Some(root_id.clone()),
                 purpose: Some("review".into()),
             }),
@@ -324,6 +337,20 @@ mod tests {
             .as_str()
             .expect("child ID")
             .to_string();
+        let (child_ws, child_local_pane) = app.parse_pane_id(&child_pane).unwrap();
+        let child_terminal = app.state.workspaces[child_ws]
+            .terminal_id(child_local_pane)
+            .unwrap()
+            .clone();
+        app.managed_pi_launches.insert(
+            child_terminal.clone(),
+            crate::app::agents::ManagedPiLaunch {
+                generation: 1,
+                session_path: "/tmp/owned.jsonl".into(),
+                earliest_birth_ticks: 1,
+                process: None,
+            },
+        );
         let detached = request(
             &mut app,
             Method::DelegationCreate(DelegationCreateParams {
@@ -374,6 +401,10 @@ mod tests {
             }),
         );
         assert!(reparented["result"]["delegation"]["parent_id"].is_null());
+        assert!(
+            !app.managed_pi_launches.contains_key(&child_terminal),
+            "reparent revokes the old launch identity"
+        );
         let reordered = request(
             &mut app,
             Method::DelegationReorder(DelegationReorderParams {

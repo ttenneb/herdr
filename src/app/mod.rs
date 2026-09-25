@@ -144,6 +144,8 @@ pub struct App {
     /// Issued accepted-channel bindings. These are server process lifecycle state,
     /// never client socket discovery or request selectors.
     pub(crate) mailbox_bootstrap_bindings: BTreeMap<String, mailbox::MailboxBootstrapSession>,
+    /// Ephemeral server-owned managed start evidence; never restored from a pane snapshot.
+    pub(crate) managed_pi_launches: HashMap<crate::terminal::TerminalId, agents::ManagedPiLaunch>,
     pub(crate) next_mailbox_bootstrap_binding: u64,
     /// Discovery address published only by a ready Headless-owned listener.
     /// It is injected into Pi launches but is never mailbox authority.
@@ -876,6 +878,7 @@ impl App {
             sender_authority_dir: crate::session::data_dir(),
             offline_mailbox_authorities: BTreeMap::new(),
             mailbox_bootstrap_bindings: BTreeMap::new(),
+            managed_pi_launches: HashMap::new(),
             next_mailbox_bootstrap_binding: 1,
             mailbox_bootstrap_discovery_address: None,
             #[cfg(test)]

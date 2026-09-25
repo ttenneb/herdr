@@ -18,6 +18,25 @@ pub struct ForegroundJob {
     pub processes: Vec<ForegroundProcess>,
 }
 
+/// PID plus kernel-reported process birth tick. Neither a PID nor argv alone
+/// survives process replacement as an execution identity.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ProcessBirthIdentity {
+    pub pid: u32,
+    pub start_ticks: u64,
+}
+
+// No equivalent audited birth/ACL contract exists on these platforms yet.
+#[cfg(not(target_os = "linux"))]
+pub(crate) fn process_birth_identity(_pid: u32) -> Option<ProcessBirthIdentity> {
+    None
+}
+
+#[cfg(not(target_os = "linux"))]
+pub(crate) fn current_boot_ticks() -> Option<u64> {
+    None
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Signal {
     Hangup,
