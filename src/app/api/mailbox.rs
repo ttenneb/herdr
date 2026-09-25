@@ -856,6 +856,58 @@ mod tests {
     }
 
     #[test]
+    fn admitted_high_claim_remains_outstanding_until_settled_before_normal_claim() {
+        let (mut app, _pane_id, sender, directory) = app_with_active_sender();
+        for (stable_id, priority, digest) in [
+            ("a-high", "high", "a".repeat(64)),
+            ("z-normal", "normal", "b".repeat(64)),
+        ] {
+            let mut submit = active_submit(sender.clone(), digest);
+            submit.submit.stable_id = stable_id.into();
+            submit.submit.priority = priority.into();
+            let response = app.handle_api_request(Request {
+                id: stable_id.into(),
+                method: Method::MailboxOfflineSubmit(submit),
+            });
+            assert!(serde_json::from_str::<SuccessResponse>(&response).is_ok());
+        }
+        let claim = |app: &mut App, id: &str| {
+            let response = app.handle_api_request(Request {
+                id: id.into(),
+                method: Method::MailboxClaim(active_claim(sender.clone())),
+            });
+            let response: SuccessResponse = serde_json::from_str(&response).unwrap();
+            let ResponseResult::MailboxClaimed { claim: Some(claim) } = response.result else {
+                panic!("expected claim")
+            };
+            claim
+        };
+        let high = claim(&mut app, "high");
+        assert_eq!(high.stable_id, "a-high");
+        let resolve = |app: &mut App, outcome| {
+            app.handle_api_request(Request {
+                id: "resolve".into(),
+                method: Method::MailboxResolve(active_resolve(
+                    sender.clone(),
+                    high.claim_id.clone(),
+                    outcome,
+                )),
+            })
+        };
+        let admitted = resolve(&mut app, ResolveOutcome::Admitted);
+        assert!(serde_json::from_str::<SuccessResponse>(&admitted).is_ok());
+        assert_eq!(claim(&mut app, "after-admitted"), high);
+        let settled = resolve(&mut app, ResolveOutcome::Settled);
+        assert!(serde_json::from_str::<SuccessResponse>(&settled).is_ok());
+        assert_eq!(claim(&mut app, "after-settled").stable_id, "z-normal");
+        let backwards: ErrorResponse =
+            serde_json::from_str(&resolve(&mut app, ResolveOutcome::Admitted)).unwrap();
+        assert_eq!(backwards.error.code, "mailbox_store_failed");
+        drop(app);
+        std::fs::remove_dir_all(directory).expect("remove mailbox directory");
+    }
+
+    #[test]
     fn mailbox_claim_replay_returns_one_durable_claim_and_resolve_is_idempotent() {
         let (mut app, _pane_id, sender_key, directory) = app_with_active_sender();
         let submitted = app.handle_api_request(Request {

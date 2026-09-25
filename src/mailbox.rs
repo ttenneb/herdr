@@ -282,6 +282,11 @@ impl MailboxStore {
                 return Err(MailboxError::InvalidRecord);
             }
             let recovered = self.load()?;
+            if let Some(existing) = recovered.heads.get(&head.stable_id) {
+                if existing != &head {
+                    return Err(MailboxError::ConflictingDuplicate);
+                }
+            }
             if let Some(existing) = recovered.receipts.get(&receipt.delivery_digest) {
                 return if existing == &receipt {
                     Ok(())
@@ -289,11 +294,7 @@ impl MailboxStore {
                     Err(MailboxError::ConflictingDuplicate)
                 };
             }
-            if let Some(existing) = recovered.heads.get(&head.stable_id) {
-                if existing != &head {
-                    return Err(MailboxError::ConflictingDuplicate);
-                }
-            } else {
+            if !recovered.heads.contains_key(&head.stable_id) {
                 self.append_synced(&MailboxRecord::Head { head })?;
             }
             // The preceding append_synced performed File::sync_all before this receipt is written.
@@ -399,7 +400,13 @@ impl MailboxStore {
                 .values()
                 .find(|claim| {
                     &claim.recipient == recipient
-                        && !recovered.resolutions.contains_key(&claim.claim_id)
+                        && !matches!(
+                            recovered.resolutions.get(&claim.claim_id),
+                            Some(ClaimResolution {
+                                outcome: ClaimResolutionOutcome::Settled,
+                                ..
+                            })
+                        )
                 })
                 .cloned()
             {
@@ -427,8 +434,8 @@ impl MailboxStore {
         })
     }
 
-    /// Persists a single resolution for the claimed work. Matching retries read
-    /// back the first resolution; a conflicting replay cannot change outcome.
+    /// Persists admission followed by settlement. Admission remains outstanding;
+    /// identical retries do not append, and settlement cannot regress to admission.
     pub fn resolve_claim(
         &self,
         claim_id: &str,
@@ -448,11 +455,14 @@ impl MailboxStore {
                 outcome,
             };
             if let Some(existing) = recovered.resolutions.get(claim_id) {
-                return if existing == &resolution {
-                    Ok(existing.clone())
-                } else {
-                    Err(MailboxError::ClaimAlreadyResolved)
-                };
+                if existing == &resolution {
+                    return Ok(existing.clone());
+                }
+                if existing.outcome != ClaimResolutionOutcome::Admitted
+                    || outcome != ClaimResolutionOutcome::Settled
+                {
+                    return Err(MailboxError::ClaimAlreadyResolved);
+                }
             }
             self.append_synced(&MailboxRecord::Resolution {
                 resolution: resolution.clone(),
@@ -514,11 +524,32 @@ impl RecoveredMailbox {
             MailboxRecord::Claim { claim } => {
                 insert_exact(&mut self.claims, claim.stable_id.clone(), claim)
             }
-            MailboxRecord::Resolution { resolution } => insert_exact(
-                &mut self.resolutions,
-                resolution.claim_id.clone(),
-                resolution,
-            ),
+            MailboxRecord::Resolution { resolution } => {
+                if !self
+                    .claims
+                    .values()
+                    .any(|claim| claim.claim_id == resolution.claim_id)
+                {
+                    return Err(MailboxError::CorruptRecord);
+                }
+                match self.resolutions.get(&resolution.claim_id) {
+                    Some(existing) if existing == &resolution => Ok(()),
+                    Some(existing)
+                        if existing.outcome == ClaimResolutionOutcome::Admitted
+                            && resolution.outcome == ClaimResolutionOutcome::Settled =>
+                    {
+                        self.resolutions
+                            .insert(resolution.claim_id.clone(), resolution);
+                        Ok(())
+                    }
+                    Some(_) => Err(MailboxError::ConflictingDuplicate),
+                    None => {
+                        self.resolutions
+                            .insert(resolution.claim_id.clone(), resolution);
+                        Ok(())
+                    }
+                }
+            }
             MailboxRecord::Grant { grant } => {
                 insert_exact(&mut self.grants, grant.grant_id.clone(), grant)
             }
@@ -746,6 +777,130 @@ mod tests {
             store.append_head_and_receipt(conflicting, receipt(&head)),
             Err(MailboxError::ConflictingDuplicate)
         );
+    }
+
+    #[test]
+    fn admitted_claim_stays_outstanding_until_settled_then_next_claim_is_minted() {
+        let store = temporary_store();
+        let mut high = head();
+        high.stable_id = "a-high".into();
+        high.priority = "high".into();
+        let mut normal = head();
+        normal.stable_id = "z-normal".into();
+        normal.delivery_digest = "c".repeat(64);
+        store.append_offline_head(high.clone()).unwrap();
+        store.append_offline_head(normal.clone()).unwrap();
+        let claim = store.claim_next(&high.recipient).unwrap().unwrap();
+        assert_eq!(claim.stable_id, high.stable_id);
+        let admitted = store
+            .resolve_claim(&claim.claim_id, ClaimResolutionOutcome::Admitted)
+            .unwrap();
+        let lines_before_retry = std::fs::read_to_string(&store.stream_path)
+            .unwrap()
+            .lines()
+            .count();
+        assert_eq!(
+            store
+                .resolve_claim(&claim.claim_id, ClaimResolutionOutcome::Admitted)
+                .unwrap(),
+            admitted
+        );
+        assert_eq!(
+            std::fs::read_to_string(&store.stream_path)
+                .unwrap()
+                .lines()
+                .count(),
+            lines_before_retry
+        );
+        let reopened = MailboxStore::open(store.stream_path.parent().unwrap()).unwrap();
+        assert_eq!(
+            reopened.load().unwrap().resolutions[&claim.claim_id],
+            admitted
+        );
+        assert_eq!(
+            reopened.claim_next(&high.recipient).unwrap(),
+            Some(claim.clone())
+        );
+        assert_eq!(reopened.load().unwrap().claims.len(), 1);
+        let settled = reopened
+            .resolve_claim(&claim.claim_id, ClaimResolutionOutcome::Settled)
+            .unwrap();
+        assert_eq!(settled.outcome, ClaimResolutionOutcome::Settled);
+        let lines_after_settle = std::fs::read_to_string(&store.stream_path)
+            .unwrap()
+            .lines()
+            .count();
+        assert_eq!(lines_after_settle, lines_before_retry + 1);
+        assert_eq!(
+            reopened
+                .resolve_claim(&claim.claim_id, ClaimResolutionOutcome::Settled)
+                .unwrap(),
+            settled
+        );
+        assert_eq!(
+            std::fs::read_to_string(&store.stream_path)
+                .unwrap()
+                .lines()
+                .count(),
+            lines_after_settle
+        );
+        assert_eq!(
+            reopened.resolve_claim(&claim.claim_id, ClaimResolutionOutcome::Admitted),
+            Err(MailboxError::ClaimAlreadyResolved)
+        );
+        let after_reload = MailboxStore::open(store.stream_path.parent().unwrap()).unwrap();
+        assert_eq!(
+            after_reload.load().unwrap().resolutions[&claim.claim_id],
+            settled
+        );
+        let next = after_reload.claim_next(&high.recipient).unwrap().unwrap();
+        assert_eq!(next.stable_id, normal.stable_id);
+        assert_eq!(
+            after_reload.claim_next(&high.recipient).unwrap(),
+            Some(next)
+        );
+    }
+
+    #[test]
+    fn old_single_stage_journals_reload_and_conflicting_resolution_replay_fails_closed() {
+        let admitted_only = temporary_store();
+        let old_head = head();
+        admitted_only.append_offline_head(old_head.clone()).unwrap();
+        let old_claim = admitted_only
+            .claim_next(&old_head.recipient)
+            .unwrap()
+            .unwrap();
+        admitted_only
+            .resolve_claim(&old_claim.claim_id, ClaimResolutionOutcome::Admitted)
+            .unwrap();
+        let old_reload = MailboxStore::open(admitted_only.stream_path.parent().unwrap()).unwrap();
+        assert_eq!(
+            old_reload.claim_next(&old_head.recipient).unwrap(),
+            Some(old_claim)
+        );
+
+        let store = temporary_store();
+        let high = head();
+        store.append_offline_head(high.clone()).unwrap();
+        let claim = store.claim_next(&high.recipient).unwrap().unwrap();
+        store
+            .resolve_claim(&claim.claim_id, ClaimResolutionOutcome::Settled)
+            .unwrap();
+        let reopened = MailboxStore::open(store.stream_path.parent().unwrap()).unwrap();
+        assert_eq!(
+            reopened.load().unwrap().resolutions[&claim.claim_id].outcome,
+            ClaimResolutionOutcome::Settled
+        );
+        assert_eq!(reopened.claim_next(&high.recipient).unwrap(), None);
+        store
+            .append_synced(&MailboxRecord::Resolution {
+                resolution: ClaimResolution {
+                    claim_id: claim.claim_id.clone(),
+                    outcome: ClaimResolutionOutcome::Admitted,
+                },
+            })
+            .unwrap();
+        assert_eq!(reopened.load(), Err(MailboxError::ConflictingDuplicate));
     }
 
     #[test]
