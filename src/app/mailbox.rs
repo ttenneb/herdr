@@ -39,7 +39,20 @@ pub(crate) struct MailboxBootstrapSession {
     pub(crate) grant_id: String,
     pub(crate) active_execution_generation: u64,
     pub(crate) binding_generation: String,
+    pub(crate) parent_report: Option<BoundParentReportRoute>,
     context: TrustedMailboxChannelContext,
+}
+
+/// Frozen to the exact delegation edge and parent execution at stream accept.
+/// Only the server derives these fields; a request supplies just a typed report.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct BoundParentReportRoute {
+    pub(crate) recipient: crate::mailbox::RecipientKey,
+    pub(crate) grant_id: String,
+    parent_generation: u64,
+    child_delegation: crate::delegation::DelegationId,
+    parent_delegation: crate::delegation::DelegationId,
+    parent_pane: crate::layout::PaneId,
 }
 
 impl MailboxBootstrapSession {
@@ -370,6 +383,125 @@ impl App {
         Ok(grant_id)
     }
 
+    fn bound_parent_report_candidate(
+        &self,
+        sender_key: &str,
+        sender_generation: u64,
+    ) -> Option<BoundParentReportRoute> {
+        let (child, child_terminal) =
+            self.state
+                .delegations
+                .records()
+                .values()
+                .find_map(|record| {
+                    let pane = record.pane_id?;
+                    let (ws_idx, _) = self.find_pane(pane)?;
+                    let terminal = self.state.workspaces[ws_idx].terminal_id(pane)?;
+                    (terminal.to_string() == sender_key).then_some((record, terminal))
+                })?;
+        let parent_delegation = child.parent_id?;
+        let parent = self.state.delegations.get(parent_delegation)?;
+        let parent_pane = parent.pane_id?;
+        if parent.tombstone
+            || child.tombstone
+            || self
+                .state
+                .terminals
+                .get(child_terminal)?
+                .managed_agent_kind()
+                != Some(crate::detect::Agent::Pi)
+            || !self
+                .state
+                .terminals
+                .get(child_terminal)?
+                .accepts_managed_agent_generation(sender_generation)
+        {
+            return None;
+        }
+        let (ws_idx, _) = self.find_pane(parent_pane)?;
+        let parent_terminal_id = self.state.workspaces[ws_idx].terminal_id(parent_pane)?;
+        let parent_key = parent_terminal_id.to_string();
+        if parent_key == sender_key
+            || self
+                .state
+                .terminals
+                .get(parent_terminal_id)?
+                .managed_agent_kind()
+                != Some(crate::detect::Agent::Pi)
+        {
+            return None;
+        }
+        let parent_record = crate::sender_authority::SenderAuthorityStore::for_sender(
+            &self.sender_authority_dir,
+            &parent_key,
+        )
+        .ok()?
+        .load()
+        .ok()??;
+        let parent_generation = parent_record.process_generation;
+        if !parent_record.authoritative()
+            || !self
+                .state
+                .terminals
+                .get(parent_terminal_id)?
+                .accepts_managed_agent_generation(parent_generation)
+            || !self.exact_active_mailbox_authority(&parent_key, parent_generation)
+        {
+            return None;
+        }
+        let recipient = crate::mailbox::RecipientKey {
+            recipient_id: parent_key,
+            generation: "1".into(),
+        };
+        Some(BoundParentReportRoute {
+            grant_id: format!("mailbox:{sender_key}:1:{}:1", recipient.recipient_id),
+            recipient,
+            parent_generation,
+            child_delegation: child.id,
+            parent_delegation,
+            parent_pane,
+        })
+    }
+
+    pub(crate) fn bound_parent_report_current(
+        &self,
+        session: &MailboxBootstrapSession,
+    ) -> Result<BoundParentReportRoute, MailboxBootstrapError> {
+        self.mailbox_bootstrap_session_current(session)?;
+        let route = session
+            .parent_report
+            .as_ref()
+            .ok_or(MailboxBootstrapError::GrantMissing)?;
+        if self
+            .bound_parent_report_candidate(&session.caller, session.active_execution_generation)
+            .as_ref()
+            != Some(route)
+        {
+            return Err(MailboxBootstrapError::GrantRevoked);
+        }
+        let authority = self
+            .offline_mailbox_authorities
+            .get(&session.caller)
+            .ok_or(MailboxBootstrapError::GrantRevoked)?;
+        let grant = authority
+            .store
+            .load()
+            .map_err(|_| MailboxBootstrapError::GrantMissing)?
+            .grants
+            .get(&route.grant_id)
+            .cloned();
+        if grant
+            != Some(crate::mailbox::MailboxGrant {
+                grant_id: route.grant_id.clone(),
+                sender: session.recipient.clone(),
+                recipient: route.recipient.clone(),
+            })
+        {
+            return Err(MailboxBootstrapError::GrantRevoked);
+        }
+        Ok(route.clone())
+    }
+
     /// Provisions a cross-recipient grant only for an accepted, current Pi
     /// bootstrap channel. The stream session supplies A; the request can name
     /// only a currently managed recipient target, never a caller, grant, or
@@ -598,8 +730,18 @@ impl App {
                 .next_mailbox_bootstrap_binding
                 .checked_add(1)
                 .ok_or(MailboxBootstrapError::GrantMissing)?;
+            let parent_report = self
+                .bound_parent_report_candidate(&candidate.sender_key, candidate.process_generation);
+            if let Some(route) = &parent_report {
+                self.provision_cross_recipient_mailbox_grant(
+                    &candidate.sender_key,
+                    route.recipient.clone(),
+                )
+                .map_err(|_| MailboxBootstrapError::GrantMissing)?;
+            }
             let session = MailboxBootstrapSession {
                 caller: candidate.sender_key.clone(),
+                parent_report,
                 recipient: crate::mailbox::RecipientKey {
                     recipient_id: candidate.sender_key.clone(),
                     generation: "1".into(),

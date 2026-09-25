@@ -34,6 +34,23 @@ impl App {
                     },
                 )
             }
+            "report_submit_parent" => {
+                let submit: crate::mailbox_v1::Submit = serde_json::from_value(params)
+                    .map_err(|_| MailboxBootstrapError::InvalidRequest)?;
+                if submit.kind != "report" {
+                    return Err(MailboxBootstrapError::InvalidRequest);
+                }
+                let route = self.bound_parent_report_current(session)?;
+                self.handle_mailbox_offline_submit(
+                    id,
+                    MailboxOfflineSubmitParams {
+                        caller: session.caller.clone(),
+                        grant_id: route.grant_id.clone(),
+                        recipient: route.recipient.clone(),
+                        submit,
+                    },
+                )
+            }
             "mailbox.provision_recipient" => {
                 #[derive(serde::Deserialize)]
                 #[serde(rename_all = "camelCase", deny_unknown_fields)]
