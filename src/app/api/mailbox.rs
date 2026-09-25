@@ -897,9 +897,32 @@ mod tests {
         let admitted = resolve(&mut app, ResolveOutcome::Admitted);
         assert!(serde_json::from_str::<SuccessResponse>(&admitted).is_ok());
         assert_eq!(claim(&mut app, "after-admitted"), high);
+        let snapshot = |app: &mut App| {
+            let response = app.handle_api_request(Request {
+                id: "snapshot".into(),
+                method: Method::MailboxSnapshot(mailbox_snapshot(
+                    sender.clone(),
+                    format!("offline:{sender}:1"),
+                    active_recipient(&sender),
+                )),
+            });
+            let response: SuccessResponse = serde_json::from_str(&response).unwrap();
+            let ResponseResult::MailboxSnapshot { snapshot } = response.result else {
+                panic!("expected snapshot")
+            };
+            snapshot.claim
+        };
+        assert_eq!(snapshot(&mut app), Some(high.clone()));
         let settled = resolve(&mut app, ResolveOutcome::Settled);
-        assert!(serde_json::from_str::<SuccessResponse>(&settled).is_ok());
-        assert_eq!(claim(&mut app, "after-settled").stable_id, "z-normal");
+        assert!(
+            serde_json::from_str::<SuccessResponse>(&settled).is_ok(),
+            "{settled}"
+        );
+        assert_eq!(snapshot(&mut app), None);
+        let normal = claim(&mut app, "after-settled");
+        assert_eq!(normal.stable_id, "z-normal");
+        assert_eq!(snapshot(&mut app), Some(normal.clone()));
+        assert_eq!(claim(&mut app, "normal-replay"), normal);
         let backwards: ErrorResponse =
             serde_json::from_str(&resolve(&mut app, ResolveOutcome::Admitted)).unwrap();
         assert_eq!(backwards.error.code, "mailbox_store_failed");

@@ -412,9 +412,24 @@ impl MailboxStore {
             {
                 return Ok(Some(existing));
             }
-            let Some(head) = recovered.heads.values().find(|head| {
-                &head.recipient == recipient && !recovered.claims.contains_key(&head.stable_id)
-            }) else {
+            let Some(head) = recovered
+                .heads
+                .values()
+                .filter(|head| {
+                    &head.recipient == recipient && !recovered.claims.contains_key(&head.stable_id)
+                })
+                // Priority wins; within a tier use the server-minted enqueue epoch,
+                // never caller-provided sequence or the stable-ID map ordering.
+                .min_by_key(|head| {
+                    let priority = match head.priority.as_str() {
+                        "high" => 0,
+                        "normal" => 1,
+                        "low" => 2,
+                        _ => 3,
+                    };
+                    (priority, head.enqueue_epoch, &head.stable_id)
+                })
+            else {
                 return Ok(None);
             };
             let claim = Claim {
@@ -862,6 +877,40 @@ mod tests {
     }
 
     #[test]
+    fn claim_next_prioritizes_high_then_server_enqueue_fifo_not_lexical_or_sender_sequence() {
+        let store = temporary_store();
+        let recipient = head().recipient;
+        for (stable_id, priority, original_sequence, delivery_digest) in [
+            ("y-normal-earlier", "normal", 99, "b"),
+            ("a-normal-later", "normal", 1, "c"),
+            ("z-high", "high", 2, "d"),
+        ] {
+            let mut item = head();
+            item.stable_id = stable_id.into();
+            item.priority = priority.into();
+            item.original_sequence = original_sequence;
+            item.delivery_digest = delivery_digest.repeat(64);
+            store.append_offline_head(item).unwrap();
+        }
+        let high = store.claim_next(&recipient).unwrap().unwrap();
+        assert_eq!(high.stable_id, "z-high");
+        store
+            .resolve_claim(&high.claim_id, ClaimResolutionOutcome::Settled)
+            .unwrap();
+        let first_normal = store.claim_next(&recipient).unwrap().unwrap();
+        assert_eq!(first_normal.stable_id, "y-normal-earlier");
+        store
+            .resolve_claim(&first_normal.claim_id, ClaimResolutionOutcome::Settled)
+            .unwrap();
+        let second_normal = store.claim_next(&recipient).unwrap().unwrap();
+        assert_eq!(second_normal.stable_id, "a-normal-later");
+        store
+            .resolve_claim(&second_normal.claim_id, ClaimResolutionOutcome::Settled)
+            .unwrap();
+        assert_eq!(store.claim_next(&recipient).unwrap(), None);
+    }
+
+    #[test]
     fn old_single_stage_journals_reload_and_conflicting_resolution_replay_fails_closed() {
         let admitted_only = temporary_store();
         let old_head = head();
@@ -876,6 +925,10 @@ mod tests {
         let old_reload = MailboxStore::open(admitted_only.stream_path.parent().unwrap()).unwrap();
         assert_eq!(
             old_reload.claim_next(&old_head.recipient).unwrap(),
+            Some(old_claim.clone())
+        );
+        assert_eq!(
+            crate::mailbox_v1::snapshot(&old_reload.load().unwrap(), &old_head.recipient).claim,
             Some(old_claim)
         );
 
@@ -892,6 +945,10 @@ mod tests {
             ClaimResolutionOutcome::Settled
         );
         assert_eq!(reopened.claim_next(&high.recipient).unwrap(), None);
+        assert_eq!(
+            crate::mailbox_v1::snapshot(&reopened.load().unwrap(), &high.recipient).claim,
+            None
+        );
         store
             .append_synced(&MailboxRecord::Resolution {
                 resolution: ClaimResolution {

@@ -123,10 +123,21 @@ pub fn snapshot(recovered: &RecoveredMailbox, recipient: &RecipientKey) -> Snaps
         })
         .cloned()
         .collect();
+    // A settled claim remains in the journal for replay, but is no longer the
+    // consumer's current work. Admission alone does not settle it.
     let claim = recovered
         .claims
         .values()
-        .find(|claim| &claim.recipient == recipient)
+        .find(|claim| {
+            &claim.recipient == recipient
+                && !matches!(
+                    recovered.resolutions.get(&claim.claim_id),
+                    Some(crate::mailbox::ClaimResolution {
+                        outcome: crate::mailbox::ClaimResolutionOutcome::Settled,
+                        ..
+                    })
+                )
+        })
         .cloned();
     Snapshot {
         heads,
