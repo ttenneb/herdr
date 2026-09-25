@@ -397,6 +397,297 @@ mod tests {
         app
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn agent_get_trusts_exact_managed_pi_session_paths_and_revokes_stale_executions() {
+        use std::os::unix::fs::PermissionsExt;
+        let mut app = app_with_agent();
+        app.state.workspaces.push(Workspace::test_new("child"));
+        app.state.ensure_test_terminals();
+        let directory = std::env::temp_dir().join(format!(
+            "herdr-pi-identity-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&directory).unwrap();
+        app.sender_authority_dir = directory.clone();
+        let mut identities = Vec::new();
+        for (ws_idx, name) in [(0, "parent"), (1, "child")] {
+            let pane = app.state.workspaces[ws_idx].tabs[0].root_pane.unwrap();
+            let terminal_id = app.state.workspaces[ws_idx]
+                .terminal_id(pane)
+                .unwrap()
+                .clone();
+            let sender = terminal_id.to_string();
+            let session = directory.join(format!("{name}.jsonl"));
+            std::fs::write(
+                &session,
+                format!(
+                    "{{\"type\":\"session\",\"version\":3,\"id\":\"{name}\",\"cwd\":\"/tmp\"}}\n"
+                ),
+            )
+            .unwrap();
+            std::fs::set_permissions(&session, std::fs::Permissions::from_mode(0o600)).unwrap();
+            let store =
+                crate::sender_authority::SenderAuthorityStore::for_sender(&directory, &sender)
+                    .unwrap();
+            store
+                .cas(
+                    None,
+                    crate::sender_authority::SenderAuthorityRecord {
+                        sender_key: sender.clone(),
+                        process_generation: 1,
+                        phase: crate::sender_authority::SenderAuthorityPhase::Preparing,
+                        transition_revision: 1,
+                    },
+                )
+                .unwrap();
+            app.state
+                .terminals
+                .get_mut(&terminal_id)
+                .unwrap()
+                .begin_managed_agent(
+                    name.into(),
+                    Agent::Pi,
+                    std::time::Instant::now(),
+                    Duration::from_secs(3),
+                    Duration::from_secs(30),
+                );
+            app.state
+                .terminals
+                .get_mut(&terminal_id)
+                .unwrap()
+                .set_managed_agent_generation(1);
+            app.handle_internal_event(AppEvent::AgentProcessDetected {
+                pane_id: pane,
+                agent: Agent::Pi,
+                process_generation: 1,
+                observed_at: std::time::Instant::now(),
+            });
+            app.handle_internal_event(AppEvent::StateChanged {
+                pane_id: pane,
+                agent: Some(Agent::Pi),
+                state: AgentState::Idle,
+                visible_blocker: false,
+                visible_working: false,
+                process_exited: false,
+                observed_at: std::time::Instant::now(),
+            });
+            let job = |session: &std::path::Path| crate::platform::ForegroundJob {
+                process_group_id: std::process::id(),
+                processes: vec![crate::platform::ForegroundProcess {
+                    pid: std::process::id(),
+                    name: "node".into(),
+                    argv0: None,
+                    argv: Some(vec![
+                        "node".into(),
+                        "/opt/node_modules/@earendil-works/pi-coding-agent/dist/cli.js".into(),
+                        "--session".into(),
+                        session.display().to_string(),
+                    ]),
+                    cmdline: None,
+                }],
+            };
+            app.install_mailbox_bootstrap_test_foreground_job(terminal_id.clone(), job(&session));
+            let target = app.public_pane_id(ws_idx, pane).unwrap();
+            let get = |app: &mut App| {
+                let response = app.handle_agent_get(
+                    "identity".into(),
+                    AgentTarget {
+                        target: target.clone(),
+                    },
+                );
+                let result: SuccessResponse = serde_json::from_str(&response).unwrap();
+                let ResponseResult::AgentInfo { agent } = result.result else {
+                    panic!("agent get")
+                };
+                assert_eq!(agent.agent_status, AgentStatus::Idle);
+                agent.agent_session
+            };
+            let identity = get(&mut app).expect("current idle Pi session identity");
+            assert_eq!(identity.source, "herdr:pi");
+            assert_eq!(
+                identity.kind,
+                crate::agent_resume::AgentSessionRefKind::Path
+            );
+            assert_eq!(identity.value, session.display().to_string());
+            identities.push((pane, terminal_id, sender, session, target));
+        }
+        let (child_pane, child_terminal, child_key, child_session, child_target) =
+            identities[1].clone();
+        let get_child = |app: &mut App| {
+            let response = app.handle_agent_get(
+                "child".into(),
+                AgentTarget {
+                    target: child_target.clone(),
+                },
+            );
+            let result: SuccessResponse = serde_json::from_str(&response).unwrap();
+            let ResponseResult::AgentInfo { agent } = result.result else {
+                panic!("agent get")
+            };
+            agent.agent_session
+        };
+        assert_ne!(
+            identities[0].3, identities[1].3,
+            "two idle panes remain distinct"
+        );
+        let forged = directory.join("forged.jsonl");
+        std::fs::write(&forged, b"{\"type\":\"session\",\"version\":3}\n").unwrap();
+        std::fs::set_permissions(&forged, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let wrong_job = crate::platform::ForegroundJob {
+            process_group_id: std::process::id(),
+            processes: vec![crate::platform::ForegroundProcess {
+                pid: std::process::id(),
+                name: "node".into(),
+                argv0: None,
+                argv: Some(vec![
+                    "node".into(),
+                    "/opt/node_modules/@earendil-works/pi-coding-agent/dist/cli.js".into(),
+                    "--session".into(),
+                    forged.display().to_string(),
+                    "--session".into(),
+                    child_session.display().to_string(),
+                ]),
+                cmdline: None,
+            }],
+        };
+        app.install_mailbox_bootstrap_test_foreground_job(child_terminal.clone(), wrong_job);
+        assert!(
+            get_child(&mut app).is_none(),
+            "ambiguous argv must not claim identity"
+        );
+        let wrong_process = crate::platform::ForegroundJob {
+            process_group_id: std::process::id(),
+            processes: vec![
+                crate::platform::ForegroundProcess {
+                    pid: std::process::id(),
+                    name: "node".into(),
+                    argv0: None,
+                    argv: Some(vec![
+                        "node".into(),
+                        "/opt/node_modules/@earendil-works/pi-coding-agent/dist/cli.js".into(),
+                    ]),
+                    cmdline: None,
+                },
+                crate::platform::ForegroundProcess {
+                    pid: std::process::id() + 1,
+                    name: "sh".into(),
+                    argv0: None,
+                    argv: Some(vec![
+                        "sh".into(),
+                        "--session".into(),
+                        child_session.display().to_string(),
+                    ]),
+                    cmdline: None,
+                },
+            ],
+        };
+        app.install_mailbox_bootstrap_test_foreground_job(child_terminal.clone(), wrong_process);
+        assert!(
+            get_child(&mut app).is_none(),
+            "another process's argv is not Pi's session"
+        );
+        let link = directory.join("link.jsonl");
+        std::os::unix::fs::symlink(&child_session, &link).unwrap();
+        let job_for = |path: &std::path::Path| crate::platform::ForegroundJob {
+            process_group_id: std::process::id(),
+            processes: vec![crate::platform::ForegroundProcess {
+                pid: std::process::id(),
+                name: "node".into(),
+                argv0: None,
+                argv: Some(vec![
+                    "node".into(),
+                    "/opt/node_modules/@earendil-works/pi-coding-agent/dist/cli.js".into(),
+                    "--session".into(),
+                    path.display().to_string(),
+                ]),
+                cmdline: None,
+            }],
+        };
+        app.install_mailbox_bootstrap_test_foreground_job(child_terminal.clone(), job_for(&link));
+        assert!(
+            get_child(&mut app).is_none(),
+            "symlink path must not claim identity"
+        );
+        app.install_mailbox_bootstrap_test_foreground_job(
+            child_terminal.clone(),
+            job_for(&child_session),
+        );
+        std::fs::set_permissions(&child_session, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(
+            get_child(&mut app).is_none(),
+            "world-readable session is not trusted"
+        );
+        std::fs::set_permissions(&child_session, std::fs::Permissions::from_mode(0o600)).unwrap();
+        assert_eq!(
+            get_child(&mut app).unwrap().value,
+            child_session.display().to_string()
+        );
+        let child_store =
+            crate::sender_authority::SenderAuthorityStore::for_sender(&directory, &child_key)
+                .unwrap();
+        child_store
+            .cas(
+                Some(2),
+                crate::sender_authority::SenderAuthorityRecord {
+                    sender_key: child_key.clone(),
+                    process_generation: 2,
+                    phase: crate::sender_authority::SenderAuthorityPhase::Active,
+                    transition_revision: 3,
+                },
+            )
+            .unwrap();
+        assert!(
+            get_child(&mut app).is_none(),
+            "a newer Active record cannot authorize an old terminal generation"
+        );
+        child_store
+            .cas(
+                Some(3),
+                crate::sender_authority::SenderAuthorityRecord {
+                    sender_key: child_key.clone(),
+                    process_generation: 2,
+                    phase: crate::sender_authority::SenderAuthorityPhase::Preparing,
+                    transition_revision: 4,
+                },
+            )
+            .unwrap();
+        assert!(get_child(&mut app).is_none(), "preparing is not authority");
+        let next = directory.join("child-next.jsonl");
+        std::fs::write(
+            &next,
+            b"{\"type\":\"session\",\"version\":3,\"id\":\"next\",\"cwd\":\"/tmp\"}\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&next, std::fs::Permissions::from_mode(0o600)).unwrap();
+        app.state
+            .terminals
+            .get_mut(&child_terminal)
+            .unwrap()
+            .set_managed_agent_generation(2);
+        app.handle_internal_event(AppEvent::AgentProcessDetected {
+            pane_id: child_pane,
+            agent: Agent::Pi,
+            process_generation: 2,
+            observed_at: std::time::Instant::now(),
+        });
+        app.install_mailbox_bootstrap_test_foreground_job(child_terminal.clone(), job_for(&next));
+        assert_eq!(
+            get_child(&mut app).unwrap().value,
+            next.display().to_string()
+        );
+        child_store.invalidate_active(&child_key, 2).unwrap();
+        assert!(
+            get_child(&mut app).is_none(),
+            "stopped execution cannot retain identity"
+        );
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
     #[tokio::test]
     async fn headless_published_discovery_is_injected_before_pi_extension_initialization() {
         let mut app = app_with_agent();

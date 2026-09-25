@@ -1001,7 +1001,7 @@ impl App {
             .collect()
     }
 
-    fn mailbox_bootstrap_foreground_job(
+    pub(crate) fn mailbox_bootstrap_foreground_job(
         &self,
         terminal_id: &crate::terminal::TerminalId,
     ) -> Option<crate::platform::ForegroundJob> {

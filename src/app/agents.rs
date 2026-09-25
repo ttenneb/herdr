@@ -465,6 +465,107 @@ impl App {
         }
     }
 
+    /// Derive Pi's identity on demand so no stopped or replaced process can
+    /// leave a reusable cached path in agent get. The caller supplies only a
+    /// target for lookup; neither the target nor a reported session is authority.
+    #[cfg(unix)]
+    fn trusted_managed_pi_session(
+        &self,
+        terminal: &crate::terminal::TerminalState,
+    ) -> Option<crate::api::schema::AgentSessionInfo> {
+        use std::io::{BufRead, Read};
+        use std::os::unix::fs::MetadataExt;
+
+        let key = terminal.id.to_string();
+        let record = crate::sender_authority::SenderAuthorityStore::for_sender(
+            &self.sender_authority_dir,
+            &key,
+        )
+        .ok()?
+        .load()
+        .ok()??;
+        if !record.authoritative()
+            || record.sender_key != key
+            || !terminal.accepts_managed_agent_generation(record.process_generation)
+            || terminal.managed_agent_kind() != Some(crate::detect::Agent::Pi)
+        {
+            return None;
+        }
+        let job = self.mailbox_bootstrap_foreground_job(&terminal.id)?;
+        let (agent, process) = crate::detect::identify_agent_process_in_job(&job)?;
+        if agent != crate::detect::Agent::Pi || process.pid == 0 {
+            return None;
+        }
+        let argv = process.argv.as_deref()?;
+        let mut session_path = None;
+        let mut args = argv.iter();
+        while let Some(arg) = args.next() {
+            let value = if arg == "--session" {
+                Some(args.next()?.as_str())
+            } else {
+                arg.strip_prefix("--session=")
+            };
+            if let Some(value) = value {
+                // Even identical duplicate options are ambiguous: do not
+                // guess which session Pi will actually select.
+                if session_path.replace(value).is_some() {
+                    return None;
+                }
+            }
+        }
+        let path = std::path::Path::new(session_path?);
+        let value = path.to_str()?;
+        crate::agent_resume::AgentSessionRef::path(value)?;
+        if path.extension()? != "jsonl" || std::fs::canonicalize(path).ok()?.as_path() != path {
+            return None;
+        }
+        let metadata = std::fs::symlink_metadata(path).ok()?;
+        if !metadata.is_file()
+            || metadata.uid() != unsafe { libc::geteuid() }
+            || metadata.mode() & 0o777 != 0o600
+            || metadata.nlink() != 1
+        {
+            return None;
+        }
+        let file = std::fs::File::open(path).ok()?;
+        let opened = file.metadata().ok()?;
+        if opened.dev() != metadata.dev() || opened.ino() != metadata.ino() {
+            return None;
+        }
+        let mut first_line = Vec::new();
+        std::io::BufReader::new(file)
+            .take(8192)
+            .read_until(b'\n', &mut first_line)
+            .ok()?;
+        if !first_line.ends_with(b"\n") {
+            return None;
+        }
+        let header: serde_json::Value = serde_json::from_slice(&first_line).ok()?;
+        if header.get("type")?.as_str()? != "session"
+            || header.get("version")?.as_u64()? == 0
+            || header.get("id")?.as_str()?.is_empty()
+            || !std::path::Path::new(header.get("cwd")?.as_str()?).is_absolute()
+        {
+            return None;
+        }
+        Some(crate::api::schema::AgentSessionInfo {
+            source: "herdr:pi".into(),
+            agent: "pi".into(),
+            kind: crate::agent_resume::AgentSessionRefKind::Path,
+            value: value.into(),
+        })
+    }
+
+    // Windows needs a separate file ownership/ACL contract. Do not claim a
+    // trusted identity there merely because the argv names a readable path.
+    #[cfg(not(unix))]
+    fn trusted_managed_pi_session(
+        &self,
+        _terminal: &crate::terminal::TerminalState,
+    ) -> Option<crate::api::schema::AgentSessionInfo> {
+        None
+    }
+
     pub(super) fn agent_info(
         &self,
         ws_idx: usize,
@@ -489,7 +590,13 @@ impl App {
             screen_detection_skipped: terminal.full_lifecycle_hook_authority_active(),
             state_labels: pane.state_labels,
             tokens: pane.tokens,
-            agent_session: pane.agent_session,
+            // Managed Pi identity is derived from this execution, not from a
+            // pane-scoped report that any local API client could have supplied.
+            agent_session: if terminal.managed_agent_kind() == Some(crate::detect::Agent::Pi) {
+                self.trusted_managed_pi_session(terminal)
+            } else {
+                pane.agent_session
+            },
             workspace_id: pane.workspace_id,
             tab_id: pane.tab_id,
             pane_id: pane.pane_id,
