@@ -111,6 +111,35 @@ impl App {
                 return Ok(serde_json::json!({"type":"todo_state", "cursor":cursor,
                                             "routeEpoch":route.route_epoch()}));
             }
+            "report_path_attempt" => {
+                let params: crate::child_report::ReportPathAttemptParams =
+                    serde_json::from_value(params)
+                        .map_err(|_| MailboxBootstrapError::InvalidRequest)?;
+                let route = self.bound_parent_report_current(session)?;
+                let identity = self
+                    .child_report_route_identity(session, &route)
+                    .ok_or(MailboxBootstrapError::GrantRevoked)?;
+                let event = params
+                    .bind(identity)
+                    .ok_or(MailboxBootstrapError::InvalidRequest)?;
+                let authority = self
+                    .offline_mailbox_authorities
+                    .get(&session.caller)
+                    .ok_or(MailboxBootstrapError::GrantRevoked)?;
+                let cursor = authority
+                    .store
+                    .append_child_report_path_attempt(event)
+                    .map_err(child_report_store_error)?;
+                // A durable event may already exist if the live route changes
+                // after fsync. The response must nevertheless fail closed.
+                self.bound_parent_report_current(session)?;
+                return Ok(
+                    serde_json::json!({"type":"report_path_attempt", "cursor":cursor,
+                    "routeEpoch":route.route_epoch(), "routeAuthenticated":true,
+                    "canonicalCommitVerified":false, "coverageQualified":false,
+                    "effectRetryAuthorized":false}),
+                );
+            }
             "report_prepared" => {
                 let params: crate::child_report::PrepareParams = serde_json::from_value(params)
                     .map_err(|_| MailboxBootstrapError::InvalidRequest)?;

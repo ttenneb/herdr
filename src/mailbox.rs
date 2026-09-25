@@ -196,6 +196,8 @@ impl From<std::io::Error> for MailboxError {
 pub struct MailboxStore {
     stream_path: PathBuf,
     lock_path: PathBuf,
+    #[cfg(test)]
+    fail_path_attempt_readback: std::sync::atomic::AtomicBool,
 }
 
 impl MailboxStore {
@@ -210,6 +212,8 @@ impl MailboxStore {
         Self {
             stream_path: directory.as_ref().join(RECORD_STREAM_FILE),
             lock_path: directory.as_ref().join(LOCK_FILE),
+            #[cfg(test)]
+            fail_path_attempt_readback: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
@@ -241,9 +245,10 @@ impl MailboxStore {
             // No server producer has proved exhaustive delivery-path closure.
             // In particular, even an internal caller cannot promote a child's
             // observed-only ACK or Todo assertion into authoritative coverage.
-            if matches!(&event, crate::child_report::ChildReportEvent::CoverageBarrier {
-                qualification: crate::child_report::CoverageQualification::AllPathsTrusted, ..
-            }) {
+            if matches!(&event, crate::child_report::ChildReportEvent::PathAttempt { .. }
+                | crate::child_report::ChildReportEvent::CoverageBarrier {
+                    qualification: crate::child_report::CoverageQualification::AllPathsTrusted, ..
+                }) {
                 return Err(MailboxError::InvalidRecord);
             }
             if let crate::child_report::ChildReportEvent::CoverageBarrier {
@@ -264,7 +269,8 @@ impl MailboxStore {
                     prior.route() == route && matches!(prior,
                         crate::child_report::ChildReportEvent::Attempt { .. }
                             | crate::child_report::ChildReportEvent::Coverage { .. }
-                            | crate::child_report::ChildReportEvent::Bypass { .. })
+                            | crate::child_report::ChildReportEvent::Bypass { .. }
+                            | crate::child_report::ChildReportEvent::PathAttempt { .. })
                 }) || recovered.heads.values().any(|head| {
                     head.kind == "report" && head.sender == route.child_terminal_id
                         && head.target == route.parent_terminal_id
@@ -289,6 +295,104 @@ impl MailboxStore {
                 .checked_add(1)
                 .ok_or(MailboxError::InvalidRecord)
         })
+    }
+
+    /// The only writer for an opt-in PathAttempt. The accepted-stream App
+    /// supplies the route; the locked journal supplies the original cursor.
+    /// Reconciliation is read-only and never authorizes a duplicate effect.
+    pub fn append_child_report_path_attempt(
+        &self,
+        mut event: crate::child_report::ChildReportEvent,
+    ) -> Result<u64, MailboxError> {
+        use crate::child_report::ChildReportEvent;
+        if !matches!(&event, ChildReportEvent::PathAttempt { cursor: 0, .. }) {
+            return Err(MailboxError::InvalidRecord);
+        }
+        self.with_exclusive_lock(|| {
+            let recovered = self.load()?;
+            let route = event.route().clone();
+            let (root, revision, digest) = match &event {
+                ChildReportEvent::PathAttempt {
+                    local_root,
+                    local_revision,
+                    state_digest,
+                    ..
+                } => (local_root, local_revision, state_digest),
+                _ => unreachable!(),
+            };
+            // The newest durable Todo observation of this delegated child
+            // must be on the current exact route, not an older ACK on a
+            // replaced epoch or an earlier revision of this route.
+            let latest = recovered.child_report_events.iter().rev().find(|prior| {
+                matches!(prior, ChildReportEvent::TodoState { route: prior_route, .. }
+                    if prior_route.child_delegation_id == route.child_delegation_id)
+            });
+            if !matches!(latest, Some(ChildReportEvent::TodoState {
+                route: prior_route, local_root, local_revision, state_digest, ..
+            }) if prior_route == &route && local_root == root
+                && local_revision == revision && state_digest == digest)
+            {
+                return Err(MailboxError::InvalidRecord);
+            }
+            if let ChildReportEvent::PathAttempt { cursor, .. } = &mut event {
+                *cursor = recovered
+                    .record_cursor
+                    .checked_add(1)
+                    .ok_or(MailboxError::InvalidRecord)?;
+            }
+            // For an identical earlier marker, restore the original cursor
+            // before equality/selector validation. Returning the current
+            // stream cursor would falsely suggest a fresh send window.
+            for prior in &recovered.child_report_events {
+                if let ChildReportEvent::PathAttempt {
+                    cursor: original, ..
+                } = prior
+                {
+                    let mut previous = prior.clone();
+                    if let ChildReportEvent::PathAttempt { cursor, .. } = &mut previous {
+                        *cursor = 0;
+                    }
+                    let mut proposed = event.clone();
+                    if let ChildReportEvent::PathAttempt { cursor, .. } = &mut proposed {
+                        *cursor = 0;
+                    }
+                    if previous == proposed {
+                        return Ok(*original);
+                    }
+                }
+            }
+            match crate::child_report::validate_next(&recovered.child_report_events, &event) {
+                Ok(true) => {}
+                Ok(false) | Err(()) => return Err(MailboxError::ConflictingDuplicate),
+            }
+            let cursor = recovered
+                .record_cursor
+                .checked_add(1)
+                .ok_or(MailboxError::InvalidRecord)?;
+            self.append_synced(&MailboxRecord::ChildReport {
+                event: event.clone(),
+            })?;
+            #[cfg(test)]
+            if self
+                .fail_path_attempt_readback
+                .load(std::sync::atomic::Ordering::SeqCst)
+            {
+                return Err(MailboxError::Io(
+                    "injected post-fsync readback failure".into(),
+                ));
+            }
+            let readback = self.load()?;
+            if readback.record_cursor != cursor || !readback.child_report_events.contains(&event) {
+                return Err(MailboxError::CorruptRecord);
+            }
+            Ok(cursor)
+        })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_fail_path_attempt_readback(&self, fail: bool) {
+        self.fail_path_attempt_readback
+            .store(fail, std::sync::atomic::Ordering::SeqCst);
     }
 
     pub fn provision_grant(&self, grant: MailboxGrant) -> Result<(), MailboxError> {
@@ -706,6 +810,11 @@ impl RecoveredMailbox {
                 insert_exact(&mut self.grants, grant.grant_id.clone(), grant)
             }
             MailboxRecord::ChildReport { event } => {
+                if matches!(&event, crate::child_report::ChildReportEvent::PathAttempt { cursor, .. }
+                    if self.record_cursor.checked_add(1) != Some(*cursor))
+                {
+                    return Err(MailboxError::CorruptRecord);
+                }
                 match crate::child_report::validate_next(&self.child_report_events, &event) {
                     Ok(true) => {
                         self.child_report_events.push(event);

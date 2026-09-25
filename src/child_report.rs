@@ -94,6 +94,48 @@ impl TodoStateParams {
     }
 }
 
+/// The only two opt-in, pre-effect Pi report paths. This is an observed
+/// route-bound attempt, not canonical producer or all-path authentication.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReportPathAttemptKind {
+    AutomaticExportHandoff,
+    LegacyBoundSubmit,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ReportPathAttemptParams {
+    pub protocol: String,
+    pub path: ReportPathAttemptKind,
+    pub local_root: String,
+    pub local_revision: u64,
+    pub state_digest: String,
+    pub report_digest: String,
+    pub report_id: String,
+    pub message_id: String,
+}
+
+impl ReportPathAttemptParams {
+    pub fn bind(self, route: RouteIdentity) -> Option<ChildReportEvent> {
+        if self.protocol != crate::mailbox_v1::PROTOCOL {
+            return None;
+        }
+        let event = ChildReportEvent::PathAttempt {
+            route,
+            path: self.path,
+            local_root: self.local_root,
+            local_revision: self.local_revision,
+            state_digest: self.state_digest,
+            report_digest: self.report_digest,
+            report_id: self.report_id,
+            message_id: self.message_id,
+            cursor: 0, // assigned under the exclusive journal lock
+        };
+        event.valid_path_attempt_fields().then_some(event)
+    }
+}
+
 /// The accepted Pi stream supplies only Todo-local and immutable report
 /// selectors. Caller, parent, grant, session, generation and epoch are never
 /// accepted from the wire.
@@ -227,6 +269,19 @@ pub enum ChildReportEvent {
         path: ReportBypassPath,
         message_id: String,
     },
+    /// An opt-in accepted-Pi pre-effect observation. The server assigns the
+    /// original journal cursor, which survives unrelated later records.
+    PathAttempt {
+        route: RouteIdentity,
+        path: ReportPathAttemptKind,
+        local_root: String,
+        local_revision: u64,
+        state_digest: String,
+        report_digest: String,
+        report_id: String,
+        message_id: String,
+        cursor: u64,
+    },
     /// This durable ACK is not a Todo-done signal. The Pi owner must bind
     /// future canonical local Todo state to this exact root/revision.
     CoverageBarrier {
@@ -251,11 +306,38 @@ impl ChildReportEvent {
             Self::TodoState { route, .. }
             | Self::Attempt { route, .. }
             | Self::Bypass { route, .. }
+            | Self::PathAttempt { route, .. }
             | Self::CoverageBarrier { route, .. }
             | Self::Coverage { route, .. } => route,
             Self::Prepared { preparation } | Self::PreparedAttempt { preparation } => {
                 &preparation.route
             }
+        }
+    }
+
+    fn valid_path_attempt_fields(&self) -> bool {
+        match self {
+            Self::PathAttempt {
+                local_root,
+                local_revision,
+                state_digest,
+                report_digest,
+                report_id,
+                message_id,
+                ..
+            } => {
+                self.route().is_exact_pi_route()
+                    && !local_root.is_empty()
+                    && local_root.len() <= 128
+                    && *local_revision > 0
+                    && valid_digest(state_digest)
+                    && valid_digest(report_digest)
+                    && !report_id.is_empty()
+                    && report_id.len() <= 128
+                    && !message_id.is_empty()
+                    && message_id.len() <= 128
+            }
+            _ => false,
         }
     }
 
@@ -284,6 +366,7 @@ impl ChildReportEvent {
                 preparation.valid()
             }
             Self::Bypass { message_id, .. } => !message_id.is_empty() && message_id.len() <= 128,
+            Self::PathAttempt { cursor, .. } => *cursor > 0 && self.valid_path_attempt_fields(),
             Self::CoverageBarrier {
                 local_root,
                 local_revision,
@@ -349,6 +432,7 @@ pub fn project(current: &RouteIdentity, mailbox: &RecoveredMailbox) -> ReportDis
                 ChildReportEvent::Attempt { .. }
                     | ChildReportEvent::Coverage { .. }
                     | ChildReportEvent::Bypass { .. }
+                    | ChildReportEvent::PathAttempt { .. }
                     | ChildReportEvent::Prepared { .. }
                     | ChildReportEvent::PreparedAttempt { .. }
             )
@@ -377,6 +461,7 @@ pub fn project(current: &RouteIdentity, mailbox: &RecoveredMailbox) -> ReportDis
             ChildReportEvent::Attempt { .. }
                 | ChildReportEvent::Coverage { .. }
                 | ChildReportEvent::Bypass { .. }
+                | ChildReportEvent::PathAttempt { .. }
         )
     }) {
         disposition.kind = ReportDispositionKind::InFlightOrUncertain;
@@ -592,6 +677,24 @@ pub fn validate_next(events: &[ChildReportEvent], next: &ChildReportEvent) -> Re
                 ChildReportEvent::PreparedAttempt { preparation: b },
             ) if a.route.child_delegation_id == b.route.child_delegation_id
                 && (a.report_id == b.report_id || a.delivery_digest == b.delivery_digest) =>
+            {
+                return Err(())
+            }
+            (
+                ChildReportEvent::PathAttempt {
+                    route: a,
+                    report_id: report_a,
+                    message_id: message_a,
+                    ..
+                },
+                ChildReportEvent::PathAttempt {
+                    route: b,
+                    report_id: report_b,
+                    message_id: message_b,
+                    ..
+                },
+            ) if a.child_delegation_id == b.child_delegation_id
+                && (report_a == report_b || message_a == message_b) =>
             {
                 return Err(())
             }

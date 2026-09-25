@@ -68,6 +68,9 @@ pub(crate) struct ReportSubmitAdvertisement {
 pub(crate) struct ParentReportAdvertisement {
     pub method: &'static str,
     pub todo_state_method: &'static str,
+    /// Optional opt-in accepted-child pre-effect observation; not a gen1
+    /// sender-origin or all-path qualification.
+    pub path_attempt_method: &'static str,
     pub prepared_method: &'static str,
     pub coverage_method: &'static str,
     /// A durable observation is not a trusted all-path closure certificate.
@@ -96,6 +99,7 @@ impl MailboxBootstrapDescriptor {
                 .map(|route| ParentReportAdvertisement {
                     method: "report_submit_parent",
                     todo_state_method: "todo_state",
+                    path_attempt_method: "report_path_attempt",
                     prepared_method: "report_prepared",
                     coverage_method: "report_coverage",
                     coverage_qualified: false,
@@ -2970,6 +2974,380 @@ mod tests {
         assert_eq!(response["error"]["code"], "grant_revoked");
         drop(listener);
         std::fs::remove_dir_all(directory).expect("remove test directory");
+    }
+
+    #[test]
+    fn optin_path_attempt_requires_latest_current_todo_and_taints_typed_receipt() {
+        use crate::child_report::{ChildReportEvent, ReportDispositionKind};
+        let (mut app, directory, sender) = active_app();
+        let (_parent, _) = active_managed_recipient(&mut app, &directory);
+        let child_pane = app.state.workspaces[0].tabs[0].root_pane.unwrap();
+        let parent_pane = app.state.workspaces[1].tabs[0].root_pane.unwrap();
+        let parent_id = app
+            .state
+            .delegations
+            .create(Some(parent_pane), None, None)
+            .unwrap();
+        let child_id = app
+            .state
+            .delegations
+            .create(Some(child_pane), Some(parent_id), None)
+            .unwrap();
+        let mut listener = listener(&directory);
+        let mut before = UnixStream::connect(listener.path()).unwrap();
+        before
+            .set_read_timeout(Some(Duration::from_secs(1)))
+            .unwrap();
+        let early = bootstrap(&mut listener, &mut app, &mut before);
+        assert!(early["result"]["parentReport"].is_null());
+        let early_binding = early["result"]["bindingGeneration"].as_str().unwrap();
+        let mut attempt = json!({
+            "protocol": crate::mailbox_v1::PROTOCOL,
+            "path":"automatic_export_handoff", "localRoot":"root", "localRevision":1,
+            "stateDigest":"a".repeat(64), "reportDigest":"b".repeat(64),
+            "reportId":"report-one", "messageId":"envelope-one"
+        });
+        let request = |binding: &str, params: Value| {
+            json!({
+                "method":"report_path_attempt", "bindingGeneration":binding, "params":params
+            })
+        };
+        let denied = exchange(
+            &mut listener,
+            &mut app,
+            &mut before,
+            request(early_binding, attempt.clone()),
+        );
+        assert_eq!(denied["error"]["code"], "grant_missing", "{denied}");
+        ready_test_route(&mut app, &directory, child_id, parent_id);
+        let denied = exchange(
+            &mut listener,
+            &mut app,
+            &mut before,
+            request(early_binding, attempt.clone()),
+        );
+        assert_ne!(denied["ok"], true, "pre-ready FD cannot be promoted");
+        let mut client = UnixStream::connect(listener.path()).unwrap();
+        client
+            .set_read_timeout(Some(Duration::from_secs(1)))
+            .unwrap();
+        let descriptor = bootstrap(&mut listener, &mut app, &mut client);
+        assert_eq!(
+            descriptor["result"]["parentReport"]["pathAttemptMethod"],
+            "report_path_attempt"
+        );
+        assert_eq!(
+            descriptor["result"]["parentReport"]["coverageQualified"],
+            false
+        );
+        let binding = descriptor["result"]["bindingGeneration"].as_str().unwrap();
+        let no_todo = exchange(
+            &mut listener,
+            &mut app,
+            &mut client,
+            request(binding, attempt.clone()),
+        );
+        assert_eq!(no_todo["error"]["code"], "invalid_request", "{no_todo}");
+        let todo = json!({"protocol":crate::mailbox_v1::PROTOCOL, "localRoot":"root",
+            "localRevision":1, "stateDigest":"a".repeat(64), "state":"not_done"});
+        let observed = exchange(
+            &mut listener,
+            &mut app,
+            &mut client,
+            json!({"method":"todo_state", "bindingGeneration":binding, "params":todo}),
+        );
+        assert_eq!(observed["result"]["type"], "todo_state", "{observed}");
+        for (field, value) in [
+            ("localRoot", json!("wrong-root")),
+            ("localRevision", json!(2)),
+            ("stateDigest", json!("f".repeat(64))),
+            ("reportDigest", json!("not-a-digest")),
+            ("path", json!("unverified_api_sender")),
+            ("protocol", json!("wrong-protocol")),
+        ] {
+            let mut wrong = attempt.clone();
+            wrong[field] = value;
+            let denied = exchange(
+                &mut listener,
+                &mut app,
+                &mut client,
+                request(binding, wrong),
+            );
+            assert_eq!(
+                denied["error"]["code"], "invalid_request",
+                "{field}: {denied}"
+            );
+        }
+        for selector in [
+            "caller",
+            "parent",
+            "recipient",
+            "grantId",
+            "session",
+            "generation",
+            "routeEpoch",
+        ] {
+            let mut forged = attempt.clone();
+            forged[selector] = json!("forged");
+            let denied = exchange(
+                &mut listener,
+                &mut app,
+                &mut client,
+                request(binding, forged),
+            );
+            assert_eq!(
+                denied["error"]["code"], "invalid_request",
+                "{selector}: {denied}"
+            );
+        }
+        let stale_binding = exchange(
+            &mut listener,
+            &mut app,
+            &mut client,
+            request("forged", attempt.clone()),
+        );
+        assert_eq!(stale_binding["error"]["code"], "grant_revoked");
+        let ordinary_api = json!({"id":"forged", "method":"report_path_attempt",
+                                 "params":attempt});
+        assert!(
+            serde_json::from_value::<crate::api::schema::Request>(ordinary_api).is_err(),
+            "generic same-UID API is not the accepted managed Pi FD"
+        );
+        // Fail an actual append (not a merely invalid wire request), and
+        // restore only this test-owned stream before continuing.
+        let stream_path = directory.join(crate::mailbox::RECORD_STREAM_FILE);
+        let original = std::fs::metadata(&stream_path).unwrap().permissions();
+        let mut readonly = original.clone();
+        readonly.set_readonly(true);
+        std::fs::set_permissions(&stream_path, readonly).unwrap();
+        let failed = exchange(
+            &mut listener,
+            &mut app,
+            &mut client,
+            request(binding, attempt.clone()),
+        );
+        std::fs::set_permissions(&stream_path, original).unwrap();
+        assert_eq!(
+            failed["ok"], false,
+            "failed journal append cannot ACK: {failed}"
+        );
+        assert!(!crate::mailbox::MailboxStore::existing(&directory)
+            .load()
+            .unwrap()
+            .child_report_events
+            .iter()
+            .any(|event| matches!(event, ChildReportEvent::PathAttempt { .. })));
+        let authority = app.offline_mailbox_authorities.get(&sender).unwrap();
+        authority.store.test_fail_path_attempt_readback(true);
+        let failed_after_fsync = exchange(
+            &mut listener,
+            &mut app,
+            &mut client,
+            request(binding, attempt.clone()),
+        );
+        app.offline_mailbox_authorities
+            .get(&sender)
+            .unwrap()
+            .store
+            .test_fail_path_attempt_readback(false);
+        assert_eq!(
+            failed_after_fsync["ok"], false,
+            "no ACK when post-fsync readback fails: {failed_after_fsync}"
+        );
+        let persisted = crate::mailbox::MailboxStore::existing(&directory)
+            .load()
+            .unwrap();
+        let failed_route = persisted
+            .child_report_events
+            .iter()
+            .find_map(|event| match event {
+                ChildReportEvent::PathAttempt { route, .. } => Some(route),
+                _ => None,
+            })
+            .expect("fsynced marker remains even though ACK failed");
+        assert_eq!(
+            crate::child_report::project(failed_route, &persisted).kind,
+            ReportDispositionKind::InFlightOrUncertain
+        );
+        // Reconciliation after an uncertain Pi effect can retrieve only the
+        // original cursor, not authority to repeat the send.
+        let first = exchange(
+            &mut listener,
+            &mut app,
+            &mut client,
+            request(binding, attempt.clone()),
+        );
+        assert_eq!(first["result"]["type"], "report_path_attempt", "{first}");
+        let result = &first["result"];
+        assert_eq!(result["routeAuthenticated"], true);
+        for field in [
+            "canonicalCommitVerified",
+            "coverageQualified",
+            "effectRetryAuthorized",
+        ] {
+            assert_eq!(result[field], false, "{field}: {first}");
+        }
+        assert!(result["routeEpoch"]
+            .as_str()
+            .is_some_and(|epoch| !epoch.is_empty()));
+        let cursor = result["cursor"].as_u64().unwrap();
+        let mut conflict = attempt.clone();
+        conflict["messageId"] = json!("different-message");
+        let denied = exchange(
+            &mut listener,
+            &mut app,
+            &mut client,
+            request(binding, conflict),
+        );
+        assert_eq!(denied["error"]["code"], "invalid_request");
+        let mut conflict = attempt.clone();
+        conflict["reportId"] = json!("different-report");
+        let denied = exchange(
+            &mut listener,
+            &mut app,
+            &mut client,
+            request(binding, conflict),
+        );
+        assert_eq!(denied["error"]["code"], "invalid_request");
+        let prepared = json!({"protocol":crate::mailbox_v1::PROTOCOL,
+            "localRoot":"root", "localRevision":1, "reportId":"report-one",
+            "reportDigest":"b".repeat(64), "stableId":"typed-one", "submitRevision":1,
+            "submitDigest":"c".repeat(64), "deliveryDigest":"d".repeat(64),
+            "messageId":"envelope-one"});
+        let ready = exchange(
+            &mut listener,
+            &mut app,
+            &mut client,
+            json!({"method":"report_prepared", "bindingGeneration":binding, "params":prepared}),
+        );
+        assert_eq!(ready["result"]["type"], "report_prepared", "{ready}");
+        let duplicate = exchange(
+            &mut listener,
+            &mut app,
+            &mut client,
+            request(binding, attempt.clone()),
+        );
+        assert_eq!(
+            duplicate["result"]["cursor"], cursor,
+            "original cursor despite later record"
+        );
+        assert_eq!(duplicate["result"]["effectRetryAuthorized"], false);
+        let submit = json!({"protocol":crate::mailbox_v1::PROTOCOL,
+            "stableId":"typed-one", "revision":1, "digest":"c".repeat(64),
+            "deliveryDigest":"d".repeat(64), "subject":"report", "body":"body",
+            "messageId":"envelope-one", "kind":"report", "priority":"normal",
+            "originalSequence":1});
+        let admitted = exchange(
+            &mut listener,
+            &mut app,
+            &mut client,
+            json!({"method":"report_submit_parent", "bindingGeneration":binding, "params":submit}),
+        );
+        assert_eq!(
+            admitted["result"]["receipt"]["status"], "admitted",
+            "{admitted}"
+        );
+        let store = crate::mailbox::MailboxStore::existing(&directory);
+        let recovered = store.load().unwrap();
+        let route = recovered
+            .child_report_events
+            .iter()
+            .find_map(|event| match event {
+                ChildReportEvent::PathAttempt {
+                    route,
+                    cursor: stored_cursor,
+                    ..
+                } => {
+                    assert_eq!(*stored_cursor, cursor);
+                    Some(route.clone())
+                }
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(result["routeEpoch"], route.route_epoch);
+        let recorded_attempt = recovered
+            .child_report_events
+            .iter()
+            .find(|event| matches!(event, ChildReportEvent::PathAttempt { .. }))
+            .unwrap()
+            .clone();
+        assert_eq!(
+            store
+                .append_child_report_event(recorded_attempt)
+                .unwrap_err(),
+            crate::mailbox::MailboxError::InvalidRecord,
+            "generic journal append must not mint or replay path attempts"
+        );
+        assert_eq!(
+            crate::child_report::project(&route, &recovered).kind,
+            ReportDispositionKind::InFlightOrUncertain
+        );
+        let mut replaced = route.clone();
+        replaced.route_epoch.push_str("-replaced");
+        assert_eq!(
+            crate::child_report::project(&replaced, &store.load().unwrap()).kind,
+            ReportDispositionKind::StaleOrReplaced
+        );
+        let todo2 = json!({"protocol":crate::mailbox_v1::PROTOCOL, "localRoot":"root",
+            "localRevision":2, "stateDigest":"e".repeat(64), "state":"done"});
+        let newer = exchange(
+            &mut listener,
+            &mut app,
+            &mut client,
+            json!({"method":"todo_state", "bindingGeneration":binding, "params":todo2}),
+        );
+        assert_eq!(newer["result"]["type"], "todo_state", "{newer}");
+        let stale = exchange(
+            &mut listener,
+            &mut app,
+            &mut client,
+            request(binding, attempt.clone()),
+        );
+        assert_eq!(
+            stale["error"]["code"], "invalid_request",
+            "older ACK no longer latest"
+        );
+        attempt["localRevision"] = json!(2);
+        attempt["stateDigest"] = json!("e".repeat(64));
+        attempt["reportId"] = json!("report-two");
+        attempt["messageId"] = json!("envelope-two");
+        attempt["path"] = json!("legacy_bound_submit");
+        let second = exchange(
+            &mut listener,
+            &mut app,
+            &mut client,
+            request(binding, attempt),
+        );
+        assert_eq!(second["result"]["type"], "report_path_attempt", "{second}");
+        let after_restart = crate::mailbox::MailboxStore::existing(&directory)
+            .load()
+            .unwrap();
+        assert_eq!(
+            crate::child_report::project(&route, &after_restart).kind,
+            ReportDispositionKind::InFlightOrUncertain
+        );
+        let authority =
+            crate::sender_authority::SenderAuthorityStore::for_sender(&directory, &sender).unwrap();
+        authority
+            .cas(
+                Some(2),
+                crate::sender_authority::SenderAuthorityRecord {
+                    sender_key: sender,
+                    process_generation: 2,
+                    phase: crate::sender_authority::SenderAuthorityPhase::Active,
+                    transition_revision: 3,
+                },
+            )
+            .unwrap();
+        let old = exchange(
+            &mut listener,
+            &mut app,
+            &mut client,
+            request(binding, json!({"protocol":crate::mailbox_v1::PROTOCOL})),
+        );
+        assert_eq!(old["error"]["code"], "grant_revoked");
+        drop(listener);
+        std::fs::remove_dir_all(directory).unwrap();
     }
 
     #[test]
