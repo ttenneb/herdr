@@ -261,6 +261,20 @@ mod unix_common;
 #[cfg(unix)]
 pub(crate) use unix_common::{begin_cli_output, end_cli_output};
 
+/// Validate a Pi JSONL named by the selected foreground process, not a client
+/// path. Keep the platform-specific ownership and file checks out of App.
+#[cfg(unix)]
+pub(crate) fn verified_pi_session_jsonl(path: &std::path::Path) -> bool {
+    unix_common::verified_pi_session_jsonl(path)
+}
+
+// Windows needs an explicit file ownership/ACL contract before this identity
+// can be trusted; a readable path alone is not sufficient authority.
+#[cfg(not(unix))]
+pub(crate) fn verified_pi_session_jsonl(_path: &std::path::Path) -> bool {
+    false
+}
+
 #[cfg(not(unix))]
 pub(crate) fn begin_cli_output() {}
 

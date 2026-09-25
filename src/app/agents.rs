@@ -468,14 +468,10 @@ impl App {
     /// Derive Pi's identity on demand so no stopped or replaced process can
     /// leave a reusable cached path in agent get. The caller supplies only a
     /// target for lookup; neither the target nor a reported session is authority.
-    #[cfg(unix)]
     fn trusted_managed_pi_session(
         &self,
         terminal: &crate::terminal::TerminalState,
     ) -> Option<crate::api::schema::AgentSessionInfo> {
-        use std::io::{BufRead, Read};
-        use std::os::unix::fs::MetadataExt;
-
         let key = terminal.id.to_string();
         let record = crate::sender_authority::SenderAuthorityStore::for_sender(
             &self.sender_authority_dir,
@@ -516,36 +512,7 @@ impl App {
         let path = std::path::Path::new(session_path?);
         let value = path.to_str()?;
         crate::agent_resume::AgentSessionRef::path(value)?;
-        if path.extension()? != "jsonl" || std::fs::canonicalize(path).ok()?.as_path() != path {
-            return None;
-        }
-        let metadata = std::fs::symlink_metadata(path).ok()?;
-        if !metadata.is_file()
-            || metadata.uid() != unsafe { libc::geteuid() }
-            || metadata.mode() & 0o777 != 0o600
-            || metadata.nlink() != 1
-        {
-            return None;
-        }
-        let file = std::fs::File::open(path).ok()?;
-        let opened = file.metadata().ok()?;
-        if opened.dev() != metadata.dev() || opened.ino() != metadata.ino() {
-            return None;
-        }
-        let mut first_line = Vec::new();
-        std::io::BufReader::new(file)
-            .take(8192)
-            .read_until(b'\n', &mut first_line)
-            .ok()?;
-        if !first_line.ends_with(b"\n") {
-            return None;
-        }
-        let header: serde_json::Value = serde_json::from_slice(&first_line).ok()?;
-        if header.get("type")?.as_str()? != "session"
-            || header.get("version")?.as_u64()? == 0
-            || header.get("id")?.as_str()?.is_empty()
-            || !std::path::Path::new(header.get("cwd")?.as_str()?).is_absolute()
-        {
+        if !crate::platform::verified_pi_session_jsonl(path) {
             return None;
         }
         Some(crate::api::schema::AgentSessionInfo {
@@ -554,16 +521,6 @@ impl App {
             kind: crate::agent_resume::AgentSessionRefKind::Path,
             value: value.into(),
         })
-    }
-
-    // Windows needs a separate file ownership/ACL contract. Do not claim a
-    // trusted identity there merely because the argv names a readable path.
-    #[cfg(not(unix))]
-    fn trusted_managed_pi_session(
-        &self,
-        _terminal: &crate::terminal::TerminalState,
-    ) -> Option<crate::api::schema::AgentSessionInfo> {
-        None
     }
 
     pub(super) fn agent_info(

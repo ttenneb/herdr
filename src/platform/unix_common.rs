@@ -1,5 +1,50 @@
 use std::path::{Path, PathBuf};
 
+/// A Pi session is trustworthy only when its exact argv path is a canonical,
+/// owner-private, single-link JSONL with a recognizable session header.
+pub(crate) fn verified_pi_session_jsonl(path: &Path) -> bool {
+    checked_pi_session_jsonl(path).is_some()
+}
+
+fn checked_pi_session_jsonl(path: &Path) -> Option<()> {
+    use std::io::{BufRead, Read};
+    use std::os::unix::fs::MetadataExt;
+
+    if path.extension()? != "jsonl" || std::fs::canonicalize(path).ok()?.as_path() != path {
+        return None;
+    }
+    let metadata = std::fs::symlink_metadata(path).ok()?;
+    if !metadata.is_file()
+        || metadata.uid() != unsafe { libc::geteuid() }
+        || metadata.mode() & 0o777 != 0o600
+        || metadata.nlink() != 1
+    {
+        return None;
+    }
+    let file = std::fs::File::open(path).ok()?;
+    let opened = file.metadata().ok()?;
+    if opened.dev() != metadata.dev() || opened.ino() != metadata.ino() {
+        return None;
+    }
+    let mut first_line = Vec::new();
+    std::io::BufReader::new(file)
+        .take(8192)
+        .read_until(b'\n', &mut first_line)
+        .ok()?;
+    if !first_line.ends_with(b"\n") {
+        return None;
+    }
+    let header: serde_json::Value = serde_json::from_slice(&first_line).ok()?;
+    if header.get("type")?.as_str()? != "session"
+        || header.get("version")?.as_u64()? == 0
+        || header.get("id")?.as_str()?.is_empty()
+        || !Path::new(header.get("cwd")?.as_str()?).is_absolute()
+    {
+        return None;
+    }
+    Some(())
+}
+
 fn set_sigpipe_disposition(handler: libc::sighandler_t) {
     let mut action: libc::sigaction = unsafe { std::mem::zeroed() };
     action.sa_sigaction = handler;
