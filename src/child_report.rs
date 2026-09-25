@@ -338,6 +338,24 @@ pub fn project(current: &RouteIdentity, mailbox: &RecoveredMailbox) -> ReportDis
         return disposition;
     }
     let events = &mailbox.child_report_events;
+    // A prior route's report or attempted path cannot be retroactively
+    // covered by a newer epoch. A prior TodoState alone is not a send and
+    // must not suppress the current route's authoritative NotDone state.
+    if events.iter().any(|event| {
+        event.route().child_delegation_id == current.child_delegation_id
+            && event.route() != current
+            && matches!(
+                event,
+                ChildReportEvent::Attempt { .. }
+                    | ChildReportEvent::Coverage { .. }
+                    | ChildReportEvent::Bypass { .. }
+                    | ChildReportEvent::Prepared { .. }
+                    | ChildReportEvent::PreparedAttempt { .. }
+            )
+    }) {
+        disposition.kind = ReportDispositionKind::StaleOrReplaced;
+        return disposition;
+    }
     let matching: Vec<_> = events
         .iter()
         .filter(|event| event.route() == current)
@@ -748,6 +766,46 @@ mod tests {
         );
     }
     #[test]
+    fn old_route_uncertainty_survives_new_todo_and_synthetic_qualification() {
+        let current = route();
+        let mut old = current.clone();
+        old.route_epoch = "earlier-epoch".into();
+        let new_events = [
+            todo(current.clone(), LocalTodoState::Done),
+            ChildReportEvent::CoverageBarrier {
+                route: current.clone(),
+                local_root: "root".into(),
+                local_revision: 1,
+                through_cursor: 0,
+                qualification: CoverageQualification::AllPathsTrusted,
+            },
+        ];
+        for prior in [
+            ChildReportEvent::Bypass {
+                route: old.clone(),
+                path: ReportBypassPath::GenericOffline,
+                message_id: "pre-ready-generic".into(),
+            },
+            ChildReportEvent::Bypass {
+                route: old.clone(),
+                path: ReportBypassPath::HandoffPty,
+                message_id: "stale-pty".into(),
+            },
+            attempt(old.clone()),
+            ChildReportEvent::Prepared {
+                preparation: prepared(old.clone()),
+            },
+        ] {
+            let mut mailbox = RecoveredMailbox::default();
+            mailbox.child_report_events.push(prior);
+            mailbox.child_report_events.extend(new_events.clone());
+            assert_eq!(
+                project(&current, &mailbox).kind,
+                ReportDispositionKind::StaleOrReplaced
+            );
+        }
+    }
+    #[test]
     fn exact_admission_and_stale_identity() {
         let r = route();
         let mut m = RecoveredMailbox::default();
@@ -1024,7 +1082,7 @@ mod tests {
                 through_cursor: 0,
                 qualification: CoverageQualification::AllPathsTrusted,
             }),
-            Err(MailboxError::ConflictingDuplicate)
+            Err(MailboxError::InvalidRecord)
         );
         let recovered = MailboxStore::existing(&path).load().unwrap();
         assert_eq!(recovered.record_cursor, 4);
@@ -1040,6 +1098,51 @@ mod tests {
             project(&r, &recovered).kind,
             ReportDispositionKind::InFlightOrUncertain
         );
+        std::fs::remove_dir_all(path).unwrap();
+    }
+
+    #[test]
+    fn store_rejects_qualified_barrier_before_and_after_restart() {
+        use crate::mailbox::{MailboxError, MailboxStore};
+        let path = std::env::temp_dir().join(format!(
+            "herdr-129-closed-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let store = MailboxStore::open(&path).unwrap();
+        let route = route();
+        let qualified = ChildReportEvent::CoverageBarrier {
+            route: route.clone(),
+            local_root: "root".into(),
+            local_revision: 1,
+            through_cursor: 0,
+            qualification: CoverageQualification::AllPathsTrusted,
+        };
+        assert_eq!(
+            store
+                .append_child_report_event(todo(route.clone(), LocalTodoState::Done))
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            store.append_child_report_event(qualified.clone()),
+            Err(MailboxError::InvalidRecord)
+        );
+        let recovered = MailboxStore::existing(&path).load().unwrap();
+        assert_eq!(recovered.record_cursor, 1);
+        assert_eq!(
+            project(&route, &recovered).kind,
+            ReportDispositionKind::InFlightOrUncertain
+        );
+        let restarted = MailboxStore::existing(&path);
+        assert_eq!(
+            restarted.append_child_report_event(qualified),
+            Err(MailboxError::InvalidRecord)
+        );
+        assert_eq!(restarted.load().unwrap().record_cursor, 1);
         std::fs::remove_dir_all(path).unwrap();
     }
 

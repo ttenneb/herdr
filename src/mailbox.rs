@@ -238,6 +238,14 @@ impl MailboxStore {
     ) -> Result<u64, MailboxError> {
         self.with_exclusive_lock(|| {
             let recovered = self.load()?;
+            // No server producer has proved exhaustive delivery-path closure.
+            // In particular, even an internal caller cannot promote a child's
+            // observed-only ACK or Todo assertion into authoritative coverage.
+            if matches!(&event, crate::child_report::ChildReportEvent::CoverageBarrier {
+                qualification: crate::child_report::CoverageQualification::AllPathsTrusted, ..
+            }) {
+                return Err(MailboxError::InvalidRecord);
+            }
             if let crate::child_report::ChildReportEvent::CoverageBarrier {
                 route, local_root, local_revision, qualification, ..
             } = &event {
