@@ -2084,6 +2084,151 @@ mod tests {
     }
 
     #[test]
+    fn fresh_app_same_ordinal_rejects_old_descriptor_on_new_accepted_stream() {
+        let (mut first, directory, sender) = active_app();
+        let mut old_listener = listener(&directory);
+        let mut old_client = UnixStream::connect(old_listener.path()).unwrap();
+        old_client
+            .set_read_timeout(Some(Duration::from_secs(1)))
+            .unwrap();
+        let old = bootstrap(&mut old_listener, &mut first, &mut old_client);
+        assert_eq!(old["ok"], true);
+        let old_binding = old["result"]["bindingGeneration"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let old_boot = first.mailbox_bootstrap_boot_nonce.clone();
+        assert_eq!(first.next_mailbox_bootstrap_binding, 2);
+        drop(old_client);
+        drop(old_listener);
+        let (_tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut restarted = App::new(
+            &crate::config::Config::default(),
+            true,
+            None,
+            rx,
+            crate::api::EventHub::default(),
+        );
+        assert_eq!(restarted.next_mailbox_bootstrap_binding, 1);
+        assert_ne!(restarted.mailbox_bootstrap_boot_nonce, old_boot);
+        restarted.state = first.state;
+        restarted.sender_authority_dir = directory.clone();
+        let record = crate::sender_authority::SenderAuthorityStore::for_sender(&directory, &sender)
+            .unwrap()
+            .load()
+            .unwrap()
+            .unwrap();
+        restarted.install_offline_mailbox_authority(record).unwrap();
+        install_trusted_test_pi(&mut restarted, &directory, &sender, std::process::id());
+        let mut new_listener = listener(&directory);
+        let mut current = UnixStream::connect(new_listener.path()).unwrap();
+        current
+            .set_read_timeout(Some(Duration::from_secs(1)))
+            .unwrap();
+        let fresh = bootstrap(&mut new_listener, &mut restarted, &mut current);
+        assert_eq!(fresh["ok"], true, "{fresh}");
+        let current_binding = fresh["result"]["bindingGeneration"].as_str().unwrap();
+        assert_ne!(current_binding, old_binding);
+        assert_eq!(current_binding.split('-').nth(3), Some("1"));
+        assert_eq!(old_binding.split('-').nth(3), Some("1"));
+        let stale = exchange(
+            &mut new_listener,
+            &mut restarted,
+            &mut current,
+            json!({
+                "method":"mailbox.snapshot","bindingGeneration":old_binding,
+                "params":{"protocol":crate::mailbox_v1::PROTOCOL}
+            }),
+        );
+        assert_eq!(stale["error"]["code"], "grant_revoked", "{stale}");
+        let new_snapshot = exchange(
+            &mut new_listener,
+            &mut restarted,
+            &mut current,
+            json!({
+                "method":"mailbox.snapshot","bindingGeneration":current_binding,
+                "params":{"protocol":crate::mailbox_v1::PROTOCOL}
+            }),
+        );
+        assert_eq!(
+            new_snapshot["result"]["type"], "mailbox_snapshot",
+            "{new_snapshot}"
+        );
+        let reported = exchange(
+            &mut new_listener,
+            &mut restarted,
+            &mut current,
+            json!({
+                "method":"report_submit","bindingGeneration":current_binding,
+                "params":{"protocol":crate::mailbox_v1::PROTOCOL,"stableId":"self-report",
+                          "revision":1,"digest":"a".repeat(64),"deliveryDigest":"b".repeat(64),
+                          "subject":"synthetic","body":"synthetic","messageId":"self-message",
+                          "kind":"report","priority":"normal","originalSequence":1}
+            }),
+        );
+        assert_eq!(
+            reported["result"]["receipt"]["status"], "admitted",
+            "{reported}"
+        );
+        // Even if a test forces the local ordinal backwards and forgets the
+        // used nonce, an existing ID must never overwrite another stream.
+        let nonce = current_binding.rsplit('-').next().unwrap().to_owned();
+        restarted.used_mailbox_bootstrap_nonces.remove(&nonce);
+        restarted.next_mailbox_bootstrap_binding = 1;
+        assert!(restarted
+            .mailbox_bootstrap_binding_candidate(Some(&nonce))
+            .is_err());
+        restarted.used_mailbox_bootstrap_nonces.insert(nonce);
+        restarted.next_mailbox_bootstrap_binding = 2;
+        // Entropy failure must not publish another accepted descriptor.
+        let current_boot = restarted.mailbox_bootstrap_boot_nonce.clone();
+        restarted.mailbox_bootstrap_boot_nonce = None;
+        let mut no_entropy = UnixStream::connect(new_listener.path()).unwrap();
+        no_entropy
+            .set_read_timeout(Some(Duration::from_secs(1)))
+            .unwrap();
+        let denied = bootstrap(&mut new_listener, &mut restarted, &mut no_entropy);
+        assert_eq!(denied["error"]["code"], "grant_missing", "{denied}");
+        restarted.mailbox_bootstrap_boot_nonce = current_boot;
+        let current_still_works = exchange(
+            &mut new_listener,
+            &mut restarted,
+            &mut current,
+            json!({
+                "method":"mailbox.snapshot","bindingGeneration":current_binding,
+                "params":{"protocol":crate::mailbox_v1::PROTOCOL}
+            }),
+        );
+        assert_eq!(current_still_works["result"]["type"], "mailbox_snapshot");
+        crate::sender_authority::SenderAuthorityStore::for_sender(&directory, &sender)
+            .unwrap()
+            .cas(
+                Some(2),
+                crate::sender_authority::SenderAuthorityRecord {
+                    sender_key: sender.clone(),
+                    process_generation: 2,
+                    phase: crate::sender_authority::SenderAuthorityPhase::Active,
+                    transition_revision: 3,
+                },
+            )
+            .unwrap();
+        let replaced = exchange(
+            &mut new_listener,
+            &mut restarted,
+            &mut current,
+            json!({
+                "method":"mailbox.snapshot","bindingGeneration":current_binding,
+                "params":{"protocol":crate::mailbox_v1::PROTOCOL}
+            }),
+        );
+        assert_eq!(replaced["error"]["code"], "grant_revoked");
+        drop(no_entropy);
+        drop(current);
+        drop(new_listener);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
     fn report_submit_is_advertised_and_returns_a_durable_connected_receipt() {
         let (mut app, directory, sender) = active_app();
         let mut listener = listener(&directory);

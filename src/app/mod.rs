@@ -148,6 +148,10 @@ pub struct App {
     pub(crate) mailbox_bootstrap_bindings: BTreeMap<String, mailbox::MailboxBootstrapSession>,
     /// Ephemeral server-owned managed start evidence; never restored from a pane snapshot.
     pub(crate) managed_pi_launches: HashMap<crate::terminal::TerminalId, agents::ManagedPiLaunch>,
+    /// Opaque per-process mailbox namespace; absent entropy disables bootstrap.
+    pub(crate) mailbox_bootstrap_boot_nonce: Option<String>,
+    /// Per-stream entropy is never reused, even with a different local ordinal.
+    pub(crate) used_mailbox_bootstrap_nonces: HashSet<String>,
     pub(crate) next_mailbox_bootstrap_binding: u64,
     /// Discovery address published only by a ready Headless-owned listener.
     /// It is injected into Pi launches but is never mailbox authority.
@@ -889,6 +893,8 @@ impl App {
             offline_mailbox_authorities: BTreeMap::new(),
             mailbox_bootstrap_bindings: BTreeMap::new(),
             managed_pi_launches: HashMap::new(),
+            mailbox_bootstrap_boot_nonce: crate::platform::random_route_epoch(),
+            used_mailbox_bootstrap_nonces: HashSet::new(),
             next_mailbox_bootstrap_binding: 1,
             mailbox_bootstrap_discovery_address: None,
             #[cfg(test)]

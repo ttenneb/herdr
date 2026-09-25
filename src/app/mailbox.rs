@@ -925,6 +925,44 @@ impl App {
         environment
     }
 
+    /// The counter is only a process-local ordinal. Both the process namespace
+    /// and each accepted stream need independent kernel entropy: a fresh App
+    /// must not mint the old `mailbox-binding-1` again. An ID is never a peer
+    /// credential; FD and current execution/route checks remain mandatory.
+    pub(crate) fn mailbox_bootstrap_binding_candidate(
+        &self,
+        stream_nonce: Option<&str>,
+    ) -> Result<String, MailboxBootstrapError> {
+        fn valid_nonce(value: &str) -> bool {
+            value.len() == 32
+                && value
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        }
+        let boot = self
+            .mailbox_bootstrap_boot_nonce
+            .as_deref()
+            .filter(|value| valid_nonce(value))
+            .ok_or(MailboxBootstrapError::GrantMissing)?;
+        let nonce = stream_nonce
+            .filter(|value| valid_nonce(value))
+            .ok_or(MailboxBootstrapError::GrantMissing)?;
+        self.next_mailbox_bootstrap_binding
+            .checked_add(1)
+            .ok_or(MailboxBootstrapError::GrantMissing)?;
+        if self.used_mailbox_bootstrap_nonces.contains(nonce) {
+            return Err(MailboxBootstrapError::GrantMissing);
+        }
+        let id = format!(
+            "mailbox-binding-{}-{}-{}",
+            boot, self.next_mailbox_bootstrap_binding, nonce
+        );
+        if self.mailbox_bootstrap_bindings.contains_key(&id) {
+            return Err(MailboxBootstrapError::GrantMissing);
+        }
+        Ok(id)
+    }
+
     /// Accept a bootstrap stream only by verifying it against a current live
     /// foreground Pi process and then re-reading the exact Active record before
     /// publishing a server-selected binding.
@@ -937,8 +975,9 @@ impl App {
             return Err(MailboxBootstrapError::GrantMissing);
         }
         for candidate in candidates {
+            let entropy = crate::platform::random_route_epoch();
             let binding_generation =
-                format!("mailbox-binding-{}", self.next_mailbox_bootstrap_binding);
+                self.mailbox_bootstrap_binding_candidate(entropy.as_deref())?;
             let recipient = SessionGeneration {
                 session: candidate.sender_key.clone(),
                 generation: candidate.process_generation,
@@ -972,6 +1011,12 @@ impl App {
                 .next_mailbox_bootstrap_binding
                 .checked_add(1)
                 .ok_or(MailboxBootstrapError::GrantMissing)?;
+            if !self
+                .used_mailbox_bootstrap_nonces
+                .insert(entropy.ok_or(MailboxBootstrapError::GrantMissing)?)
+            {
+                return Err(MailboxBootstrapError::GrantMissing);
+            }
             let parent_report = (!candidate.history_only)
                 .then(|| {
                     self.bound_parent_report_candidate(
@@ -1289,4 +1334,54 @@ pub(crate) struct LiveMailboxBootstrapCandidate {
     process_generation: u64,
     foreground_pi_pid: u32,
     history_only: bool,
+}
+
+#[cfg(test)]
+mod binding_tests {
+    use super::*;
+
+    #[test]
+    fn bootstrap_binding_entropy_and_collision_fail_closed() {
+        let (_tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = App::new(
+            &crate::config::Config::default(),
+            true,
+            None,
+            rx,
+            crate::api::EventHub::default(),
+        );
+        app.mailbox_bootstrap_boot_nonce = Some("a".repeat(32));
+        let stream = "b".repeat(32);
+        let first = app
+            .mailbox_bootstrap_binding_candidate(Some(&stream))
+            .unwrap();
+        assert_eq!(
+            first,
+            format!("mailbox-binding-{}-1-{}", "a".repeat(32), stream)
+        );
+        assert!(
+            app.mailbox_bootstrap_bindings.is_empty(),
+            "mint candidate is not admission"
+        );
+        app.mailbox_bootstrap_boot_nonce = None;
+        assert!(app
+            .mailbox_bootstrap_binding_candidate(Some(&stream))
+            .is_err());
+        app.mailbox_bootstrap_boot_nonce = Some("A".repeat(32));
+        assert!(app
+            .mailbox_bootstrap_binding_candidate(Some(&stream))
+            .is_err());
+        app.mailbox_bootstrap_boot_nonce = Some("a".repeat(32));
+        assert!(app.mailbox_bootstrap_binding_candidate(None).is_err());
+        assert!(app.mailbox_bootstrap_binding_candidate(Some("0")).is_err());
+        app.used_mailbox_bootstrap_nonces.insert(stream.clone());
+        assert!(app
+            .mailbox_bootstrap_binding_candidate(Some(&stream))
+            .is_err());
+        app.used_mailbox_bootstrap_nonces.clear();
+        app.next_mailbox_bootstrap_binding = u64::MAX;
+        assert!(app
+            .mailbox_bootstrap_binding_candidate(Some(&stream))
+            .is_err());
+    }
 }
