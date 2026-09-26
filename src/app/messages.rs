@@ -13,6 +13,106 @@ use crate::mailbox::{
     ServerDelivery,
 };
 
+/// The re-delivery copy for an explicit Retry: same text, sender, recipient
+/// and priority; a new stable ID derived from the old head and its claim.
+pub(crate) fn retry_head(head: &MailboxHead, claim: &crate::mailbox::Claim) -> MailboxHead {
+    let stable_id = format!(
+        "retry.{}",
+        &sha256_fields(&[head.stable_id.as_bytes(), claim.claim_id.as_bytes()])[..32]
+    );
+    let mut delivery = head.delivery.clone().unwrap_or(ServerDelivery {
+        origin: "retry".into(),
+        sender_label: head.sender.clone(),
+        sender_session: None,
+        recipient_session: None,
+        correlation: None,
+        retry_of: None,
+    });
+    delivery.retry_of = Some(head.stable_id.clone());
+    MailboxHead {
+        digest: sha256_fields(&[
+            stable_id.as_bytes(),
+            &1_u64.to_be_bytes(),
+            head.subject.as_bytes(),
+            head.body.as_bytes(),
+        ]),
+        delivery_digest: sha256_fields(&[b"herdr-retry-delivery", stable_id.as_bytes()]),
+        revision: 1,
+        message_id: format!("retry:{}", head.message_id),
+        enqueue_epoch: 0,
+        accepted_at: now_secs(),
+        delivery: Some(delivery),
+        stable_id,
+        ..head.clone()
+    }
+}
+
+/// A head for the human's own typing at a pane (`mailbox.enqueue_self`):
+/// addressed to that pane's inbox only, sender `human@<terminal>`. The same
+/// `clientId` yields the same stable ID, so a retry never queues twice.
+pub(crate) fn human_self_head(
+    inbox: &RecipientKey,
+    terminal_key: &str,
+    subject: String,
+    body: String,
+    priority: String,
+    client_id: Option<String>,
+    recipient_session: Option<String>,
+) -> Option<MailboxHead> {
+    if !matches!(priority.as_str(), "low" | "normal" | "high")
+        || !mailbox_safe_text(&subject, &body)
+        || client_id
+            .as_ref()
+            .is_some_and(|id| id.is_empty() || id.len() > 128 || id.chars().any(char::is_control))
+    {
+        return None;
+    }
+    let sender = format!("human@{terminal_key}");
+    let message_id = client_id
+        .or_else(crate::platform::random_route_epoch)
+        .unwrap_or_else(|| format!("self-{}", now_secs()));
+    let stable_id = format!(
+        "self.{}",
+        &sha256_fields(&[
+            inbox.recipient_id.as_bytes(),
+            sender.as_bytes(),
+            message_id.as_bytes()
+        ])[..32]
+    );
+    Some(MailboxHead {
+        digest: sha256_fields(&[
+            stable_id.as_bytes(),
+            &1_u64.to_be_bytes(),
+            subject.as_bytes(),
+            body.as_bytes(),
+        ]),
+        delivery_digest: sha256_fields(&[b"herdr-self-delivery", stable_id.as_bytes()]),
+        stable_id,
+        revision: 1,
+        recipient_generation: inbox.generation.clone(),
+        recipient: inbox.clone(),
+        subject,
+        body,
+        sender: sender.clone(),
+        target: terminal_key.to_string(),
+        grant_id: format!("self:{terminal_key}"),
+        message_id,
+        kind: "advisory".into(),
+        priority,
+        original_sequence: 1,
+        enqueue_epoch: 0,
+        accepted_at: now_secs(),
+        delivery: Some(ServerDelivery {
+            origin: "human_typed".into(),
+            sender_label: "human at pane".into(),
+            sender_session: None,
+            recipient_session,
+            correlation: None,
+            retry_of: None,
+        }),
+    })
+}
+
 /// Pi's per-head limits for the Messages path; larger sends use the PTY path.
 const MAX_SUBJECT_BYTES: usize = 160;
 const MAX_BODY_BYTES: usize = 16_384;
@@ -123,29 +223,23 @@ pub(crate) fn inbox_snapshot(
         out.receipts.extend(part.receipts);
         out.head_states.extend(part.head_states);
     }
-    let withdrawn: std::collections::HashSet<String> = out
-        .heads
-        .iter()
-        .filter(|head| {
-            recovered
-                .claims
-                .get(&head.stable_id)
-                .is_some_and(is_withdrawn_claim)
-        })
-        .map(|head| head.stable_id.clone())
-        .collect();
-    out.heads
-        .retain(|head| !withdrawn.contains(&head.stable_id));
-    out.receipts
-        .retain(|receipt| !withdrawn.contains(&receipt.stable_id));
-    out.head_states
-        .retain(|state| !withdrawn.contains(&state.stable_id));
+    // Dropped heads stay (settled, `closedBy:"dropped"`) so history keeps
+    // the human's decision.
     for state in &mut out.head_states {
         state.previous_session = state.lifecycle == crate::mailbox_v1::HeadLifecycle::Held
             && state
                 .recipient_session
                 .as_deref()
                 .is_some_and(|pinned| current_session != Some(pinned));
+        if recovered
+            .claims
+            .get(&state.stable_id)
+            .is_some_and(is_withdrawn_claim)
+        {
+            state.closed_by = Some("dropped".into());
+            state.claim_execution = None;
+            continue;
+        }
         state.claim_execution = recovered.claims.get(&state.stable_id).map(|claim| {
             if claim_is_current(claim, execution) {
                 "current".into()
@@ -153,6 +247,12 @@ pub(crate) fn inbox_snapshot(
                 "other".into()
             }
         });
+        state.recovery_needed = state.claim_execution.as_deref() == Some("other")
+            && matches!(
+                state.lifecycle,
+                crate::mailbox_v1::HeadLifecycle::Claimed
+                    | crate::mailbox_v1::HeadLifecycle::Admitted
+            );
     }
     out.claim = out
         .head_states
@@ -742,6 +842,7 @@ impl App {
                 sender_session: sender.session.clone(),
                 recipient_session,
                 correlation: message.correlation,
+                retry_of: None,
             }),
         };
         let receipt = store

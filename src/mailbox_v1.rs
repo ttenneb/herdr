@@ -140,6 +140,14 @@ pub struct HeadState {
     /// `other` when another (for example an exited) Pi does.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub claim_execution: Option<String>,
+    /// A claim left claimed or admitted (uncertain) by another, ended Pi
+    /// execution: never auto-rerun, resolved only by explicit Retry or Drop.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub recovery_needed: bool,
+    /// For a settled head closed by the recipient instead of by a completed
+    /// run: `dropped` or `retried`. Kept in history.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub closed_by: Option<String>,
 }
 
 pub fn snapshot(
@@ -221,6 +229,8 @@ pub fn snapshot(
                     .and_then(|delivery| delivery.recipient_session.clone()),
                 previous_session: false,
                 claim_execution: None,
+                recovery_needed: false,
+                closed_by: resolution.and_then(|resolution| resolution.closed_by.clone()),
             }
         })
         .collect();
@@ -478,6 +488,7 @@ mod tests {
             ClaimResolution {
                 claim_id: "different-claim".into(),
                 outcome: ClaimResolutionOutcome::Settled,
+                closed_by: None,
             },
         );
         assert_eq!(
@@ -525,6 +536,7 @@ mod tests {
             ClaimResolution {
                 claim_id: "duplicate".into(),
                 outcome: ClaimResolutionOutcome::Settled,
+                closed_by: None,
             },
         );
         assert_eq!(

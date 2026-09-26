@@ -408,6 +408,8 @@ impl App {
                 | "mailbox.edit"
                 | "mailbox.resolve"
                 | "mailbox.drop"
+                | "mailbox.retry"
+                | "mailbox.enqueue_self"
         ) {
             return None;
         }
@@ -440,6 +442,130 @@ impl App {
                 serde_json::to_value(result).map_err(|_| MailboxBootstrapError::InvalidRequest)
             };
             match method {
+                "mailbox.retry" => {
+                    // The recipient's explicit Retry of a head that an ended
+                    // Pi execution left claimed or admitted: re-deliver it as
+                    // a new head (runs in normal order) and close the old
+                    // claim. Deterministic, so a repeated Retry is idempotent.
+                    let params: HeadVersionParams = serde_json::from_value(params.clone())
+                        .map_err(|_| MailboxBootstrapError::InvalidRequest)?;
+                    protocol_ok(&params.protocol)?;
+                    let recovered = load()?;
+                    let head = recovered
+                        .heads
+                        .get(&params.stable_id)
+                        .filter(|head| {
+                            recipients.contains(&head.recipient)
+                                && head.revision == params.expected_revision
+                        })
+                        .cloned()
+                        .ok_or(MailboxBootstrapError::InvalidRequest)?;
+                    let claim = recovered
+                        .claims
+                        .get(&head.stable_id)
+                        .filter(|claim| {
+                            !crate::mailbox::is_withdrawn_claim(claim)
+                                && !crate::app::messages::claim_is_current(claim, &execution)
+                        })
+                        .cloned()
+                        .ok_or(MailboxBootstrapError::InvalidRequest)?;
+                    let already_settled = matches!(
+                        recovered.resolutions.get(&claim.claim_id),
+                        Some(crate::mailbox::ClaimResolution {
+                            outcome: crate::mailbox::ClaimResolutionOutcome::Settled,
+                            ..
+                        })
+                    );
+                    let copy = crate::app::messages::retry_head(&head, &claim);
+                    let existing = recovered.heads.contains_key(&copy.stable_id);
+                    if already_settled && !existing {
+                        return Err(MailboxBootstrapError::InvalidRequest);
+                    }
+                    let receipt = if existing {
+                        recovered
+                            .receipts
+                            .get(&copy.delivery_digest)
+                            .cloned()
+                            .ok_or(MailboxBootstrapError::GrantMissing)?
+                    } else {
+                        store
+                            .append_offline_head(copy.clone())
+                            .map_err(|_| MailboxBootstrapError::InvalidRequest)?
+                    };
+                    let resolution = store
+                        .resolve_claim_closed_by(
+                            &claim.claim_id,
+                            crate::mailbox::ClaimResolutionOutcome::Settled,
+                            Some("retried"),
+                        )
+                        .map_err(|_| MailboxBootstrapError::InvalidRequest)?;
+                    Ok(serde_json::json!({
+                        "type": "mailbox_retried",
+                        "stableId": head.stable_id,
+                        "revision": head.revision,
+                        "newStableId": copy.stable_id,
+                        "receipt": {"head": receipt, "claim": claim, "resolution": resolution},
+                        "snapshot": view(&load()?)?,
+                    }))
+                }
+                "mailbox.enqueue_self" => {
+                    // The human's own typing at this pane, queued in this
+                    // pane's inbox only. No recipient selector exists, so it
+                    // cannot reach any other pane, and it grants nothing.
+                    #[derive(serde::Deserialize)]
+                    #[serde(rename_all = "camelCase", deny_unknown_fields)]
+                    struct EnqueueSelfParams {
+                        protocol: String,
+                        subject: String,
+                        body: String,
+                        #[serde(default)]
+                        priority: Option<String>,
+                        #[serde(default)]
+                        client_id: Option<String>,
+                    }
+                    let params: EnqueueSelfParams = serde_json::from_value(params.clone())
+                        .map_err(|_| MailboxBootstrapError::InvalidRequest)?;
+                    protocol_ok(&params.protocol)?;
+                    let inbox = session
+                        .pane_inbox
+                        .clone()
+                        .ok_or(MailboxBootstrapError::GrantMissing)?;
+                    let head = crate::app::messages::human_self_head(
+                        &inbox,
+                        &session.caller,
+                        params.subject,
+                        params.body,
+                        params.priority.unwrap_or_else(|| "normal".into()),
+                        params.client_id,
+                        current.clone(),
+                    )
+                    .ok_or(MailboxBootstrapError::InvalidRequest)?;
+                    let stable_id = head.stable_id.clone();
+                    let existing = load()?
+                        .heads
+                        .get(&stable_id)
+                        .map(|existing| existing.delivery_digest.clone());
+                    let duplicate = existing.is_some();
+                    let receipt = match existing {
+                        // A retried clientId: the original head and receipt.
+                        Some(delivery_digest) => load()?
+                            .receipts
+                            .get(&delivery_digest)
+                            .cloned()
+                            .ok_or(MailboxBootstrapError::GrantMissing)?,
+                        None => store
+                            .append_offline_head(head)
+                            .map_err(|_| MailboxBootstrapError::InvalidRequest)?,
+                    };
+                    Ok(serde_json::json!({
+                        "type": "mailbox_enqueued",
+                        "stableId": stable_id,
+                        "revision": receipt.revision,
+                        "duplicate": duplicate,
+                        "receipt": receipt,
+                        "snapshot": view(&load()?)?,
+                    }))
+                }
                 "mailbox.snapshot" => {
                     let params: ProtocolParams = serde_json::from_value(params.clone())
                         .map_err(|_| MailboxBootstrapError::InvalidRequest)?;
@@ -485,9 +611,10 @@ impl App {
                         .filter(|claim| {
                             recipients.contains(&claim.recipient)
                                 && !crate::mailbox::is_withdrawn_claim(claim)
-                                && crate::app::messages::claim_is_current(claim, &execution)
                         })
+                        .cloned()
                         .ok_or(MailboxBootstrapError::InvalidRequest)?;
+                    let own = crate::app::messages::claim_is_current(&claim, &execution);
                     let outcome = match resolve.outcome {
                         crate::mailbox_v1::ResolveOutcome::Admitted => {
                             crate::mailbox::ClaimResolutionOutcome::Admitted
@@ -496,8 +623,20 @@ impl App {
                             crate::mailbox::ClaimResolutionOutcome::Settled
                         }
                     };
+                    // The pane's currently attached Pi may close a claim that a
+                    // previous Pi in the same pane left claimed or admitted
+                    // (rc2 property, extended to pane queues and receive-only
+                    // Pis): settle only, never admit, recorded as recovered.
+                    // Any other caller is outside this pane's inbox and refused.
+                    if !own && outcome != crate::mailbox::ClaimResolutionOutcome::Settled {
+                        return Err(MailboxBootstrapError::InvalidRequest);
+                    }
                     let resolution = store
-                        .resolve_claim(&claim.claim_id, outcome)
+                        .resolve_claim_closed_by(
+                            &claim.claim_id,
+                            outcome,
+                            (!own).then_some("recovered"),
+                        )
                         .map_err(|_| MailboxBootstrapError::InvalidRequest)?;
                     to_value(ResponseResult::MailboxResolved { resolution })
                 }
@@ -533,9 +672,10 @@ impl App {
                                 ) =>
                         {
                             store
-                                .resolve_claim(
+                                .resolve_claim_closed_by(
                                     &claim.claim_id,
                                     crate::mailbox::ClaimResolutionOutcome::Settled,
+                                    Some("dropped"),
                                 )
                                 .map_err(|_| MailboxBootstrapError::InvalidRequest)?;
                         }
