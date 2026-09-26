@@ -26,7 +26,22 @@ pub(crate) struct ProcessBirthIdentity {
     pub start_ticks: u64,
 }
 
-// No equivalent audited birth/ACL contract exists on these platforms yet.
+// No equivalent audited birth/ACL contract exists on these platforms yet, so
+// every managed-Pi trust input below is deliberately absent and the callers
+// fail closed: no launch floor (no ManagedPiLaunch record), no birth (no bound
+// or rederived Pi session), no boot/route entropy (no mailbox bootstrap and no
+// ready delegation route), and `from_verified_local_socket` refuses the
+// accepted stream. PID, process name and argv are never substituted.
+//
+// Enabling a platform requires all four together, each proven on a real host:
+// - macOS: proc_pidinfo(PROC_PIDTBSDINFO) start time is wall-clock based, so
+//   the post-launch floor needs a step-safe clock or the audit-token pid
+//   version; peer identity needs LOCAL_PEERTOKEN (not LOCAL_PEERPID alone)
+//   checked against that same token; ancestry via pbi_ppid; entropy via
+//   getentropy.
+// - Windows: GetProcessTimes creation time plus a held process handle; the
+//   mailbox needs a named-pipe or AF_UNIX peer PID bound to that handle,
+//   an ACL-verified session file, and a session writer lease (none exist).
 #[cfg(not(target_os = "linux"))]
 pub(crate) fn process_birth_identity(_pid: u32) -> Option<ProcessBirthIdentity> {
     None

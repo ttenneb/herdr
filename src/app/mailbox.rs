@@ -1,5 +1,9 @@
 use std::collections::BTreeMap;
+#[cfg(unix)]
 use std::os::fd::RawFd;
+// No accepted mailbox stream exists off Unix; the socket verifier refuses it.
+#[cfg(not(unix))]
+type RawFd = i32;
 
 use crate::api::schema::MailboxOfflineSubmitParams;
 use crate::app::App;

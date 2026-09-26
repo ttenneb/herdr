@@ -623,6 +623,147 @@ mod tests {
         std::fs::remove_dir_all(directory).unwrap();
     }
 
+    // Models the macOS/Windows/other-Unix contract on any Unix host: the
+    // platform has no audited process-birth source, so every weaker signal
+    // below (PID, process name, argv --session, private session file, Active
+    // authority and a server launch record) must still fail closed.
+    #[cfg(unix)]
+    #[test]
+    fn managed_pi_identity_fails_closed_without_platform_process_birth() {
+        use std::os::unix::fs::PermissionsExt;
+        // Beyond every supported pid_max, so no platform can report a birth.
+        const NO_BIRTH_PID: u32 = 999_999_999;
+        assert!(crate::platform::process_birth_identity(NO_BIRTH_PID).is_none());
+        let mut app = app_with_agent();
+        let directory = std::env::temp_dir().join(format!(
+            "herdr-no-birth-pi-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&directory).unwrap();
+        app.sender_authority_dir = directory.clone();
+        let session = directory.join("owned.jsonl");
+        std::fs::write(
+            &session,
+            b"{\"type\":\"session\",\"version\":3,\"id\":\"owned\",\"cwd\":\"/tmp\"}\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&session, std::fs::Permissions::from_mode(0o600)).unwrap();
+        assert!(crate::platform::verified_pi_session_jsonl(&session));
+        let pane = app.state.workspaces[0].tabs[0].root_pane.unwrap();
+        let terminal_id = app.state.workspaces[0].terminal_id(pane).unwrap().clone();
+        let key = terminal_id.to_string();
+        crate::sender_authority::SenderAuthorityStore::for_sender(&directory, &key)
+            .unwrap()
+            .cas(
+                None,
+                crate::sender_authority::SenderAuthorityRecord {
+                    sender_key: key,
+                    process_generation: 1,
+                    phase: crate::sender_authority::SenderAuthorityPhase::Preparing,
+                    transition_revision: 1,
+                },
+            )
+            .unwrap();
+        let terminal = app.state.terminals.get_mut(&terminal_id).unwrap();
+        terminal.begin_managed_agent(
+            "nobirth".into(),
+            Agent::Pi,
+            std::time::Instant::now(),
+            Duration::from_secs(3),
+            Duration::from_secs(30),
+        );
+        terminal.set_managed_agent_generation(1);
+        app.install_mailbox_bootstrap_test_foreground_job(
+            terminal_id.clone(),
+            crate::platform::ForegroundJob {
+                process_group_id: NO_BIRTH_PID,
+                processes: vec![crate::platform::ForegroundProcess {
+                    pid: NO_BIRTH_PID,
+                    name: "pi".into(),
+                    argv0: Some("pi".into()),
+                    argv: Some(vec![
+                        "pi".into(),
+                        "--session".into(),
+                        session.display().to_string(),
+                    ]),
+                    cmdline: None,
+                }],
+            },
+        );
+        // Weakest possible floor: only a missing birth can reject the process.
+        app.managed_pi_launches.insert(
+            terminal_id.clone(),
+            crate::app::agents::ManagedPiLaunch {
+                generation: 1,
+                session_path: session.display().to_string(),
+                earliest_birth_ticks: 0,
+                process: None,
+            },
+        );
+        app.handle_internal_event(AppEvent::AgentProcessDetected {
+            pane_id: pane,
+            agent: Agent::Pi,
+            process_generation: 1,
+            observed_at: std::time::Instant::now(),
+        });
+        app.handle_internal_event(AppEvent::StateChanged {
+            pane_id: pane,
+            agent: Some(Agent::Pi),
+            state: AgentState::Idle,
+            visible_blocker: false,
+            visible_working: false,
+            process_exited: false,
+            observed_at: std::time::Instant::now(),
+        });
+        let target = app.public_pane_id(0, pane).unwrap();
+        let get = |app: &mut App| {
+            let response = app.handle_agent_get(
+                "nobirth".into(),
+                AgentTarget {
+                    target: target.clone(),
+                },
+            );
+            let result: SuccessResponse = serde_json::from_str(&response).unwrap();
+            let ResponseResult::AgentInfo { agent } = result.result else {
+                panic!("agent get")
+            };
+            assert_eq!(agent.agent_status, AgentStatus::Idle);
+            agent.agent_session
+        };
+        assert!(
+            app.managed_pi_launches[&terminal_id].process.is_none(),
+            "PID, name and argv cannot bind a launch without a process birth"
+        );
+        assert!(get(&mut app).is_none(), "no birth means no Pi identity");
+
+        // Positive control: the identical state becomes trusted only once the
+        // platform supplies a birth for this PID, proving birth is the gate.
+        let birth = crate::platform::ProcessBirthIdentity {
+            pid: NO_BIRTH_PID,
+            start_ticks: 7,
+        };
+        app.mailbox_bootstrap_test_process_births
+            .insert(NO_BIRTH_PID, birth);
+        app.bind_active_managed_pi_process(&terminal_id, 1);
+        assert_eq!(app.managed_pi_launches[&terminal_id].process, Some(birth));
+        assert_eq!(
+            get(&mut app).expect("control: birth-bound identity").value,
+            session.display().to_string()
+        );
+
+        // Identity is rederived on demand: once the birth becomes unreadable
+        // (exit, or a platform without a birth source) the bound record alone
+        // is not authority.
+        app.mailbox_bootstrap_test_process_births
+            .remove(&NO_BIRTH_PID);
+        assert!(get(&mut app).is_none(), "bound record without live birth");
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
     #[cfg(target_os = "linux")]
     #[test]
     fn agent_get_trusts_exact_managed_pi_session_paths_and_revokes_stale_executions() {
@@ -1023,6 +1164,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn headless_published_discovery_is_injected_before_pi_extension_initialization() {
         let mut app = app_with_agent();
