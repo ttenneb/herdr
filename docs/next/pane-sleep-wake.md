@@ -12,14 +12,12 @@ Every managed launch (`herdr agent start`, and `herdr collection helper-launch` 
 
 The recipe, the end of a Herdr sleep and any route-carry change are applied only after the launch actually started, so a failed start loses none of them.
 
-A launch that passes the reserved `--env HERDR_LIFECYCLE_ROLE=<roleId>` belongs to a lifecycle role manager. Herdr never sleeps or wakes it.
 
 ## Sleep
 
 `herdr agent sleep <agent>` (API `agent.sleep`) records that Herdr put the agent to sleep, then sends it a ctrl+d guarded by the exact terminal and agent name. It refuses:
 
 - agents without a recipe, including a hand-typed `pi`;
-- lifecycle-owned agents;
 - the parent of a ready delegation route or of a live child delegation (`parent of active delegation routes; not sleeping`): a slept parent has no live generation or trusted session, so its children's bound report routes would stop working;
 - Collection helpers: their agent is the pane's first process, so the pane closes when it exits, and there is nothing left to wake;
 - agents that are working or blocked.
@@ -33,12 +31,12 @@ The sleep record is persisted. After a server restart, a slept pane stays asleep
 The mailbox calls `App::wake_pane(pane_key, trigger_head)` in two situations. The trigger's `cause` records which:
 
 - `head_appended`: a message is queued for a slept pane that has no attached Pi;
-- `restore_backlog`: after a server restart, the mailbox sweeps slept panes that still have unsettled heads.
+- `restore_backlog`: after a server restart, the mailbox sweeps slept panes that still have unsettled heads (3 s after start, then every 30 s; a pane whose restored shell is not at its prompt yet is re-swept every 1.5 s for up to 30 s).
 
 Both are level-triggered. The wake:
 
 - relaunches the recipe through the managed launch path (`start_agent`), in the same pane and terminal, so the mailbox recipient stays the same. The Pi gets a new sender generation and resumes its `--session`. No prompt is sent: the Gate drains the queue;
-- acts only if the pane has a sleep record, a recipe and an idle shell, has no live agent, and is not lifecycle-owned;
+- acts only if the pane has a sleep record, a recipe and an idle shell, and has no live agent;
 - is single-flight per pane. Further calls while a wake is outstanding return `Duplicate`;
 - resolves when the woken generation attaches to Messages (becomes Active), which also ends the sleep. If it does not attach within 60 s, the wake counts as failed and one retry runs with a fresh wake ID. After a second failure, the pane cools down for 30 s;
 - writes one owner-only record per wake ID under `<data dir>/pane-wakes/`: `requested`, then `started`, `duplicate`, `refused` (with a reason) or `failed`. A wake ID never launches twice.
@@ -47,8 +45,7 @@ Never woken:
 
 - a Pi the human quit by hand. There is no sleep record, so its messages wait until someone starts it;
 - a hand-typed `pi`, which has no recipe;
-- Collection helpers;
-- lifecycle-owned panes.
+- Collection helpers.
 
 ## Restart resume
 

@@ -8,10 +8,6 @@
 
 use serde::{Deserialize, Serialize};
 
-/// Reserved `--env` key a lifecycle role manager passes on its launches.
-/// Herdr never sleeps or wakes such a pane; the role manager owns it.
-pub(crate) const LIFECYCLE_ROLE_ENV: &str = "HERDR_LIFECYCLE_ROLE";
-
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct LaunchRecipe {
@@ -23,8 +19,7 @@ pub(crate) struct LaunchRecipe {
     /// credential-like names.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub env: Vec<(String, String)>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub lifecycle_role: Option<String>,
+    // A retired `lifecycleRole` field in older session.json is ignored.
 }
 
 /// Set only by `agent.sleep`; cleared when a Pi for the pane attaches to
@@ -58,7 +53,7 @@ pub(crate) struct RouteCarry {
 /// Environment names a recipe may persist. Everything else passed with
 /// `--env` is dropped, so a relaunch never replays a credential.
 fn env_name_allowed(name: &str) -> bool {
-    const EXPLICIT: &[&str] = &[LIFECYCLE_ROLE_ENV, "TERM", "LANG", "LC_ALL", "TZ"];
+    const EXPLICIT: &[&str] = &["TERM", "LANG", "LC_ALL", "TZ"];
     let allowed = name.starts_with("PI_") || EXPLICIT.contains(&name);
     let upper = name.to_ascii_uppercase();
     let credential = [
@@ -213,10 +208,6 @@ impl LaunchRecipe {
         {
             return None;
         }
-        let lifecycle_role = env
-            .iter()
-            .find(|(key, _)| key == LIFECYCLE_ROLE_ENV)
-            .map(|(_, value)| value.clone());
         let env = env
             .iter()
             .filter(|(key, value)| env_name_allowed(key) && !value_has_url_credentials(value))
@@ -227,7 +218,6 @@ impl LaunchRecipe {
             kind: kind.to_string(),
             args: args.to_vec(),
             env,
-            lifecycle_role,
         })
     }
 
@@ -262,22 +252,20 @@ mod tests {
                 ("ANTHROPIC_API_KEY", "sk-secret"),
                 ("GITHUB_TOKEN", "t"),
                 ("OPENAI_BASE_URL", "https://api.example"),
-                ("HERDR_LIFECYCLE_ROLE", "owner-1"),
             ]),
         )
         .unwrap();
-        assert_eq!(
-            recipe.env,
-            pairs(&[
-                ("PI_CODING_AGENT_DIR", "/a"),
-                ("HERDR_LIFECYCLE_ROLE", "owner-1")
-            ])
-        );
-        assert_eq!(recipe.lifecycle_role.as_deref(), Some("owner-1"));
-        assert_eq!(
-            recipe.env_assignments(),
-            ["PI_CODING_AGENT_DIR=/a", "HERDR_LIFECYCLE_ROLE=owner-1"]
-        );
+        assert_eq!(recipe.env, pairs(&[("PI_CODING_AGENT_DIR", "/a")]));
+        assert_eq!(recipe.env_assignments(), ["PI_CODING_AGENT_DIR=/a"]);
+    }
+
+    #[test]
+    fn a_recipe_saved_with_the_retired_lifecycle_role_still_loads() {
+        let recipe: LaunchRecipe = serde_json::from_str(
+            r#"{"name":"owner","kind":"pi","args":[],"lifecycleRole":"owner-1"}"#,
+        )
+        .unwrap();
+        assert_eq!(recipe.name, "owner");
     }
 
     #[test]
@@ -289,7 +277,6 @@ mod tests {
             &pairs(&[
                 ("PI_CODING_AGENT_DIR", "/a"),
                 ("PI_TASKING_HERDR_ADAPTER_CONFIG", "/cfg.json"),
-                ("HERDR_LIFECYCLE_ROLE", "owner-1"),
                 ("LANG", "C.UTF-8"),
                 ("PATH", "/usr/bin"),
                 ("HTTPS_PROXY", "http://proxy:8080"),
@@ -309,7 +296,6 @@ mod tests {
             pairs(&[
                 ("PI_CODING_AGENT_DIR", "/a"),
                 ("PI_TASKING_HERDR_ADAPTER_CONFIG", "/cfg.json"),
-                ("HERDR_LIFECYCLE_ROLE", "owner-1"),
                 ("LANG", "C.UTF-8"),
             ])
         );

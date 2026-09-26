@@ -7,9 +7,6 @@
 - `herdr collection helper-launch ... -- --session <file>` now gets the same managed Pi launch as `agent start` (generation, launch record, session-file checks), so such helpers show `managed` trust and attach to Messages.
 - Custom build channels (`HERDR_BUILD_CHANNEL` other than stable/preview, e.g. `stabilized`) show the channel in `herdr --version`, refuse `herdr update`, and never show an upstream update notice.
 - Added an owner-only exact-parent report acknowledgement Unix-socket transport with live issuer/child-session authority checks, durable content intent, accepted child-durability results, conflict-safe dedupe, and query-only lost-ack recovery.
-- Added a pinned role-specific user-systemd instance boundary for queued-input activations, with exact activation-ID start validation, durable duplicate/uncertain start handling, generated result schema, and no generic wake path.
-- Added an external queued-input lifecycle scheduler with exact v1 request/issuer validation, digest-bound secure activation materialization, durable conflict-safe idempotency, bounded role guards, and explicit same-ID uncertain recovery.
-- Added an external one-shot Pi role lifecycle manager with exact durable identity/resume binding, default-deny human-question grants, truthful user-systemd readiness, bounded restart policy, and durable activation/transport receipts.
 - Added failure-atomic `herdr collection helper-launch`, which starts the managed agent as the newly selected collection member's initial process, waits for interactive readiness, transports an exact bounded assignment, and removes the member if startup or assignment transport does not complete.
 - Added bounded exact-session `herdr handoff` validation/submission and staged `herdr run` launch receipts; run profile application remains delegated to a verified Pi-owned helper interface.
 - Added strict `herdr worktree create --new-branch-only` semantics that cannot race into reusing an existing branch.
@@ -24,11 +21,11 @@
 - The plugin marketplace now discovers valid manifests at repository roots and subdirectories, groups multiple plugins under each repository, and publishes their versions and exact default-branch commits.
 - Custom themes can now define separate light and dark color overrides when automatic theme switching is enabled. (#837, thanks @aneym)
 
+### Removed
+- Retired the external systemd role lifecycle (`scripts/herdr_role_lifecycle.py`, `scripts/herdr_mailbox_transport.py`, `herdr mailbox dispatch`, the reserved `HERDR_LIFECYCLE_ROLE` launch key). Roles start through `launch-role-agent.sh`; sleeping panes are woken in-process by `herdr agent sleep` and Messages.
+
 ### Changed
-- `herdr agent start` now accepts bounded repeatable `--env NAME=VALUE` child-only assignments; the lifecycle manager uses it to transport the exact secure `PI_TASKING_HERDR_ADAPTER_CONFIG` into Pi launched by the separate Herdr server.
-- Lifecycle readiness, watchdog, and status notifications now use bounded direct main-process `NOTIFY_SOCKET` datagrams, satisfying `NotifyAccess=main` attribution without helper-process races or PID spoofing.
-- Lifecycle managed-agent generations now use a deterministic activation-bound 32-character Herdr-safe digest name, independent of readable role or execution ID length and characters.
-- Lifecycle role manifests now securely pin the owner-only Herdr server socket and propagate it to the rendered service plus every Herdr CLI subprocess, preventing user-systemd from falling back to an unrelated default socket.
+- `herdr agent start` now accepts bounded repeatable `--env NAME=VALUE` child-only assignments, for example to transport the exact secure `PI_TASKING_HERDR_ADAPTER_CONFIG` into a Pi launched by the separate Herdr server.
 - Corrected the parent-acknowledgement wire to use tasking's exact assignment object, canonical 22-character IDs, four-field Herdr identities, and authoritative 512-byte required-identity bounds while rejecting every additional property; optional `assignedByPaneId` remains capped at 128 bytes.
 - Space and tab activity now follow top-level agents while completed delegated subagents outside collections appear as a separate unread attention badge that clears when terminal input is delivered to their top-level parent. Completed collection members remain local to their collection, while blocked descendants still make the primary status red regardless of placement.
 - Newly expanded collection previews now automatically use at least half of the collection height while preserving explicit manual sizes.

@@ -270,8 +270,7 @@ impl App {
             .state
             .terminals
             .get(&terminal_id)
-            .and_then(|terminal| terminal.launch_recipe.clone())
-            .filter(|recipe| recipe.lifecycle_role.is_none());
+            .and_then(|terminal| terminal.launch_recipe.clone());
         let public_pane_id = self
             .find_pane(pane_id)
             .and_then(|(ws_idx, _)| self.public_pane_id(ws_idx, pane_id));

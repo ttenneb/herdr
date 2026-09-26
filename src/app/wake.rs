@@ -9,8 +9,7 @@
 //!
 //! Only panes Herdr itself put to sleep are woken. Never woken: a Pi the human
 //! quit by hand (no sleep record), hand-typed `pi` (no recipe), Collection
-//! helpers (their pane closes when Pi exits, so they cannot sleep), and panes
-//! launched by a lifecycle role manager (`HERDR_LIFECYCLE_ROLE`).
+//! helpers (their pane closes when Pi exits, so they cannot sleep).
 //!
 //! [`LaunchRecipe`]: crate::launch_recipe::LaunchRecipe
 
@@ -79,7 +78,6 @@ pub(crate) enum WakeRefusal {
     UnknownPane,
     NotSleeping,
     NoRecipe,
-    LifecycleOwned,
     PiAttached,
     PaneNotAtIdleShell,
     CoolingDown { retry_after_ms: u64 },
@@ -92,7 +90,6 @@ impl WakeRefusal {
             Self::UnknownPane => "unknown_pane",
             Self::NotSleeping => "not_sleeping",
             Self::NoRecipe => "no_recipe",
-            Self::LifecycleOwned => "lifecycle_owned",
             Self::PiAttached => "pi_attached",
             Self::PaneNotAtIdleShell => "pane_not_at_idle_shell",
             Self::CoolingDown { .. } => "cooling_down",
@@ -417,9 +414,6 @@ impl App {
         let Some(recipe) = terminal.launch_recipe.clone() else {
             return refuse(self, Some(&terminal_id), WakeRefusal::NoRecipe);
         };
-        if recipe.lifecycle_role.is_some() {
-            return refuse(self, Some(&terminal_id), WakeRefusal::LifecycleOwned);
-        }
         if retry && self.terminal_parents_active_routes(&terminal_id) {
             return refuse(self, Some(&terminal_id), WakeRefusal::ParentOfActiveRoutes);
         }
@@ -602,12 +596,9 @@ impl App {
             .terminals
             .get(terminal_id)
             .ok_or("the pane has no managed agent")?;
-        let recipe = terminal.launch_recipe.as_ref().ok_or(
+        terminal.launch_recipe.as_ref().ok_or(
             "no launch recipe: only agents started by agent.start or helper-launch can sleep",
         )?;
-        if recipe.lifecycle_role.is_some() {
-            return Err("a lifecycle role manager owns this agent");
-        }
         if self.terminal_parents_active_routes(terminal_id) {
             return Err(PARENT_OF_ACTIVE_ROUTES);
         }
@@ -849,38 +840,6 @@ mod tests {
             "{outcome:?}"
         );
         assert!(input.try_recv().is_err(), "nothing was launched");
-    }
-
-    #[tokio::test]
-    async fn lifecycle_owned_panes_neither_sleep_nor_wake() {
-        let (mut app, pane, terminal, public) = app_with_shell_pane();
-        let _input = start(
-            &mut app,
-            &public,
-            vec![format!(
-                "{}=owner-1",
-                crate::launch_recipe::LIFECYCLE_ROLE_ENV
-            )],
-        );
-        let response = app.handle_api_request(crate::api::schema::Request {
-            id: "sleep".into(),
-            method: crate::api::schema::Method::AgentSleep(AgentTarget {
-                target: public.clone(),
-            }),
-        });
-        assert!(response.contains("agent_sleep_unavailable"), "{response}");
-        assert!(app.state.terminals[&terminal].sleep.is_none());
-        // Even with a sleep record, a lifecycle-owned pane is never woken.
-        pi_exits(&mut app, pane);
-        app.state.terminals.get_mut(&terminal).unwrap().sleep =
-            Some(App::new_pane_sleep("owner".into(), 1));
-        assert!(matches!(
-            app.wake_pane(&public, trigger()),
-            WakeOutcome::Refused {
-                reason: WakeRefusal::LifecycleOwned,
-                ..
-            }
-        ));
     }
 
     /// A wake whose start fails after commit keeps the pane's recipe, sleep
