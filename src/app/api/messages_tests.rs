@@ -2767,13 +2767,18 @@ async fn typed_delivery_waits_for_the_humans_draft_then_types_in_order() {
         .clone();
     // No Messages in this pane: sends are typed.
     assert!(!fixture.app.pane_takes_messages(&fixture.terminals[1]));
-    // Typed and fully backspaced: no draft.
+    // Typed and fully backspaced: Herdr cannot prove the editor empty, so
+    // the draft stays possibly present until a submit/clear key.
     for _ in 0..3 {
         human_key(&mut fixture.app, &terminal, KeyCode::Char('x'));
     }
     for _ in 0..4 {
         human_key(&mut fixture.app, &terminal, KeyCode::Backspace);
     }
+    assert!(fixture.app.pane_draft_pending(&terminal));
+    let ctrl_u =
+        crate::input::TerminalKey::new(KeyCode::Char('u'), crossterm::event::KeyModifiers::CONTROL);
+    fixture.app.note_human_key(&terminal, &ctrl_u);
     assert!(!fixture.app.pane_draft_pending(&terminal));
     // API send-keys never counts as human input.
     let target = fixture.app.public_pane_id(1, fixture.panes[1]).unwrap();
@@ -3563,6 +3568,53 @@ async fn a_held_message_fails_when_the_agent_name_or_session_changes() {
                 [crate::api::schema::EventData::DeliveryDeferredFailed { code, .. }] if code == "agent_replaced"
             ),
             "{change}: {events:?}"
+        );
+    }
+}
+
+/// QA batch 3, 1a+: keys that can insert text without a printable key
+/// (history recall, Tab completion, Ctrl-R, Ctrl-Y, Backspace) mark the
+/// draft; Ctrl-J and Ctrl-M are not submits; only plain Enter, Ctrl-C and
+/// Ctrl-U clear.
+#[tokio::test]
+async fn any_forwarded_key_marks_a_possible_draft() {
+    use crossterm::event::{KeyCode, KeyModifiers};
+    let mut fixture = fixture();
+    let terminal = fixture.app.state.workspaces[1]
+        .terminal_id(fixture.panes[1])
+        .unwrap()
+        .clone();
+    let press = |app: &mut App, code, modifiers| {
+        app.note_human_key(&terminal, &crate::input::TerminalKey::new(code, modifiers));
+    };
+    for (code, modifiers) in [
+        (KeyCode::Up, KeyModifiers::NONE),
+        (KeyCode::Tab, KeyModifiers::NONE),
+        (KeyCode::Char('r'), KeyModifiers::CONTROL),
+        (KeyCode::Char('y'), KeyModifiers::CONTROL),
+        (KeyCode::Backspace, KeyModifiers::NONE),
+        (KeyCode::Char('j'), KeyModifiers::CONTROL),
+        (KeyCode::Char('m'), KeyModifiers::CONTROL),
+        (KeyCode::Esc, KeyModifiers::NONE),
+    ] {
+        press(&mut fixture.app, KeyCode::Enter, KeyModifiers::NONE);
+        assert!(!fixture.app.pane_draft_pending(&terminal));
+        press(&mut fixture.app, code, modifiers);
+        assert!(
+            fixture.app.pane_draft_pending(&terminal),
+            "{code:?} {modifiers:?} marks a possible draft"
+        );
+    }
+    for (code, modifiers) in [
+        (KeyCode::Enter, KeyModifiers::NONE),
+        (KeyCode::Char('c'), KeyModifiers::CONTROL),
+        (KeyCode::Char('u'), KeyModifiers::CONTROL),
+    ] {
+        press(&mut fixture.app, KeyCode::Up, KeyModifiers::NONE);
+        press(&mut fixture.app, code, modifiers);
+        assert!(
+            !fixture.app.pane_draft_pending(&terminal),
+            "{code:?} {modifiers:?} clears"
         );
     }
 }

@@ -22,7 +22,8 @@ use crate::terminal::TerminalId;
 pub(crate) const TYPED_DEFERRAL_LIMIT: Duration = Duration::from_secs(600);
 const TYPED_SUBMIT_DELAY: Duration = Duration::from_millis(300);
 
-/// Pending human input in one pane since its last Enter (an estimate).
+/// Whether the human may have unsent input in one pane since its last
+/// submit/clear key (`count > 0`: possibly present).
 #[derive(Debug, Clone, Copy, Default)]
 pub(crate) struct HumanDraft {
     pub count: usize,
@@ -51,28 +52,27 @@ pub(crate) struct TypedDeferral {
     pub reason: String,
 }
 
-/// How a human keystroke changes the draft estimate.
+/// How a human keystroke changes the draft state: `None` clears it,
+/// `Some(0)` leaves it, `Some(1)` marks a draft as possibly present.
+///
+/// Any forwarded key may put text in the editor (history recall with Up or
+/// Ctrl-R, Tab completion, Ctrl-Y, agent autocomplete, Backspace over a
+/// submitted line...), so every non-release key marks the draft except the
+/// known submit/clear keys: a plain unmodified Enter, Ctrl-C and Ctrl-U.
+/// Ctrl-J, Ctrl-M and modified Enter insert newlines; Esc proves nothing.
 fn key_effect(key: &crate::input::TerminalKey) -> Option<isize> {
     if key.kind == crossterm::event::KeyEventKind::Release {
         return Some(0);
     }
-    let control = key.modifiers.contains(KeyModifiers::CONTROL);
-    let alt = key.modifiers.contains(KeyModifiers::ALT);
     match key.code {
-        // Only a real, unmodified Enter submits. A modified Enter (Shift,
-        // Alt, Ctrl) inserts a newline in most agent editors; Esc proves
-        // nothing about the editor's content.
         KeyCode::Enter if key.modifiers.is_empty() => None,
-        KeyCode::Enter => Some(1),
-        KeyCode::Char(c) if control && matches!(c.to_ascii_lowercase(), 'c' | 'u') => None,
-        KeyCode::Char(_) if control || alt => Some(0),
-        KeyCode::Char(_) => Some(
-            key.generated_text
-                .as_ref()
-                .map_or(1, |text| text.chars().count().max(1)) as isize,
-        ),
-        KeyCode::Backspace => Some(-1),
-        _ => Some(0),
+        KeyCode::Char(c)
+            if key.modifiers == KeyModifiers::CONTROL
+                && matches!(c.to_ascii_lowercase(), 'c' | 'u') =>
+        {
+            None
+        }
+        _ => Some(1),
     }
 }
 
@@ -114,9 +114,6 @@ impl App {
                         .terminals
                         .get(terminal_id)
                         .and_then(|terminal| terminal.managed_agent_generation());
-                }
-                if draft.count == 0 {
-                    self.clear_human_draft(terminal_id);
                 }
             }
         }
