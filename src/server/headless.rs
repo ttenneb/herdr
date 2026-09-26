@@ -506,16 +506,23 @@ impl HeadlessServer {
         // Set non-blocking on Unix so we can poll it from the event loop.
         #[cfg(unix)]
         listener.set_nonblocking(ListenerNonblockingMode::Accept)?;
+        // The authenticated mailbox listener exists only where accepted-stream
+        // peer identity is implemented. Elsewhere no discovery is published,
+        // so managed Pi launches receive an explicit empty address.
+        #[cfg(unix)]
         let mailbox_bootstrap_listener =
             crate::server::mailbox_bootstrap::MailboxBootstrapListener::bind()?;
         // Publish only after this HeadlessServer owns a successfully bound,
         // permission-restricted listener. Managed Pi launch happens later, so
         // extension initialization sees an explicit discovery value or none.
-        crate::server::mailbox_bootstrap::publish_owned_mailbox_bootstrap_discovery(
-            &mut app,
-            &mailbox_bootstrap_listener,
-        );
-        info!(path = %mailbox_bootstrap_listener.path().display(), "mailbox bootstrap socket listening");
+        #[cfg(unix)]
+        {
+            crate::server::mailbox_bootstrap::publish_owned_mailbox_bootstrap_discovery(
+                &mut app,
+                &mailbox_bootstrap_listener,
+            );
+            info!(path = %mailbox_bootstrap_listener.path().display(), "mailbox bootstrap socket listening");
+        }
 
         // Channel for server events from client threads.
         let (server_event_tx, server_event_rx) = mpsc::channel(64);
