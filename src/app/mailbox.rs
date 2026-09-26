@@ -46,9 +46,9 @@ pub(crate) struct MailboxBootstrapSession {
     pub(crate) parent_report: Option<BoundParentReportRoute>,
     /// #159: advertise the parent signal long-poll (feature on only).
     pub(crate) parent_signals: bool,
-    /// #159: advertise recovery wait/decline to a covered child that already
-    /// has a durable done ACK and closure barrier on this route.
-    pub(crate) child_recovery: bool,
+    /// #159: this stream is a covered child whose committed domain names its
+    /// ready route; advertises `coveredChild` and the recovery methods.
+    pub(crate) covered_child: bool,
     pub(crate) history_only: bool,
     history_edge: Option<(
         crate::delegation::DelegationId,
@@ -1055,13 +1055,13 @@ impl App {
                 )
                 .map_err(|_| MailboxBootstrapError::GrantMissing)?;
             }
-            let child_recovery = parent_report
+            let covered_child = parent_report
                 .as_ref()
                 .is_some_and(|route| self.covered_child_recovery_advertised(route));
             let session = MailboxBootstrapSession {
                 caller: candidate.sender_key.clone(),
                 parent_signals: self.child_report_signals_enabled && !candidate.history_only,
-                child_recovery,
+                covered_child,
                 parent_report,
                 history_only: candidate.history_only,
                 history_edge: self.history_delegation_edge(&candidate.sender_key),
@@ -1086,6 +1086,11 @@ impl App {
             return Ok(session);
         }
         Err(MailboxBootstrapError::PeerRejected)
+    }
+
+    /// Forget the binding of an accepted stream that closed.
+    pub(crate) fn release_mailbox_bootstrap_binding(&mut self, binding_generation: &str) {
+        self.mailbox_bootstrap_bindings.remove(binding_generation);
     }
 
     pub(crate) fn mailbox_bootstrap_session_current(

@@ -10,12 +10,12 @@
 //! or (for an exact admitted report) no signal at all.
 //!
 //! The records live in their own append-only file next to the mailbox journal
-//! and are written under the mailbox's exclusive lock. Closure cursors (the
-//! signal `cursor`, `closureCursor`, recovery, decline and wake cursors) are
-//! strictly increasing and always minted above the mailbox cursor current at
-//! write time, so `todoStateCursor < closureCursor < cursor` holds although
-//! `todoStateCursor` is a mailbox-journal cursor. An older Herdr that does not
-//! know this file ignores it.
+//! and are written under the mailbox's exclusive lock. A closure cursor (the
+//! signal `cursor`, `closureCursor`, recovery, decline, wake and bind
+//! cursors) is its record's 1-based line ordinal in this file. The
+//! `todoStateCursor` is a mailbox-journal cursor. The two spaces are never
+//! compared; only same-space ordering is checked. An older Herdr that does
+//! not know this file ignores it.
 
 use std::fs::{File, OpenOptions};
 use std::io::{BufRead, BufReader, Write};
@@ -435,7 +435,6 @@ impl ClosureRecord {
         match self {
             Self::Signal { cursor, signal } => {
                 signal.signal_cursor == *cursor
-                    && signal.todo.todo_state_cursor < signal.closure.closure_cursor
                     && signal.closure.closure_cursor < *cursor
                     && signal.parent_todo.as_ref().is_none_or(ParentTodo::valid)
                     && match signal.signal_type {
@@ -479,27 +478,26 @@ impl ClosureRecord {
     }
 }
 
-/// Recovered closure journal. Cursors are strictly increasing, not dense.
+/// Recovered closure journal. Record `n` (1-based line ordinal) always
+/// carries cursor `n`; closure cursors are never derived from, or compared
+/// with, mailbox cursors.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct ClosureJournal {
     pub records: Vec<ClosureRecord>,
     committed: Vec<bool>,
-    /// Mailbox cursor observed by the current transaction; new closure
-    /// cursors are minted above it.
-    floor: u64,
 }
 
 impl ClosureJournal {
     pub fn last_cursor(&self) -> u64 {
-        self.records.last().map_or(0, ClosureRecord::cursor)
+        self.records.len() as u64
     }
 
     pub fn next_cursor(&self) -> u64 {
-        self.last_cursor().max(self.floor) + 1
+        self.last_cursor() + 1
     }
 
     fn push(&mut self, record: ClosureRecord) -> Result<(), MailboxError> {
-        if record.cursor() <= self.last_cursor() || !record.valid() {
+        if record.cursor() != self.next_cursor() || !record.valid() {
             return Err(MailboxError::CorruptRecord);
         }
         if let ClosureRecord::Commit { first, last, .. } = &record {
@@ -787,12 +785,11 @@ pub fn closure_transaction<T>(
 ) -> Result<T, MailboxError> {
     store.with_exclusive_lock(|| {
         let mailbox = store.load()?;
-        let mut journal = load_closure(store)?;
-        journal.floor = mailbox.record_cursor;
+        let journal = load_closure(store)?;
         let (records, result) = plan(&mailbox, &journal)?;
         let mut previous = journal.next_cursor() - 1;
         for record in &records {
-            if record.cursor() <= previous || !record.valid() {
+            if record.cursor() != previous + 1 || !record.valid() {
                 return Err(MailboxError::InvalidRecord);
             }
             previous = record.cursor();
@@ -1207,6 +1204,8 @@ mod tests {
     #[test]
     fn journal_serves_only_committed_authority_and_rejects_invalid_records() {
         let current = route();
+        // todoStateCursor is a mailbox cursor far beyond the closure ordinals:
+        // the spaces are never compared.
         let signal = |cursor, signal_type, reason, counts: ClosureCounts| ClosureRecord::Signal {
             cursor,
             signal: ChildReportSignal {
@@ -1219,13 +1218,9 @@ mod tests {
                     local_revision: 1,
                     state_digest: "a".repeat(64),
                     state: LocalTodoState::Done,
-                    todo_state_cursor: 40,
+                    todo_state_cursor: 1_000_000,
                 },
-                closure: SignalClosure::new(
-                    signal_type == SignalType::MissingAfterDone,
-                    45,
-                    counts,
-                ),
+                closure: SignalClosure::new(signal_type == SignalType::MissingAfterDone, 1, counts),
                 parent_todo: None,
                 recovery: SignalRecovery {
                     available: signal_type == SignalType::MissingAfterDone,
@@ -1236,18 +1231,25 @@ mod tests {
             path_attempt_count: 1,
             ..ClosureCounts::default()
         };
-        assert!(!signal(50, SignalType::MissingAfterDone, None, busy).valid());
+        assert!(signal(
+            2,
+            SignalType::MissingAfterDone,
+            None,
+            ClosureCounts::default()
+        )
+        .valid());
+        assert!(!signal(2, SignalType::MissingAfterDone, None, busy).valid());
         assert!(!signal(
-            50,
+            2,
             SignalType::MissingAfterDone,
             Some(UnknownReason::InFlight),
             ClosureCounts::default()
         )
         .valid());
-        assert!(!signal(50, SignalType::ReportUnknown, None, busy).valid());
-        // Pi's ordering check: todoStateCursor < closureCursor < cursor.
+        assert!(!signal(2, SignalType::ReportUnknown, None, busy).valid());
+        // Same-space ordering is still enforced: closureCursor < cursor.
         assert!(!signal(
-            45,
+            1,
             SignalType::MissingAfterDone,
             None,
             ClosureCounts::default()
@@ -1255,7 +1257,7 @@ mod tests {
         .valid());
         let wire = serde_json::to_value(
             match signal(
-                50,
+                2,
                 SignalType::MissingAfterDone,
                 None,
                 ClosureCounts::default(),
@@ -1265,61 +1267,65 @@ mod tests {
             },
         )
         .unwrap();
-        assert_eq!(wire["cursor"], 50);
+        assert_eq!(wire["cursor"], 2);
+        assert_eq!(wire["todo"]["todoStateCursor"], 1_000_000);
         assert_eq!(
             wire["closure"],
-            serde_json::json!({"coverageQualified":true,"closureCursor":45,
+            serde_json::json!({"coverageQualified":true,"closureCursor":1,
                 "pathAttemptCount":0,"preparedCount":0,"admittedReportCount":0})
         );
         let mut journal = ClosureJournal::default();
         journal
+            .push(ClosureRecord::Frozen {
+                cursor: 1,
+                route: current.clone(),
+                local_root: "root".into(),
+                local_revision: 1,
+            })
+            .unwrap();
+        journal
             .push(signal(
-                50,
+                2,
                 SignalType::MissingAfterDone,
                 None,
                 ClosureCounts::default(),
             ))
             .unwrap();
         assert!(
-            journal.signal(50).is_none(),
+            journal.signal(2).is_none(),
             "uncommitted signal is not served"
         );
         assert!(journal
             .signals_for_parent("parent-terminal", 3, 0)
             .is_empty());
+        // A cursor must equal its line ordinal.
+        assert!(journal
+            .push(ClosureRecord::Commit {
+                cursor: 4,
+                first: 1,
+                last: 2,
+            })
+            .is_err());
         journal
             .push(ClosureRecord::Commit {
-                cursor: 51,
-                first: 50,
-                last: 50,
+                cursor: 3,
+                first: 1,
+                last: 2,
             })
             .unwrap();
-        assert!(journal.signal(50).is_some());
+        assert!(journal.signal(2).is_some());
         assert_eq!(journal.signals_for_parent("parent-terminal", 3, 0).len(), 1);
         assert!(journal
             .signals_for_parent("parent-terminal", 4, 0)
             .is_empty());
-        // Cursors must increase; a commit must cover the uncommitted tail.
         assert!(journal
             .push(ClosureRecord::Commit {
-                cursor: 51,
-                first: 50,
-                last: 51,
+                cursor: 4,
+                first: 2,
+                last: 3,
             })
             .is_err());
-        assert!(journal
-            .push(ClosureRecord::Commit {
-                cursor: 60,
-                first: 50,
-                last: 51,
-            })
-            .is_err());
-        journal.floor = 99;
-        assert_eq!(
-            journal.next_cursor(),
-            100,
-            "minted above the mailbox cursor"
-        );
+        assert_eq!(journal.next_cursor(), 4);
     }
 
     #[test]

@@ -82,6 +82,10 @@ pub(crate) struct ParentReportAdvertisement {
     pub protocol: &'static str,
     pub recipient: crate::mailbox::RecipientKey,
     pub grant_id: String,
+    /// #159: `true` only for a covered child whose domain names this ready
+    /// route, from route readiness onward. Pi keys the child role on it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub covered_child: Option<bool>,
     /// #159/#161: offered only to a covered child, always alongside
     /// `todoStateMethod`.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -127,12 +131,13 @@ impl MailboxBootstrapDescriptor {
                     protocol: crate::mailbox_v1::PROTOCOL,
                     recipient: route.recipient.clone(),
                     grant_id: route.grant_id.clone(),
-                    recovery_wait_method: session.child_recovery.then_some("report_recovery_wait"),
+                    covered_child: session.covered_child.then_some(true),
+                    recovery_wait_method: session.covered_child.then_some("report_recovery_wait"),
                     recovery_decline_method: session
-                        .child_recovery
+                        .covered_child
                         .then_some("report_recovery_decline"),
                     recovery_wake_method: session
-                        .child_recovery
+                        .covered_child
                         .then_some("report_recovery_wake_request"),
                 }),
             parent_signals: session
@@ -372,8 +377,16 @@ impl MailboxBootstrapListener {
                 }
             }
         }
+        // A closed stream's server-issued binding dies with it, so probing
+        // clients cannot accumulate stale bindings.
         for id in closed {
-            self.accepted.remove(&id);
+            if let Some(session) = self
+                .accepted
+                .remove(&id)
+                .and_then(|connection| connection.session)
+            {
+                app.release_mailbox_bootstrap_binding(&session.binding_generation);
+            }
         }
         Ok(())
     }
@@ -3642,6 +3655,11 @@ mod tests {
         let descriptor = bootstrap(&mut listener, &mut app, &mut child);
         assert_eq!(descriptor["result"]["caller"], child_key, "{descriptor}");
         let covered = enabled && register;
+        if covered {
+            assert_eq!(descriptor["result"]["parentReport"]["coveredChild"], true);
+        } else {
+            assert!(descriptor["result"]["parentReport"]["coveredChild"].is_null());
+        }
         for (field, method) in [
             ("recoveryWaitMethod", "report_recovery_wait"),
             ("recoveryDeclineMethod", "report_recovery_decline"),
@@ -4756,5 +4774,93 @@ mod tests {
 
     fn current_route_key(fx: &mut Covered) -> String {
         fx.child_terminal.to_string()
+    }
+
+    #[test]
+    fn closure_cursors_are_closure_ordinals_even_when_the_mailbox_is_far_longer() {
+        let mut fx = covered_fixture(true, true, Some(0));
+        let store = crate::mailbox::MailboxStore::existing(&fx.directory);
+        for index in 0..300 {
+            store
+                .provision_grant(crate::mailbox::MailboxGrant {
+                    grant_id: format!("unrelated-{index}"),
+                    sender: crate::mailbox::RecipientKey {
+                        recipient_id: "unrelated-sender".into(),
+                        generation: "1".into(),
+                    },
+                    recipient: crate::mailbox::RecipientKey {
+                        recipient_id: "unrelated-recipient".into(),
+                        generation: "1".into(),
+                    },
+                })
+                .unwrap();
+        }
+        let done = call(&mut fx, false, "todo_state", todo(1, true));
+        let todo_cursor = done["result"]["cursor"].as_u64().unwrap();
+        let page = signals(&mut fx, 0);
+        assert_eq!(page.len(), 1, "{page:?}");
+        let signal = &page[0];
+        assert_eq!(signal["type"], "missing_after_done", "{signal}");
+        assert_eq!(signal["todo"]["todoStateCursor"], todo_cursor);
+        let signal_cursor = signal["cursor"].as_u64().unwrap();
+        let closure_cursor = signal["closure"]["closureCursor"].as_u64().unwrap();
+        assert!(
+            todo_cursor > 300 && signal_cursor < 20,
+            "{todo_cursor} vs {signal_cursor}"
+        );
+        assert!(closure_cursor < signal_cursor);
+        // Each closure cursor is its record's line ordinal in the closure file.
+        let lines = std::fs::read_to_string(
+            fx.directory
+                .join(crate::child_report_closure::CLOSURE_STREAM_FILE),
+        )
+        .unwrap();
+        for (ordinal, line) in lines.lines().enumerate() {
+            let record: Value = serde_json::from_str(line).unwrap();
+            assert_eq!(record["cursor"], ordinal as u64 + 1);
+        }
+        let requested = call(
+            &mut fx,
+            true,
+            "report_recovery_request",
+            recovery_request(signal),
+        );
+        assert!(requested["result"]["recoveryCursor"].as_u64().unwrap() > signal_cursor);
+        let woken = wake(&mut fx, false, signal_cursor);
+        assert!(
+            woken["result"]["wakeCursor"].as_u64().unwrap() > signal_cursor,
+            "{woken}"
+        );
+        finish(fx);
+    }
+
+    #[test]
+    fn closed_streams_release_their_bindings() {
+        let mut fx = covered_fixture(true, true, Some(0));
+        let issued = fx.app.mailbox_bootstrap_bindings.len();
+        assert!(fx
+            .app
+            .mailbox_bootstrap_bindings
+            .contains_key(&fx.child_binding));
+        let mut probe = connect(&fx.listener);
+        let descriptor = bootstrap(&mut fx.listener, &mut fx.app, &mut probe);
+        let probe_binding = descriptor["result"]["bindingGeneration"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        assert_eq!(fx.app.mailbox_bootstrap_bindings.len(), issued + 1);
+        drop(probe);
+        fx.listener.poll(&mut fx.app).unwrap();
+        assert!(!fx
+            .app
+            .mailbox_bootstrap_bindings
+            .contains_key(&probe_binding));
+        assert_eq!(fx.app.mailbox_bootstrap_bindings.len(), issued);
+        // Live streams keep working.
+        assert_eq!(
+            call(&mut fx, false, "todo_state", todo(1, false))["result"]["type"],
+            "todo_state"
+        );
+        finish(fx);
     }
 }
