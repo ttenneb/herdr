@@ -264,7 +264,12 @@ pub(crate) fn inbox_snapshot(
                     .and_then(|claim| claim.execution.as_deref())
                     .is_some_and(execution_alive)
             });
-        state.recovery_needed = state.claim_execution.as_deref() == Some("other")
+        let typed_history = recovered
+            .heads
+            .get(&state.stable_id)
+            .is_some_and(crate::mailbox::is_typed_history);
+        state.recovery_needed = !typed_history
+            && state.claim_execution.as_deref() == Some("other")
             && state.claim_execution_alive == Some(false)
             && matches!(
                 state.lifecycle,
@@ -440,25 +445,7 @@ pub(crate) fn append_typed_history(
         }),
     };
     store
-        .append_offline_head(head)
-        .map_err(|error| format!("{error:?}"))?;
-    let claim_id = format!("typed:{stable_id}");
-    store
-        .claim(crate::mailbox::Claim {
-            claim_id: claim_id.clone(),
-            recipient,
-            stable_id,
-            revision: 1,
-            digest,
-            execution: None,
-        })
-        .map_err(|error| format!("{error:?}"))?;
-    store
-        .resolve_claim_closed_by(
-            &claim_id,
-            crate::mailbox::ClaimResolutionOutcome::Settled,
-            Some("typed"),
-        )
+        .append_typed_history(head)
         .map_err(|error| format!("{error:?}"))?;
     Ok(())
 }
@@ -796,6 +783,7 @@ impl App {
             .heads
             .values()
             .filter(|head| recipients.contains(&head.recipient))
+            .filter(|head| !crate::mailbox::is_typed_history(head))
             .filter(|head| match recovered.claims.get(&head.stable_id) {
                 None => true,
                 Some(claim) => {
@@ -840,6 +828,7 @@ impl App {
                 .heads
                 .values()
                 .filter(|head| recipients.contains(&head.recipient))
+                .filter(|head| !crate::mailbox::is_typed_history(head))
                 .filter(|head| match recovered.claims.get(&head.stable_id) {
                     None => true,
                     Some(claim) => {
@@ -1211,6 +1200,7 @@ impl App {
                         && head.sender == sender_key
                         && head.delivery.is_some()
                         && !recovered.claims.contains_key(&head.stable_id)
+                        && !crate::mailbox::is_typed_history(head)
                 })
                 .collect()
         } else {
