@@ -1207,7 +1207,8 @@ impl App {
             .terminals
             .insert(new_pane.terminal.id.clone(), new_pane.terminal);
         if let Some(prepared) = managed {
-            self.commit_managed_launch(&helper_terminal_id, prepared);
+            let recipe = self.commit_managed_launch(&helper_terminal_id, prepared);
+            self.finalize_managed_launch(&helper_terminal_id, recipe);
         }
         // Always select the newly allocated helper. In a nonempty Collection, leaving an
         // older member selected risks assigning or observing the old busy pane instead.

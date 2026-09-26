@@ -410,21 +410,48 @@ impl App {
     /// Bind a prepared launch once its terminal and runtime exist and the
     /// terminal has begun its managed agent: the generation goes to both, and a
     /// trusted Pi session is recorded for Active-time process binding.
+    /// Returns the launch's recipe, to be applied with
+    /// [`Self::finalize_managed_launch`] only once the process has actually
+    /// been started (input sent or member spawned).
     pub(super) fn commit_managed_launch(
         &mut self,
         terminal_id: &crate::terminal::TerminalId,
         prepared: PreparedManagedLaunch,
-    ) {
+    ) -> Option<crate::launch_recipe::LaunchRecipe> {
         if let Some(runtime) = self.terminal_runtimes.get(terminal_id) {
             runtime.set_managed_agent_generation(prepared.generation);
         }
+        if let Some(terminal) = self.state.terminals.get_mut(terminal_id) {
+            terminal.set_managed_agent_generation(prepared.generation);
+        }
+        if let Some((session_path, earliest_birth_ticks)) = prepared.pi_session {
+            self.managed_pi_launches.insert(
+                terminal_id.clone(),
+                ManagedPiLaunch {
+                    generation: prepared.generation,
+                    session_path,
+                    earliest_birth_ticks,
+                    process: None,
+                },
+            );
+        }
+        prepared.recipe
+    }
+
+    /// After a successful start: record the recipe, and end a Herdr sleep and
+    /// drop a carried route for a hand start, or queue the route carry for a
+    /// recipe relaunch. A failed start never gets here, so it loses nothing.
+    pub(super) fn finalize_managed_launch(
+        &mut self,
+        terminal_id: &crate::terminal::TerminalId,
+        recipe: Option<crate::launch_recipe::LaunchRecipe>,
+    ) {
         let relaunch = self.recipe_relaunches.contains(terminal_id)
             || self.pane_wakes.contains_key(terminal_id);
         let mut carry_route = false;
         if let Some(terminal) = self.state.terminals.get_mut(terminal_id) {
-            terminal.set_managed_agent_generation(prepared.generation);
             // The durable recipe is what a later wake or restart relaunches.
-            terminal.launch_recipe = prepared.recipe;
+            terminal.launch_recipe = recipe;
             if relaunch {
                 // A wake keeps the sleep until its Pi attaches; a recipe
                 // relaunch may carry the pane's delegation route over.
@@ -442,17 +469,6 @@ impl App {
             );
         } else {
             self.pending_route_carries.remove(terminal_id);
-        }
-        if let Some((session_path, earliest_birth_ticks)) = prepared.pi_session {
-            self.managed_pi_launches.insert(
-                terminal_id.clone(),
-                ManagedPiLaunch {
-                    generation: prepared.generation,
-                    session_path,
-                    earliest_birth_ticks,
-                    process: None,
-                },
-            );
         }
     }
 
@@ -564,7 +580,7 @@ impl App {
             return Err(AgentStartError::TargetUnavailable(params.pane_id));
         };
         terminal.begin_managed_agent(name.clone(), kind, now, AGENT_START_SETTLE_DELAY, timeout);
-        self.commit_managed_launch(&terminal_id, managed);
+        let recipe = self.commit_managed_launch(&terminal_id, managed);
         let sent = self
             .terminal_runtimes
             .get(&terminal_id)
@@ -581,6 +597,7 @@ impl App {
             self.abandon_managed_launch(&terminal_id, generation);
             return Err(AgentStartError::InputFailed(err));
         }
+        self.finalize_managed_launch(&terminal_id, recipe);
         self.acknowledge_terminal_input(&terminal_id);
         self.state.mark_session_dirty();
         self.schedule_session_save();

@@ -817,6 +817,63 @@ mod tests {
         ));
     }
 
+    /// A wake whose start fails after commit keeps the pane's recipe, sleep
+    /// and carried route, so a later wake can still carry the route.
+    #[tokio::test]
+    async fn a_failed_wake_loses_neither_recipe_nor_sleep_nor_route_carry() {
+        let (mut app, _pane, terminal, public) = app_with_shell_pane();
+        let recipe = crate::launch_recipe::LaunchRecipe::capture(
+            "owner",
+            "pi",
+            &["--session".into(), "/sessions/owner.jsonl".into()],
+            &[],
+        );
+        let carry = crate::launch_recipe::RouteCarry {
+            child_delegation: "d2".into(),
+            parent_delegation: "d1".into(),
+            session_path: "/sessions/owner.jsonl".into(),
+            generation: 1,
+            parent_terminal: "term_parent".into(),
+            parent_session: "/sessions/parent.jsonl".into(),
+        };
+        {
+            let state = app.state.terminals.get_mut(&terminal).unwrap();
+            state.launch_recipe = recipe.clone();
+            state.sleep = Some(App::new_pane_sleep("owner".into(), 1));
+            state.route_carry = Some(carry.clone());
+        }
+        // The pane's input is closed: the start is committed, then the send fails.
+        let (runtime, input) = crate::terminal::TerminalRuntime::test_with_channel(80, 24);
+        drop(input);
+        app.terminal_runtimes.insert(terminal.clone(), runtime);
+        let outcome = app.wake_pane(&public, trigger());
+        assert!(matches!(outcome, WakeOutcome::Failed { .. }), "{outcome:?}");
+        let state = &app.state.terminals[&terminal];
+        assert_eq!(state.launch_recipe, recipe);
+        assert!(state.sleep.is_some());
+        assert_eq!(state.route_carry, Some(carry));
+        assert!(app.pending_route_carries.is_empty());
+        assert!(!app.managed_pi_launches.contains_key(&terminal));
+        // A hand start that fails the same way does not clear them either.
+        app.pane_wake_cooldowns.clear();
+        let (runtime, input) = crate::terminal::TerminalRuntime::test_with_channel(80, 24);
+        drop(input);
+        app.terminal_runtimes.insert(terminal.clone(), runtime);
+        let started = app.start_agent(AgentStartParams {
+            name: "other".into(),
+            kind: "pi".into(),
+            pane_id: public.clone(),
+            args: vec!["--thinking".into(), "low".into()],
+            env: Vec::new(),
+            timeout_ms: None,
+        });
+        assert!(started.is_err());
+        let state = &app.state.terminals[&terminal];
+        assert_eq!(state.launch_recipe, recipe);
+        assert!(state.sleep.is_some());
+        assert!(state.route_carry.is_some());
+    }
+
     #[tokio::test]
     async fn unattached_wake_expires_retries_once_then_cools_down() {
         let (mut app, pane, terminal, public) = app_with_shell_pane();
@@ -1252,8 +1309,20 @@ mod tests {
         let (mut app, _pane, terminal, _public) = app_with_shell_pane();
         app.terminal_runtimes.remove(&terminal);
         app.state.view.terminal_area = ratatui::layout::Rect::new(0, 0, 80, 24);
-        // A plain shell, independent of the developer's login shell and rc files.
-        app.state.default_shell = "/bin/sh".into();
+        // An inert "sh" that reads and discards its input: the resume command
+        // typed into it can never start a real agent.
+        let fake_shell_dir = std::env::temp_dir().join(format!(
+            "herdr-inert-shell-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::create_dir_all(&fake_shell_dir).unwrap();
+        let fake_shell = fake_shell_dir.join("sh");
+        crate::test_env::write_executable(
+            &fake_shell,
+            "#!/bin/sh\nwhile read -r line; do :; done\n",
+        );
+        app.state.default_shell = fake_shell.display().to_string();
         {
             let state = app.state.terminals.get_mut(&terminal).unwrap();
             // The restored snapshot: a recipe, a resume plan and a stale agent
@@ -1262,7 +1331,7 @@ mod tests {
                 "owner",
                 "pi",
                 &["--thinking".into(), "low".into()],
-                &[("PATH".into(), "/nonexistent".into())],
+                &[],
             );
             state.pending_agent_resume_plan = Some(crate::agent_resume::AgentResumePlan {
                 agent: "pi".into(),
@@ -1300,5 +1369,6 @@ mod tests {
         if let Some(runtime) = app.terminal_runtimes.remove(&terminal) {
             runtime.shutdown();
         }
+        let _ = std::fs::remove_dir_all(fake_shell_dir);
     }
 }

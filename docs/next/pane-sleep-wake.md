@@ -7,8 +7,10 @@ Herdr can put a managed agent to sleep and wake it again, in the same pane and t
 Every managed launch (`herdr agent start`, and `herdr collection helper-launch` with `--session`) records a launch recipe on the pane when it commits, and the recipe is persisted with the session:
 
 - the agent name, kind and arguments exactly as launched;
-- only the `--env NAME=value` pairs the caller passed explicitly, minus credential-like names (`*TOKEN*`, `*SECRET*`, `*KEY*`, `*AUTH*`, `*PASSWORD*`, …). The inherited environment is never stored;
-- a launch with a secret on its command line (`--api-key`, `--token`) gets no recipe.
+- only allowlisted `--env NAME=value` pairs the caller passed explicitly: `PI_*` (except credential-like names such as `*TOKEN*`, `*SECRET*`, `*API_KEY*`, `*AUTH*`, `*PASSWORD*`), `HERDR_LIFECYCLE_ROLE`, `TERM`, `LANG`, `LC_ALL` and `TZ`. Anything else, and any value with `scheme://user:pass@` credentials, is dropped. The inherited environment is never stored;
+- no recipe at all for a launch with a secret on its command line (`--api-key`, `--token`, URL credentials), or with an initial prompt that a wake would re-send: a positional message, an `@file`, `-p`/`--print`, or anything after `--`.
+
+The recipe, the end of a Herdr sleep and any route-carry change are applied only after the launch actually started, so a failed start loses none of them.
 
 A launch that passes the reserved `--env HERDR_LIFECYCLE_ROLE=<roleId>` belongs to a lifecycle role manager. Herdr never sleeps or wakes it.
 
@@ -55,4 +57,11 @@ A delegation report route is tied to the child Pi's process generation. When `he
 
 When a recipe relaunch starts a new generation, Herdr re-establishes `route_ready` for it with the same expected parent, once the new Pi is Active with a trusted session. A recipe relaunch here means `wake_pane` or the restart resume. The relaunch must be in the same pane, whose terminal is still bound to the child delegation, and on the same session file. Each outcome gets a durable record under `<data dir>/route-carries/<child>-g<generation>.json`: `established`, `refused` (different session or pane) or `expired` (not ready within 60 s).
 
+The carry also pins the parent execution: the parent terminal and parent session the route was ready with. If the parent pane now runs another terminal or another session, the carry is refused, the child's old route is removed (the child shows not ready), and the refusal is recorded.
+
 A hand start (`agent start`, helper launch) never inherits a route; it drops the remembered route. A different session file or a different pane drops it too.
+
+## Policy notes and known issues
+
+- **Launch-time session checks are policy, not a security boundary.** The directory a `--session` file must sit in is resolved from the launch's own `--env` (`PI_CODING_AGENT_SESSION_DIR`, `PI_CODING_AGENT_DIR`) before the server environment, so a caller can steer it. The checks are path based: the file is verified at launch and again at every identity read, but not held open, so a same-user process can swap it in between (TOCTOU). Both are accepted: the caller already runs as the same user.
+- **Known issue:** two panes launched as managed on the same `--session` file are out of scope. Both would present the same trusted session identity. Wake, restart resume and route carry assume one pane per session file.
