@@ -105,7 +105,7 @@ impl App {
                         .map(str::to_string)
                 });
             if let Some(stable_id) = stable_id {
-                self.wake_for_appended_head(&terminal_id, stable_id);
+                self.request_pane_wake_if_detached(&terminal_id.to_string(), &stable_id);
             }
             return response;
         }
@@ -222,13 +222,21 @@ impl App {
         }
         if expected_agent == crate::detect::Agent::Pi
             && params.send.transport != Some(crate::api::schema::MessageTransport::Pty)
-            && self
-                .attached_messages_recipient(&terminal_id.to_string())
-                .is_some()
+            && self.pane_takes_messages(&terminal_id.to_string())
         {
             if let Some(response) =
                 self.handoff_via_messages(&id, &envelope, &params.send, &receipt)
             {
+                if let Some(stable_id) = serde_json::from_str::<serde_json::Value>(&response)
+                    .ok()
+                    .and_then(|value| {
+                        value["result"]["receipt"]["delivery"]["stable_id"]
+                            .as_str()
+                            .map(str::to_string)
+                    })
+                {
+                    self.request_pane_wake_if_detached(&terminal_id.to_string(), &stable_id);
+                }
                 return response;
             }
         } else if params.send.transport == Some(crate::api::schema::MessageTransport::Mailbox) {

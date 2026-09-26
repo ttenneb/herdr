@@ -33,8 +33,6 @@ pub(crate) const PARENT_OF_ACTIVE_ROUTES: &str = "parent of active delegation ro
 /// whenever a slept pane has unsettled heads; wake_pane refuses or coalesces.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 #[serde(rename_all = "snake_case")]
-// Constructed by the mailbox wake hook (herdr_identity_owner, rc3).
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) enum WakeCause {
     /// A head was appended for the pane's recipient.
     HeadAppended,
@@ -130,16 +128,40 @@ fn new_wake_id() -> String {
 }
 
 impl App {
-    /// The restart-stable pane key is resolved here and only here. In
-    /// next-maint the key is the current public pane ID; the restart-stable key
-    /// design replaces this body.
+    /// The restart-stable pane key is resolved here and only here. The key is
+    /// the pane's durable Messages queue key (`TerminalState::queue_key`,
+    /// also accepted as its `pane:<queueKey>` recipient ID), which survives
+    /// Pi restarts, sleep and server restarts. A current public pane ID is
+    /// still accepted for callers that address a pane directly.
     pub(crate) fn resolve_wake_pane_key(
         &self,
         pane_key: &str,
     ) -> Option<(usize, crate::layout::PaneId, TerminalId)> {
+        let queue_key = pane_key.strip_prefix("pane:").unwrap_or(pane_key);
+        if let Some(terminal) = self.state.terminals.values().find(|terminal| {
+            crate::terminal::state::valid_queue_key(queue_key) && terminal.queue_key == queue_key
+        }) {
+            let (ws_idx, pane_id) = self.pane_of_terminal(&terminal.id)?;
+            return Some((ws_idx, pane_id, terminal.id.clone()));
+        }
         let (ws_idx, pane_id) = self.parse_current_public_pane_id(pane_key)?;
         let terminal_id = self.state.workspaces.get(ws_idx)?.terminal_id(pane_id)?;
         Some((ws_idx, pane_id, terminal_id.clone()))
+    }
+
+    fn pane_of_terminal(&self, terminal_id: &TerminalId) -> Option<(usize, crate::layout::PaneId)> {
+        self.state
+            .workspaces
+            .iter()
+            .enumerate()
+            .find_map(|(ws_idx, workspace)| {
+                workspace.tabs.iter().find_map(|tab| {
+                    tab.panes
+                        .iter()
+                        .find(|(_, pane)| &pane.attached_terminal_id == terminal_id)
+                        .map(|(pane_id, _)| (ws_idx, *pane_id))
+                })
+            })
     }
 
     /// Whether the pane of this terminal is the parent of a ready delegation
@@ -321,8 +343,6 @@ impl App {
     /// Pi readiness) and single-flight per pane: while one wake is
     /// outstanding, further calls coalesce into it. Every call writes one
     /// durable record.
-    // Called by the mailbox wake hook (herdr_identity_owner, rc3).
-    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn wake_pane(&mut self, pane_key: &str, trigger_head: WakeTrigger) -> WakeOutcome {
         self.wake_pane_attempt(pane_key, trigger_head, false)
     }
@@ -622,79 +642,54 @@ pub(crate) const WAKE_SWEEP_WINDOW: Duration = Duration::from_secs(30);
 const WAKE_SWEEP_POLL: Duration = Duration::from_millis(500);
 
 impl App {
-    /// The Messages recipient of a pane Herdr put to sleep, so a send can be
-    /// queued for it while no Pi is attached.
-    pub(crate) fn sleeping_messages_recipient(
-        &self,
-        terminal_id: &str,
-    ) -> Option<crate::mailbox::RecipientKey> {
-        self.state
-            .terminals
-            .values()
-            .find(|terminal| terminal.id.to_string() == terminal_id)
-            .filter(|terminal| terminal.sleep.is_some())
-            .map(|_| crate::mailbox::RecipientKey {
-                recipient_id: terminal_id.to_string(),
-                generation: "1".into(),
-            })
-    }
-
+    /// The restart-stable wake key of this terminal's pane: its queue key.
     fn wake_pane_key_for_terminal(&self, terminal_id: &TerminalId) -> Option<String> {
-        self.state
-            .workspaces
-            .iter()
-            .enumerate()
-            .find_map(|(ws_idx, workspace)| {
-                workspace.tabs.iter().find_map(|tab| {
-                    tab.panes
-                        .iter()
-                        .find(|(_, pane)| &pane.attached_terminal_id == terminal_id)
-                        .and_then(|(pane_id, _)| self.public_pane_id(ws_idx, *pane_id))
-                })
-            })
+        self.pane_of_terminal(terminal_id)?;
+        Some(self.state.terminals.get(terminal_id)?.queue_key.clone())
     }
 
-    /// The mailbox hook: a head was appended for a recipient whose terminal
-    /// may be asleep. Only a slept pane with no attached Messages stream is
-    /// woken; Duplicate and Refused outcomes are expected and ignored.
-    pub(crate) fn wake_for_appended_head(&mut self, terminal_id: &TerminalId, head_id: String) {
-        let asleep = self
+    /// The single wake call per queued head. Called from the
+    /// `pane.wake_requested` emit point (`request_pane_wake_if_detached`),
+    /// which already checked that no Pi is attached. Only a pane Herdr put to
+    /// sleep is woken; Duplicate and Refused outcomes are expected and ignored.
+    pub(crate) fn wake_on_requested(&mut self, terminal_key: &str, head_id: &str) {
+        let Some(terminal) = self
             .state
             .terminals
-            .get(terminal_id)
-            .is_some_and(|terminal| terminal.sleep.is_some());
-        if !asleep
-            || self
-                .attached_messages_recipient(&terminal_id.to_string())
-                .is_some()
-        {
+            .values()
+            .find(|terminal| terminal.id.to_string() == terminal_key)
+        else {
+            return;
+        };
+        if terminal.sleep.is_none() {
             return;
         }
-        let Some(pane_key) = self.wake_pane_key_for_terminal(terminal_id) else {
+        let terminal_id = terminal.id.clone();
+        let Some(pane_key) = self.wake_pane_key_for_terminal(&terminal_id) else {
             return;
         };
         let _ = self.wake_pane(
             &pane_key,
             WakeTrigger {
                 cause: WakeCause::HeadAppended,
-                recipient_id: terminal_id.to_string(),
-                head_id,
+                recipient_id: format!("pane:{pane_key}"),
+                head_id: head_id.to_string(),
             },
         );
     }
 
-    /// [`Self::wake_for_appended_head`] for a mailbox recipient ID, which is
-    /// the recipient terminal's ID.
-    pub(crate) fn wake_for_appended_recipient(&mut self, recipient_id: &str, head_id: String) {
-        let terminal_id = self
-            .state
+    /// The terminal whose pane inbox covers this mailbox recipient ID (its
+    /// `pane:<queueKey>` or its legacy terminal key).
+    pub(crate) fn terminal_for_recipient(&self, recipient_id: &str) -> Option<String> {
+        let queue_key = recipient_id.strip_prefix("pane:");
+        self.state
             .terminals
-            .keys()
-            .find(|terminal| terminal.to_string() == recipient_id)
-            .cloned();
-        if let Some(terminal_id) = terminal_id {
-            self.wake_for_appended_head(&terminal_id, head_id);
-        }
+            .values()
+            .find(|terminal| match queue_key {
+                Some(key) => terminal.queue_key == key,
+                None => terminal.id.to_string() == recipient_id,
+            })
+            .map(|terminal| terminal.id.to_string())
     }
 
     /// The terminal of a handoff recipient that Herdr put to sleep, if the
@@ -718,16 +713,15 @@ impl App {
             .then_some(terminal_id)
     }
 
+    /// The first unsettled head in the pane's inbox (its queue key and the
+    /// legacy terminal key).
     fn first_unsettled_head(&self, terminal_id: &TerminalId) -> Option<String> {
-        let recipient = crate::mailbox::RecipientKey {
-            recipient_id: terminal_id.to_string(),
-            generation: "1".into(),
-        };
         let store = crate::mailbox::MailboxStore::open(&self.sender_authority_dir).ok()?;
-        let snapshot = crate::mailbox_v1::snapshot(&store.load().ok()?, &recipient).ok()?;
-        snapshot
-            .head_states
-            .into_iter()
+        let recovered = store.load().ok()?;
+        self.inbox_recipients(&terminal_id.to_string())
+            .iter()
+            .filter_map(|recipient| crate::mailbox_v1::snapshot(&recovered, recipient).ok())
+            .flat_map(|snapshot| snapshot.head_states)
             .find(|state| state.lifecycle != crate::mailbox_v1::HeadLifecycle::Settled)
             .map(|state| state.stable_id)
     }
@@ -778,7 +772,7 @@ impl App {
                 &pane_key,
                 WakeTrigger {
                     cause: WakeCause::RestoreBacklog,
-                    recipient_id: terminal_id.to_string(),
+                    recipient_id: format!("pane:{pane_key}"),
                     head_id,
                 },
             );
@@ -1089,7 +1083,20 @@ mod tests {
         )
     }
 
+    /// A Pi is detected in the pane; it counts as having attached Messages
+    /// before (so its pane keeps a Messages queue while it sleeps).
     fn pi_attaches(app: &mut App, pane: crate::layout::PaneId, generation: u64) {
+        if let Some(terminal) = app
+            .state
+            .workspaces
+            .iter()
+            .find_map(|workspace| workspace.terminal_id(pane))
+            .cloned()
+        {
+            if let Some(state) = app.state.terminals.get_mut(&terminal) {
+                state.messages_capable = true;
+            }
+        }
         app.handle_internal_event(crate::events::AppEvent::AgentProcessDetected {
             pane_id: pane,
             agent: crate::detect::Agent::Pi,
@@ -1098,53 +1105,23 @@ mod tests {
         });
     }
 
+    /// The woken generation claims and settles its pane inbox's next head
+    /// (queue key and legacy terminal key), bound to its execution.
     fn claim(app: &mut App, terminal: &TerminalId, generation: u64) -> Option<String> {
-        let response = request(
-            app,
-            crate::api::schema::Method::MailboxClaim(crate::api::schema::MailboxClaimParams {
-                caller: terminal.to_string(),
-                grant_id: format!("offline:{terminal}:{generation}"),
-                recipient: crate::mailbox::RecipientKey {
-                    recipient_id: terminal.to_string(),
-                    generation: "1".into(),
-                },
-                claim: crate::mailbox_v1::ClaimRequest {
-                    protocol: crate::mailbox_v1::PROTOCOL.into(),
-                },
-            }),
-        );
-        let claim = &response["result"]["claim"];
-        if claim.is_null() {
-            return None;
-        }
-        let stable_id = claim["stable_id"]
-            .as_str()
-            .or_else(|| claim["stableId"].as_str())
-            .expect("claimed head id")
-            .to_string();
-        let claim_id = claim["claim_id"]
-            .as_str()
-            .or_else(|| claim["claimId"].as_str())
-            .expect("claim id")
-            .to_string();
-        let resolved = request(
-            app,
-            crate::api::schema::Method::MailboxResolve(crate::api::schema::MailboxResolveParams {
-                caller: terminal.to_string(),
-                grant_id: format!("offline:{terminal}:{generation}"),
-                recipient: crate::mailbox::RecipientKey {
-                    recipient_id: terminal.to_string(),
-                    generation: "1".into(),
-                },
-                resolve: crate::mailbox_v1::Resolve {
-                    protocol: crate::mailbox_v1::PROTOCOL.into(),
-                    claim_id,
-                    outcome: crate::mailbox_v1::ResolveOutcome::Settled,
-                },
-            }),
-        );
-        assert!(resolved.get("error").is_none(), "{resolved}");
-        Some(stable_id)
+        let store = crate::mailbox::MailboxStore::open(&app.sender_authority_dir).unwrap();
+        let claim = store
+            .claim_next_for_execution(
+                &app.inbox_recipients(&terminal.to_string()),
+                &format!("managed:{terminal}:{generation}"),
+            )
+            .unwrap()?;
+        store
+            .resolve_claim(
+                &claim.claim_id,
+                crate::mailbox::ClaimResolutionOutcome::Settled,
+            )
+            .unwrap();
+        Some(claim.stable_id)
     }
 
     /// The wake hook end to end: sleep, then `agent prompt` to the sleeping
@@ -1174,6 +1151,23 @@ mod tests {
             .expect("the head woke the pane")
             .clone();
         assert_eq!(outstanding.trigger.cause, WakeCause::HeadAppended);
+        // The wake is keyed by the pane's restart-stable queue key.
+        let queue_key = app.state.terminals[&terminal].queue_key.clone();
+        assert_eq!(outstanding.pane_key, queue_key);
+        assert_eq!(
+            outstanding.trigger.recipient_id,
+            format!("pane:{queue_key}")
+        );
+        for key in [
+            queue_key.clone(),
+            format!("pane:{queue_key}"),
+            public.clone(),
+        ] {
+            assert_eq!(
+                app.resolve_wake_pane_key(&key).map(|(_, _, t)| t),
+                Some(terminal.clone())
+            );
+        }
         let second = prompt(&mut app, "owner", "second task");
         assert_eq!(second["result"]["delivery"]["path"], "mailbox", "{second}");
         assert_eq!(
@@ -1530,9 +1524,9 @@ mod tests {
         app.wake_sweep_done = false;
         app.wake_sweep_settled.clear();
         app.pane_wake_cooldowns.clear();
-        let recipient = app
-            .sleeping_messages_recipient(&terminal.to_string())
-            .unwrap();
+        let recipient = crate::app::messages::pane_recipient(
+            &app.pane_queue_key(&terminal.to_string()).unwrap(),
+        );
         let sender = crate::app::messages::SenderAttribution {
             terminal: None,
             label: "external".into(),
@@ -1557,7 +1551,7 @@ mod tests {
             routed,
             Ok(crate::app::messages::SendRoute::Mailbox(_))
         ));
-        assert_eq!(recipient.recipient_id, terminal.to_string());
+        assert!(recipient.recipient_id.starts_with("pane:"));
         while input.try_recv().is_ok() {}
         assert!(app.run_wake_backlog_sweep(Instant::now()));
         let outstanding = app

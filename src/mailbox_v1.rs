@@ -136,6 +136,10 @@ pub struct HeadState {
     /// recipient's current one: shown, never claimed, until Retry or Drop.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub previous_session: bool,
+    /// For a claimed head: `current` when this execution holds the claim,
+    /// `other` when another (for example an exited) Pi does.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub claim_execution: Option<String>,
 }
 
 pub fn snapshot(
@@ -216,6 +220,7 @@ pub fn snapshot(
                     .as_ref()
                     .and_then(|delivery| delivery.recipient_session.clone()),
                 previous_session: false,
+                claim_execution: None,
             }
         })
         .collect();
@@ -456,6 +461,7 @@ mod tests {
             stable_id: head.stable_id.clone(),
             revision: head.revision,
             digest: head.digest.clone(),
+            execution: None,
         };
         let mut mismatched = exact.clone();
         mismatched.digest = "f".repeat(64);
@@ -500,6 +506,7 @@ mod tests {
                 recipient: head.recipient.clone(),
                 revision: head.revision,
                 digest: head.digest.clone(),
+                execution: None,
             },
         );
         recovered.claims.insert(
@@ -510,6 +517,7 @@ mod tests {
                 recipient: second.recipient.clone(),
                 revision: second.revision,
                 digest: second.digest.clone(),
+                execution: None,
             },
         );
         recovered.resolutions.insert(

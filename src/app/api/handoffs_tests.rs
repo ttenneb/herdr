@@ -86,7 +86,10 @@ async fn exact_session_handoff_uses_normal_prompt_transaction() {
         "req".into(),
         HandoffSendParams {
             envelope: envelope(identity(&app, pane)),
-            send: Default::default(),
+            send: crate::api::schema::MessageSendOptions {
+                transport: Some(crate::api::schema::MessageTransport::Pty),
+                ..Default::default()
+            },
         },
     );
     let success: SuccessResponse = serde_json::from_str(&response).unwrap();
@@ -112,7 +115,10 @@ async fn replacement_session_is_rejected_without_writing() {
         "req".into(),
         HandoffSendParams {
             envelope: stale,
-            send: Default::default(),
+            send: crate::api::schema::MessageSendOptions {
+                transport: Some(crate::api::schema::MessageTransport::Pty),
+                ..Default::default()
+            },
         },
     );
     let success: SuccessResponse = serde_json::from_str(&response).unwrap();
@@ -220,7 +226,10 @@ async fn hand_typed_pi_reported_session_is_visible_marked_reported_and_handoffs_
             "req".into(),
             HandoffSendParams {
                 envelope,
-                send: Default::default(),
+                send: crate::api::schema::MessageSendOptions {
+                    transport: Some(crate::api::schema::MessageTransport::Pty),
+                    ..Default::default()
+                },
             },
         );
         let success: SuccessResponse = serde_json::from_str(&response).unwrap();

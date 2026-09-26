@@ -937,7 +937,7 @@ impl App {
             used_mailbox_bootstrap_nonces: HashSet::new(),
             next_mailbox_bootstrap_binding: 1,
             mailbox_bootstrap_discovery_address: None,
-            unmanaged_pi_messages: config.experimental.unmanaged_pi_messages,
+            unmanaged_pi_messages: config.experimental.unmanaged_pi_messages.unwrap_or(true),
             #[cfg(test)]
             mailbox_bootstrap_test_foreground_jobs: HashMap::new(),
             #[cfg(test)]
@@ -1766,7 +1766,7 @@ impl App {
             self.state.switch_ascii_input_source_in_prefix =
                 config.experimental.switch_ascii_input_source_in_prefix;
             self.persist_pane_history = config.experimental.pane_history;
-            self.unmanaged_pi_messages = config.experimental.unmanaged_pi_messages;
+            self.unmanaged_pi_messages = config.experimental.unmanaged_pi_messages.unwrap_or(true);
             crate::integration::set_pane_mailbox_bootstrap_address(
                 self.unmanaged_pi_messages
                     .then(|| self.mailbox_bootstrap_discovery_address.clone())

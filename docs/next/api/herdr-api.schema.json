@@ -1307,6 +1307,43 @@
               "type": "object"
             },
             {
+              "description": "A Messages head was queued for a pane with no attached Pi. Consumers\n(sleep/wake, #25) may wake the pane's agent; Herdr itself does nothing\nelse.",
+              "properties": {
+                "pane_id": {
+                  "type": "string"
+                },
+                "queue_key": {
+                  "type": "string"
+                },
+                "reason": {
+                  "type": "string"
+                },
+                "stable_id": {
+                  "type": "string"
+                },
+                "terminal_id": {
+                  "type": "string"
+                },
+                "type": {
+                  "const": "pane_wake_requested",
+                  "type": "string"
+                },
+                "workspace_id": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type",
+                "pane_id",
+                "workspace_id",
+                "terminal_id",
+                "queue_key",
+                "stable_id",
+                "reason"
+              ],
+              "type": "object"
+            },
+            {
               "properties": {
                 "agent": {
                   "type": [
@@ -1463,6 +1500,7 @@
             "pane_output_changed",
             "pane_exited",
             "pane_agent_detected",
+            "pane_wake_requested",
             "pane_agent_status_changed",
             "layout_updated"
           ],
@@ -6355,6 +6393,18 @@
             },
             {
               "properties": {
+                "type": {
+                  "const": "pane.wake_requested",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
                 "lines": {
                   "format": "uint32",
                   "minimum": 0,
@@ -10383,6 +10433,43 @@
               "type": "object"
             },
             {
+              "description": "A Messages head was queued for a pane with no attached Pi. Consumers\n(sleep/wake, #25) may wake the pane's agent; Herdr itself does nothing\nelse.",
+              "properties": {
+                "pane_id": {
+                  "type": "string"
+                },
+                "queue_key": {
+                  "type": "string"
+                },
+                "reason": {
+                  "type": "string"
+                },
+                "stable_id": {
+                  "type": "string"
+                },
+                "terminal_id": {
+                  "type": "string"
+                },
+                "type": {
+                  "const": "pane_wake_requested",
+                  "type": "string"
+                },
+                "workspace_id": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type",
+                "pane_id",
+                "workspace_id",
+                "terminal_id",
+                "queue_key",
+                "stable_id",
+                "reason"
+              ],
+              "type": "object"
+            },
+            {
               "properties": {
                 "agent": {
                   "type": [
@@ -10539,6 +10626,7 @@
             "pane_output_changed",
             "pane_exited",
             "pane_agent_detected",
+            "pane_wake_requested",
             "pane_agent_status_changed",
             "layout_updated"
           ],
@@ -11822,6 +11910,13 @@
             },
             "digest": {
               "type": "string"
+            },
+            "execution": {
+              "description": "The recipient execution that took this claim (per-pane queues). Only\nthat execution sees and resolves it; absent on older claims.",
+              "type": [
+                "string",
+                "null"
+              ]
             },
             "recipient": {
               "$ref": "#/schemas/success_response/$defs/RecipientKey"
@@ -13168,6 +13263,43 @@
               "type": "object"
             },
             {
+              "description": "A Messages head was queued for a pane with no attached Pi. Consumers\n(sleep/wake, #25) may wake the pane's agent; Herdr itself does nothing\nelse.",
+              "properties": {
+                "pane_id": {
+                  "type": "string"
+                },
+                "queue_key": {
+                  "type": "string"
+                },
+                "reason": {
+                  "type": "string"
+                },
+                "stable_id": {
+                  "type": "string"
+                },
+                "terminal_id": {
+                  "type": "string"
+                },
+                "type": {
+                  "const": "pane_wake_requested",
+                  "type": "string"
+                },
+                "workspace_id": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type",
+                "pane_id",
+                "workspace_id",
+                "terminal_id",
+                "queue_key",
+                "stable_id",
+                "reason"
+              ],
+              "type": "object"
+            },
+            {
               "properties": {
                 "agent": {
                   "type": [
@@ -13339,6 +13471,7 @@
             "pane_output_changed",
             "pane_exited",
             "pane_agent_detected",
+            "pane_wake_requested",
             "pane_agent_status_changed",
             "layout_updated"
           ],
@@ -13440,6 +13573,13 @@
         },
         "HeadState": {
           "properties": {
+            "claimExecution": {
+              "description": "For a claimed head: `current` when this execution holds the claim,\n`other` when another (for example an exited) Pi does.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
             "claimId": {
               "type": [
                 "string",

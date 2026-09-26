@@ -167,6 +167,11 @@ pub struct PaneSnapshot {
     pub sleep: Option<crate::launch_recipe::PaneSleep>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub route_carry: Option<crate::launch_recipe::RouteCarry>,
+    /// Durable Messages queue key of this pane (see `TerminalState::queue_key`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub queue_key: Option<String>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub messages_capable: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -512,6 +517,8 @@ fn capture_tab(
         let launch_recipe = terminal.and_then(|terminal| terminal.launch_recipe.clone());
         let sleep = terminal.and_then(|terminal| terminal.sleep.clone());
         let route_carry = terminal.and_then(|terminal| terminal.route_carry.clone());
+        let queue_key = terminal.map(|terminal| terminal.queue_key.clone());
+        let messages_capable = terminal.is_some_and(|terminal| terminal.messages_capable);
         let agent_session = terminal.and_then(|terminal| {
             if let Some(authority) = terminal.hook_authority.as_ref() {
                 if let Some(session_ref) = authority.session_ref.as_ref() {
@@ -546,6 +553,8 @@ fn capture_tab(
                 launch_recipe,
                 sleep,
                 route_carry,
+                queue_key,
+                messages_capable,
             },
         );
     }
@@ -994,6 +1003,8 @@ mod tests {
                 launch_recipe: None,
                 sleep: None,
                 route_carry: None,
+                queue_key: None,
+                messages_capable: false,
             },
         );
         panes.insert(
@@ -1009,6 +1020,8 @@ mod tests {
                 launch_recipe: None,
                 sleep: None,
                 route_carry: None,
+                queue_key: None,
+                messages_capable: false,
             },
         );
 
@@ -1698,6 +1711,8 @@ mod tests {
                 launch_recipe: None,
                 sleep: None,
                 route_carry: None,
+                queue_key: None,
+                messages_capable: false,
             },
         );
         panes.insert(
@@ -1715,6 +1730,8 @@ mod tests {
                 launch_recipe: None,
                 sleep: None,
                 route_carry: None,
+                queue_key: None,
+                messages_capable: false,
             },
         );
 

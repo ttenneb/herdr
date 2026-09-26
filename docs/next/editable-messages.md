@@ -14,19 +14,19 @@ A structured prompt with `supersession.mode = replace_pending` edits its own wai
 ## What the queued message looks like
 Handoffs keep their exact `HERDR HANDOFF v1` text as the body, and plain prompts use the subject "Message from <sender>". Senders are attributed from the calling process's pane; that attribution is never authority.
 
-## Restarting Pi
-A message is tied to the recipient's Pi session at send time. After a restart, messages for the old session stay visible with `headStates[].previousSession = true` (and `recipientSession`), but `mailbox.claim` skips them, so they never run on their own and never block newer messages. The recipient explicitly Retries (`mailbox.repin`, which repins to the current session as a new revision with its admitted receipt) or Drops (`mailbox.drop`, a durable withdrawn claim, settled) each one, with `expectedRevision`.
+## Every Pi pane has a queue
+Messages are addressed to the pane, not to a Pi process or session: `recipient = pane:<queueKey>`. The queue key is minted with the pane, saved in session.json and restored unchanged, so queued messages survive Pi restarts, sleep and Herdr server restarts.
+- Once a pane's Pi has attached Messages, the pane keeps queueing while no Pi is attached. When a Pi attaches again (managed or receive-only), the backlog runs in normal priority order.
+- A Pi that never attached (no Messages support, or receive-only switched off) and panes running another agent keep typed input. `--transport` overrides.
+- Claims belong to the Pi execution that took them. A claim left behind by an exited Pi never blocks the pane; it shows as `claimExecution: "other"` and the human can Drop it.
+- The session a message was sent to is shown (`recipientSession`, `previousSession`) but does not gate delivery.
+- Queuing for a pane with no attached Pi emits `pane.wake_requested` for the sleep/wake owner.
 
 ## Pis without a trusted launch
-With `[experimental] unmanaged_pi_messages = true` (default false), a typed `pi` or a Collection helper also gets Messages.
-- It may read, claim and edit only its own inbox.
-- It has no sender, report or route authority.
-- Every pane shell then carries `HERDR_MAILBOX_BOOTSTRAP_ADDRESS`.
+Receive-only Messages for a typed `pi` or a Collection helper are on by default (`[experimental] unmanaged_pi_messages = false` turns them off). Such a Pi may read, claim, edit and drop only its pane's inbox; it has no sender, report or route authority. Every pane shell carries `HERDR_MAILBOX_BOOTSTRAP_ADDRESS` while it is on.
 
 ## Edited messages keep history (F3)
 Editing a waiting message now records an admitted receipt for the new revision, so the recipient's current list and settled history stay valid.
 
 ## For Pi integrators
-- The descriptor carries `binding`: `managed`, `history_only` or `recipient_only`. A recipient-only descriptor has a recipient-scoped `grantId` and no `reportSubmit` or `parentReport`.
-- `messages` advertises `watchMethod` (`mailbox.watch`, max `watchMaxWaitMs` 30000), `repinMethod` and `dropMethod`.
-- `mailbox.watch {protocol, afterCursor?, waitMs?}` returns `{type:"mailbox_watch", changed, cursor}`. Use a dedicated second accepted stream: additional streams never revoke earlier ones.
+See the wire reference: descriptor `binding` and `messages` (`watchMethod`, `watchMaxWaitMs`, `inbox`, `dropMethod`), `mailbox.watch {afterCursor, waitMs}` → `{changed, cursor}`, `headStates[].recipientSession / previousSession / claimExecution`, and `mailbox.drop {stableId, expectedRevision}`. Use a dedicated accepted stream for watch; streams never revoke each other.

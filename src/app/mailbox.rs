@@ -52,6 +52,8 @@ pub(crate) struct MailboxBootstrapSession {
     /// resolve only its own inbox; it never gets sender, grant, bound-report
     /// or route authority.
     pub(crate) recipient_only: Option<RecipientOnlyBinding>,
+    /// The pane's durable Messages queue (`pane:<queueKey>`), advertised to Pi.
+    pub(crate) pane_inbox: Option<crate::mailbox::RecipientKey>,
 }
 
 /// The exact foreground Pi execution a recipient-only session is bound to.
@@ -300,16 +302,14 @@ impl OfflineMailboxAuthority {
     pub(crate) fn claim(
         &self,
         params: crate::api::schema::MailboxClaimParams,
-        current_session: Option<&str>,
+        _current_session: Option<&str>,
     ) -> Result<Option<crate::mailbox::Claim>, OfflineMailboxError> {
         crate::mailbox_v1::validate_request(&crate::mailbox_v1::Request::Claim(params.claim))
             .map_err(OfflineMailboxError::Transport)?;
         let capability =
             self.capability_for(&params.caller, &params.grant_id, &params.recipient)?;
         self.store
-            .claim_next_eligible(&capability.recipient, |head| {
-                crate::app::messages::head_claimable_by(head, current_session)
-            })
+            .claim_next(&capability.recipient)
             .map_err(OfflineMailboxError::Store)
     }
 
@@ -1134,7 +1134,12 @@ impl App {
                     recipient_id: terminal_key.clone(),
                     generation: "1".into(),
                 },
-                grant_id: format!("recipient-only:{terminal_key}"),
+                grant_id: format!(
+                    "recipient-only:{}",
+                    self.pane_queue_key(&terminal_key)
+                        .map(|key| format!("pane:{key}"))
+                        .unwrap_or_else(|| terminal_key.clone())
+                ),
                 active_execution_generation: 0,
                 binding_generation: binding_generation.clone(),
                 context,
@@ -1142,9 +1147,13 @@ impl App {
                     foreground_pid,
                     start_ticks: birth.start_ticks,
                 }),
+                pane_inbox: self
+                    .pane_queue_key(&terminal_key)
+                    .map(|key| crate::app::messages::pane_recipient(&key)),
             };
             self.mailbox_bootstrap_bindings
                 .insert(binding_generation, session.clone());
+            self.mark_pane_messages_capable(&session.caller);
             return Ok(session);
         }
         Err(MailboxBootstrapError::PeerRejected)
@@ -1175,6 +1184,20 @@ impl App {
             && self
                 .managed_pi_process_birth(binding.foreground_pid)
                 .is_some_and(|birth| birth.start_ticks == binding.start_ticks)
+    }
+
+    fn mark_pane_messages_capable(&mut self, terminal_key: &str) {
+        if let Some(terminal) = self
+            .state
+            .terminals
+            .values_mut()
+            .find(|terminal| terminal.id.to_string() == terminal_key)
+        {
+            if !terminal.messages_capable {
+                terminal.messages_capable = true;
+                self.state.mark_session_dirty();
+            }
+        }
     }
 
     /// Releases the binding of a closed bootstrap stream so "has Messages"
@@ -1271,9 +1294,13 @@ impl App {
                 binding_generation: binding_generation.clone(),
                 context,
                 recipient_only: None,
+                pane_inbox: self
+                    .pane_queue_key(&candidate.sender_key)
+                    .map(|key| crate::app::messages::pane_recipient(&key)),
             };
             self.mailbox_bootstrap_bindings
                 .insert(binding_generation, session.clone());
+            self.mark_pane_messages_capable(&session.caller);
             return Ok(session);
         }
         Err(MailboxBootstrapError::PeerRejected)
@@ -1409,15 +1436,15 @@ impl App {
         let recovered = store
             .load()
             .map_err(|_| MailboxBootstrapError::GrantMissing)?;
-        let mut snapshot = crate::mailbox_v1::snapshot(&recovered, &session.recipient)
-            .map_err(|_| MailboxBootstrapError::GrantMissing)?;
-        // Withdrawn (dropped) heads are settled but never part of history.
+        // The whole pane inbox; withdrawn (dropped) heads are never history.
         let current = self.current_agent_session_value(&session.caller);
-        snapshot = crate::app::messages::filter_recipient_snapshot(
-            snapshot,
+        let mut snapshot = crate::app::messages::inbox_snapshot(
             &recovered,
+            &self.inbox_recipients(&session.caller),
+            &crate::app::messages::session_execution(session),
             current.as_deref(),
-        );
+        )
+        .map_err(|_| MailboxBootstrapError::GrantMissing)?;
         let settled: std::collections::HashSet<_> = snapshot
             .head_states
             .iter()

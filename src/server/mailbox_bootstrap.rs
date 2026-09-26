@@ -47,7 +47,7 @@ pub(crate) struct MailboxBootstrapDescriptor {
     /// report or route advertisement is ever present).
     pub binding: &'static str,
     /// Own-inbox methods beyond the v1 set: `mailbox.watch` (long-poll),
-    /// `mailbox.repin` (Retry) and `mailbox.drop` (Drop).
+    /// and `mailbox.drop` (the human's Drop).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub messages: Option<MessagesAdvertisement>,
     /// Offered only when the server can validate an exact active delegation
@@ -69,7 +69,9 @@ pub(crate) struct MailboxBootstrapDescriptor {
 pub(crate) struct MessagesAdvertisement {
     pub watch_method: &'static str,
     pub watch_max_wait_ms: u64,
-    pub repin_method: &'static str,
+    /// The pane's durable queue: every message addressed to this pane.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub inbox: Option<crate::mailbox::RecipientKey>,
     pub drop_method: &'static str,
     pub protocol: &'static str,
 }
@@ -133,7 +135,7 @@ impl MailboxBootstrapDescriptor {
             messages: (!session.history_only).then_some(MessagesAdvertisement {
                 watch_method: "mailbox.watch",
                 watch_max_wait_ms: MAX_WATCH_TIMEOUT_MS,
-                repin_method: "mailbox.repin",
+                inbox: session.pane_inbox.clone(),
                 drop_method: "mailbox.drop",
                 protocol: crate::mailbox_v1::PROTOCOL,
             }),
@@ -539,6 +541,9 @@ mod tests {
             api_rx,
             crate::api::EventHub::default(),
         );
+        // These tests cover the trusted managed path; receive-only bindings
+        // for untrusted Pis are covered in app::api::messages_tests.
+        app.unmanaged_pi_messages = false;
         app.state.workspaces = vec![crate::workspace::Workspace::test_new("sender")];
         app.state.ensure_test_terminals();
         app.state.active = Some(0);

@@ -226,6 +226,9 @@ impl ActiveSubscription {
             Subscription::PaneFocused {} => Ok(event_subscription(EventKind::PaneFocused)),
             Subscription::PaneMoved {} => Ok(event_subscription(EventKind::PaneMoved)),
             Subscription::PaneExited {} => Ok(event_subscription(EventKind::PaneExited)),
+            Subscription::PaneWakeRequested {} => {
+                Ok(event_subscription(EventKind::PaneWakeRequested))
+            }
             Subscription::PaneAgentDetected {} => {
                 Ok(event_subscription(EventKind::PaneAgentDetected))
             }

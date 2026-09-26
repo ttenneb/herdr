@@ -100,16 +100,80 @@ pub(crate) fn head_standing(
     }
 }
 
-/// Whether the recipient's current execution may claim this unclaimed head.
-pub(crate) fn head_claimable_by(head: &MailboxHead, current_session: Option<&str>) -> bool {
-    match head
-        .delivery
-        .as_ref()
-        .and_then(|delivery| delivery.recipient_session.as_deref())
-    {
-        Some(pinned) => current_session == Some(pinned),
-        None => true,
+/// The per-pane inbox view for one attached Pi execution: every recipient
+/// key of the pane (its durable queue key plus the legacy terminal key),
+/// withdrawn heads removed, the session pin shown as display information,
+/// and claims marked as this execution's (`current`) or another's (`other`).
+/// `claim` is only this execution's outstanding claim.
+pub(crate) fn inbox_snapshot(
+    recovered: &RecoveredMailbox,
+    recipients: &[RecipientKey],
+    execution: &str,
+    current_session: Option<&str>,
+) -> Result<crate::mailbox_v1::Snapshot, crate::mailbox::MailboxError> {
+    let mut out = crate::mailbox_v1::Snapshot {
+        heads: Vec::new(),
+        receipts: Vec::new(),
+        head_states: Vec::new(),
+        claim: None,
+    };
+    for recipient in recipients {
+        let part = crate::mailbox_v1::snapshot(recovered, recipient)?;
+        out.heads.extend(part.heads);
+        out.receipts.extend(part.receipts);
+        out.head_states.extend(part.head_states);
     }
+    let withdrawn: std::collections::HashSet<String> = out
+        .heads
+        .iter()
+        .filter(|head| {
+            recovered
+                .claims
+                .get(&head.stable_id)
+                .is_some_and(is_withdrawn_claim)
+        })
+        .map(|head| head.stable_id.clone())
+        .collect();
+    out.heads
+        .retain(|head| !withdrawn.contains(&head.stable_id));
+    out.receipts
+        .retain(|receipt| !withdrawn.contains(&receipt.stable_id));
+    out.head_states
+        .retain(|state| !withdrawn.contains(&state.stable_id));
+    for state in &mut out.head_states {
+        state.previous_session = state.lifecycle == crate::mailbox_v1::HeadLifecycle::Held
+            && state
+                .recipient_session
+                .as_deref()
+                .is_some_and(|pinned| current_session != Some(pinned));
+        state.claim_execution = recovered.claims.get(&state.stable_id).map(|claim| {
+            if claim_is_current(claim, execution) {
+                "current".into()
+            } else {
+                "other".into()
+            }
+        });
+    }
+    out.claim = out
+        .head_states
+        .iter()
+        .filter(|state| {
+            matches!(
+                state.lifecycle,
+                crate::mailbox_v1::HeadLifecycle::Claimed
+                    | crate::mailbox_v1::HeadLifecycle::Admitted
+            ) && state.claim_execution.as_deref() == Some("current")
+        })
+        .find_map(|state| recovered.claims.get(&state.stable_id).cloned());
+    Ok(out)
+}
+
+/// Legacy claims without an execution belong to whichever Pi holds the pane.
+pub(crate) fn claim_is_current(claim: &crate::mailbox::Claim, execution: &str) -> bool {
+    claim
+        .execution
+        .as_deref()
+        .is_none_or(|owner| owner == execution)
 }
 
 /// Removes withdrawn heads (with their states and receipts) from a recipient
@@ -258,7 +322,170 @@ pub(crate) fn parse_structured_prompt(text: &str) -> Option<OutgoingMessage> {
     })
 }
 
+/// The durable per-pane recipient key (`pane:<queueKey>`).
+pub(crate) fn pane_recipient(queue_key: &str) -> RecipientKey {
+    RecipientKey {
+        recipient_id: format!("pane:{queue_key}"),
+        generation: "1".into(),
+    }
+}
+
+/// Stable identity of the Pi execution behind a bootstrap session; claims are
+/// bound to it so two Pis can never both claim one head.
+pub(crate) fn session_execution(session: &crate::app::MailboxBootstrapSession) -> String {
+    match session.recipient_only {
+        Some(binding) => format!("pid:{}:{}", binding.foreground_pid, binding.start_ticks),
+        None => format!(
+            "managed:{}:{}",
+            session.caller, session.active_execution_generation
+        ),
+    }
+}
+
 impl App {
+    /// Every recipient key a pane's inbox covers: its durable queue key and
+    /// the legacy terminal key used by older Pi-to-Pi grants.
+    pub(crate) fn inbox_recipients(&self, terminal_key: &str) -> Vec<RecipientKey> {
+        let mut keys = Vec::new();
+        if let Some(terminal) = self
+            .state
+            .terminals
+            .values()
+            .find(|terminal| terminal.id.to_string() == terminal_key)
+        {
+            keys.push(pane_recipient(&terminal.queue_key));
+        }
+        keys.push(RecipientKey {
+            recipient_id: terminal_key.to_string(),
+            generation: "1".into(),
+        });
+        keys
+    }
+
+    pub(crate) fn pane_queue_key(&self, terminal_key: &str) -> Option<String> {
+        self.state
+            .terminals
+            .values()
+            .find(|terminal| terminal.id.to_string() == terminal_key)
+            .map(|terminal| terminal.queue_key.clone())
+    }
+
+    /// A pane gets a Messages queue when its foreground agent is Pi, or when
+    /// no agent process is attached yet but the pane is a Pi pane (managed Pi
+    /// launch, or its last reported session was Pi: restarting or asleep).
+    /// A pane whose foreground agent is another agent keeps PTY input.
+    pub(crate) fn pane_takes_messages(&self, terminal_key: &str) -> bool {
+        let Some(terminal) = self
+            .state
+            .terminals
+            .values()
+            .find(|terminal| terminal.id.to_string() == terminal_key)
+        else {
+            return false;
+        };
+        if matches!(terminal.effective_known_agent(), Some(agent) if agent != crate::detect::Agent::Pi)
+        {
+            return false;
+        }
+        // A Pi attached right now, or a pane whose Pi attached before and is
+        // restarting or asleep. A Pi that never attached keeps typed input.
+        self.attached_messages_recipient(terminal_key).is_some() || terminal.messages_capable
+    }
+
+    /// A public pane ID whose pane has a Messages queue but no agent process
+    /// right now (its Pi exited, is restarting or asleep).
+    pub(crate) fn messages_queue_target(
+        &self,
+        target: &str,
+        options: &MessageSendOptions,
+    ) -> Option<crate::app::terminal_targets::TerminalTarget> {
+        if options.transport == Some(MessageTransport::Pty) {
+            return None;
+        }
+        let (ws_idx, pane_id) = self.parse_current_public_pane_id(target)?;
+        let resolved = self.terminal_target_for_pane(ws_idx, pane_id)?;
+        self.pane_takes_messages(&resolved.terminal_id)
+            .then_some(resolved)
+    }
+
+    /// The `agent prompt` result for a queue-only pane (no agent process).
+    pub(crate) fn queue_only_agent_info(
+        &self,
+        ws_idx: usize,
+        pane_id: crate::layout::PaneId,
+    ) -> Option<crate::api::schema::AgentInfo> {
+        let pane = self.pane_info(ws_idx, pane_id)?;
+        Some(crate::api::schema::AgentInfo {
+            terminal_id: pane.terminal_id,
+            name: None,
+            agent: pane.agent,
+            title: pane.title,
+            terminal_title: pane.terminal_title,
+            terminal_title_stripped: pane.terminal_title_stripped,
+            display_agent: pane.display_agent,
+            agent_status: pane.agent_status,
+            screen_detection_skipped: false,
+            state_labels: pane.state_labels,
+            tokens: pane.tokens,
+            agent_session: None,
+            agent_session_trust: None,
+            workspace_id: pane.workspace_id,
+            tab_id: pane.tab_id,
+            pane_id: pane.pane_id,
+            focused: pane.focused,
+            launch_pending: false,
+            interactive_ready: false,
+            state_change_seq: 0,
+            cwd: pane.cwd,
+            foreground_cwd: pane.foreground_cwd,
+            revision: pane.revision,
+        })
+    }
+
+    /// Wake hook: a head was appended for a pane with no attached Pi. Emits
+    /// `pane.wake_requested`; the sleep/wake owner (#25) acts on it.
+    pub(crate) fn request_pane_wake_if_detached(&mut self, terminal_key: &str, stable_id: &str) {
+        if self.attached_messages_recipient(terminal_key).is_some() {
+            return;
+        }
+        let Some(queue_key) = self.pane_queue_key(terminal_key) else {
+            return;
+        };
+        let Some((ws_idx, pane_id)) =
+            self.state
+                .workspaces
+                .iter()
+                .enumerate()
+                .find_map(|(ws_idx, workspace)| {
+                    workspace.tabs.iter().find_map(|tab| {
+                        tab.panes
+                            .iter()
+                            .find(|(_, pane)| pane.attached_terminal_id.to_string() == terminal_key)
+                            .map(|(pane_id, _)| (ws_idx, *pane_id))
+                    })
+                })
+        else {
+            return;
+        };
+        let Some(public_pane) = self.public_pane_id(ws_idx, pane_id) else {
+            return;
+        };
+        let workspace_id = self.public_workspace_id(ws_idx);
+        tracing::info!(pane = %public_pane, stable_id, "messages: wake requested for a pane with no attached Pi");
+        self.emit_event(crate::api::schema::EventEnvelope {
+            event: crate::api::schema::EventKind::PaneWakeRequested,
+            data: crate::api::schema::EventData::PaneWakeRequested {
+                pane_id: public_pane,
+                workspace_id,
+                terminal_id: terminal_key.to_string(),
+                queue_key,
+                stable_id: stable_id.to_string(),
+                reason: "message_queued".into(),
+            },
+        });
+        self.wake_on_requested(terminal_key, stable_id);
+    }
+
     /// The server-issued recipient key of a live, current, non-history
     /// Messages stream for this terminal, if any.
     pub(crate) fn attached_messages_recipient(&self, terminal_id: &str) -> Option<RecipientKey> {
@@ -332,17 +559,19 @@ impl App {
         if transport == MessageTransport::Pty {
             return Ok(SendRoute::Pty);
         }
-        let Some(recipient) = self
-            .attached_messages_recipient(recipient_terminal)
-            .or_else(|| self.sleeping_messages_recipient(recipient_terminal))
+        // Every Pi pane has a queue, whether or not a Pi is attached right now.
+        let Some(queue_key) = self
+            .pane_queue_key(recipient_terminal)
+            .filter(|_| self.pane_takes_messages(recipient_terminal))
         else {
             return match transport {
                 MessageTransport::Mailbox => Err(SendRefusal::MailboxUnavailable(
-                    "the recipient has no live Messages connection",
+                    "the recipient pane is not a Pi pane",
                 )),
                 _ => Ok(SendRoute::Pty),
             };
         };
+        let recipient = pane_recipient(&queue_key);
         if !mailbox_safe_text(&message.subject, &message.body) {
             return match transport {
                 MessageTransport::Mailbox => Err(SendRefusal::MailboxUnavailable(

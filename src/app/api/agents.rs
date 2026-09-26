@@ -103,7 +103,7 @@ impl App {
         match self.route_ordinary_send(&terminal_id.to_string(), &sender, message, &options) {
             Ok(crate::app::messages::SendRoute::Mailbox(delivery)) => {
                 if let Some(head_id) = delivery.stable_id.clone() {
-                    self.wake_for_appended_head(&terminal_id, head_id);
+                    self.request_pane_wake_if_detached(&terminal_id.to_string(), &head_id);
                 }
                 let Some(agent) = self.agent_info_with_sleeping(ws_idx, pane_id, true) else {
                     return agent_not_found(id, &params.target);
@@ -140,7 +140,12 @@ impl App {
         }
         let resolved = match self.resolve_agent_target(&params.target) {
             Ok(resolved) => resolved,
-            Err(err) => return encode_error_body(id, self.agent_target_error_body(err)),
+            // A pane whose Pi has exited (restarting, asleep) still has its
+            // Messages queue; the pane ID keeps addressing it.
+            Err(err) => match self.messages_queue_target(&params.target, &params.send) {
+                Some(resolved) => resolved,
+                None => return encode_error_body(id, self.agent_target_error_body(err)),
+            },
         };
         let Some(terminal_id) = self
             .state
@@ -151,6 +156,60 @@ impl App {
         else {
             return agent_not_found(id, &params.target);
         };
+        let terminal_key = terminal_id.to_string();
+        if params.send.transport != Some(crate::api::schema::MessageTransport::Pty)
+            && self.pane_takes_messages(&terminal_key)
+        {
+            let sender = self.attribute_sender(params.send.caller_pid);
+            let message = crate::app::messages::parse_structured_prompt(&params.text)
+                .unwrap_or_else(|| crate::app::messages::OutgoingMessage {
+                    origin: "agent_prompt",
+                    subject: crate::app::messages::subject_for("Message from", &sender.label),
+                    body: params.text.clone(),
+                    priority: "normal".into(),
+                    kind: "advisory".into(),
+                    message_id: None,
+                    correlation: None,
+                    replace_pending: false,
+                });
+            match self.route_ordinary_send(&terminal_key, &sender, message, &params.send) {
+                Ok(crate::app::messages::SendRoute::Pty) => {}
+                Ok(crate::app::messages::SendRoute::Mailbox(delivery)) => {
+                    if let Some(stable_id) = delivery.stable_id.clone() {
+                        self.request_pane_wake_if_detached(&terminal_key, &stable_id);
+                    }
+                    let Some(agent) = self
+                        .agent_info_with_sleeping(resolved.ws_idx, resolved.pane_id, true)
+                        .or_else(|| self.queue_only_agent_info(resolved.ws_idx, resolved.pane_id))
+                    else {
+                        return agent_not_found(id, &params.target);
+                    };
+                    return encode_success(
+                        id,
+                        ResponseResult::AgentPrompted {
+                            agent,
+                            delivery: Some(delivery),
+                        },
+                    );
+                }
+                Err(refusal) => {
+                    if let Some(json) =
+                        crate::app::messages::pending_error_json(id.clone(), &refusal)
+                    {
+                        return json;
+                    }
+                    return match refusal {
+                        crate::app::messages::SendRefusal::MailboxUnavailable(message) => {
+                            encode_error(id, "messages_unavailable", message)
+                        }
+                        crate::app::messages::SendRefusal::Store(message) => {
+                            encode_error(id, "mailbox_store_failed", message)
+                        }
+                        _ => encode_error(id, "agent_prompt_failed", "send refused"),
+                    };
+                }
+            }
+        }
         let Some(terminal) = self.state.terminals.get(&terminal_id) else {
             return agent_not_found(id, &params.target);
         };
@@ -186,52 +245,9 @@ impl App {
                 ),
             );
         }
-        if expected_agent == crate::detect::Agent::Pi {
-            let terminal_key = terminal_id.to_string();
-            let sender = self.attribute_sender(params.send.caller_pid);
-            let message = crate::app::messages::parse_structured_prompt(&params.text)
-                .unwrap_or_else(|| crate::app::messages::OutgoingMessage {
-                    origin: "agent_prompt",
-                    subject: crate::app::messages::subject_for("Message from", &sender.label),
-                    body: params.text.clone(),
-                    priority: "normal".into(),
-                    kind: "advisory".into(),
-                    message_id: None,
-                    correlation: None,
-                    replace_pending: false,
-                });
-            match self.route_ordinary_send(&terminal_key, &sender, message, &params.send) {
-                Ok(crate::app::messages::SendRoute::Pty) => {}
-                Ok(crate::app::messages::SendRoute::Mailbox(delivery)) => {
-                    let Some(agent) = self.agent_info(resolved.ws_idx, resolved.pane_id) else {
-                        return agent_not_found(id, &params.target);
-                    };
-                    return encode_success(
-                        id,
-                        ResponseResult::AgentPrompted {
-                            agent,
-                            delivery: Some(delivery),
-                        },
-                    );
-                }
-                Err(refusal) => {
-                    if let Some(json) =
-                        crate::app::messages::pending_error_json(id.clone(), &refusal)
-                    {
-                        return json;
-                    }
-                    return match refusal {
-                        crate::app::messages::SendRefusal::MailboxUnavailable(message) => {
-                            encode_error(id, "messages_unavailable", message)
-                        }
-                        crate::app::messages::SendRefusal::Store(message) => {
-                            encode_error(id, "mailbox_store_failed", message)
-                        }
-                        _ => encode_error(id, "agent_prompt_failed", "send refused"),
-                    };
-                }
-            }
-        } else if params.send.transport == Some(crate::api::schema::MessageTransport::Mailbox) {
+        if expected_agent != crate::detect::Agent::Pi
+            && params.send.transport == Some(crate::api::schema::MessageTransport::Mailbox)
+        {
             return encode_error(
                 id,
                 "messages_unavailable",
@@ -1757,7 +1773,10 @@ mod tests {
                 target: public_pane_id.clone(),
                 text: "resume".into(),
                 wait: None,
-                send: Default::default(),
+                send: crate::api::schema::MessageSendOptions {
+                    transport: Some(crate::api::schema::MessageTransport::Pty),
+                    ..Default::default()
+                },
             },
         );
         let failed: crate::api::schema::ErrorResponse = serde_json::from_str(&failed).unwrap();
@@ -1846,7 +1865,10 @@ mod tests {
                 target: public_pane_id,
                 text: "A != B".into(),
                 wait: None,
-                send: Default::default(),
+                send: crate::api::schema::MessageSendOptions {
+                    transport: Some(crate::api::schema::MessageTransport::Pty),
+                    ..Default::default()
+                },
             },
         );
         let success: SuccessResponse = serde_json::from_str(&response).unwrap();
@@ -1878,7 +1900,10 @@ mod tests {
                 target: "reviewer".into(),
                 text: "A != B".into(),
                 wait: None,
-                send: Default::default(),
+                send: crate::api::schema::MessageSendOptions {
+                    transport: Some(crate::api::schema::MessageTransport::Pty),
+                    ..Default::default()
+                },
             },
         );
         let raw_response: SuccessResponse = serde_json::from_str(&raw_response).unwrap();
@@ -1903,7 +1928,10 @@ mod tests {
                 target: "opencode".into(),
                 text: "wrong target".into(),
                 wait: None,
-                send: Default::default(),
+                send: crate::api::schema::MessageSendOptions {
+                    transport: Some(crate::api::schema::MessageTransport::Pty),
+                    ..Default::default()
+                },
             },
         );
         let error: crate::api::schema::ErrorResponse = serde_json::from_str(&rejected).unwrap();
@@ -1936,7 +1964,10 @@ mod tests {
                     target: target.clone(),
                     text: text.into(),
                     wait: None,
-                    send: Default::default(),
+                    send: crate::api::schema::MessageSendOptions {
+                        transport: Some(crate::api::schema::MessageTransport::Pty),
+                        ..Default::default()
+                    },
                 },
             );
             assert!(serde_json::from_str::<SuccessResponse>(&response).is_ok());
@@ -1971,7 +2002,10 @@ mod tests {
                 target,
                 text: "first".into(),
                 wait: None,
-                send: Default::default(),
+                send: crate::api::schema::MessageSendOptions {
+                    transport: Some(crate::api::schema::MessageTransport::Pty),
+                    ..Default::default()
+                },
             },
         );
         assert!(serde_json::from_str::<SuccessResponse>(&response).is_ok());
@@ -2019,7 +2053,10 @@ mod tests {
                 target: "reviewer".into(),
                 text: "unrelated prompt".into(),
                 wait: None,
-                send: Default::default(),
+                send: crate::api::schema::MessageSendOptions {
+                    transport: Some(crate::api::schema::MessageTransport::Pty),
+                    ..Default::default()
+                },
             },
         );
 
@@ -2061,7 +2098,10 @@ mod tests {
                 target: "reviewer".into(),
                 text: "A != B".into(),
                 wait: None,
-                send: Default::default(),
+                send: crate::api::schema::MessageSendOptions {
+                    transport: Some(crate::api::schema::MessageTransport::Pty),
+                    ..Default::default()
+                },
             },
         );
         let success: SuccessResponse = serde_json::from_str(&response).unwrap();
@@ -2180,7 +2220,10 @@ mod tests {
                 target: "reviewer".into(),
                 text: "A != B".into(),
                 wait: None,
-                send: Default::default(),
+                send: crate::api::schema::MessageSendOptions {
+                    transport: Some(crate::api::schema::MessageTransport::Pty),
+                    ..Default::default()
+                },
             },
         );
         let error: crate::api::schema::ErrorResponse = serde_json::from_str(&response).unwrap();

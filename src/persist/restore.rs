@@ -572,6 +572,10 @@ fn restore_tab(
 
         let saved_seen = saved_pane.is_none_or(|pane| pane.seen);
         let saved_label = saved_pane.and_then(|p| p.label.clone());
+        let saved_messages_capable = saved_pane.is_some_and(|p| p.messages_capable);
+        let saved_queue_key = saved_pane
+            .and_then(|p| p.queue_key.clone())
+            .filter(|key| crate::terminal::state::valid_queue_key(key));
         let saved_agent_name = saved_pane.and_then(|p| p.agent_name.clone());
         let saved_managed_agent = saved_pane
             .and_then(|pane| pane.managed_agent_kind.as_deref())
@@ -628,6 +632,10 @@ fn restore_tab(
             terminal.route_carry = saved_route_carry.clone();
             if let Some(label) = saved_label {
                 terminal.set_manual_label(label);
+            }
+            if let Some(key) = saved_queue_key.clone() {
+                terminal.queue_key = key;
+                terminal.messages_capable = saved_messages_capable;
             }
             if let Some(session) = restored_agent_session {
                 terminal.set_persisted_agent_session(session);
@@ -730,6 +738,10 @@ fn restore_tab(
                 }
                 if let Some(label) = saved_label {
                     terminal.set_manual_label(label);
+                }
+                if let Some(key) = saved_queue_key.clone() {
+                    terminal.queue_key = key;
+                    terminal.messages_capable = saved_messages_capable;
                 }
                 if let Some(session) = restored_agent_session {
                     terminal.set_persisted_agent_session(session);
@@ -1266,6 +1278,8 @@ mod tests {
             launch_recipe: None,
             sleep: None,
             route_carry: None,
+            queue_key: None,
+            messages_capable: false,
         }
     }
 
@@ -1765,6 +1779,8 @@ mod tests {
                             launch_recipe: None,
                             sleep: None,
                             route_carry: None,
+                            queue_key: None,
+                            messages_capable: false,
                         },
                     )]),
                     zoomed: false,
@@ -1821,6 +1837,87 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn restore_keeps_the_pane_queue_key_across_server_restart() {
+        let cwd = std::env::current_dir().unwrap();
+        let snapshot = SessionSnapshot {
+            version: super::super::snapshot::SNAPSHOT_VERSION,
+            repositories: Vec::new(),
+            space_order: Vec::new(),
+            workspaces: vec![WorkspaceSnapshot {
+                id: Some("workspace".into()),
+                custom_name: None,
+                identity_cwd: cwd.clone(),
+                checkout: None,
+                worktree_space: None,
+                public_pane_numbers: HashMap::new(),
+                next_public_pane_number: 0,
+                public_tab_numbers: Vec::new(),
+                next_public_tab_number: 0,
+                tabs: vec![TabSnapshot {
+                    custom_name: None,
+                    layout: LayoutSnapshot::Pane(0),
+                    panes: HashMap::from([(
+                        0,
+                        super::super::snapshot::PaneSnapshot {
+                            cwd,
+                            seen: true,
+                            label: Some("reviewer".into()),
+                            agent_name: Some("reviewer".into()),
+                            managed_agent_kind: Some("opencode".into()),
+                            agent_session: Some(super::super::snapshot::PaneAgentSessionSnapshot {
+                                source: "herdr:opencode".into(),
+                                agent: "opencode".into(),
+                                kind: crate::agent_resume::AgentSessionRefKind::Id,
+                                value: "opencode-session".into(),
+                            }),
+                            launch_argv: None,
+                            launch_recipe: None,
+                            sleep: None,
+                            route_carry: None,
+                            queue_key: Some("0123456789abcdef0123456789abcdef".into()),
+                            messages_capable: true,
+                        },
+                    )]),
+                    zoomed: false,
+                    focused: Some(0),
+                    root_pane: Some(0),
+
+                    collections: Vec::new(),
+                    focused_leaf: None,
+                }],
+                active_tab: 0,
+            }],
+            active: Some(0),
+            selected: 0,
+            sidebar_width: None,
+            sidebar_section_split: None,
+            collapsed_space_keys: Default::default(),
+
+            delegations: Vec::new(),
+            collection_archive_times: Vec::new(),
+        };
+        let (events, _event_rx) = mpsc::channel(4);
+
+        let (_workspaces, _delegations, _archive_times, terminals, _runtimes) = restore(
+            &snapshot,
+            None,
+            24,
+            80,
+            0,
+            test_restore_shell(),
+            crate::config::ShellModeConfig::NonLogin,
+            false,
+            events,
+            Arc::new(Notify::new()),
+            Arc::new(RenderSignal::new()),
+        );
+
+        let terminal = terminals.values().next().expect("restored terminal");
+        assert_eq!(terminal.queue_key, "0123456789abcdef0123456789abcdef");
+        assert!(terminal.messages_capable);
+    }
+
+    #[tokio::test]
     async fn restore_preserves_public_id_mapping_after_pane_id_remap() {
         let cwd = std::env::current_dir().unwrap();
         let snapshot = SessionSnapshot {
@@ -1859,6 +1956,8 @@ mod tests {
                                 launch_recipe: None,
                                 sleep: None,
                                 route_carry: None,
+                                queue_key: None,
+                                messages_capable: false,
                             },
                         ),
                         (
@@ -1874,6 +1973,8 @@ mod tests {
                                 launch_recipe: None,
                                 sleep: None,
                                 route_carry: None,
+                                queue_key: None,
+                                messages_capable: false,
                             },
                         ),
                     ]),
@@ -2161,6 +2262,8 @@ mod tests {
                     launch_recipe: None,
                     sleep: None,
                     route_carry: None,
+                    queue_key: None,
+                    messages_capable: false,
                 },
             )
         };
@@ -2180,6 +2283,8 @@ mod tests {
             launch_recipe: None,
             sleep: None,
             route_carry: None,
+            queue_key: None,
+            messages_capable: false,
         };
         let snapshot = SessionSnapshot {
             version: super::super::snapshot::SNAPSHOT_VERSION,
@@ -2380,6 +2485,8 @@ mod tests {
                                 launch_recipe: recipe.clone(),
                                 sleep: sleep.clone(),
                                 route_carry: Some(carry.clone()),
+                                queue_key: None,
+                                messages_capable: true,
                             },
                         )]),
                         zoomed: false,
@@ -2465,6 +2572,8 @@ mod tests {
                             launch_recipe: None,
                             sleep: None,
                             route_carry: None,
+                            queue_key: None,
+                            messages_capable: false,
                         },
                     )]),
                     zoomed: false,
@@ -2642,6 +2751,8 @@ mod tests {
                 launch_recipe: None,
                 sleep: None,
                 route_carry: None,
+                queue_key: None,
+                messages_capable: false,
             },
         );
         let history = SessionHistorySnapshot {
