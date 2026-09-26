@@ -3686,3 +3686,97 @@ async fn any_forwarded_key_marks_a_possible_draft() {
         );
     }
 }
+
+/// QA re-check: a crash between the typed history appends never turns the
+/// row into a deliverable or recoverable message. Simulated by writing the
+/// head alone, and the head plus its claim without a resolution.
+#[tokio::test]
+async fn a_partly_written_typed_history_row_is_never_delivered_or_recovered() {
+    let mut fixture = fixture();
+    let session = attach_recipient(&mut fixture);
+    let queue_key = fixture.app.pane_queue_key(&fixture.terminals[1]).unwrap();
+    let store = crate::mailbox::MailboxStore::open(&fixture.app.sender_authority_dir).unwrap();
+    let typed_head = |stable_id: &str| crate::mailbox::MailboxHead {
+        delivery: Some(crate::mailbox::ServerDelivery {
+            origin: "agent_prompt".into(),
+            sender_label: "tpm".into(),
+            sender_session: None,
+            recipient_session: None,
+            correlation: None,
+            retry_of: None,
+            typed_reason: Some("no_messages".into()),
+        }),
+        ..scoped_test_head(
+            stable_id,
+            "term_s",
+            &crate::app::messages::pane_recipient(&queue_key),
+            'e',
+        )
+    };
+    // Crash after the head (and its receipt) alone.
+    let head_only = typed_head("typed.headonly");
+    store.append_offline_head(head_only.clone()).unwrap();
+    // Crash after the claim, before the settled resolution.
+    let with_claim = typed_head("typed.withclaim");
+    store.append_offline_head(with_claim.clone()).unwrap();
+    store
+        .claim(crate::mailbox::Claim {
+            claim_id: "typed:typed.withclaim".into(),
+            recipient: with_claim.recipient.clone(),
+            stable_id: with_claim.stable_id.clone(),
+            revision: 1,
+            digest: with_claim.digest.clone(),
+            execution: None,
+        })
+        .unwrap();
+    let protocol = crate::mailbox_v1::PROTOCOL;
+    let claim = dispatch(
+        &mut fixture.app,
+        &session,
+        "mailbox.claim",
+        json!({"protocol": protocol}),
+    )
+    .unwrap();
+    assert!(claim["claim"].is_null(), "never delivered: {claim}");
+    let snapshot = dispatch(
+        &mut fixture.app,
+        &session,
+        "mailbox.snapshot",
+        json!({"protocol": protocol}),
+    )
+    .unwrap();
+    assert!(
+        !snapshot.to_string().contains("\"recoveryNeeded\":true"),
+        "never offered for recovery: {snapshot}"
+    );
+    assert!(dispatch(
+        &mut fixture.app,
+        &session,
+        "mailbox.retry",
+        json!({"protocol": protocol, "stableId": "typed.withclaim", "expectedRevision": 1}),
+    )
+    .is_err());
+    assert_eq!(
+        fixture.app.unsettled_queue_len(&fixture.terminals[1]),
+        0,
+        "not counted as queued"
+    );
+    // The single-lock writer refuses a non-typed head and writes a full row.
+    let full = typed_head("typed.full");
+    store.append_typed_history(full).unwrap();
+    let recovered = store.load().unwrap();
+    let resolution = &recovered.resolutions["typed:typed.full"];
+    assert_eq!(resolution.closed_by.as_deref(), Some("typed"));
+    assert!(recovered
+        .receipts
+        .values()
+        .any(|r| r.stable_id == "typed.full"));
+    let mut plain = scoped_test_head(
+        "send.plain",
+        "term_s",
+        &crate::app::messages::pane_recipient(&queue_key),
+        'f',
+    );
+    plain.delivery = None;
+    assert!(store.append_typed_history(plain).is_err());
+}

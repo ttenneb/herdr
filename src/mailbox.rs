@@ -93,6 +93,14 @@ pub struct SendCorrelation {
 /// stranded head. They are never delivered and never claimable.
 pub const WITHDRAWN_CLAIM_PREFIX: &str = "withdrawn:";
 
+/// A history-only record of a message typed into a pane (never deliverable,
+/// never claimable, never recovered or retried).
+pub fn is_typed_history(head: &MailboxHead) -> bool {
+    head.delivery
+        .as_ref()
+        .is_some_and(|delivery| delivery.typed_reason.is_some())
+}
+
 pub fn is_withdrawn_claim(claim: &Claim) -> bool {
     claim.claim_id.starts_with(WITHDRAWN_CLAIM_PREFIX)
 }
@@ -660,6 +668,56 @@ impl MailboxStore {
 
     /// The claim record is forced before this method returns. Notification is intentionally
     /// absent: a crash after this call recovers an outstanding claim instead of resending.
+    /// Appends a typed-delivery history row (head, receipt, `typed:` claim,
+    /// settled resolution with closedBy "typed") under one exclusive lock.
+    /// A crash between the appends leaves a head that is still history-only
+    /// (`delivery.typedReason`), so it is never delivered or recovered.
+    pub fn append_typed_history(&self, mut head: MailboxHead) -> Result<(), MailboxError> {
+        if !is_typed_history(&head) {
+            return Err(MailboxError::InvalidRecord);
+        }
+        self.with_exclusive_lock(|| {
+            let recovered = self.load()?;
+            if recovered.heads.contains_key(&head.stable_id) {
+                return Err(MailboxError::ConflictingDuplicate);
+            }
+            head.enqueue_epoch = recovered
+                .heads
+                .values()
+                .map(|existing| existing.enqueue_epoch)
+                .max()
+                .unwrap_or(0)
+                .checked_add(1)
+                .ok_or(MailboxError::InvalidRecord)?;
+            validate_head(&head)?;
+            let claim = Claim {
+                claim_id: format!("typed:{}", head.stable_id),
+                recipient: head.recipient.clone(),
+                stable_id: head.stable_id.clone(),
+                revision: head.revision,
+                digest: head.digest.clone(),
+                execution: None,
+            };
+            validate_claim(&claim)?;
+            let receipt = AdmissionReceipt {
+                delivery_digest: head.delivery_digest.clone(),
+                stable_id: head.stable_id.clone(),
+                revision: head.revision,
+                digest: head.digest.clone(),
+                status: ReceiptStatus::Admitted,
+            };
+            let resolution = ClaimResolution {
+                claim_id: claim.claim_id.clone(),
+                outcome: ClaimResolutionOutcome::Settled,
+                closed_by: Some("typed".into()),
+            };
+            self.append_synced(&MailboxRecord::Head { head })?;
+            self.append_synced(&MailboxRecord::Receipt { receipt })?;
+            self.append_synced(&MailboxRecord::Claim { claim })?;
+            self.append_synced(&MailboxRecord::Resolution { resolution })
+        })
+    }
+
     pub fn claim(&self, claim: Claim) -> Result<(), MailboxError> {
         self.with_exclusive_lock(|| {
             validate_claim(&claim)?;
@@ -707,6 +765,10 @@ impl MailboxStore {
                 .find(|claim| {
                     &claim.recipient == recipient
                         && !is_withdrawn_claim(claim)
+                        && !recovered
+                            .heads
+                            .get(&claim.stable_id)
+                            .is_some_and(is_typed_history)
                         && !matches!(
                             recovered.resolutions.get(&claim.claim_id),
                             Some(ClaimResolution {
@@ -725,6 +787,7 @@ impl MailboxStore {
                 .filter(|head| {
                     &head.recipient == recipient
                         && !recovered.claims.contains_key(&head.stable_id)
+                        && !is_typed_history(head)
                         && eligible(head)
                 })
                 // Priority wins; within a tier use the server-minted enqueue epoch,
@@ -804,6 +867,7 @@ impl MailboxStore {
                 .filter(|head| {
                     recipients.contains(&head.recipient)
                         && !recovered.claims.contains_key(&head.stable_id)
+                        && !is_typed_history(head)
                 })
                 .min_by_key(|head| {
                     let priority = match head.priority.as_str() {
