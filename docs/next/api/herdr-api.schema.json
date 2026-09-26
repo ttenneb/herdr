@@ -2181,11 +2181,41 @@
       "$defs": {
         "AgentPromptParams": {
           "properties": {
+            "edit_pending": {
+              "description": "Replace the text of this sender's waiting message with this stableId\n(taken from a `pending_exists` result).",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "expect_revision": {
+              "description": "With `edit_pending`: the pending revision the sender last saw.",
+              "format": "uint64",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "send_new": {
+              "description": "Queue this message even though earlier ones are still waiting.",
+              "type": "boolean"
+            },
             "target": {
               "type": "string"
             },
             "text": {
               "type": "string"
+            },
+            "transport": {
+              "anyOf": [
+                {
+                  "$ref": "#/schemas/request/$defs/MessageTransport"
+                },
+                {
+                  "type": "null"
+                }
+              ]
             },
             "wait": {
               "anyOf": [
@@ -3681,8 +3711,38 @@
         },
         "HandoffSendParams": {
           "properties": {
+            "edit_pending": {
+              "description": "Replace the text of this sender's waiting message with this stableId\n(taken from a `pending_exists` result).",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
             "envelope": {
               "$ref": "#/schemas/request/$defs/HerdrHandoff"
+            },
+            "expect_revision": {
+              "description": "With `edit_pending`: the pending revision the sender last saw.",
+              "format": "uint64",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "send_new": {
+              "description": "Queue this message even though earlier ones are still waiting.",
+              "type": "boolean"
+            },
+            "transport": {
+              "anyOf": [
+                {
+                  "$ref": "#/schemas/request/$defs/MessageTransport"
+                },
+                {
+                  "type": "null"
+                }
+              ]
             }
           },
           "required": [
@@ -4190,6 +4250,26 @@
             "protocol"
           ],
           "type": "object"
+        },
+        "MessageTransport": {
+          "description": "How an ordinary send reaches the recipient.",
+          "oneOf": [
+            {
+              "const": "auto",
+              "description": "The recipient's Messages queue when it has a live Messages stream,\notherwise typed into the pane exactly as before.",
+              "type": "string"
+            },
+            {
+              "const": "mailbox",
+              "description": "The recipient's Messages queue only; refuse if it has none.",
+              "type": "string"
+            },
+            {
+              "const": "pty",
+              "description": "Typed into the pane (the pre-Messages behaviour).",
+              "type": "string"
+            }
+          ]
         },
         "NotificationShowParams": {
           "properties": {
@@ -13265,23 +13345,42 @@
           "type": "string"
         },
         "HandoffTransportOutcome": {
-          "enum": [
-            "runtime_transaction_admitted",
-            "sender_identity_mismatch",
-            "recipient_identity_mismatch",
-            "recipient_not_ready",
-            "recipient_blocked",
-            "recipient_not_foreground",
-            "queue_full",
-            "payload_too_large",
-            "transport_closed"
-          ],
-          "type": "string"
+          "oneOf": [
+            {
+              "enum": [
+                "runtime_transaction_admitted",
+                "sender_identity_mismatch",
+                "recipient_identity_mismatch",
+                "recipient_not_ready",
+                "recipient_blocked",
+                "recipient_not_foreground",
+                "queue_full",
+                "payload_too_large",
+                "transport_closed"
+              ],
+              "type": "string"
+            },
+            {
+              "const": "mailbox_admitted",
+              "description": "Durably queued in the recipient's Messages; the recipient runs it when\nit next picks up work.",
+              "type": "string"
+            }
+          ]
         },
         "HandoffTransportReceipt": {
           "properties": {
             "attemptedPath": {
               "type": "string"
+            },
+            "delivery": {
+              "anyOf": [
+                {
+                  "$ref": "#/schemas/success_response/$defs/MessageDelivery"
+                },
+                {
+                  "type": "null"
+                }
+              ]
             },
             "detail": {
               "type": "string"
@@ -13352,6 +13451,17 @@
             },
             "lifecycle": {
               "$ref": "#/schemas/success_response/$defs/HeadLifecycle"
+            },
+            "previousSession": {
+              "description": "True for a held head pinned to a different session than the viewing\nrecipient's current one: shown, never claimed, until Retry or Drop.",
+              "type": "boolean"
+            },
+            "recipientSession": {
+              "description": "The recipient Pi session a server-sent head is pinned to.",
+              "type": [
+                "string",
+                "null"
+              ]
             },
             "revision": {
               "format": "uint64",
@@ -13705,6 +13815,17 @@
             "body": {
               "type": "string"
             },
+            "delivery": {
+              "anyOf": [
+                {
+                  "$ref": "#/schemas/success_response/$defs/ServerDelivery"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Present only on heads the server minted from an ordinary send\n(`agent prompt`, structured prompt, `handoff send`). Additive: older\njournals and Pi peers ignore it."
+            },
             "deliveryDigest": {
               "type": "string"
             },
@@ -13775,6 +13896,40 @@
             "originalSequence",
             "enqueueEpoch",
             "acceptedAt"
+          ],
+          "type": "object"
+        },
+        "MessageDelivery": {
+          "description": "Where an ordinary send went.",
+          "properties": {
+            "duplicate": {
+              "description": "True when an identical correlated send found its existing message.",
+              "type": "boolean"
+            },
+            "edited": {
+              "type": "boolean"
+            },
+            "path": {
+              "description": "`mailbox` or `pty`.",
+              "type": "string"
+            },
+            "revision": {
+              "format": "uint64",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "stable_id": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          "required": [
+            "path"
           ],
           "type": "object"
         },
@@ -15674,6 +15829,16 @@
                 "agent": {
                   "$ref": "#/schemas/success_response/$defs/AgentInfo"
                 },
+                "delivery": {
+                  "anyOf": [
+                    {
+                      "$ref": "#/schemas/success_response/$defs/MessageDelivery"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
+                },
                 "type": {
                   "const": "agent_prompted",
                   "type": "string"
@@ -16828,6 +16993,27 @@
             }
           ]
         },
+        "SendCorrelation": {
+          "properties": {
+            "key": {
+              "type": "string"
+            },
+            "namespace": {
+              "type": "string"
+            },
+            "revision": {
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            }
+          },
+          "required": [
+            "namespace",
+            "key",
+            "revision"
+          ],
+          "type": "object"
+        },
         "ServerCapabilities": {
           "properties": {
             "detached_server_daemon": {
@@ -16840,6 +17026,47 @@
           },
           "required": [
             "live_handoff"
+          ],
+          "type": "object"
+        },
+        "ServerDelivery": {
+          "description": "Server-owned send metadata for a head minted from an ordinary agent send.\nAttribution only: none of these values grant mailbox authority.",
+          "properties": {
+            "correlation": {
+              "anyOf": [
+                {
+                  "$ref": "#/schemas/success_response/$defs/SendCorrelation"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "origin": {
+              "description": "`agent_prompt`, `structured_prompt` or `handoff`.",
+              "type": "string"
+            },
+            "recipientSession": {
+              "description": "The recipient's `agent_session` value when the head was sent. A head\npinned to a session is only claimable by that session; another\nsession sees it as stranded and must explicitly adopt or drop it.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "senderLabel": {
+              "description": "Display label for the sending pane or agent, or `external`.",
+              "type": "string"
+            },
+            "senderSession": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          "required": [
+            "origin",
+            "senderLabel"
           ],
           "type": "object"
         },
