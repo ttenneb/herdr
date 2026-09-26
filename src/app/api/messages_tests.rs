@@ -261,7 +261,12 @@ async fn a_non_pi_agent_pane_keeps_the_pty_bytes_unchanged() {
     let ResponseResult::AgentPrompted { delivery, .. } = success.result else {
         panic!("prompted")
     };
-    assert_eq!(delivery, None, "non-Pi agent: PTY path, no delivery field");
+    let delivery = delivery.expect("delivery");
+    assert_eq!(
+        (delivery.path.as_str(), delivery.reason.as_str()),
+        ("pty", "not_pi"),
+        "non-Pi agent: typed, and the sender is told why"
+    );
     let typed = fixture.rx[1].recv().await.unwrap();
     assert!(String::from_utf8_lossy(&typed).contains(text));
     assert!(crate::mailbox::MailboxStore::open(&fixture.directory)
@@ -2658,7 +2663,24 @@ async fn a_live_pi_without_messages_after_30s_gets_new_messages_typed() {
         .load()
         .unwrap()
         .heads;
-    assert_eq!(heads.len(), 1);
+    assert_eq!(
+        heads
+            .values()
+            .filter(|head| !head.stable_id.starts_with("typed."))
+            .count(),
+        1
+    );
+    assert!(
+        heads
+            .values()
+            .any(|head| head.stable_id.starts_with("typed.")
+                && head
+                    .delivery
+                    .as_ref()
+                    .and_then(|d| d.typed_reason.as_deref())
+                    == Some("fallback_30s")),
+        "the typed fallback is in history"
+    );
     // A Pi that attached once keeps queueing even with its stream down.
     fixture.app.messages_attached_pis.insert((old_pi, 11), None);
     assert!(fixture.app.pane_takes_messages(&key));
@@ -2745,13 +2767,18 @@ async fn typed_delivery_waits_for_the_humans_draft_then_types_in_order() {
         .clone();
     // No Messages in this pane: sends are typed.
     assert!(!fixture.app.pane_takes_messages(&fixture.terminals[1]));
-    // Typed and fully backspaced: no draft.
+    // Typed and fully backspaced: Herdr cannot prove the editor empty, so
+    // the draft stays possibly present until a submit/clear key.
     for _ in 0..3 {
         human_key(&mut fixture.app, &terminal, KeyCode::Char('x'));
     }
     for _ in 0..4 {
         human_key(&mut fixture.app, &terminal, KeyCode::Backspace);
     }
+    assert!(fixture.app.pane_draft_pending(&terminal));
+    let ctrl_u =
+        crate::input::TerminalKey::new(KeyCode::Char('u'), crossterm::event::KeyModifiers::CONTROL);
+    fixture.app.note_human_key(&terminal, &ctrl_u);
     assert!(!fixture.app.pane_draft_pending(&terminal));
     // API send-keys never counts as human input.
     let target = fixture.app.public_pane_id(1, fixture.panes[1]).unwrap();
@@ -2814,10 +2841,12 @@ async fn typed_delivery_waits_for_the_humans_draft_then_types_in_order() {
     // The typed delivery itself did not create a draft.
     assert!(!fixture.app.pane_draft_pending(&terminal));
     let direct = prompt_pane(&mut fixture, "direct", None);
-    assert!(
-        direct["result"]["delivery"].is_null(),
+    assert_eq!(
+        direct["result"]["delivery"]["path"], "pty",
         "typed at once: {direct}"
     );
+    assert_eq!(direct["result"]["delivery"]["reason"], "no_messages");
+    assert_eq!(direct["result"]["delivery"]["editable"], false);
 }
 
 /// After 10 minutes a held delivery fails with agent_input_busy; a sender
@@ -2851,6 +2880,7 @@ async fn a_held_delivery_fails_after_the_limit_and_the_sender_is_told() {
         "recipient".into(),
         sender(&fixture),
         "agent_prompt",
+        "no_messages".into(),
     );
     fixture.app.typed_deferrals[0].deadline =
         std::time::Instant::now() - std::time::Duration::from_secs(1);
@@ -3251,8 +3281,16 @@ async fn pis_editor_has_text_report_wins_over_the_count() {
         .unwrap()
         .unwrap();
     assert!(String::from_utf8_lossy(&typed).contains("held by Pi's flag"));
-    // Pi's "clear" also wins over a positive Herdr count.
+    // QA batch 3 #3: a stale Pi "false" does not override fresh keys (OR)...
     human_key(&mut fixture.app, &terminal, KeyCode::Char('q'));
+    assert!(fixture.app.pane_draft_pending(&terminal));
+    // ...a repeated false (no edge) leaves Herdr's flag...
+    report_editor(&mut fixture, false);
+    assert!(fixture.app.pane_draft_pending(&terminal));
+    // ...and Pi's true→false edge clears it.
+    report_editor(&mut fixture, true);
+    assert!(fixture.app.pane_draft_pending(&terminal));
+    report_editor(&mut fixture, false);
     assert!(!fixture.app.pane_draft_pending(&terminal));
     // The report is dropped when the agent process exits.
     report_editor(&mut fixture, true);
@@ -3317,4 +3355,460 @@ async fn a_messages_pi_is_never_typed_into_even_for_text_messages_cannot_carry()
         .unwrap()
         .heads
         .is_empty());
+}
+
+/// VQRO 1a: a bracketed paste ending in a newline stays in the unsent
+/// draft; Esc and a modified Enter do not prove the editor empty; only a
+/// real, unmodified Enter clears.
+#[tokio::test]
+async fn only_a_real_enter_clears_the_draft() {
+    use crossterm::event::{KeyCode, KeyModifiers};
+    let mut fixture = fixture();
+    let focused = fixture.app.state.workspaces[0]
+        .terminal_id(fixture.panes[0])
+        .unwrap()
+        .clone();
+    let key = |code, modifiers| {
+        crate::raw_input::RawInputEvent::Key(crate::input::TerminalKey::new(code, modifiers))
+    };
+    fixture.app.route_client_events(
+        vec![crate::raw_input::RawInputEvent::Paste(
+            "pasted line\n".into(),
+        )],
+        false,
+    );
+    assert!(
+        fixture.app.pane_draft_pending(&focused),
+        "paste ending in a newline"
+    );
+    for (code, modifiers) in [
+        (KeyCode::Esc, KeyModifiers::NONE),
+        (KeyCode::Enter, KeyModifiers::SHIFT),
+        (KeyCode::Enter, KeyModifiers::ALT),
+        (KeyCode::Char('j'), KeyModifiers::CONTROL),
+    ] {
+        fixture
+            .app
+            .route_client_events(vec![key(code, modifiers)], false);
+        assert!(
+            fixture.app.pane_draft_pending(&focused),
+            "{code:?} {modifiers:?} must not clear the draft"
+        );
+    }
+    fixture
+        .app
+        .route_client_events(vec![key(KeyCode::Enter, KeyModifiers::NONE)], false);
+    assert!(!fixture.app.pane_draft_pending(&focused));
+    // A pasted lone newline is still unsent input.
+    fixture.app.route_client_events(
+        vec![crate::raw_input::RawInputEvent::Paste("\n".into())],
+        false,
+    );
+    assert!(fixture.app.pane_draft_pending(&focused));
+}
+
+/// VQRO 1b: a held message is pinned to the recipient's execution. If
+/// another agent of the same kind replaced it by the time the draft clears,
+/// the message fails with agent_replaced (sender told) and is never typed.
+#[tokio::test]
+async fn a_held_message_is_never_typed_into_a_replacement_agent() {
+    use crossterm::event::KeyCode;
+    let mut fixture = fixture();
+    let terminal = fixture.app.state.workspaces[1]
+        .terminal_id(fixture.panes[1])
+        .unwrap()
+        .clone();
+    let pi = |pid: u32| crate::platform::ForegroundJob {
+        process_group_id: pid,
+        processes: vec![crate::platform::ForegroundProcess {
+            pid,
+            name: "pi".into(),
+            argv0: None,
+            argv: Some(vec!["pi".into()]),
+            cmdline: Some("pi".into()),
+        }],
+    };
+    let mut birth = crate::platform::process_birth_identity(std::process::id()).unwrap();
+    for (pid, ticks) in [(4_000_000_060_u32, 21_u64), (4_000_000_061, 22)] {
+        birth.start_ticks = ticks;
+        fixture
+            .app
+            .mailbox_bootstrap_test_process_births
+            .insert(pid, birth);
+    }
+    fixture
+        .app
+        .install_mailbox_bootstrap_test_foreground_job(terminal.clone(), pi(4_000_000_060));
+    human_key(&mut fixture.app, &terminal, KeyCode::Char('d'));
+    let sequence = fixture.app.event_hub.current_sequence();
+    let held = prompt_pane(&mut fixture, "for the original Pi", None);
+    assert_eq!(held["result"]["delivery"]["path"], "pty_deferred", "{held}");
+    // The Pi is replaced by another Pi in the same pane.
+    fixture
+        .app
+        .install_mailbox_bootstrap_test_foreground_job(terminal.clone(), pi(4_000_000_061));
+    human_key(&mut fixture.app, &terminal, KeyCode::Enter);
+    assert!(fixture.app.typed_deferrals.is_empty());
+    assert!(
+        fixture.rx[1].try_recv().is_err(),
+        "never typed into the new agent"
+    );
+    let events = deferral_events(&fixture.app, sequence);
+    assert!(
+        matches!(
+            events.as_slice(),
+            [crate::api::schema::EventData::DeliveryDeferredFailed { code, .. }] if code == "agent_replaced"
+        ),
+        "{events:?}"
+    );
+    // The same execution still gets its held message.
+    human_key(&mut fixture.app, &terminal, KeyCode::Char('e'));
+    let held = prompt_pane(&mut fixture, "for the same Pi", None);
+    assert_eq!(held["result"]["delivery"]["path"], "pty_deferred");
+    human_key(&mut fixture.app, &terminal, KeyCode::Enter);
+    let typed = tokio::time::timeout(std::time::Duration::from_secs(2), fixture.rx[1].recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(String::from_utf8_lossy(&typed).contains("for the same Pi"));
+}
+
+/// VQRO 2: every send result says how it was delivered and why, and typed
+/// deliveries leave a settled, never-claimable history row
+/// (closedBy "typed", delivery.typedReason) in the pane's queue.
+#[tokio::test]
+async fn every_send_reports_its_method_and_typed_sends_leave_history() {
+    let mut fixture = fixture();
+    // Typed: the pane has no Messages yet.
+    let typed = prompt_pane(&mut fixture, "typed hello", None);
+    assert_eq!(typed["result"]["delivery"]["path"], "pty", "{typed}");
+    assert_eq!(typed["result"]["delivery"]["reason"], "no_messages");
+    let explicit = prompt_pane(
+        &mut fixture,
+        "typed on purpose",
+        Some(MessageTransport::Pty),
+    );
+    assert_eq!(explicit["result"]["delivery"]["reason"], "explicit_pty");
+    // Queued once the pane's Pi attached Messages.
+    let session = attach_recipient(&mut fixture);
+    let queued = prompt_pane(&mut fixture, "queued hello", None);
+    assert_eq!(queued["result"]["delivery"]["path"], "mailbox", "{queued}");
+    assert_eq!(queued["result"]["delivery"]["reason"], "messages");
+    assert_eq!(queued["result"]["delivery"]["editable"], true);
+    // History shows the typed ones as closed rows; they are never claimed.
+    let snapshot = dispatch(
+        &mut fixture.app,
+        &session,
+        "mailbox.snapshot",
+        json!({"protocol": crate::mailbox_v1::PROTOCOL}),
+    )
+    .unwrap();
+    let heads = snapshot["snapshot"]["heads"].as_array().unwrap();
+    let typed_rows: Vec<_> = heads
+        .iter()
+        .filter(|head| head["stableId"].as_str().unwrap().starts_with("typed."))
+        .collect();
+    assert_eq!(typed_rows.len(), 2, "{snapshot}");
+    let reasons: Vec<_> = typed_rows
+        .iter()
+        .map(|head| head["delivery"]["typedReason"].as_str().unwrap())
+        .collect();
+    assert!(reasons.contains(&"no_messages") && reasons.contains(&"explicit_pty"));
+    for row in &typed_rows {
+        let state = snapshot["snapshot"]["headStates"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|state| state["stableId"] == row["stableId"])
+            .unwrap();
+        assert_eq!(state["lifecycle"], "settled");
+        assert_eq!(state["closedBy"], "typed");
+        // An admitted receipt with the row's exact revision and digest.
+        let receipt = snapshot["snapshot"]["receipts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|receipt| receipt["stableId"] == row["stableId"])
+            .expect("typed row has a receipt");
+        assert_eq!(receipt["status"], "admitted");
+        assert_eq!(receipt["revision"], row["revision"]);
+        assert_eq!(receipt["digest"], row["digest"]);
+        assert_eq!(receipt["deliveryDigest"], row["deliveryDigest"]);
+        assert!(state.get("recoveryNeeded").is_none());
+    }
+    let claim = dispatch(
+        &mut fixture.app,
+        &session,
+        "mailbox.claim",
+        json!({"protocol": crate::mailbox_v1::PROTOCOL}),
+    )
+    .unwrap();
+    assert!(
+        claim["claim"]["stableId"]
+            .as_str()
+            .unwrap()
+            .starts_with("send."),
+        "only the queued message is claimable: {claim}"
+    );
+    let history = fixture
+        .app
+        .dispatch_mailbox_bootstrap(
+            &session,
+            "mailbox.history_snapshot",
+            json!({"protocol": crate::mailbox_v1::PROTOCOL}),
+        )
+        .expect("history");
+    assert!(
+        history.to_string().contains("\"closedBy\":\"typed\""),
+        "{history}"
+    );
+}
+
+/// A pane that takes Messages is never typed into: oversize text is refused
+/// with messages_unavailable and reason "oversized"; nothing is typed or
+/// queued.
+#[tokio::test]
+async fn oversize_text_to_a_messages_pane_is_refused_not_typed() {
+    let mut fixture = fixture();
+    attach_recipient(&mut fixture);
+    let big = "x".repeat(20 * 1024);
+    let refused = prompt_pane(&mut fixture, &big, None);
+    assert_eq!(
+        refused["error"]["code"], "messages_unavailable",
+        "{refused}"
+    );
+    assert_eq!(refused["error"]["reason"], "oversized");
+    assert!(fixture.rx[1].try_recv().is_err(), "nothing typed");
+    assert!(crate::mailbox::MailboxStore::open(&fixture.directory)
+        .unwrap()
+        .load()
+        .unwrap()
+        .heads
+        .is_empty());
+}
+
+/// QA batch 3, 1b+: a held message is also pinned to the addressed agent
+/// name and agent session; a rename or a new session fails it with
+/// agent_replaced instead of typing.
+#[tokio::test]
+async fn a_held_message_fails_when_the_agent_name_or_session_changes() {
+    use crossterm::event::KeyCode;
+    for change in ["name", "session"] {
+        let mut fixture = fixture();
+        let terminal = fixture.app.state.workspaces[1]
+            .terminal_id(fixture.panes[1])
+            .unwrap()
+            .clone();
+        fixture
+            .app
+            .state
+            .terminals
+            .get_mut(&terminal)
+            .unwrap()
+            .set_agent_name("worker".into());
+        human_key(&mut fixture.app, &terminal, KeyCode::Char('d'));
+        let sequence = fixture.app.event_hub.current_sequence();
+        let held = prompt_pane(&mut fixture, "for worker", None);
+        assert_eq!(held["result"]["delivery"]["path"], "pty_deferred", "{held}");
+        if change == "name" {
+            fixture
+                .app
+                .state
+                .terminals
+                .get_mut(&terminal)
+                .unwrap()
+                .set_agent_name("someone-else".into());
+        } else {
+            report_session(
+                &mut fixture.app,
+                1,
+                fixture.panes[1],
+                "/sessions/s1-new.jsonl",
+                99,
+            );
+        }
+        human_key(&mut fixture.app, &terminal, KeyCode::Enter);
+        assert!(fixture.rx[1].try_recv().is_err(), "{change}: never typed");
+        let events = deferral_events(&fixture.app, sequence);
+        assert!(
+            matches!(
+                events.as_slice(),
+                [crate::api::schema::EventData::DeliveryDeferredFailed { code, .. }] if code == "agent_replaced"
+            ),
+            "{change}: {events:?}"
+        );
+    }
+}
+
+/// QA batch 3, 1a+: keys that can insert text without a printable key
+/// (history recall, Tab completion, Ctrl-R, Ctrl-Y, Backspace) mark the
+/// draft; Ctrl-J and Ctrl-M are not submits; only plain Enter, Ctrl-C and
+/// Ctrl-U clear.
+#[tokio::test]
+async fn any_forwarded_key_marks_a_possible_draft() {
+    use crossterm::event::{KeyCode, KeyModifiers};
+    let mut fixture = fixture();
+    let terminal = fixture.app.state.workspaces[1]
+        .terminal_id(fixture.panes[1])
+        .unwrap()
+        .clone();
+    let press = |app: &mut App, code, modifiers| {
+        app.note_human_key(&terminal, &crate::input::TerminalKey::new(code, modifiers));
+    };
+    for (code, modifiers) in [
+        (KeyCode::Up, KeyModifiers::NONE),
+        (KeyCode::Tab, KeyModifiers::NONE),
+        (KeyCode::Char('r'), KeyModifiers::CONTROL),
+        (KeyCode::Char('y'), KeyModifiers::CONTROL),
+        (KeyCode::Backspace, KeyModifiers::NONE),
+        (KeyCode::Char('j'), KeyModifiers::CONTROL),
+        (KeyCode::Char('m'), KeyModifiers::CONTROL),
+        (KeyCode::Esc, KeyModifiers::NONE),
+    ] {
+        press(&mut fixture.app, KeyCode::Enter, KeyModifiers::NONE);
+        assert!(!fixture.app.pane_draft_pending(&terminal));
+        press(&mut fixture.app, code, modifiers);
+        assert!(
+            fixture.app.pane_draft_pending(&terminal),
+            "{code:?} {modifiers:?} marks a possible draft"
+        );
+    }
+    for (code, modifiers) in [
+        (KeyCode::Enter, KeyModifiers::NONE),
+        (KeyCode::Char('c'), KeyModifiers::CONTROL),
+        (KeyCode::Char('u'), KeyModifiers::CONTROL),
+    ] {
+        press(&mut fixture.app, KeyCode::Up, KeyModifiers::NONE);
+        press(&mut fixture.app, code, modifiers);
+        assert!(
+            !fixture.app.pane_draft_pending(&terminal),
+            "{code:?} {modifiers:?} clears"
+        );
+    }
+}
+
+/// QA re-check: a crash between the typed history appends never turns the
+/// row into a deliverable or recoverable message. Simulated by writing the
+/// head alone, and the head plus its claim without a resolution.
+#[tokio::test]
+async fn a_partly_written_typed_history_row_is_never_delivered_or_recovered() {
+    let mut fixture = fixture();
+    let session = attach_recipient(&mut fixture);
+    let queue_key = fixture.app.pane_queue_key(&fixture.terminals[1]).unwrap();
+    let store = crate::mailbox::MailboxStore::open(&fixture.app.sender_authority_dir).unwrap();
+    let typed_head = |stable_id: &str| crate::mailbox::MailboxHead {
+        delivery: Some(crate::mailbox::ServerDelivery {
+            origin: "agent_prompt".into(),
+            sender_label: "tpm".into(),
+            sender_session: None,
+            recipient_session: None,
+            correlation: None,
+            retry_of: None,
+            typed_reason: Some("no_messages".into()),
+        }),
+        ..scoped_test_head(
+            stable_id,
+            "term_s",
+            &crate::app::messages::pane_recipient(&queue_key),
+            'e',
+        )
+    };
+    // Crash after the head (and its receipt) alone.
+    let head_only = typed_head("typed.headonly");
+    store.append_offline_head(head_only.clone()).unwrap();
+    // Crash after the claim, before the settled resolution.
+    let with_claim = typed_head("typed.withclaim");
+    store.append_offline_head(with_claim.clone()).unwrap();
+    store
+        .claim(crate::mailbox::Claim {
+            claim_id: "typed:typed.withclaim".into(),
+            recipient: with_claim.recipient.clone(),
+            stable_id: with_claim.stable_id.clone(),
+            revision: 1,
+            digest: with_claim.digest.clone(),
+            execution: None,
+        })
+        .unwrap();
+    let protocol = crate::mailbox_v1::PROTOCOL;
+    let claim = dispatch(
+        &mut fixture.app,
+        &session,
+        "mailbox.claim",
+        json!({"protocol": protocol}),
+    )
+    .unwrap();
+    assert!(claim["claim"].is_null(), "never delivered: {claim}");
+    let snapshot = dispatch(
+        &mut fixture.app,
+        &session,
+        "mailbox.snapshot",
+        json!({"protocol": protocol}),
+    )
+    .unwrap();
+    assert!(
+        !snapshot.to_string().contains("\"recoveryNeeded\":true"),
+        "never offered for recovery: {snapshot}"
+    );
+    // Projection: both torn rows read as settled, closedBy "typed", with no
+    // claim exposed and no held row, in snapshot and history.
+    for stable_id in ["typed.headonly", "typed.withclaim"] {
+        let state = snapshot["snapshot"]["headStates"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|state| state["stableId"] == stable_id)
+            .unwrap_or_else(|| panic!("{stable_id} listed: {snapshot}"));
+        assert_eq!(state["lifecycle"], "settled", "{state}");
+        assert_eq!(state["closedBy"], "typed");
+        assert!(state.get("claimId").is_none(), "{state}");
+        assert!(state.get("claimExecution").is_none(), "{state}");
+    }
+    assert!(snapshot["snapshot"]
+        .get("claim")
+        .is_none_or(|claim| claim.is_null()));
+    let history = fixture
+        .app
+        .dispatch_mailbox_bootstrap(
+            &session,
+            "mailbox.history_snapshot",
+            json!({"protocol": protocol}),
+        )
+        .expect("history")
+        .to_string();
+    for stable_id in ["typed.headonly", "typed.withclaim"] {
+        assert!(
+            history.contains(stable_id),
+            "{stable_id} in history: {history}"
+        );
+    }
+    assert!(dispatch(
+        &mut fixture.app,
+        &session,
+        "mailbox.retry",
+        json!({"protocol": protocol, "stableId": "typed.withclaim", "expectedRevision": 1}),
+    )
+    .is_err());
+    assert_eq!(
+        fixture.app.unsettled_queue_len(&fixture.terminals[1]),
+        0,
+        "not counted as queued"
+    );
+    // The single-lock writer refuses a non-typed head and writes a full row.
+    let full = typed_head("typed.full");
+    store.append_typed_history(full).unwrap();
+    let recovered = store.load().unwrap();
+    let resolution = &recovered.resolutions["typed:typed.full"];
+    assert_eq!(resolution.closed_by.as_deref(), Some("typed"));
+    assert!(recovered
+        .receipts
+        .values()
+        .any(|r| r.stable_id == "typed.full"));
+    let mut plain = scoped_test_head(
+        "send.plain",
+        "term_s",
+        &crate::app::messages::pane_recipient(&queue_key),
+        'f',
+    );
+    plain.delivery = None;
+    assert!(store.append_typed_history(plain).is_err());
 }

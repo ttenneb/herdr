@@ -22,7 +22,8 @@ use crate::terminal::TerminalId;
 pub(crate) const TYPED_DEFERRAL_LIMIT: Duration = Duration::from_secs(600);
 const TYPED_SUBMIT_DELAY: Duration = Duration::from_millis(300);
 
-/// Pending human input in one pane since its last Enter (an estimate).
+/// Whether the human may have unsent input in one pane since its last
+/// submit/clear key (`count > 0`: possibly present).
 #[derive(Debug, Clone, Copy, Default)]
 pub(crate) struct HumanDraft {
     pub count: usize,
@@ -43,28 +44,35 @@ pub(crate) struct TypedDeferral {
     pub sender: crate::app::messages::SenderAttribution,
     pub origin: &'static str,
     pub deadline: Instant,
+    /// The recipient agent's execution when the message was sent (managed
+    /// generation and foreground process PID plus birth tick). A held
+    /// message is only ever typed into that same execution.
+    pub execution: Option<String>,
+    /// Why it is typed rather than queued (for the history record).
+    pub reason: String,
 }
 
-/// How a human keystroke changes the draft estimate.
+/// How a human keystroke changes the draft state: `None` clears it,
+/// `Some(0)` leaves it, `Some(1)` marks a draft as possibly present.
+///
+/// Any forwarded key may put text in the editor (history recall with Up or
+/// Ctrl-R, Tab completion, Ctrl-Y, agent autocomplete, Backspace over a
+/// submitted line...), so every non-release key marks the draft except the
+/// known submit/clear keys: a plain unmodified Enter, Ctrl-C and Ctrl-U.
+/// Ctrl-J, Ctrl-M and modified Enter insert newlines; Esc proves nothing.
 fn key_effect(key: &crate::input::TerminalKey) -> Option<isize> {
     if key.kind == crossterm::event::KeyEventKind::Release {
         return Some(0);
     }
-    let control = key.modifiers.contains(KeyModifiers::CONTROL);
-    let alt = key.modifiers.contains(KeyModifiers::ALT);
     match key.code {
-        KeyCode::Enter | KeyCode::Esc => None,
-        KeyCode::Char(c) if control && matches!(c.to_ascii_lowercase(), 'c' | 'u' | 'j' | 'm') => {
+        KeyCode::Enter if key.modifiers.is_empty() => None,
+        KeyCode::Char(c)
+            if key.modifiers == KeyModifiers::CONTROL
+                && matches!(c.to_ascii_lowercase(), 'c' | 'u') =>
+        {
             None
         }
-        KeyCode::Char(_) if control || alt => Some(0),
-        KeyCode::Char(_) => Some(
-            key.generated_text
-                .as_ref()
-                .map_or(1, |text| text.chars().count().max(1)) as isize,
-        ),
-        KeyCode::Backspace => Some(-1),
-        _ => Some(0),
+        _ => Some(1),
     }
 }
 
@@ -107,28 +115,26 @@ impl App {
                         .get(terminal_id)
                         .and_then(|terminal| terminal.managed_agent_generation());
                 }
-                if draft.count == 0 {
-                    self.clear_human_draft(terminal_id);
-                }
             }
         }
     }
 
-    /// Human text (a paste or a text commit) reached this terminal.
-    pub(crate) fn note_human_text(&mut self, terminal_id: &TerminalId, text: &str) {
-        let added = text.chars().filter(|c| !c.is_control()).count();
-        if text.ends_with('\r') || text.ends_with('\n') {
-            // A committed line was submitted with it.
+    /// Human text reached this terminal: a paste (`paste`: bracketed, so a
+    /// trailing newline stays in the unsent draft) or a text commit, where a
+    /// trailing carriage return is a raw Enter byte that submits.
+    pub(crate) fn note_human_text(&mut self, terminal_id: &TerminalId, text: &str, paste: bool) {
+        if !paste && text.ends_with('\r') {
             self.clear_human_draft(terminal_id);
             return;
         }
+        let added = text.chars().filter(|c| *c != '\u{1b}').count();
         if added > 0 {
             let draft = self.human_drafts.entry(terminal_id.clone()).or_default();
             draft.count = draft.count.saturating_add(added);
         }
     }
 
-    fn clear_human_draft(&mut self, terminal_id: &TerminalId) {
+    pub(crate) fn clear_human_draft(&mut self, terminal_id: &TerminalId) {
         let had = self.human_drafts.remove(terminal_id).is_some();
         if had
             || self
@@ -175,19 +181,24 @@ impl App {
         }
     }
 
-    /// Whether the pane's editor may hold the human's unsent text. A Pi's
-    /// own `editor_has_text` report wins; otherwise Herdr's input count.
+    /// Whether the pane's editor may hold the human's unsent text: a Pi's
+    /// `editor_has_text=true` report, OR Herdr's own key-based flag (a stale
+    /// false from Pi never overrides fresh keys; Pi's true→false edge clears
+    /// Herdr's flag when it arrives).
     pub(crate) fn pane_draft_pending(&self, terminal_id: &TerminalId) -> bool {
-        if let Some(reported) = self.state.terminals.get(terminal_id).and_then(|terminal| {
-            (terminal.effective_known_agent() == Some(crate::detect::Agent::Pi))
-                .then_some(terminal.editor_has_text)
-                .flatten()
-        }) {
-            return reported;
-        }
-        self.human_drafts
+        let reported = self
+            .state
+            .terminals
             .get(terminal_id)
-            .is_some_and(|draft| draft.count > 0)
+            .is_some_and(|terminal| {
+                terminal.effective_known_agent() == Some(crate::detect::Agent::Pi)
+                    && terminal.editor_has_text == Some(true)
+            });
+        reported
+            || self
+                .human_drafts
+                .get(terminal_id)
+                .is_some_and(|draft| draft.count > 0)
     }
 
     /// Whether a typed delivery to this terminal must be held: a draft is
@@ -208,8 +219,10 @@ impl App {
         target: String,
         sender: crate::app::messages::SenderAttribution,
         origin: &'static str,
+        reason: String,
     ) -> String {
         let id = new_deferral_id();
+        let execution = self.current_agent_execution(&terminal_id);
         tracing::info!(
             deferral = %id,
             terminal = %terminal_id,
@@ -225,8 +238,106 @@ impl App {
             sender,
             origin,
             deadline: Instant::now() + TYPED_DEFERRAL_LIMIT,
+            execution,
+            reason,
         });
         id
+    }
+
+    /// The pane's current agent identity: its managed generation (if any),
+    /// its foreground agent process as PID plus kernel birth tick, its agent
+    /// name, and its agent session (for a handoff, the envelope's recipient
+    /// session, which was verified current at send time).
+    pub(crate) fn current_agent_execution(&self, terminal_id: &TerminalId) -> Option<String> {
+        let generation = self
+            .state
+            .terminals
+            .get(terminal_id)
+            .and_then(|terminal| terminal.managed_agent_generation())
+            .filter(|generation| *generation > 0);
+        let process = self
+            .mailbox_bootstrap_foreground_job(terminal_id)
+            .and_then(|job| {
+                crate::detect::identify_agent_process_in_job(&job).map(|(_, process)| process.pid)
+            })
+            .and_then(|pid| {
+                self.managed_pi_process_birth(pid)
+                    .map(|birth| (pid, birth.start_ticks))
+            });
+        let name = self
+            .state
+            .terminals
+            .get(terminal_id)
+            .and_then(|terminal| terminal.agent_name.clone());
+        let session = self.current_agent_session_value(&terminal_id.to_string());
+        if generation.is_none() && process.is_none() && name.is_none() && session.is_none() {
+            return None;
+        }
+        // Execution, addressed name and agent session: a held message goes
+        // only to exactly the agent it was sent to.
+        Some(format!(
+            "g{}/p{}/n{}/s{}",
+            generation.map_or_else(|| "-".into(), |g| g.to_string()),
+            process.map_or_else(|| "-".into(), |(pid, ticks)| format!("{pid}:{ticks}")),
+            name.as_deref().unwrap_or("-"),
+            session.as_deref().unwrap_or("-"),
+        ))
+    }
+
+    /// Why a message to this terminal is typed rather than queued.
+    pub(crate) fn typed_reason(
+        &self,
+        terminal_id: &TerminalId,
+        transport: Option<crate::api::schema::MessageTransport>,
+    ) -> String {
+        if transport == Some(crate::api::schema::MessageTransport::Pty) {
+            return "explicit_pty".into();
+        }
+        let key = terminal_id.to_string();
+        let Some(terminal) = self.state.terminals.get(terminal_id) else {
+            return "no_messages".into();
+        };
+        if matches!(terminal.effective_known_agent(), Some(agent) if agent != crate::detect::Agent::Pi)
+        {
+            return "not_pi".into();
+        }
+        if terminal.messages_capable && !self.pane_takes_messages(&key) {
+            return "fallback_30s".into();
+        }
+        "no_messages".into()
+    }
+
+    /// Durable history for a message typed into a pane: a head in the
+    /// pane's queue, never claimable, settled at once with closedBy "typed"
+    /// and `delivery.typedReason`, so Messages history shows typed
+    /// deliveries next to queued ones. Best effort: a failure is logged.
+    pub(crate) fn record_typed_delivery(
+        &mut self,
+        terminal_id: &TerminalId,
+        sender: &crate::app::messages::SenderAttribution,
+        text: &str,
+        reason: &str,
+        origin: &'static str,
+    ) {
+        // History is for Pi panes (Messages); other agents keep none.
+        if reason == "not_pi" {
+            return;
+        }
+        let key = terminal_id.to_string();
+        let Some(queue_key) = self.pane_queue_key(&key) else {
+            return;
+        };
+        if let Err(err) = crate::app::messages::append_typed_history(
+            &self.sender_authority_dir,
+            &queue_key,
+            &key,
+            sender,
+            text,
+            reason,
+            origin,
+        ) {
+            tracing::warn!(terminal = %terminal_id, %err, "could not record the typed delivery in history");
+        }
     }
 
     pub(crate) fn next_typed_deferral_deadline(&self) -> Option<Instant> {
@@ -262,6 +373,15 @@ impl App {
                 }
                 continue;
             }
+            if self.current_agent_execution(&deferral.terminal_id) != deferral.execution {
+                self.fail_typed_deferral(
+                    &deferral,
+                    "agent_replaced",
+                    "the agent in the recipient pane was replaced while the message waited; it was not typed into the new agent",
+                );
+                changed = true;
+                continue;
+            }
             match self.type_submission(
                 &deferral.terminal_id,
                 deferral.expected_agent,
@@ -269,6 +389,13 @@ impl App {
             ) {
                 Ok(()) => {
                     tracing::info!(deferral = %deferral.id, "held typed delivery typed");
+                    self.record_typed_delivery(
+                        &deferral.terminal_id,
+                        &deferral.sender,
+                        &deferral.text,
+                        &deferral.reason,
+                        deferral.origin,
+                    );
                     self.emit_deferral_event(&deferral, "delivered", None, None);
                 }
                 Err((code, message)) => self.fail_typed_deferral(&deferral, code, &message),

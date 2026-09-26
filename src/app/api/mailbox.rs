@@ -491,6 +491,7 @@ impl App {
                         .filter(|head| {
                             recipients.contains(&head.recipient)
                                 && head.revision == params.expected_revision
+                                && !crate::mailbox::is_typed_history(head)
                         })
                         .cloned()
                         .ok_or(MailboxBootstrapError::InvalidRequest)?;

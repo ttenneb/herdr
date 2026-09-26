@@ -14369,11 +14369,21 @@
               "description": "True when an identical correlated send found its existing message.",
               "type": "boolean"
             },
+            "editable": {
+              "default": false,
+              "description": "Whether the sender can still edit it (a queued message not yet\npicked up).",
+              "type": "boolean"
+            },
             "edited": {
               "type": "boolean"
             },
             "path": {
-              "description": "`mailbox`, `pty`, or `pty_deferred` (held while the recipient pane has\nunsent human input; see `deferral_id`).",
+              "description": "`mailbox` (queued in the pane's Messages), `pty` (typed into the\npane), or `pty_deferred` (held while the recipient pane has unsent\nhuman input; see `deferral_id`).",
+              "type": "string"
+            },
+            "reason": {
+              "default": "",
+              "description": "Why: `messages` for `mailbox`; for `pty` or `pty_deferred`:\n`explicit_pty`, `no_messages`, `not_pi`, or `fallback_30s`.",
               "type": "string"
             },
             "revision": {
@@ -17544,6 +17554,13 @@
               "type": "string"
             },
             "senderSession": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "typedReason": {
+              "description": "Set on the history record of a message typed into the pane instead\nof queued: why (`explicit_pty`, `no_messages`, `not_pi`,\n`fallback_30s`, `oversized`). Such a head is settled at once with\n`closedBy:\"typed\"` and is never claimable.",
               "type": [
                 "string",
                 "null"

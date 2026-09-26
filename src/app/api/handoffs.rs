@@ -243,9 +243,8 @@ impl App {
                 return response;
             }
         } else if params.send.transport == Some(crate::api::schema::MessageTransport::Mailbox) {
-            return encode_error(
+            return crate::app::messages::messages_unavailable_json(
                 id,
-                "messages_unavailable",
                 "the recipient has no live Messages connection",
             );
         }
@@ -316,17 +315,18 @@ impl App {
             );
         }
         let typed_ahead_of_queued = (queued_ahead > 0).then_some(queued_ahead);
+        let typed_reason = self.typed_reason(&terminal_id, params.send.transport);
+        let sender = crate::app::messages::SenderAttribution {
+            terminal: Some(envelope.sender.terminal_id.clone()),
+            label: self
+                .current_identity_info(&envelope.sender)
+                .and_then(|agent| agent.name)
+                .unwrap_or_else(|| envelope.sender.pane_id.clone()),
+            session: Some(envelope.sender.agent_session.value.clone()),
+            external_key: None,
+        };
         // Never type into the human's unsent draft: hold it (in order).
         if self.typed_delivery_must_wait(&terminal_id) {
-            let sender = crate::app::messages::SenderAttribution {
-                terminal: Some(envelope.sender.terminal_id.clone()),
-                label: self
-                    .current_identity_info(&envelope.sender)
-                    .and_then(|agent| agent.name)
-                    .unwrap_or_else(|| envelope.sender.pane_id.clone()),
-                session: Some(envelope.sender.agent_session.value.clone()),
-                external_key: None,
-            };
             let deferral_id = self.defer_typed_delivery(
                 terminal_id.clone(),
                 prompt,
@@ -334,6 +334,7 @@ impl App {
                 envelope.recipient.pane_id.clone(),
                 sender,
                 "handoff",
+                typed_reason.clone(),
             );
             let mut held = receipt(
                 HandoffTransportOutcome::DeferredHumanDraft,
@@ -341,6 +342,8 @@ impl App {
             );
             held.delivery = Some(crate::api::schema::MessageDelivery {
                 path: "pty_deferred".into(),
+                reason: typed_reason.clone(),
+                editable: false,
                 deferral_id: Some(deferral_id),
                 typed_ahead_of_queued,
                 stable_id: None,
@@ -381,17 +384,19 @@ impl App {
             self.commit_archived_member_input(restore);
         }
         self.acknowledge_terminal_input(&terminal_id);
+        self.record_typed_delivery(&terminal_id, &sender, &prompt, &typed_reason, "handoff");
         let mut admitted = receipt(HandoffTransportOutcome::RuntimeTransactionAdmitted, "Herdr runtime admitted the complete prompt transaction; Pi/gate/agent acknowledgement is unknown".into());
-        admitted.delivery =
-            typed_ahead_of_queued.map(|queued| crate::api::schema::MessageDelivery {
-                path: "pty".into(),
-                typed_ahead_of_queued: Some(queued),
-                deferral_id: None,
-                stable_id: None,
-                revision: None,
-                edited: false,
-                duplicate: false,
-            });
+        admitted.delivery = Some(crate::api::schema::MessageDelivery {
+            path: "pty".into(),
+            reason: typed_reason,
+            editable: false,
+            typed_ahead_of_queued,
+            deferral_id: None,
+            stable_id: None,
+            revision: None,
+            edited: false,
+            duplicate: false,
+        });
         encode_success(id, ResponseResult::HandoffTransport { receipt: admitted })
     }
 
@@ -460,7 +465,7 @@ impl App {
             Ok(crate::app::messages::SendRoute::Pty) => None,
             // The recipient takes Messages: never fall back to typing into it.
             Err(crate::app::messages::SendRefusal::MailboxUnavailable(message)) => Some(
-                encode_error(id.to_string(), "messages_unavailable", message),
+                crate::app::messages::messages_unavailable_json(id.to_string(), message),
             ),
             Err(refusal) => crate::app::messages::pending_error_json(id.to_string(), &refusal)
                 .or_else(|| match refusal {

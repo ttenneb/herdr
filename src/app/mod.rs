@@ -2129,7 +2129,7 @@ impl App {
                                         if runtime.try_send_paste(text).is_ok() {
                                             if let Some(terminal_id) = terminal_id {
                                                 self.acknowledge_terminal_input(&terminal_id);
-                                                self.note_human_text(&terminal_id, &pasted);
+                                                self.note_human_text(&terminal_id, &pasted, true);
                                             }
                                         }
                                     }
