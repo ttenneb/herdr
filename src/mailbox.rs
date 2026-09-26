@@ -183,6 +183,10 @@ pub enum ClaimResolutionOutcome {
 pub struct ClaimResolution {
     pub claim_id: String,
     pub outcome: ClaimResolutionOutcome,
+    /// Set when the recipient's explicit Drop or Retry closed the claim
+    /// (`dropped` or `retried`) rather than the head running to completion.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub closed_by: Option<String>,
 }
 
 /// Durable server-owned recipient policy. This is deliberately distinct from
@@ -852,6 +856,7 @@ impl MailboxStore {
                 resolution: ClaimResolution {
                     claim_id,
                     outcome: ClaimResolutionOutcome::Settled,
+                    closed_by: Some("dropped".into()),
                 },
             })
         })
@@ -863,6 +868,17 @@ impl MailboxStore {
         &self,
         claim_id: &str,
         outcome: ClaimResolutionOutcome,
+    ) -> Result<ClaimResolution, MailboxError> {
+        self.resolve_claim_closed_by(claim_id, outcome, None)
+    }
+
+    /// As `resolve_claim`, recording that the recipient's explicit Drop or
+    /// Retry (not a completed run) closed the claim.
+    pub fn resolve_claim_closed_by(
+        &self,
+        claim_id: &str,
+        outcome: ClaimResolutionOutcome,
+        closed_by: Option<&str>,
     ) -> Result<ClaimResolution, MailboxError> {
         self.with_exclusive_lock(|| {
             let recovered = self.load()?;
@@ -876,6 +892,7 @@ impl MailboxStore {
             let resolution = ClaimResolution {
                 claim_id: claim_id.into(),
                 outcome,
+                closed_by: closed_by.map(str::to_string),
             };
             if let Some(existing) = recovered.resolutions.get(claim_id) {
                 if existing == &resolution {
@@ -1673,6 +1690,7 @@ mod tests {
                 resolution: ClaimResolution {
                     claim_id: claim.claim_id.clone(),
                     outcome: ClaimResolutionOutcome::Admitted,
+                    closed_by: None,
                 },
             })
             .unwrap();

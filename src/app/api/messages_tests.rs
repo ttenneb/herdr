@@ -794,17 +794,33 @@ async fn previous_session_heads_run_in_order_with_the_pin_shown_and_can_be_dropp
         json!({"protocol": crate::mailbox_v1::PROTOCOL}),
     )
     .unwrap();
-    let mut bodies: Vec<_> = history["snapshot"]["heads"]
+    // History keeps the human's Drop, marked as such.
+    let snapshot = &history["snapshot"];
+    let mut rows: Vec<(String, Option<String>)> = snapshot["heads"]
         .as_array()
         .unwrap()
         .iter()
-        .map(|head| head["body"].as_str().unwrap().to_string())
+        .map(|head| {
+            let state = snapshot["headStates"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|state| state["stableId"] == head["stableId"])
+                .unwrap();
+            (
+                head["body"].as_str().unwrap().to_string(),
+                state["closedBy"].as_str().map(str::to_string),
+            )
+        })
         .collect();
-    bodies.sort();
+    rows.sort();
     assert_eq!(
-        bodies,
-        vec!["first", "later"],
-        "a dropped head is never history"
+        rows,
+        vec![
+            ("drop me".to_string(), Some("dropped".to_string())),
+            ("first".to_string(), None),
+            ("later".to_string(), None),
+        ]
     );
 }
 
@@ -1194,6 +1210,29 @@ async fn a_killed_pis_admitted_claim_needs_recovery_and_drop_or_retry_resolves_i
     let again = dispatch(&mut fixture.app, &third, "mailbox.retry", retry).unwrap();
     assert_eq!(again["newStableId"], retried["newStableId"]);
     assert!(recovery_states(&mut fixture.app, &third).is_empty());
+    let closed = |app: &mut App, session: &MailboxBootstrapSession, stable: &serde_json::Value| {
+        dispatch(
+            app,
+            session,
+            "mailbox.snapshot",
+            json!({"protocol": crate::mailbox_v1::PROTOCOL}),
+        )
+        .unwrap()["snapshot"]["headStates"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|state| &state["stableId"] == stable)
+            .unwrap()["closedBy"]
+            .clone()
+    };
+    assert_eq!(
+        closed(&mut fixture.app, &third, &dropped_claim["stableId"]),
+        "dropped"
+    );
+    assert_eq!(
+        closed(&mut fixture.app, &third, &retried_claim["stableId"]),
+        "retried"
+    );
     // The re-delivered copy runs in normal order, marked as a retry.
     let mut claimed = Vec::new();
     for _ in 0..2 {

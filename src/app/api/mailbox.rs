@@ -479,9 +479,10 @@ impl App {
                             .map_err(|_| MailboxBootstrapError::InvalidRequest)?
                     };
                     let resolution = store
-                        .resolve_claim(
+                        .resolve_claim_closed_by(
                             &claim.claim_id,
                             crate::mailbox::ClaimResolutionOutcome::Settled,
+                            Some("retried"),
                         )
                         .map_err(|_| MailboxBootstrapError::InvalidRequest)?;
                     Ok(serde_json::json!({
@@ -644,9 +645,10 @@ impl App {
                                 ) =>
                         {
                             store
-                                .resolve_claim(
+                                .resolve_claim_closed_by(
                                     &claim.claim_id,
                                     crate::mailbox::ClaimResolutionOutcome::Settled,
+                                    Some("dropped"),
                                 )
                                 .map_err(|_| MailboxBootstrapError::InvalidRequest)?;
                         }

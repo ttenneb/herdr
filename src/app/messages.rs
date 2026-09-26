@@ -223,29 +223,23 @@ pub(crate) fn inbox_snapshot(
         out.receipts.extend(part.receipts);
         out.head_states.extend(part.head_states);
     }
-    let withdrawn: std::collections::HashSet<String> = out
-        .heads
-        .iter()
-        .filter(|head| {
-            recovered
-                .claims
-                .get(&head.stable_id)
-                .is_some_and(is_withdrawn_claim)
-        })
-        .map(|head| head.stable_id.clone())
-        .collect();
-    out.heads
-        .retain(|head| !withdrawn.contains(&head.stable_id));
-    out.receipts
-        .retain(|receipt| !withdrawn.contains(&receipt.stable_id));
-    out.head_states
-        .retain(|state| !withdrawn.contains(&state.stable_id));
+    // Dropped heads stay (settled, `closedBy:"dropped"`) so history keeps
+    // the human's decision.
     for state in &mut out.head_states {
         state.previous_session = state.lifecycle == crate::mailbox_v1::HeadLifecycle::Held
             && state
                 .recipient_session
                 .as_deref()
                 .is_some_and(|pinned| current_session != Some(pinned));
+        if recovered
+            .claims
+            .get(&state.stable_id)
+            .is_some_and(is_withdrawn_claim)
+        {
+            state.closed_by = Some("dropped".into());
+            state.claim_execution = None;
+            continue;
+        }
         state.claim_execution = recovered.claims.get(&state.stable_id).map(|claim| {
             if claim_is_current(claim, execution) {
                 "current".into()
