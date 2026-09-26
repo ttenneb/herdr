@@ -77,7 +77,14 @@ impl App {
                 if method == "report_submit" && submit.kind != "report" {
                     return Err(MailboxBootstrapError::InvalidRequest);
                 }
-                self.handle_mailbox_offline_submit(
+                let submit_via = if method == "report_submit" {
+                    // Unchanged self-report path (pending a decision on its use).
+                    Self::handle_mailbox_server_scoped_submit
+                } else {
+                    Self::handle_mailbox_offline_submit
+                };
+                submit_via(
+                    self,
                     id,
                     MailboxOfflineSubmitParams {
                         caller: session.caller.clone(),
@@ -604,35 +611,15 @@ impl App {
                 "bound-parent report grants require their accepted stream",
             );
         }
-        if params.submit.kind == "report"
-            && self.offline_mailbox_authority_current(&params.caller).ok() == Some(true)
-        {
-            if let Some(route) = self
-                .legacy_child_parent_report_identity(&params.caller, &params.recipient.recipient_id)
-            {
-                let Some(authority) = self.offline_mailbox_authorities.get(&params.caller) else {
-                    return encode_error(
-                        id,
-                        "mailbox_authority_unavailable",
-                        "sender route unavailable",
-                    );
-                };
-                if authority
-                    .store
-                    .append_child_report_event(crate::child_report::ChildReportEvent::Bypass {
-                        route,
-                        path: crate::child_report::ReportBypassPath::GenericOffline,
-                        message_id: params.submit.message_id.clone(),
-                    })
-                    .is_err()
-                {
-                    return encode_error(
-                        id,
-                        "mailbox_store_failed",
-                        "legacy report visibility could not be made durable",
-                    );
-                }
-            }
+        // A report head addressed to anyone else (a parent over a provisioned
+        // cross grant) is admitted only through report_submit_parent on a ready
+        // bound route. Self-addressed reports are unchanged pending review.
+        if params.submit.kind == "report" && params.recipient.recipient_id != params.caller {
+            return encode_error(
+                id,
+                "report_route_required",
+                "report heads are admitted only through report_submit_parent on a ready bound route",
+            );
         }
         let recipient = params.recipient.recipient_id.clone();
         let stable_id = params.submit.stable_id.clone();
@@ -949,7 +936,7 @@ mod tests {
                 subject: "offline subject".into(),
                 body: "offline body".into(),
                 message_id: "message-1".into(),
-                kind: "report".into(),
+                kind: "advisory".into(),
                 priority: "normal".into(),
                 original_sequence: 1,
             },
@@ -1787,6 +1774,55 @@ mod tests {
         .expect("install active authority");
     }
 
+    /// Defense in depth: a report head for another recipient (a parent over a
+    /// provisioned cross grant) is never admitted by the generic submit path;
+    /// only report_submit_parent on a ready bound route may admit one.
+    #[test]
+    fn generic_report_submit_over_a_cross_grant_is_refused_without_a_head() {
+        let (mut app, _pane_id, sender_a, directory) = app_with_active_sender();
+        let parent = RecipientKey {
+            recipient_id: "parent-b".into(),
+            generation: "1".into(),
+        };
+        let grant_id = app
+            .provision_cross_recipient_mailbox_grant(&sender_a, parent.clone())
+            .expect("server provisioned A to B grant");
+        let mut report = submit(
+            sender_a.clone(),
+            grant_id.clone(),
+            parent.clone(),
+            "a".repeat(64),
+        );
+        report.submit.kind = "report".into();
+        let refused = app.handle_api_request(Request {
+            id: "cross-report".into(),
+            method: Method::MailboxOfflineSubmit(report),
+        });
+        let refused: ErrorResponse = serde_json::from_str(&refused).expect("refused");
+        assert_eq!(refused.error.code, "report_route_required");
+        let recovered = crate::mailbox::MailboxStore::open(&directory)
+            .unwrap()
+            .load()
+            .unwrap();
+        assert!(recovered.heads.is_empty(), "no head was admitted");
+        // The same grant still carries ordinary messages.
+        let ordinary = app.handle_api_request(Request {
+            id: "cross-advisory".into(),
+            method: Method::MailboxOfflineSubmit(submit(
+                sender_a,
+                grant_id,
+                parent,
+                "c".repeat(64),
+            )),
+        });
+        assert!(
+            serde_json::from_str::<SuccessResponse>(&ordinary).is_ok(),
+            "{ordinary}"
+        );
+        drop(app);
+        std::fs::remove_dir_all(directory).expect("remove mailbox directory");
+    }
+
     #[test]
     fn cross_recipient_offline_delivery_survives_fresh_consumer_execution() {
         let (mut app, _pane_id, sender_a, directory) = app_with_active_sender();
@@ -1831,7 +1867,7 @@ mod tests {
         assert_eq!(snapshot.heads[0].target, "recipient-b");
         assert_eq!(snapshot.heads[0].grant_id, grant_id);
         assert_eq!(snapshot.heads[0].message_id, "message-1");
-        assert_eq!(snapshot.heads[0].kind, "report");
+        assert_eq!(snapshot.heads[0].kind, "advisory");
         assert_eq!(snapshot.heads[0].priority, "normal");
         assert_eq!(snapshot.heads[0].original_sequence, 1);
         assert!(snapshot.heads[0].enqueue_epoch > 0);
