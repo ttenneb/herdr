@@ -227,7 +227,15 @@ impl App {
         };
 
         if let Some(name) = normalized_name.as_deref() {
-            let conflicts = self.agent_name_conflicts(name, &resolved.terminal_id);
+            let mut conflicts = self.agent_name_conflicts(name, &resolved.terminal_id);
+            // A sleeping agent keeps its name (see start_agent).
+            let own_terminal = self
+                .state
+                .workspaces
+                .get(resolved.ws_idx)
+                .and_then(|workspace| workspace.terminal_id(resolved.pane_id))
+                .cloned();
+            conflicts.extend(self.sleeping_name_conflicts(name, own_terminal.as_ref()));
             if !conflicts.is_empty() {
                 return Err(AgentRenameError::DuplicateName {
                     name: name.to_string(),

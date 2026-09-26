@@ -1467,11 +1467,12 @@ mod tests {
         pi_exits(&mut app, pane);
         let (_other_pane, other_terminal, other_public) = second_pane(&mut app);
         let (runtime, _other_input) = crate::terminal::TerminalRuntime::test_with_channel(80, 24);
-        app.terminal_runtimes.insert(other_terminal, runtime);
+        app.terminal_runtimes
+            .insert(other_terminal.clone(), runtime);
         let taken = app.start_agent(AgentStartParams {
             name: "owner".into(),
             kind: "pi".into(),
-            pane_id: other_public,
+            pane_id: other_public.clone(),
             args: Vec::new(),
             env: Vec::new(),
             timeout_ms: None,
@@ -1479,6 +1480,28 @@ mod tests {
         assert!(matches!(
             taken,
             Err(crate::app::agents::AgentStartError::DuplicateName { .. })
+        ));
+        // Nor can another pane's agent be renamed to it.
+        app.state
+            .terminals
+            .get_mut(&other_terminal)
+            .unwrap()
+            .set_detected_state(
+                Some(crate::detect::Agent::Pi),
+                crate::detect::AgentState::Idle,
+            );
+        let renamed = app.rename_agent_target(&other_public, Some("owner".into()));
+        assert!(
+            matches!(
+                renamed,
+                Err(crate::app::agents::AgentRenameError::DuplicateName { ref name, ref candidates })
+                    if name == "owner" && candidates.iter().any(|agent| agent.terminal_id == terminal.to_string())
+            ),
+            "rename to a sleeping agent's name must be refused"
+        );
+        assert!(!matches!(
+            app.rename_agent_target(&other_public, Some("free-name".into())),
+            Err(crate::app::agents::AgentRenameError::DuplicateName { .. })
         ));
         // The wake itself relaunches the same name in the same pane.
         assert!(matches!(
