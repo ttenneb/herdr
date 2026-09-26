@@ -1247,6 +1247,12 @@ impl App {
     }
 
     fn mark_pane_messages_capable(&mut self, terminal_key: &str) {
+        // Remember that this exact Pi process attached (the typed fallback
+        // never applies to it, even while its stream reconnects).
+        if let Some(pi) = self.foreground_pi_identity(terminal_key) {
+            self.messages_attached_pis.insert(pi);
+        }
+        let mut flipped = false;
         if let Some(terminal) = self
             .state
             .terminals
@@ -1255,9 +1261,37 @@ impl App {
         {
             if !terminal.messages_capable {
                 terminal.messages_capable = true;
-                self.state.mark_session_dirty();
+                flipped = true;
             }
         }
+        if flipped {
+            // Durable at once, not on the debounced save: after a crash the
+            // pane must still queue for its next Pi.
+            self.state.mark_session_dirty();
+            if self.no_session {
+                return;
+            }
+            if let Err(err) = self.durably_save_delegation_edge() {
+                tracing::warn!(terminal = terminal_key, %err, "messages: could not persist the Messages-capable pane at once; the next session save will");
+            }
+        }
+    }
+
+    /// The pane's current foreground Pi process as (PID, birth tick).
+    pub(crate) fn foreground_pi_identity(&self, terminal_key: &str) -> Option<(u32, u64)> {
+        let terminal_id = self
+            .state
+            .terminals
+            .keys()
+            .find(|terminal_id| terminal_id.to_string() == terminal_key)?;
+        let job = self.mailbox_bootstrap_foreground_job(terminal_id)?;
+        let (agent, process) = crate::detect::identify_agent_process_in_job(&job)?;
+        if agent != crate::detect::Agent::Pi || process.pid == 0 {
+            return None;
+        }
+        let pid = process.pid;
+        let birth = self.managed_pi_process_birth(pid)?;
+        Some((pid, birth.start_ticks))
     }
 
     /// Releases the binding of a closed bootstrap stream so "has Messages"

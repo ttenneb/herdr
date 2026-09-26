@@ -2548,3 +2548,119 @@ async fn cross_pane_edit_pending_works_and_a_process_posing_as_the_recipient_is_
     );
     assert_eq!(store.load().unwrap().heads[&stable_id], head, "unchanged");
 }
+
+/// messages_capable is persisted at once (not only on the debounced save)
+/// when the pane's first Messages stream attaches.
+#[tokio::test]
+async fn the_messages_capable_flip_is_saved_at_once() {
+    let mut fixture = fixture();
+    let session_path = fixture.directory.join("session.json");
+    fixture.app.no_session = false;
+    fixture.app.session_save_path = session_path.clone();
+    assert!(!session_path.exists());
+    attach_recipient(&mut fixture);
+    let saved: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&session_path).expect("saved at once")).unwrap();
+    let queue_key = fixture.app.pane_queue_key(&fixture.terminals[1]).unwrap();
+    let text = saved.to_string();
+    assert!(text.contains(&queue_key), "the pane's queue key is saved");
+    assert!(
+        text.contains("\"messages_capable\":true") || text.contains("\"messagesCapable\":true"),
+        "the flip is saved: {text}"
+    );
+}
+
+/// A live Pi that has not attached Messages within 30 s of starting gets NEW
+/// messages typed; before that, and in a pane with no Pi, they queue; a Pi
+/// that attached once keeps queueing even while its stream is down.
+#[tokio::test]
+async fn a_live_pi_without_messages_after_30s_gets_new_messages_typed() {
+    let mut fixture = fixture();
+    let terminal_id = fixture.app.state.workspaces[1]
+        .terminal_id(fixture.panes[1])
+        .unwrap()
+        .clone();
+    let key = fixture.terminals[1].clone();
+    fixture
+        .app
+        .state
+        .terminals
+        .get_mut(&terminal_id)
+        .unwrap()
+        .messages_capable = true;
+    // No Pi in the pane (plain shell / restarting): queue.
+    assert!(fixture.app.pane_takes_messages(&key));
+    // An older Pi without Messages starts in the pane.
+    let old_pi = 4_000_000_030_u32;
+    let mut birth = crate::platform::process_birth_identity(std::process::id()).unwrap();
+    birth.start_ticks = 11;
+    fixture
+        .app
+        .mailbox_bootstrap_test_process_births
+        .insert(old_pi, birth);
+    fixture.app.install_mailbox_bootstrap_test_foreground_job(
+        terminal_id.clone(),
+        crate::platform::ForegroundJob {
+            process_group_id: old_pi,
+            processes: vec![crate::platform::ForegroundProcess {
+                pid: old_pi,
+                name: "pi".into(),
+                argv0: None,
+                argv: Some(vec!["pi".into()]),
+                cmdline: Some("pi".into()),
+            }],
+        },
+    );
+    fixture
+        .app
+        .messages_test_process_ages
+        .insert(old_pi, std::time::Duration::from_secs(5));
+    assert!(
+        fixture.app.pane_takes_messages(&key),
+        "within 30 s it may still attach: queue"
+    );
+    fixture
+        .app
+        .route_ordinary_send(
+            &key,
+            &sender(&fixture),
+            plain("queued early"),
+            &Default::default(),
+        )
+        .unwrap();
+    fixture
+        .app
+        .messages_test_process_ages
+        .insert(old_pi, std::time::Duration::from_secs(31));
+    assert!(
+        !fixture.app.pane_takes_messages(&key),
+        "no Messages after 30 s: new messages are typed"
+    );
+    let response = fixture.app.handle_agent_prompt(
+        "typed".into(),
+        AgentPromptParams {
+            target: fixture.app.public_pane_id(1, fixture.panes[1]).unwrap(),
+            text: "typed now".into(),
+            wait: None,
+            send: MessageSendOptions::default(),
+        },
+    );
+    let success: SuccessResponse = serde_json::from_str(&response).unwrap();
+    let ResponseResult::AgentPrompted { delivery, .. } = success.result else {
+        panic!("prompted")
+    };
+    assert_ne!(
+        delivery.map(|delivery| delivery.path),
+        Some("mailbox".into())
+    );
+    // The early head still waits in the queue.
+    let heads = crate::mailbox::MailboxStore::open(&fixture.directory)
+        .unwrap()
+        .load()
+        .unwrap()
+        .heads;
+    assert_eq!(heads.len(), 1);
+    // A Pi that attached once keeps queueing even with its stream down.
+    fixture.app.messages_attached_pis.insert((old_pi, 11));
+    assert!(fixture.app.pane_takes_messages(&key));
+}

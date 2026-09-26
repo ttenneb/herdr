@@ -454,6 +454,10 @@ pub(crate) fn session_execution(session: &crate::app::MailboxBootstrapSession) -
     }
 }
 
+/// How long a live Pi may take to attach Messages before new sends to its
+/// pane are typed instead of queued.
+pub(crate) const MESSAGES_ATTACH_GRACE: std::time::Duration = std::time::Duration::from_secs(30);
+
 impl App {
     /// Whether a claiming execution still runs: `pid:<pid>:<ticks>` while
     /// that exact process lives; `managed:<terminal>:<generation>` while that
@@ -555,7 +559,39 @@ impl App {
         }
         // A Pi attached right now, or a pane whose Pi attached before and is
         // restarting or asleep. A Pi that never attached keeps typed input.
-        self.attached_messages_recipient(terminal_key).is_some() || terminal.messages_capable
+        if self.attached_messages_recipient(terminal_key).is_some() {
+            return true;
+        }
+        if !terminal.messages_capable {
+            return false;
+        }
+        // A live Pi that has not attached Messages within 30 s of starting
+        // (an older Pi, the extension off, receive-only disabled) gets NEW
+        // messages typed again; queued heads wait for the next Messages Pi.
+        // A pane with no Pi (plain shell, restarting) keeps queueing.
+        if let Some((pid, start_ticks)) = self.foreground_pi_identity(terminal_key) {
+            if !self.messages_attached_pis.contains(&(pid, start_ticks))
+                && self
+                    .pi_process_age(pid, start_ticks)
+                    .is_some_and(|age| age >= MESSAGES_ATTACH_GRACE)
+            {
+                tracing::warn!(
+                    terminal = terminal_key,
+                    pid,
+                    "messages: the Pi in this pane has not attached Messages within 30 s; new messages are typed (queued ones wait for a Messages Pi)"
+                );
+                return false;
+            }
+        }
+        true
+    }
+
+    fn pi_process_age(&self, pid: u32, start_ticks: u64) -> Option<std::time::Duration> {
+        #[cfg(test)]
+        if let Some(age) = self.messages_test_process_ages.get(&pid) {
+            return Some(*age);
+        }
+        crate::platform::process_age_from_birth_tick(start_ticks)
     }
 
     /// Runs the backlog sweep from the server tick: first a few seconds after
