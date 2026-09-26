@@ -32,6 +32,8 @@ struct Fixture {
         std::os::unix::net::UnixStream,
         std::os::unix::net::UnixStream,
     )>,
+    /// Added to the test Pi's start tick so a later attach is a new execution.
+    execution_offset: u64,
 }
 
 impl Drop for Fixture {
@@ -95,6 +97,7 @@ fn fixture() -> Fixture {
         rx: receivers,
         directory,
         _peer: None,
+        execution_offset: 0,
     }
 }
 
@@ -135,7 +138,9 @@ fn attach_recipient(fixture: &mut Fixture) -> MailboxBootstrapSession {
             }],
         },
     );
-    let birth = crate::platform::process_birth_identity(pid).unwrap();
+    let mut birth = crate::platform::process_birth_identity(pid).unwrap();
+    // Each attach_* call may model a different Pi process in the pane.
+    birth.start_ticks += fixture.execution_offset;
     fixture
         .app
         .mailbox_bootstrap_test_process_births
@@ -1031,6 +1036,261 @@ async fn enqueue_self_queues_only_into_the_own_pane_inbox() {
     )
     .unwrap();
     assert_eq!(claim["claim"]["stableId"], first["stableId"]);
+}
+
+fn claim_and_admit(app: &mut App, session: &MailboxBootstrapSession) -> serde_json::Value {
+    let claim = dispatch(
+        app,
+        session,
+        "mailbox.claim",
+        json!({"protocol": crate::mailbox_v1::PROTOCOL}),
+    )
+    .unwrap();
+    dispatch(
+        app,
+        session,
+        "mailbox.resolve",
+        json!({"protocol": crate::mailbox_v1::PROTOCOL, "claimId": claim["claim"]["claimId"], "outcome": "admitted"}),
+    )
+    .unwrap();
+    claim["claim"].clone()
+}
+
+fn recovery_states(app: &mut App, session: &MailboxBootstrapSession) -> Vec<serde_json::Value> {
+    let snapshot = dispatch(
+        app,
+        session,
+        "mailbox.snapshot",
+        json!({"protocol": crate::mailbox_v1::PROTOCOL}),
+    )
+    .unwrap()["snapshot"]
+        .clone();
+    let recovery: Vec<serde_json::Value> = snapshot["headStates"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|state| state["recoveryNeeded"] == true)
+        .cloned()
+        .collect();
+    // Another Pi's claim is never presented as this Pi's claim.
+    assert!(!recovery
+        .iter()
+        .any(|state| state["stableId"] == snapshot["claim"]["stableId"]));
+    if !snapshot["claim"].is_null() {
+        assert_eq!(
+            snapshot["claim"]["execution"],
+            crate::app::messages::session_execution(session)
+        );
+    }
+    recovery
+}
+
+/// A Pi killed mid-turn leaves its claim admitted. The next Pi in the pane sees
+/// it as needing recovery (never auto-rerun, never blocking), and Drop or
+/// Retry resolves it with a durable receipt.
+#[tokio::test]
+async fn a_killed_pis_admitted_claim_needs_recovery_and_drop_or_retry_resolves_it() {
+    let mut fixture = fixture();
+    let first = attach_recipient(&mut fixture);
+    let recipient = fixture.terminals[1].clone();
+    let sender = sender(&fixture);
+    for (index, body) in ["running when killed", "also running", "next"]
+        .iter()
+        .enumerate()
+    {
+        fixture
+            .app
+            .route_ordinary_send(
+                &recipient,
+                &sender,
+                plain(body),
+                &MessageSendOptions {
+                    send_new: index > 0,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+    }
+    let dropped_claim = claim_and_admit(&mut fixture.app, &first);
+    // A second claim by the same Pi is refused while the first is outstanding.
+    // Settle nothing: the Pi is killed mid-turn; its binding ends.
+    fixture
+        .app
+        .release_mailbox_bootstrap_binding(&first.binding_generation);
+    fixture.execution_offset = 1;
+    let second = attach_recipient(&mut fixture);
+    assert_ne!(
+        crate::app::messages::session_execution(&first),
+        crate::app::messages::session_execution(&second)
+    );
+    let recovery = recovery_states(&mut fixture.app, &second);
+    assert_eq!(recovery.len(), 1);
+    assert_eq!(recovery[0]["stableId"], dropped_claim["stableId"]);
+    assert_eq!(recovery[0]["lifecycle"], "admitted");
+    assert_eq!(recovery[0]["claimExecution"], "other");
+    // Never auto-rerun and never stuck: the new Pi's claim skips it.
+    let next = dispatch(
+        &mut fixture.app,
+        &second,
+        "mailbox.claim",
+        json!({"protocol": crate::mailbox_v1::PROTOCOL}),
+    )
+    .unwrap();
+    assert_ne!(next["claim"]["stableId"], dropped_claim["stableId"]);
+    // The new Pi cannot resolve another execution's claim.
+    assert!(dispatch(
+        &mut fixture.app,
+        &second,
+        "mailbox.resolve",
+        json!({"protocol": crate::mailbox_v1::PROTOCOL, "claimId": dropped_claim["claimId"], "outcome": "settled"}),
+    )
+    .is_err());
+    let dropped = dispatch(
+        &mut fixture.app,
+        &second,
+        "mailbox.drop",
+        json!({"protocol": crate::mailbox_v1::PROTOCOL, "stableId": dropped_claim["stableId"], "expectedRevision": 1}),
+    )
+    .unwrap();
+    assert_eq!(dropped["type"], "mailbox_dropped");
+    assert_eq!(dropped["receipt"]["resolution"]["outcome"], "settled");
+    assert_eq!(
+        dropped["receipt"]["claim"]["claimId"],
+        dropped_claim["claimId"]
+    );
+    // Durable: a fresh load sees the settled resolution.
+    let recovered = crate::mailbox::MailboxStore::open(&fixture.directory)
+        .unwrap()
+        .load()
+        .unwrap();
+    assert_eq!(
+        recovered.resolutions[dropped_claim["claimId"].as_str().unwrap()].outcome,
+        crate::mailbox::ClaimResolutionOutcome::Settled
+    );
+    assert!(recovery_states(&mut fixture.app, &second).is_empty());
+
+    // Retry: the second Pi is killed too, holding "also running"'s claim.
+    let retried_claim = next["claim"].clone();
+    dispatch(
+        &mut fixture.app,
+        &second,
+        "mailbox.resolve",
+        json!({"protocol": crate::mailbox_v1::PROTOCOL, "claimId": retried_claim["claimId"], "outcome": "admitted"}),
+    )
+    .unwrap();
+    fixture
+        .app
+        .release_mailbox_bootstrap_binding(&second.binding_generation);
+    fixture.execution_offset = 2;
+    let third = attach_recipient(&mut fixture);
+    let recovery = recovery_states(&mut fixture.app, &third);
+    assert_eq!(recovery.len(), 1);
+    let retry = json!({"protocol": crate::mailbox_v1::PROTOCOL, "stableId": retried_claim["stableId"], "expectedRevision": 1});
+    let retried = dispatch(&mut fixture.app, &third, "mailbox.retry", retry.clone()).unwrap();
+    assert_eq!(retried["type"], "mailbox_retried");
+    assert_eq!(retried["receipt"]["head"]["status"], "admitted");
+    assert_eq!(retried["receipt"]["resolution"]["outcome"], "settled");
+    // Idempotent: a repeated Retry returns the same re-delivery.
+    let again = dispatch(&mut fixture.app, &third, "mailbox.retry", retry).unwrap();
+    assert_eq!(again["newStableId"], retried["newStableId"]);
+    assert!(recovery_states(&mut fixture.app, &third).is_empty());
+    // The re-delivered copy runs in normal order, marked as a retry.
+    let mut claimed = Vec::new();
+    for _ in 0..2 {
+        let claim = dispatch(
+            &mut fixture.app,
+            &third,
+            "mailbox.claim",
+            json!({"protocol": crate::mailbox_v1::PROTOCOL}),
+        )
+        .unwrap();
+        let stable = claim["claim"]["stableId"].as_str().unwrap().to_string();
+        let claim_id = claim["claim"]["claimId"].clone();
+        for outcome in ["admitted", "settled"] {
+            dispatch(
+                &mut fixture.app,
+                &third,
+                "mailbox.resolve",
+                json!({"protocol": crate::mailbox_v1::PROTOCOL, "claimId": claim_id, "outcome": outcome}),
+            )
+            .unwrap();
+        }
+        claimed.push(stable);
+    }
+    assert!(claimed.contains(&retried["newStableId"].as_str().unwrap().to_string()));
+    let recovered = crate::mailbox::MailboxStore::open(&fixture.directory)
+        .unwrap()
+        .load()
+        .unwrap();
+    let copy = &recovered.heads[retried["newStableId"].as_str().unwrap()];
+    assert_eq!(copy.body, "also running");
+    assert_eq!(
+        copy.delivery.as_ref().unwrap().retry_of.as_deref(),
+        retried_claim["stableId"].as_str()
+    );
+}
+
+/// The same recovery across a Herdr server restart: the claim was taken by a
+/// Pi in the old server; the restored pane's new Pi sees it as needing
+/// recovery and Drop resolves it durably.
+#[tokio::test]
+async fn recovery_is_visible_and_droppable_after_a_server_restart() {
+    let mut before = fixture();
+    let first = attach_recipient(&mut before);
+    let queue_key = before.app.pane_queue_key(&before.terminals[1]).unwrap();
+    let sender = sender(&before);
+    let recipient = before.terminals[1].clone();
+    before
+        .app
+        .route_ordinary_send(
+            &recipient,
+            &sender,
+            plain("mid-turn at restart"),
+            &Default::default(),
+        )
+        .unwrap();
+    let claim = claim_and_admit(&mut before.app, &first);
+    // Server restart: fresh App, same durable state, restored pane key.
+    let mut after = fixture();
+    std::fs::remove_dir_all(&after.directory).ok();
+    after.app.sender_authority_dir = before.directory.clone();
+    // The Pi in the restored pane is a new process.
+    after.execution_offset = 1;
+    let restored_terminal = after.app.state.workspaces[1]
+        .terminal_id(after.panes[1])
+        .unwrap()
+        .clone();
+    {
+        let terminal = after
+            .app
+            .state
+            .terminals
+            .get_mut(&restored_terminal)
+            .unwrap();
+        terminal.queue_key = queue_key;
+        terminal.messages_capable = true;
+    }
+    let session = attach_recipient(&mut after);
+    let recovery = recovery_states(&mut after.app, &session);
+    assert_eq!(recovery.len(), 1);
+    assert_eq!(recovery[0]["stableId"], claim["stableId"]);
+    let next = dispatch(
+        &mut after.app,
+        &session,
+        "mailbox.claim",
+        json!({"protocol": crate::mailbox_v1::PROTOCOL}),
+    )
+    .unwrap();
+    assert!(next["claim"].is_null(), "never auto-rerun");
+    let dropped = dispatch(
+        &mut after.app,
+        &session,
+        "mailbox.drop",
+        json!({"protocol": crate::mailbox_v1::PROTOCOL, "stableId": claim["stableId"], "expectedRevision": 1}),
+    )
+    .unwrap();
+    assert_eq!(dropped["receipt"]["resolution"]["outcome"], "settled");
+    assert!(recovery_states(&mut after.app, &session).is_empty());
 }
 
 #[tokio::test]

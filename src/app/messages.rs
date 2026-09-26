@@ -13,6 +13,40 @@ use crate::mailbox::{
     ServerDelivery,
 };
 
+/// The re-delivery copy for an explicit Retry: same text, sender, recipient
+/// and priority; a new stable ID derived from the old head and its claim.
+pub(crate) fn retry_head(head: &MailboxHead, claim: &crate::mailbox::Claim) -> MailboxHead {
+    let stable_id = format!(
+        "retry.{}",
+        &sha256_fields(&[head.stable_id.as_bytes(), claim.claim_id.as_bytes()])[..32]
+    );
+    let mut delivery = head.delivery.clone().unwrap_or(ServerDelivery {
+        origin: "retry".into(),
+        sender_label: head.sender.clone(),
+        sender_session: None,
+        recipient_session: None,
+        correlation: None,
+        retry_of: None,
+    });
+    delivery.retry_of = Some(head.stable_id.clone());
+    MailboxHead {
+        digest: sha256_fields(&[
+            stable_id.as_bytes(),
+            &1_u64.to_be_bytes(),
+            head.subject.as_bytes(),
+            head.body.as_bytes(),
+        ]),
+        delivery_digest: sha256_fields(&[b"herdr-retry-delivery", stable_id.as_bytes()]),
+        revision: 1,
+        message_id: format!("retry:{}", head.message_id),
+        enqueue_epoch: 0,
+        accepted_at: now_secs(),
+        delivery: Some(delivery),
+        stable_id,
+        ..head.clone()
+    }
+}
+
 /// A head for the human's own typing at a pane (`mailbox.enqueue_self`):
 /// addressed to that pane's inbox only, sender `human@<terminal>`. The same
 /// `clientId` yields the same stable ID, so a retry never queues twice.
@@ -74,6 +108,7 @@ pub(crate) fn human_self_head(
             sender_session: None,
             recipient_session,
             correlation: None,
+            retry_of: None,
         }),
     })
 }
@@ -218,6 +253,12 @@ pub(crate) fn inbox_snapshot(
                 "other".into()
             }
         });
+        state.recovery_needed = state.claim_execution.as_deref() == Some("other")
+            && matches!(
+                state.lifecycle,
+                crate::mailbox_v1::HeadLifecycle::Claimed
+                    | crate::mailbox_v1::HeadLifecycle::Admitted
+            );
     }
     out.claim = out
         .head_states
@@ -806,6 +847,7 @@ impl App {
                 sender_session: sender.session.clone(),
                 recipient_session,
                 correlation: message.correlation,
+                retry_of: None,
             }),
         };
         let receipt = store

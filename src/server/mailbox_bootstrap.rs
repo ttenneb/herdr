@@ -73,6 +73,8 @@ pub(crate) struct MessagesAdvertisement {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub inbox: Option<crate::mailbox::RecipientKey>,
     pub drop_method: &'static str,
+    /// Re-deliver a head an ended Pi execution left in recovery.
+    pub retry_method: &'static str,
     /// The human's own typing at this pane, queued in this pane's inbox only.
     pub enqueue_self_method: &'static str,
     pub protocol: &'static str,
@@ -139,6 +141,7 @@ impl MailboxBootstrapDescriptor {
                 watch_max_wait_ms: MAX_WATCH_TIMEOUT_MS,
                 inbox: session.pane_inbox.clone(),
                 drop_method: "mailbox.drop",
+                retry_method: "mailbox.retry",
                 enqueue_self_method: "mailbox.enqueue_self",
                 protocol: crate::mailbox_v1::PROTOCOL,
             }),

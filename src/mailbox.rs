@@ -69,6 +69,10 @@ pub struct ServerDelivery {
     pub recipient_session: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub correlation: Option<SendCorrelation>,
+    /// Set on a head created by the recipient's explicit Retry of a head an
+    /// ended Pi execution left in recovery: the original stable ID.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retry_of: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
@@ -1110,6 +1114,7 @@ fn same_delivery_except_pin(a: &Option<ServerDelivery>, b: &Option<ServerDeliver
                 && a.sender_label == b.sender_label
                 && a.sender_session == b.sender_session
                 && a.correlation == b.correlation
+                && a.retry_of == b.retry_of
         }
         _ => false,
     }

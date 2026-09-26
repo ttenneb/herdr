@@ -394,6 +394,7 @@ impl App {
                 | "mailbox.edit"
                 | "mailbox.resolve"
                 | "mailbox.drop"
+                | "mailbox.retry"
                 | "mailbox.enqueue_self"
         ) {
             return None;
@@ -427,6 +428,71 @@ impl App {
                 serde_json::to_value(result).map_err(|_| MailboxBootstrapError::InvalidRequest)
             };
             match method {
+                "mailbox.retry" => {
+                    // The recipient's explicit Retry of a head that an ended
+                    // Pi execution left claimed or admitted: re-deliver it as
+                    // a new head (runs in normal order) and close the old
+                    // claim. Deterministic, so a repeated Retry is idempotent.
+                    let params: HeadVersionParams = serde_json::from_value(params.clone())
+                        .map_err(|_| MailboxBootstrapError::InvalidRequest)?;
+                    protocol_ok(&params.protocol)?;
+                    let recovered = load()?;
+                    let head = recovered
+                        .heads
+                        .get(&params.stable_id)
+                        .filter(|head| {
+                            recipients.contains(&head.recipient)
+                                && head.revision == params.expected_revision
+                        })
+                        .cloned()
+                        .ok_or(MailboxBootstrapError::InvalidRequest)?;
+                    let claim = recovered
+                        .claims
+                        .get(&head.stable_id)
+                        .filter(|claim| {
+                            !crate::mailbox::is_withdrawn_claim(claim)
+                                && !crate::app::messages::claim_is_current(claim, &execution)
+                        })
+                        .cloned()
+                        .ok_or(MailboxBootstrapError::InvalidRequest)?;
+                    let already_settled = matches!(
+                        recovered.resolutions.get(&claim.claim_id),
+                        Some(crate::mailbox::ClaimResolution {
+                            outcome: crate::mailbox::ClaimResolutionOutcome::Settled,
+                            ..
+                        })
+                    );
+                    let copy = crate::app::messages::retry_head(&head, &claim);
+                    let existing = recovered.heads.contains_key(&copy.stable_id);
+                    if already_settled && !existing {
+                        return Err(MailboxBootstrapError::InvalidRequest);
+                    }
+                    let receipt = if existing {
+                        recovered
+                            .receipts
+                            .get(&copy.delivery_digest)
+                            .cloned()
+                            .ok_or(MailboxBootstrapError::GrantMissing)?
+                    } else {
+                        store
+                            .append_offline_head(copy.clone())
+                            .map_err(|_| MailboxBootstrapError::InvalidRequest)?
+                    };
+                    let resolution = store
+                        .resolve_claim(
+                            &claim.claim_id,
+                            crate::mailbox::ClaimResolutionOutcome::Settled,
+                        )
+                        .map_err(|_| MailboxBootstrapError::InvalidRequest)?;
+                    Ok(serde_json::json!({
+                        "type": "mailbox_retried",
+                        "stableId": head.stable_id,
+                        "revision": head.revision,
+                        "newStableId": copy.stable_id,
+                        "receipt": {"head": receipt, "claim": claim, "resolution": resolution},
+                        "snapshot": view(&load()?)?,
+                    }))
+                }
                 "mailbox.enqueue_self" => {
                     // The human's own typing at this pane, queued in this
                     // pane's inbox only. No recipient selector exists, so it
