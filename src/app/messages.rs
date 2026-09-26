@@ -392,6 +392,56 @@ impl App {
         self.attached_messages_recipient(terminal_key).is_some() || terminal.messages_capable
     }
 
+    /// A public pane ID whose pane has a Messages queue but no agent process
+    /// right now (its Pi exited, is restarting or asleep).
+    pub(crate) fn messages_queue_target(
+        &self,
+        target: &str,
+        options: &MessageSendOptions,
+    ) -> Option<crate::app::terminal_targets::TerminalTarget> {
+        if options.transport == Some(MessageTransport::Pty) {
+            return None;
+        }
+        let (ws_idx, pane_id) = self.parse_current_public_pane_id(target)?;
+        let resolved = self.terminal_target_for_pane(ws_idx, pane_id)?;
+        self.pane_takes_messages(&resolved.terminal_id)
+            .then_some(resolved)
+    }
+
+    /// The `agent prompt` result for a queue-only pane (no agent process).
+    pub(crate) fn queue_only_agent_info(
+        &self,
+        ws_idx: usize,
+        pane_id: crate::layout::PaneId,
+    ) -> Option<crate::api::schema::AgentInfo> {
+        let pane = self.pane_info(ws_idx, pane_id)?;
+        Some(crate::api::schema::AgentInfo {
+            terminal_id: pane.terminal_id,
+            name: None,
+            agent: pane.agent,
+            title: pane.title,
+            terminal_title: pane.terminal_title,
+            terminal_title_stripped: pane.terminal_title_stripped,
+            display_agent: pane.display_agent,
+            agent_status: pane.agent_status,
+            screen_detection_skipped: false,
+            state_labels: pane.state_labels,
+            tokens: pane.tokens,
+            agent_session: None,
+            agent_session_trust: None,
+            workspace_id: pane.workspace_id,
+            tab_id: pane.tab_id,
+            pane_id: pane.pane_id,
+            focused: pane.focused,
+            launch_pending: false,
+            interactive_ready: false,
+            state_change_seq: 0,
+            cwd: pane.cwd,
+            foreground_cwd: pane.foreground_cwd,
+            revision: pane.revision,
+        })
+    }
+
     /// Wake hook: a head was appended for a pane with no attached Pi. Emits
     /// `pane.wake_requested`; the sleep/wake owner (#25) acts on it.
     pub(crate) fn request_pane_wake_if_detached(&mut self, terminal_key: &str, stable_id: &str) {

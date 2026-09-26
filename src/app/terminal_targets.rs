@@ -156,7 +156,7 @@ impl App {
             .collect()
     }
 
-    fn terminal_target_for_pane(
+    pub(crate) fn terminal_target_for_pane(
         &self,
         ws_idx: usize,
         pane_id: crate::layout::PaneId,

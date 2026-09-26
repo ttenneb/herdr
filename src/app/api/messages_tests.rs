@@ -246,6 +246,18 @@ async fn a_pi_pane_without_an_attached_pi_queues_and_requests_a_wake() {
         .get_mut(&terminal_id)
         .unwrap()
         .messages_capable = true;
+    // Its Pi has exited: the pane is at a shell with no agent process.
+    fixture
+        .app
+        .state
+        .terminals
+        .get_mut(&terminal_id)
+        .unwrap()
+        .set_detected_state(None, AgentState::Unknown);
+    assert!(fixture
+        .app
+        .resolve_agent_target(&fixture.app.public_pane_id(1, fixture.panes[1]).unwrap())
+        .is_err());
     let target = fixture.app.public_pane_id(1, fixture.panes[1]).unwrap();
     let sequence = fixture.app.event_hub.current_sequence();
     let response = fixture.app.handle_agent_prompt(
@@ -297,6 +309,13 @@ async fn a_pi_pane_without_an_attached_pi_queues_and_requests_a_wake() {
     assert_eq!(stable_id, &head.stable_id);
     assert_eq!(reason, "message_queued");
     // When the pane's Pi attaches, the backlog is its inbox and runs in order.
+    fixture
+        .app
+        .state
+        .terminals
+        .get_mut(&terminal_id)
+        .unwrap()
+        .set_detected_state(Some(Agent::Pi), AgentState::Idle);
     let session = attach_recipient(&mut fixture);
     let claim = dispatch(
         &mut fixture.app,

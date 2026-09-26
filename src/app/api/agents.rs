@@ -65,7 +65,12 @@ impl App {
         }
         let resolved = match self.resolve_agent_target(&params.target) {
             Ok(resolved) => resolved,
-            Err(err) => return encode_error_body(id, self.agent_target_error_body(err)),
+            // A pane whose Pi has exited (restarting, asleep) still has its
+            // Messages queue; the pane ID keeps addressing it.
+            Err(err) => match self.messages_queue_target(&params.target, &params.send) {
+                Some(resolved) => resolved,
+                None => return encode_error_body(id, self.agent_target_error_body(err)),
+            },
         };
         let Some(terminal_id) = self
             .state
@@ -98,7 +103,10 @@ impl App {
                     if let Some(stable_id) = delivery.stable_id.clone() {
                         self.request_pane_wake_if_detached(&terminal_key, &stable_id);
                     }
-                    let Some(agent) = self.agent_info(resolved.ws_idx, resolved.pane_id) else {
+                    let Some(agent) = self
+                        .agent_info(resolved.ws_idx, resolved.pane_id)
+                        .or_else(|| self.queue_only_agent_info(resolved.ws_idx, resolved.pane_id))
+                    else {
                         return agent_not_found(id, &params.target);
                     };
                     return encode_success(
