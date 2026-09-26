@@ -2788,7 +2788,25 @@ fn bundled_integration_assets_report_session_refs() {
     assert!(PI_EXTENSION_ASSET.contains("pane.report_agent\""));
     assert!(PI_EXTENSION_ASSET.contains("pi.on(\"agent_start\""));
     assert!(PI_EXTENSION_ASSET.contains("pi.on(\"agent_settled\""));
-    assert!(!PI_EXTENSION_ASSET.contains("pi.on(\"session_shutdown\""));
+    // Pane ownership ends on confirmed process exit, never on Pi's
+    // session_shutdown: a handler may only clean up locally (the editor
+    // signal's timer and input hook), never report.
+    if let Some(start) = PI_EXTENSION_ASSET.find("pi.on(\"session_shutdown\"") {
+        let rest = &PI_EXTENSION_ASSET[start + 1..];
+        let handler = &rest[..rest.find("pi.on(").unwrap_or(rest.len())];
+        for report in [
+            "sendState",
+            "queueState",
+            "publishState",
+            "sendRequest",
+            "report_agent",
+        ] {
+            assert!(
+                !handler.contains(report),
+                "session_shutdown must not report: {handler}"
+            );
+        }
+    }
     assert!(OMP_EXTENSION_ASSET.contains("agent_session_path"));
     assert!(OMP_EXTENSION_ASSET.contains("agent_session_id"));
     assert!(OMP_EXTENSION_ASSET.contains("ctx?.hasUI !== true"));

@@ -2,10 +2,11 @@
 // managed by herdr; reinstalling or updating the integration overwrites this file.
 // add custom hooks/plugins beside this file instead of editing it.
 // HERDR_INTEGRATION_ID=pi
-// HERDR_INTEGRATION_VERSION=8
+// HERDR_INTEGRATION_VERSION=11
 // @ts-nocheck
 
 import net from "node:net";
+import path from "node:path";
 
 const HERDR_ENV = process.env.HERDR_ENV;
 const socketPath = process.env.HERDR_SOCKET_PATH;
@@ -58,6 +59,7 @@ type AgentState = "working" | "blocked" | "idle";
 type QueuedState = {
   state: AgentState;
   message?: string;
+  editorHasText?: boolean;
   seq: number;
 };
 
@@ -74,7 +76,10 @@ function updateSessionRef(ctx: any): void {
   try {
     const file = ctx?.sessionManager?.getSessionFile?.();
     currentAgentSessionPath =
-      typeof file === "string" && file.startsWith("/") ? file : undefined;
+      typeof file === "string" &&
+      (path.posix.isAbsolute(file) || path.win32.isAbsolute(file))
+        ? file
+        : undefined;
   } catch {
     currentAgentSessionPath = undefined;
   }
@@ -127,7 +132,9 @@ function reportSession(sessionStartSource?: string): Promise<void> {
   });
 }
 
-function sendState(state: AgentState, message?: string, seq = nextReportSeq()): Promise<void> {
+// editor_has_text: the human has unsent text in Pi's editor (a boolean, never the content). Herdr can defer
+// typed delivery while it is true. Older Herdr ignores the unknown field.
+function sendState(state: AgentState, message?: string, seq = nextReportSeq(), editorHasText?: boolean): Promise<void> {
   return sendRequest({
     id: `${source}:${Date.now()}:${Math.random().toString(36).slice(2)}`,
     method: "pane.report_agent",
@@ -138,6 +145,7 @@ function sendState(state: AgentState, message?: string, seq = nextReportSeq()): 
       state,
       message,
       seq,
+      ...(editorHasText === undefined ? {} : { editor_has_text: editorHasText }),
     }),
   });
 }
@@ -145,8 +153,8 @@ function sendState(state: AgentState, message?: string, seq = nextReportSeq()): 
 let sendInFlight = false;
 let queuedState: QueuedState | undefined;
 
-function queueState(state: AgentState, message?: string): void {
-  queuedState = { state, message, seq: nextReportSeq() };
+function queueState(state: AgentState, message?: string, editorHasText?: boolean): void {
+  queuedState = { state, message, editorHasText, seq: nextReportSeq() };
   if (!sendInFlight) {
     void drainStateQueue();
   }
@@ -162,7 +170,7 @@ async function drainStateQueue(): Promise<void> {
     while (queuedState) {
       const next = queuedState;
       queuedState = undefined;
-      await sendState(next.state, next.message, next.seq);
+      await sendState(next.state, next.message, next.seq, next.editorHasText);
     }
   } finally {
     sendInFlight = false;
@@ -183,6 +191,52 @@ export default function (pi) {
   let lastState: AgentState | undefined;
   let lastMessage: string | undefined;
   let rootSession = false;
+  // Edge-triggered: re-checked after each terminal input (the editor applies the key first) and once a second
+  // (programmatic changes: an extension restoring a draft, a submit); a report is sent only when it flips.
+  let editorHasText: boolean | undefined;
+  let lastEditorHasText: boolean | undefined;
+  let editorUi: any;
+  let stopTerminalInput: (() => void) | undefined;
+  let editorPoll: ReturnType<typeof setInterval> | undefined;
+
+  function readEditorHasText(): boolean | undefined {
+    try {
+      const text = editorUi?.getEditorText?.();
+      return typeof text === "string" ? text.trim().length > 0 : undefined;
+    } catch {
+      return undefined;
+    }
+  }
+
+  function checkEditor() {
+    if (!rootSession) {
+      return;
+    }
+    const next = readEditorHasText();
+    if (next === undefined || next === editorHasText) {
+      return;
+    }
+    editorHasText = next;
+    publishState();
+  }
+
+  function watchEditor(ctx) {
+    stopTerminalInput?.();
+    stopTerminalInput = undefined;
+    if (editorPoll) clearInterval(editorPoll);
+    editorUi = ctx?.ui;
+    try {
+      stopTerminalInput = editorUi?.onTerminalInput?.(() => {
+        setTimeout(checkEditor, 0);
+        return undefined;
+      });
+    } catch {
+      stopTerminalInput = undefined;
+    }
+    editorPoll = setInterval(checkEditor, 1000);
+    editorPoll.unref?.();
+    editorHasText = readEditorHasText();
+  }
 
   function desiredState() {
     if (blockedCount > 0) {
@@ -196,12 +250,13 @@ export default function (pi) {
 
   function publishState(force = false) {
     const next = desiredState();
-    if (!force && next.state === lastState && next.message === lastMessage) {
+    if (!force && next.state === lastState && next.message === lastMessage && editorHasText === lastEditorHasText) {
       return;
     }
     lastState = next.state;
     lastMessage = next.message;
-    queueState(next.state, next.message);
+    lastEditorHasText = editorHasText;
+    queueState(next.state, next.message, editorHasText);
   }
 
   const blockingToolCalls = new Set<string>();
@@ -263,6 +318,7 @@ export default function (pi) {
     }
     rootSession = true;
     updateSessionRef(ctx);
+    watchEditor(ctx);
     await reportSession(event?.reason);
     // A reload can replace this extension mid-run without emitting another agent_start.
     agentActive = ctx?.isIdle?.() === false;
@@ -277,6 +333,14 @@ export default function (pi) {
     void reportSession();
     agentActive = true;
     publishState();
+  });
+
+  pi.on("session_shutdown", () => {
+    stopTerminalInput?.();
+    stopTerminalInput = undefined;
+    if (editorPoll) clearInterval(editorPoll);
+    editorPoll = undefined;
+    editorUi = undefined;
   });
 
   pi.on("agent_settled", (_event, ctx) => {
