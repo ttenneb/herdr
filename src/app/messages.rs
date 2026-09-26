@@ -920,12 +920,12 @@ impl App {
             }
             Some(head)
         } else if let Some(wanted) = options.edit_pending.as_deref() {
-            // `--edit-pending` without a stableId edits the newest waiting
-            // message (pending is newest first).
+            // Contract (final): `--edit-pending <stableId>` names exactly one
+            // waiting message; there is no implicit "newest".
             match pending
                 .iter()
                 .copied()
-                .find(|head| wanted.is_empty() || head.stable_id == wanted)
+                .find(|head| head.stable_id == wanted)
             {
                 Some(head) => Some(head),
                 None => return Err(SendRefusal::PendingChanged(listed(&pending))),
@@ -1019,7 +1019,7 @@ pub(crate) fn pending_error_json(id: String, refusal: &SendRefusal) -> Option<St
     let (code, message, pending) = match refusal {
         SendRefusal::PendingExists(pending) => (
             "pending_exists",
-            "you already have messages waiting for this recipient; resend with --edit-pending (newest, or a stableId) or --send-new",
+            "you already have messages waiting for this recipient; resend with --edit-pending <stableId> (pending is newest first) or --send-new",
             pending,
         ),
         SendRefusal::PendingChanged(pending) => (

@@ -1666,11 +1666,11 @@ async fn the_backlog_sweep_wakes_a_sleeping_pane_with_queued_messages() {
         .any(|record| record["outcome"] == "duplicate"));
 }
 
-/// Accepted sender contract: after --send-new there are several waiting
-/// messages; --edit-pending without a stableId edits the NEWEST, and the
-/// refusal carries `newest` and `pendingCount` (plus the full `pending` list).
+/// Final sender contract (a6d1b1f8): error.pending is the array of waiting
+/// messages, newest first, and --edit-pending names one by stableId.
+/// `newest` and `pendingCount` are additive conveniences.
 #[tokio::test]
-async fn edit_pending_without_an_id_edits_the_newest_and_reports_the_count() {
+async fn edit_pending_needs_an_explicit_stable_id_and_the_pending_list_is_newest_first() {
     let mut fixture = fixture();
     let session = attach_recipient(&mut fixture);
     let recipient = fixture.terminals[1].clone();
@@ -1706,6 +1706,21 @@ async fn edit_pending_without_an_id_edits_the_newest_and_reports_the_count() {
     assert_eq!(json["error"]["pendingCount"], 3);
     assert_eq!(json["error"]["newest"]["stableId"], json!(ids[2]));
     assert_eq!(json["error"]["pending"][0], json["error"]["newest"]);
+    // No implicit "newest": an empty stableId matches nothing.
+    assert!(matches!(
+        fixture.app.route_ordinary_send(
+            &recipient,
+            &sender,
+            plain("no id"),
+            &MessageSendOptions {
+                edit_pending: Some(String::new()),
+                ..Default::default()
+            },
+        ),
+        Err(SendRefusal::PendingChanged(_))
+    ));
+    assert_eq!(json["error"]["pending"][0]["stableId"], json!(ids[2]));
+    assert_eq!(json["error"]["pending"][2]["stableId"], json!(ids[0]));
     let edited = fixture
         .app
         .route_ordinary_send(
@@ -1713,7 +1728,7 @@ async fn edit_pending_without_an_id_edits_the_newest_and_reports_the_count() {
             &sender,
             plain("newest, edited"),
             &MessageSendOptions {
-                edit_pending: Some(String::new()),
+                edit_pending: Some(ids[2].clone()),
                 expect_revision: Some(1),
                 ..Default::default()
             },
