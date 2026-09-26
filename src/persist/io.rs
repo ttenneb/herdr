@@ -61,8 +61,19 @@ impl SessionWriter {
                 "session writer lock is not private",
             ));
         }
-        if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
-            return Err(std::io::Error::last_os_error());
+        // A concurrent fork (any pane or helper spawn) briefly shares a just-
+        // released lock description until the child execs and CLOEXEC closes
+        // it. Retry that transient holder for a bounded interval; a live
+        // competing writer still fails closed afterwards.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(250);
+        while unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+            let error = std::io::Error::last_os_error();
+            if error.kind() != std::io::ErrorKind::WouldBlock
+                || std::time::Instant::now() >= deadline
+            {
+                return Err(error);
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
         }
         Ok(Arc::new(Self {
             _lock: lock,
@@ -492,6 +503,37 @@ mod tests {
     }
 
     #[cfg(unix)]
+    #[test]
+    fn session_writer_waits_out_a_transient_lock_holder_but_not_a_live_one() {
+        use std::os::fd::AsRawFd;
+        let path = temp_session_path("transient-writer");
+        drop(SessionWriter::acquire(&path).unwrap());
+        let lock_path = path.parent().unwrap().join(".session-writer.lock");
+        // Models a forked child that still shares a released description.
+        let transient = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&lock_path)
+            .unwrap();
+        assert_eq!(
+            unsafe { libc::flock(transient.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+            0
+        );
+        let releaser = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(40));
+            drop(transient);
+        });
+        let lease = SessionWriter::acquire(&path).expect("transient holder is waited out");
+        releaser.join().unwrap();
+        let started = std::time::Instant::now();
+        assert!(
+            SessionWriter::acquire(&path).is_err(),
+            "a live writer still wins"
+        );
+        assert!(started.elapsed() < std::time::Duration::from_secs(2));
+        drop(lease);
+    }
+
     #[test]
     fn exclusive_session_writer_denies_competing_stale_saver() {
         let path = temp_session_path("exclusive-writer");

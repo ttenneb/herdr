@@ -369,9 +369,13 @@ mod tests {
     use super::*;
 
     fn unique_dir() -> PathBuf {
+        // Parallel tests may read the same clock value; the process-wide
+        // counter keeps every test directory distinct.
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         std::env::temp_dir().join(format!(
-            "herdr-mailbox-bootstrap-{}-{}",
+            "herdr-mailbox-bootstrap-{}-{}-{}",
             std::process::id(),
+            NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .expect("clock after epoch")
