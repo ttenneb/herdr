@@ -229,8 +229,21 @@ pub struct MessageSendOptions {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct MessageDelivery {
     /// `mailbox`, `pty`, or `pty_deferred` (held while the recipient pane has
-    /// unsent human input; see `deferral_id`).
+    /// unsent human input; see `deferral_id`). Kept for compatibility; see
+    /// `method`.
     pub path: String,
+    /// How the message was delivered: `queued` (the pane's Messages queue),
+    /// `typed` (typed into the pane) or `pty_deferred` (held, typed later).
+    #[serde(default)]
+    pub method: String,
+    /// Why: `messages` for queued; for typed or held: `explicit_pty`,
+    /// `no_messages`, `not_pi`, `fallback_30s`, or `oversized`.
+    #[serde(default)]
+    pub reason: String,
+    /// Whether the sender can still edit it (a queued message not yet
+    /// picked up).
+    #[serde(default)]
+    pub editable: bool,
     /// For `pty_deferred`: the ID in the later `delivery.deferred_delivered`
     /// or `delivery.deferred_failed` event.
     #[serde(default, skip_serializing_if = "Option::is_none")]

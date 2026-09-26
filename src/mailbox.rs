@@ -73,6 +73,12 @@ pub struct ServerDelivery {
     /// ended Pi execution left in recovery: the original stable ID.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub retry_of: Option<String>,
+    /// Set on the history record of a message typed into the pane instead
+    /// of queued: why (`explicit_pty`, `no_messages`, `not_pi`,
+    /// `fallback_30s`, `oversized`). Such a head is settled at once with
+    /// `closedBy:"typed"` and is never claimable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub typed_reason: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]

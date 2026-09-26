@@ -274,10 +274,11 @@ impl App {
             );
         }
         let typed_ahead_of_queued = (queued_ahead > 0).then_some(queued_ahead);
+        let typed_reason = self.typed_reason(&terminal_id, params.send.transport);
+        let sender = self.attribute_sender(params.send.caller_pid);
         // Never type into the human's unsent draft: hold the delivery (in
         // order) until the pane's editor is clear.
         if self.typed_delivery_must_wait(&terminal_id) {
-            let sender = self.attribute_sender(params.send.caller_pid);
             let deferral_id = self.defer_typed_delivery(
                 terminal_id.clone(),
                 params.text.clone(),
@@ -285,6 +286,7 @@ impl App {
                 params.target.clone(),
                 sender,
                 "agent_prompt",
+                typed_reason.clone(),
             );
             let Some(agent) = self.agent_info(resolved.ws_idx, resolved.pane_id) else {
                 return agent_not_found(id, &params.target);
@@ -295,6 +297,9 @@ impl App {
                     agent,
                     delivery: Some(crate::api::schema::MessageDelivery {
                         path: "pty_deferred".into(),
+                        method: "pty_deferred".into(),
+                        reason: typed_reason.clone(),
+                        editable: false,
                         deferral_id: Some(deferral_id),
                         typed_ahead_of_queued,
                         stable_id: None,
@@ -310,6 +315,13 @@ impl App {
         {
             return encode_error(id, code, message);
         }
+        self.record_typed_delivery(
+            &terminal_id,
+            &sender,
+            &params.text,
+            &typed_reason,
+            "agent_prompt",
+        );
         let Some(agent) = self.agent_info(resolved.ws_idx, resolved.pane_id) else {
             return agent_not_found(id, &params.target);
         };
@@ -317,9 +329,12 @@ impl App {
             id,
             ResponseResult::AgentPrompted {
                 agent,
-                delivery: typed_ahead_of_queued.map(|queued| crate::api::schema::MessageDelivery {
+                delivery: Some(crate::api::schema::MessageDelivery {
                     path: "pty".into(),
-                    typed_ahead_of_queued: Some(queued),
+                    method: "typed".into(),
+                    reason: typed_reason,
+                    editable: false,
+                    typed_ahead_of_queued,
                     deferral_id: None,
                     stable_id: None,
                     revision: None,

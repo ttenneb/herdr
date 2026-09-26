@@ -27,6 +27,7 @@ pub(crate) fn retry_head(head: &MailboxHead, claim: &crate::mailbox::Claim) -> M
         recipient_session: None,
         correlation: None,
         retry_of: None,
+        typed_reason: None,
     });
     delivery.retry_of = Some(head.stable_id.clone());
     MailboxHead {
@@ -110,6 +111,7 @@ pub(crate) fn human_self_head(
             recipient_session,
             correlation: None,
             retry_of: None,
+            typed_reason: None,
         }),
     })
 }
@@ -355,6 +357,112 @@ fn sha256_fields(fields: &[&[u8]]) -> String {
 
 /// Text Pi's Messages path renders safely: bounded, no terminal or bidi
 /// controls (tab and newline are fine). Anything else keeps the PTY path.
+/// Writes the history record of a typed delivery (see
+/// `App::record_typed_delivery`): head, `typed:` claim, settled resolution
+/// with closedBy "typed". Only record kinds rc2 already reads.
+pub(crate) fn append_typed_history(
+    directory: &std::path::Path,
+    queue_key: &str,
+    recipient_terminal: &str,
+    sender: &SenderAttribution,
+    text: &str,
+    reason: &str,
+    origin: &'static str,
+) -> Result<(), String> {
+    let store = MailboxStore::open(directory).map_err(|error| error.to_string())?;
+    let recipient = pane_recipient(queue_key);
+    let stable_id = format!(
+        "typed.{}",
+        crate::platform::random_route_epoch().unwrap_or_else(|| sha256_fields(&[
+            text.as_bytes(),
+            &now_secs().to_be_bytes()
+        ])[..32]
+            .to_string())
+    );
+    // History text: control characters (other than newline and tab) are
+    // shown as spaces, and the body is capped to Messages limits.
+    let mut body: String = text
+        .chars()
+        .map(|ch| {
+            if (ch.is_control() && ch != '\n' && ch != '\t')
+                || matches!(ch, '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}')
+            {
+                ' '
+            } else {
+                ch
+            }
+        })
+        .collect();
+    while body.len() > MAX_BODY_BYTES {
+        body.pop();
+    }
+    if body.trim().is_empty() {
+        body = "(empty)".into();
+    }
+    let subject = subject_for("Typed from", &sender.label);
+    let sender_key = sender
+        .terminal
+        .clone()
+        .or_else(|| sender.external_key.clone())
+        .unwrap_or_else(|| "external".into());
+    let digest = sha256_fields(&[
+        stable_id.as_bytes(),
+        &1_u64.to_be_bytes(),
+        subject.as_bytes(),
+        body.as_bytes(),
+    ]);
+    let head = MailboxHead {
+        delivery_digest: sha256_fields(&[b"herdr-typed-delivery", stable_id.as_bytes()]),
+        stable_id: stable_id.clone(),
+        revision: 1,
+        digest: digest.clone(),
+        recipient_generation: recipient.generation.clone(),
+        recipient: recipient.clone(),
+        subject,
+        body,
+        sender: sender_key.clone(),
+        target: recipient_terminal.to_string(),
+        grant_id: format!("typed:{sender_key}"),
+        message_id: stable_id.clone(),
+        kind: "advisory".into(),
+        priority: "normal".into(),
+        original_sequence: 1,
+        enqueue_epoch: 0,
+        accepted_at: now_secs(),
+        delivery: Some(crate::mailbox::ServerDelivery {
+            origin: origin.into(),
+            sender_label: sender.label.clone(),
+            sender_session: sender.session.clone(),
+            recipient_session: None,
+            correlation: None,
+            retry_of: None,
+            typed_reason: Some(reason.to_string()),
+        }),
+    };
+    store
+        .append_offline_head(head)
+        .map_err(|error| format!("{error:?}"))?;
+    let claim_id = format!("typed:{stable_id}");
+    store
+        .claim(crate::mailbox::Claim {
+            claim_id: claim_id.clone(),
+            recipient,
+            stable_id,
+            revision: 1,
+            digest,
+            execution: None,
+        })
+        .map_err(|error| format!("{error:?}"))?;
+    store
+        .resolve_claim_closed_by(
+            &claim_id,
+            crate::mailbox::ClaimResolutionOutcome::Settled,
+            Some("typed"),
+        )
+        .map_err(|error| format!("{error:?}"))?;
+    Ok(())
+}
+
 pub(crate) fn mailbox_safe_text(subject: &str, body: &str) -> bool {
     let clean = |text: &str| {
         !text.chars().any(|ch| {
@@ -1061,6 +1169,9 @@ impl App {
                 deferral_id: None,
                 typed_ahead_of_queued: None,
                 path: "mailbox".into(),
+                method: "queued".into(),
+                reason: "messages".into(),
+                editable: !recovered.claims.contains_key(&existing.stable_id),
                 stable_id: Some(existing.stable_id.clone()),
                 revision: Some(existing.revision),
                 edited: false,
@@ -1162,6 +1273,9 @@ impl App {
                 deferral_id: None,
                 typed_ahead_of_queued: None,
                 path: "mailbox".into(),
+                method: "queued".into(),
+                reason: "messages".into(),
+                editable: true,
                 stable_id: Some(edited.stable_id),
                 revision: Some(edited.revision),
                 edited: true,
@@ -1201,6 +1315,7 @@ impl App {
                 recipient_session,
                 correlation: message.correlation,
                 retry_of: None,
+                typed_reason: None,
             }),
         };
         let receipt = store
@@ -1210,6 +1325,9 @@ impl App {
             deferral_id: None,
             typed_ahead_of_queued: None,
             path: "mailbox".into(),
+            method: "queued".into(),
+            reason: "messages".into(),
+            editable: true,
             stable_id: Some(receipt.stable_id),
             revision: Some(receipt.revision),
             edited: false,
