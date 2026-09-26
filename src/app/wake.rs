@@ -1089,7 +1089,11 @@ mod tests {
         }
         let second = prompt(&mut app, "owner", "second task");
         assert_eq!(second["result"]["delivery"]["path"], "mailbox", "{second}");
-        assert_eq!(wake_records(&app), 2, "the second append coalesces once");
+        assert_eq!(
+            wake_records(&app),
+            1,
+            "a wake is outstanding: the second append makes no wake call"
+        );
         assert_eq!(
             app.pane_wakes[&terminal].wake_id, outstanding.wake_id,
             "coalesced"

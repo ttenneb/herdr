@@ -185,6 +185,41 @@ fn dispatch(
     app.dispatch_mailbox_bootstrap(session, method, params)
 }
 
+pub(crate) fn scoped_test_head(
+    stable_id: &str,
+    sender: &str,
+    recipient: &crate::mailbox::RecipientKey,
+    digest_char: char,
+) -> crate::mailbox::MailboxHead {
+    crate::mailbox::MailboxHead {
+        stable_id: stable_id.into(),
+        revision: 1,
+        digest: digest_char.to_string().repeat(64),
+        delivery_digest: format!("{stable_id}-delivery")
+            .bytes()
+            .map(|b| format!("{:x}", b % 16))
+            .collect::<String>()
+            .chars()
+            .chain(std::iter::repeat('0'))
+            .take(64)
+            .collect(),
+        recipient: recipient.clone(),
+        subject: "original".into(),
+        body: "original body".into(),
+        recipient_generation: recipient.generation.clone(),
+        sender: sender.into(),
+        target: recipient.recipient_id.clone(),
+        grant_id: format!("test-grant-{stable_id}"),
+        message_id: format!("message-{stable_id}"),
+        kind: "advisory".into(),
+        priority: "normal".into(),
+        original_sequence: 1,
+        enqueue_epoch: 0,
+        accepted_at: 1,
+        delivery: None,
+    }
+}
+
 fn snapshot_heads(app: &mut App, session: &MailboxBootstrapSession) -> Vec<serde_json::Value> {
     let value = dispatch(
         app,
@@ -1580,9 +1615,11 @@ async fn a_message_for_a_sleeping_pane_wakes_it_by_its_durable_key() {
     fixture
         .app
         .request_pane_wake_if_detached(&fixture.terminals[1].clone(), "second");
-    assert!(wake_records(&fixture)
-        .iter()
-        .any(|record| record["outcome"] == "duplicate"));
+    // The second message joins the outstanding wake without another call:
+    // one wake, one durable record, no duplicate records.
+    let records = wake_records(&fixture);
+    assert_eq!(records.len(), 1, "{records:?}");
+    assert!(fixture.app.pane_wakes.contains_key(&terminal_id));
 }
 
 /// A pane that is not asleep (hand-quit Pi, hand-typed pi, helper) is never
@@ -1661,16 +1698,15 @@ async fn the_backlog_sweep_wakes_a_sleeping_pane_with_queued_messages() {
     fixture
         .app
         .maybe_sweep_sleeping_backlog(start + std::time::Duration::from_secs(40));
-    assert!(wake_records(&fixture)
-        .iter()
-        .any(|record| record["outcome"] == "duplicate"));
+    // A repeat sweep while the wake is outstanding writes no record.
+    assert_eq!(wake_records(&fixture).len(), 1);
 }
 
-/// Accepted sender contract: after --send-new there are several waiting
-/// messages; --edit-pending without a stableId edits the NEWEST, and the
-/// refusal carries `newest` and `pendingCount` (plus the full `pending` list).
+/// Final sender contract (a6d1b1f8): error.pending is the array of waiting
+/// messages, newest first, and --edit-pending names one by stableId.
+/// `newest` and `pendingCount` are additive conveniences.
 #[tokio::test]
-async fn edit_pending_without_an_id_edits_the_newest_and_reports_the_count() {
+async fn edit_pending_needs_an_explicit_stable_id_and_the_pending_list_is_newest_first() {
     let mut fixture = fixture();
     let session = attach_recipient(&mut fixture);
     let recipient = fixture.terminals[1].clone();
@@ -1706,6 +1742,21 @@ async fn edit_pending_without_an_id_edits_the_newest_and_reports_the_count() {
     assert_eq!(json["error"]["pendingCount"], 3);
     assert_eq!(json["error"]["newest"]["stableId"], json!(ids[2]));
     assert_eq!(json["error"]["pending"][0], json["error"]["newest"]);
+    // No implicit "newest": an empty stableId matches nothing.
+    assert!(matches!(
+        fixture.app.route_ordinary_send(
+            &recipient,
+            &sender,
+            plain("no id"),
+            &MessageSendOptions {
+                edit_pending: Some(String::new()),
+                ..Default::default()
+            },
+        ),
+        Err(SendRefusal::PendingChanged(_))
+    ));
+    assert_eq!(json["error"]["pending"][0]["stableId"], json!(ids[2]));
+    assert_eq!(json["error"]["pending"][2]["stableId"], json!(ids[0]));
     let edited = fixture
         .app
         .route_ordinary_send(
@@ -1713,7 +1764,7 @@ async fn edit_pending_without_an_id_edits_the_newest_and_reports_the_count() {
             &sender,
             plain("newest, edited"),
             &MessageSendOptions {
-                edit_pending: Some(String::new()),
+                edit_pending: Some(ids[2].clone()),
                 expect_revision: Some(1),
                 ..Default::default()
             },
@@ -1844,6 +1895,30 @@ async fn a_second_accepted_stream_never_revokes_the_first() {
         .accept_mailbox_bootstrap_stream(pair.0.as_raw_fd())
         .expect("second stream accepted");
     assert_ne!(second.binding_generation, first.binding_generation);
+    // This fixture is a hand-typed Pi: both streams are recipient-only and
+    // both advertise the watch.
+    for session in [&first, &second] {
+        assert!(session.recipient_only.is_some());
+        let descriptor = crate::server::mailbox_bootstrap::descriptor_value(session);
+        assert_eq!(descriptor["binding"], "recipient_only");
+        assert_eq!(descriptor["messages"]["watchMethod"], "mailbox.watch");
+        assert_eq!(descriptor["messages"]["watchMaxWaitMs"], 30000);
+    }
+    // The watch stream sees the next append while the first stays current.
+    let watched = fixture.app.mailbox_watch_marker(&second).unwrap();
+    fixture
+        .app
+        .route_ordinary_send(
+            &recipient,
+            &sender,
+            plain("two"),
+            &MessageSendOptions {
+                send_new: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    assert_ne!(fixture.app.mailbox_watch_marker(&second).unwrap(), watched);
     assert!(fixture
         .app
         .mailbox_bootstrap_session_current(&first)
@@ -2013,4 +2088,73 @@ async fn watch_marker_changes_on_every_append_and_bindings_release() {
         .app
         .attached_messages_recipient(&recipient)
         .is_none());
+}
+
+/// Authority scope on the Messages stream (the same code serves managed and
+/// recipient-only sessions): edit, drop, reprioritize, retry and resolve of
+/// a head addressed to another pane are refused and change nothing.
+#[tokio::test]
+async fn a_stream_never_touches_another_panes_heads() {
+    let mut fixture = fixture();
+    let x = attach_recipient(&mut fixture);
+    let y = crate::mailbox::RecipientKey {
+        recipient_id: fixture.terminals[0].clone(),
+        generation: "1".into(),
+    };
+    let store = crate::mailbox::MailboxStore::open(&fixture.app.sender_authority_dir).unwrap();
+    store
+        .append_offline_head(scoped_test_head("for-y", "term_z", &y, 'b'))
+        .unwrap();
+    let before = store.load().unwrap();
+    let protocol = crate::mailbox_v1::PROTOCOL;
+    for (method, params) in [
+        (
+            "mailbox.edit",
+            json!({"protocol": protocol, "stableId": "for-y", "revision": 1,
+                   "digest": "b".repeat(64), "subject": "tampered", "body": "tampered"}),
+        ),
+        (
+            "mailbox.drop",
+            json!({"protocol": protocol, "stableId": "for-y", "expectedRevision": 1}),
+        ),
+        (
+            "mailbox.reprioritize",
+            json!({"protocol": protocol, "stableId": "for-y", "expectedRevision": 1, "priority": "high"}),
+        ),
+        (
+            "mailbox.retry",
+            json!({"protocol": protocol, "stableId": "for-y", "expectedRevision": 1}),
+        ),
+    ] {
+        assert!(
+            matches!(
+                dispatch(&mut fixture.app, &x, method, params),
+                Err(crate::app::MailboxBootstrapError::HeadOutOfScope)
+            ),
+            "{method} must refuse a head addressed to another pane"
+        );
+    }
+    // A claim held in Y's inbox cannot be resolved from X's stream either.
+    store
+        .claim(crate::mailbox::Claim {
+            claim_id: "y-claim".into(),
+            stable_id: "for-y".into(),
+            revision: 1,
+            digest: "b".repeat(64),
+            recipient: y.clone(),
+            execution: None,
+        })
+        .unwrap();
+    assert!(matches!(
+        dispatch(
+            &mut fixture.app,
+            &x,
+            "mailbox.resolve",
+            json!({"protocol": protocol, "claimId": "y-claim", "outcome": "settled"}),
+        ),
+        Err(crate::app::MailboxBootstrapError::HeadOutOfScope)
+    ));
+    let after = store.load().unwrap();
+    assert_eq!(after.heads, before.heads, "nothing was changed");
+    assert!(after.resolutions.is_empty());
 }

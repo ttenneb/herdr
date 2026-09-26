@@ -434,6 +434,16 @@ impl App {
                 )
                 .map_err(|_| MailboxBootstrapError::GrantMissing)
             };
+            // Scope: a head (or claim) that exists outside this pane's own
+            // inbox is refused with a distinct error and never touched.
+            let in_scope = |stable_id: &str| -> Result<(), MailboxBootstrapError> {
+                match load()?.heads.get(stable_id) {
+                    Some(head) if !recipients.contains(&head.recipient) => {
+                        Err(MailboxBootstrapError::HeadOutOfScope)
+                    }
+                    _ => Ok(()),
+                }
+            };
             let protocol_ok = |protocol: &str| {
                 (protocol == crate::mailbox_v1::PROTOCOL)
                     .then_some(())
@@ -451,6 +461,7 @@ impl App {
                     let params: HeadVersionParams = serde_json::from_value(params.clone())
                         .map_err(|_| MailboxBootstrapError::InvalidRequest)?;
                     protocol_ok(&params.protocol)?;
+                    in_scope(&params.stable_id)?;
                     let recovered = load()?;
                     let head = recovered
                         .heads
@@ -524,6 +535,7 @@ impl App {
                     let params: ReprioritizeParams = serde_json::from_value(params.clone())
                         .map_err(|_| MailboxBootstrapError::InvalidRequest)?;
                     protocol_ok(&params.protocol)?;
+                    in_scope(&params.stable_id)?;
                     if !matches!(params.priority.as_str(), "low" | "normal" | "high") {
                         return Err(MailboxBootstrapError::InvalidRequest);
                     }
@@ -646,6 +658,7 @@ impl App {
                     let edit: crate::mailbox_v1::Edit = serde_json::from_value(params.clone())
                         .map_err(|_| MailboxBootstrapError::InvalidRequest)?;
                     // Own pane inbox only.
+                    in_scope(&edit.stable_id)?;
                     if !load()?
                         .heads
                         .get(&edit.stable_id)
@@ -664,6 +677,11 @@ impl App {
                         serde_json::from_value(params.clone())
                             .map_err(|_| MailboxBootstrapError::InvalidRequest)?;
                     let recovered = load()?;
+                    if recovered.claims.values().any(|claim| {
+                        claim.claim_id == resolve.claim_id && !recipients.contains(&claim.recipient)
+                    }) {
+                        return Err(MailboxBootstrapError::HeadOutOfScope);
+                    }
                     let claim = recovered
                         .claims
                         .values()
@@ -706,6 +724,7 @@ impl App {
                     let params: HeadVersionParams = serde_json::from_value(params.clone())
                         .map_err(|_| MailboxBootstrapError::InvalidRequest)?;
                     protocol_ok(&params.protocol)?;
+                    in_scope(&params.stable_id)?;
                     let recovered = load()?;
                     let head = recovered
                         .heads
@@ -846,6 +865,16 @@ impl App {
                 "mailbox_caller_mismatch",
                 "caller selector does not match the authenticated local sender",
             ),
+            Err(crate::app::mailbox::OfflineMailboxError::HeadOutOfScope) => encode_error(
+                id,
+                "mailbox_head_out_of_scope",
+                "that message is neither in your own inbox nor one you sent to this recipient; nothing was changed",
+            ),
+            Err(crate::app::mailbox::OfflineMailboxError::NotRecipient) => encode_error(
+                id,
+                "mailbox_not_recipient",
+                "a send grant cannot claim, resolve or read another recipient's messages",
+            ),
             Err(crate::app::mailbox::OfflineMailboxError::CapabilityMismatch) => encode_error(
                 id,
                 "mailbox_capability_mismatch",
@@ -899,6 +928,16 @@ impl App {
                 "mailbox_caller_mismatch",
                 "caller selector does not match the authenticated local sender",
             ),
+            Err(crate::app::mailbox::OfflineMailboxError::HeadOutOfScope) => encode_error(
+                id,
+                "mailbox_head_out_of_scope",
+                "that message is neither in your own inbox nor one you sent to this recipient; nothing was changed",
+            ),
+            Err(crate::app::mailbox::OfflineMailboxError::NotRecipient) => encode_error(
+                id,
+                "mailbox_not_recipient",
+                "a send grant cannot claim, resolve or read another recipient's messages",
+            ),
             Err(crate::app::mailbox::OfflineMailboxError::CapabilityMismatch) => encode_error(
                 id,
                 "mailbox_capability_mismatch",
@@ -942,6 +981,16 @@ impl App {
                 id,
                 "mailbox_caller_mismatch",
                 "caller selector does not match the authenticated local sender",
+            ),
+            Err(crate::app::mailbox::OfflineMailboxError::HeadOutOfScope) => encode_error(
+                id,
+                "mailbox_head_out_of_scope",
+                "that message is neither in your own inbox nor one you sent to this recipient; nothing was changed",
+            ),
+            Err(crate::app::mailbox::OfflineMailboxError::NotRecipient) => encode_error(
+                id,
+                "mailbox_not_recipient",
+                "a send grant cannot claim, resolve or read another recipient's messages",
             ),
             Err(crate::app::mailbox::OfflineMailboxError::CapabilityMismatch) => encode_error(
                 id,
@@ -990,6 +1039,16 @@ impl App {
                 id,
                 "mailbox_caller_mismatch",
                 "caller selector does not match the authenticated local sender",
+            ),
+            Err(crate::app::mailbox::OfflineMailboxError::HeadOutOfScope) => encode_error(
+                id,
+                "mailbox_head_out_of_scope",
+                "that message is neither in your own inbox nor one you sent to this recipient; nothing was changed",
+            ),
+            Err(crate::app::mailbox::OfflineMailboxError::NotRecipient) => encode_error(
+                id,
+                "mailbox_not_recipient",
+                "a send grant cannot claim, resolve or read another recipient's messages",
             ),
             Err(crate::app::mailbox::OfflineMailboxError::CapabilityMismatch) => encode_error(
                 id,
@@ -1045,6 +1104,16 @@ impl App {
                 id,
                 "mailbox_caller_mismatch",
                 "caller selector does not match the authenticated local sender",
+            ),
+            Err(crate::app::mailbox::OfflineMailboxError::HeadOutOfScope) => encode_error(
+                id,
+                "mailbox_head_out_of_scope",
+                "that message is neither in your own inbox nor one you sent to this recipient; nothing was changed",
+            ),
+            Err(crate::app::mailbox::OfflineMailboxError::NotRecipient) => encode_error(
+                id,
+                "mailbox_not_recipient",
+                "a send grant cannot claim, resolve or read another recipient's messages",
             ),
             Err(crate::app::mailbox::OfflineMailboxError::CapabilityMismatch) => encode_error(
                 id,
@@ -1530,6 +1599,153 @@ mod tests {
         assert_eq!(durable.receipts[&head.delivery_digest].revision, 2);
         drop(app);
         std::fs::remove_dir_all(directory).expect("remove mailbox directory");
+    }
+
+    /// Authority scope on the API path: a recipient edits only its own
+    /// inbox; a sender edits only heads it sent to the named recipient; a
+    /// send grant never claims, resolves or reads the recipient's messages.
+    /// Every refusal has a distinct code and changes nothing.
+    #[test]
+    fn mailbox_api_never_touches_heads_outside_the_callers_scope() {
+        let (mut app, _pane_id, x, directory) = app_with_active_sender();
+        let y = RecipientKey {
+            recipient_id: "term_y".into(),
+            generation: "1".into(),
+        };
+        let w = RecipientKey {
+            recipient_id: "term_w".into(),
+            generation: "1".into(),
+        };
+        let store = crate::mailbox::MailboxStore::open(&directory).unwrap();
+        // Z's message to Y, and Y's message to W: neither involves X.
+        store
+            .append_offline_head(crate::app::api::messages_tests::scoped_test_head(
+                "z-to-y", "term_z", &y, 'b',
+            ))
+            .unwrap();
+        store
+            .append_offline_head(crate::app::api::messages_tests::scoped_test_head(
+                "y-to-w", "term_y", &w, 'c',
+            ))
+            .unwrap();
+        let before = store.load().unwrap();
+        let edit_with = |grant: &str, recipient: &RecipientKey, stable_id: &str, digest: char| {
+            Method::MailboxEdit(crate::api::schema::MailboxEditParams {
+                caller: x.clone(),
+                grant_id: grant.into(),
+                recipient: recipient.clone(),
+                edit: crate::mailbox_v1::Edit {
+                    protocol: PROTOCOL.into(),
+                    stable_id: stable_id.into(),
+                    revision: 1,
+                    digest: digest.to_string().repeat(64),
+                    subject: "tampered".into(),
+                    body: "tampered".into(),
+                },
+            })
+        };
+        let code = |app: &mut App, method: Method| {
+            let response = app.handle_api_request(Request {
+                id: "scope".into(),
+                method,
+            });
+            serde_json::from_str::<ErrorResponse>(&response)
+                .unwrap_or_else(|_| panic!("expected a refusal: {response}"))
+                .error
+                .code
+        };
+        let own = format!("offline:{x}:1");
+        let own_recipient = active_recipient(&x);
+        // X, through its own inbox grant, edits a head addressed to Y.
+        assert_eq!(
+            code(&mut app, edit_with(&own, &own_recipient, "z-to-y", 'b')),
+            "mailbox_head_out_of_scope"
+        );
+        // X edits a head Y sent (to W).
+        assert_eq!(
+            code(&mut app, edit_with(&own, &own_recipient, "y-to-w", 'c')),
+            "mailbox_head_out_of_scope"
+        );
+        // With a send grant to Y, X still cannot edit Z's message to Y.
+        let to_y = app
+            .provision_cross_recipient_mailbox_grant(&x, y.clone())
+            .unwrap();
+        assert_eq!(
+            code(&mut app, edit_with(&to_y, &y, "z-to-y", 'b')),
+            "mailbox_head_out_of_scope"
+        );
+        assert_eq!(
+            store.load().unwrap().heads,
+            before.heads,
+            "no refused edit changed anything"
+        );
+        // ...nor claim, resolve or read Y's inbox through the send grant.
+        assert_eq!(
+            code(
+                &mut app,
+                Method::MailboxClaim(crate::api::schema::MailboxClaimParams {
+                    caller: x.clone(),
+                    grant_id: to_y.clone(),
+                    recipient: y.clone(),
+                    claim: ClaimRequest {
+                        protocol: PROTOCOL.into(),
+                    },
+                })
+            ),
+            "mailbox_not_recipient"
+        );
+        assert!(store.load().unwrap().claims.is_empty());
+        assert_eq!(
+            code(
+                &mut app,
+                Method::MailboxResolve(crate::api::schema::MailboxResolveParams {
+                    caller: x.clone(),
+                    grant_id: to_y.clone(),
+                    recipient: y.clone(),
+                    resolve: Resolve {
+                        protocol: PROTOCOL.into(),
+                        claim_id: "any".into(),
+                        outcome: ResolveOutcome::Settled,
+                    },
+                })
+            ),
+            "mailbox_not_recipient"
+        );
+        // X's own message to Y is editable through the send grant, and the
+        // send-grant view shows only X's own messages.
+        let submitted = app.handle_api_request(Request {
+            id: "x-to-y".into(),
+            method: Method::MailboxOfflineSubmit(submit(
+                x.clone(),
+                to_y.clone(),
+                y.clone(),
+                "9".repeat(64),
+            )),
+        });
+        assert!(
+            serde_json::from_str::<SuccessResponse>(&submitted).is_ok(),
+            "{submitted}"
+        );
+        let edited = app.handle_api_request(Request {
+            id: "edit-own".into(),
+            method: edit_with(&to_y, &y, "stable-1", 'a'),
+        });
+        let edited: SuccessResponse = serde_json::from_str(&edited).expect("own edit");
+        let ResponseResult::MailboxEdited { snapshot } = edited.result else {
+            panic!("edited")
+        };
+        assert_eq!(
+            snapshot
+                .heads
+                .iter()
+                .map(|head| head.stable_id.as_str())
+                .collect::<Vec<_>>(),
+            ["stable-1"],
+            "the send-grant view hides Z's message to Y"
+        );
+        assert_eq!(snapshot.heads[0].revision, 2);
+        drop(app);
+        std::fs::remove_dir_all(directory).ok();
     }
 
     #[test]
