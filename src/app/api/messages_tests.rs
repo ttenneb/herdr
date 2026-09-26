@@ -970,6 +970,69 @@ async fn queued_messages_survive_a_server_restart_and_arrive_exactly_once() {
     std::fs::remove_dir_all(&after.directory).ok();
 }
 
+/// The human's busy-time typing joins the same queue as a server head, only
+/// in the typing pane's own inbox, for managed and receive-only bindings.
+#[tokio::test]
+async fn enqueue_self_queues_only_into_the_own_pane_inbox() {
+    let mut fixture = fixture();
+    let session = attach_recipient(&mut fixture);
+    assert!(session.recipient_only.is_some(), "allowed for receive-only");
+    let queue_key = fixture.app.pane_queue_key(&fixture.terminals[1]).unwrap();
+    let enqueue = |app: &mut App, body: &str, client: &str| {
+        dispatch(
+            app,
+            &session,
+            "mailbox.enqueue_self",
+            json!({"protocol": crate::mailbox_v1::PROTOCOL, "subject": "Typed while busy",
+                   "body": body, "priority": "normal", "clientId": client}),
+        )
+    };
+    let first = enqueue(&mut fixture.app, "fix the test first", "typed-1").unwrap();
+    assert_eq!(first["type"], "mailbox_enqueued");
+    assert_eq!(first["duplicate"], false);
+    assert_eq!(first["receipt"]["status"], "admitted");
+    // A retry with the same clientId never queues twice.
+    let again = enqueue(&mut fixture.app, "fix the test first", "typed-1").unwrap();
+    assert_eq!(again["duplicate"], true);
+    assert_eq!(again["stableId"], first["stableId"]);
+    let heads = snapshot_heads(&mut fixture.app, &session);
+    assert_eq!(heads.len(), 1);
+    assert_eq!(
+        heads[0]["recipient"]["recipientId"],
+        format!("pane:{queue_key}")
+    );
+    assert_eq!(
+        heads[0]["sender"],
+        format!("human@{}", fixture.terminals[1])
+    );
+    assert_eq!(heads[0]["delivery"]["origin"], "human_typed");
+    assert_eq!(heads[0]["delivery"]["senderLabel"], "human at pane");
+    // No selector can point it anywhere else, and bad input is refused.
+    for params in [
+        json!({"protocol": crate::mailbox_v1::PROTOCOL, "subject": "s", "body": "b",
+               "recipient": {"recipientId": format!("pane:{}", fixture.app.pane_queue_key(&fixture.terminals[0]).unwrap()), "generation": "1"}}),
+        json!({"protocol": crate::mailbox_v1::PROTOCOL, "subject": "s", "body": "b", "target": fixture.terminals[0]}),
+        json!({"protocol": crate::mailbox_v1::PROTOCOL, "subject": "s", "body": "b", "priority": "urgent"}),
+        json!({"protocol": crate::mailbox_v1::PROTOCOL, "subject": "s", "body": "\u{1b}[2J"}),
+    ] {
+        assert!(dispatch(&mut fixture.app, &session, "mailbox.enqueue_self", params).is_err());
+    }
+    let recovered = crate::mailbox::MailboxStore::open(&fixture.directory)
+        .unwrap()
+        .load()
+        .unwrap();
+    assert_eq!(recovered.heads.len(), 1, "nothing reached another pane");
+    // It runs in the same order as every other head: the Pi claims it.
+    let claim = dispatch(
+        &mut fixture.app,
+        &session,
+        "mailbox.claim",
+        json!({"protocol": crate::mailbox_v1::PROTOCOL}),
+    )
+    .unwrap();
+    assert_eq!(claim["claim"]["stableId"], first["stableId"]);
+}
+
 #[tokio::test]
 async fn a_second_accepted_stream_never_revokes_the_first() {
     let mut fixture = fixture();

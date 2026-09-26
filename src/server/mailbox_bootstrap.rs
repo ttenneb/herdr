@@ -73,6 +73,8 @@ pub(crate) struct MessagesAdvertisement {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub inbox: Option<crate::mailbox::RecipientKey>,
     pub drop_method: &'static str,
+    /// The human's own typing at this pane, queued in this pane's inbox only.
+    pub enqueue_self_method: &'static str,
     pub protocol: &'static str,
 }
 
@@ -137,6 +139,7 @@ impl MailboxBootstrapDescriptor {
                 watch_max_wait_ms: MAX_WATCH_TIMEOUT_MS,
                 inbox: session.pane_inbox.clone(),
                 drop_method: "mailbox.drop",
+                enqueue_self_method: "mailbox.enqueue_self",
                 protocol: crate::mailbox_v1::PROTOCOL,
             }),
             parent_report: session
@@ -943,6 +946,19 @@ mod tests {
                    "params":{"protocol":crate::mailbox_v1::PROTOCOL}}),
         );
         assert_eq!(still["ok"], true, "{still}");
+        // A managed binding may self-enqueue into its own pane inbox too.
+        assert_eq!(
+            descriptor["result"]["messages"]["enqueueSelfMethod"],
+            "mailbox.enqueue_self"
+        );
+        let typed = exchange(
+            &mut listener,
+            &mut app,
+            &mut client,
+            json!({"method":"mailbox.enqueue_self","requestId":"self-1","bindingGeneration":binding,
+                   "params":{"protocol":crate::mailbox_v1::PROTOCOL,"subject":"Typed","body":"typed while busy"}}),
+        );
+        assert_eq!(typed["result"]["type"], "mailbox_enqueued", "{typed}");
         drop(second);
         listener.poll(&mut app).unwrap();
         assert!(app.attached_messages_recipient(&sender).is_some());

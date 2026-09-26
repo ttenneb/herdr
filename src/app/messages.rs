@@ -13,6 +13,71 @@ use crate::mailbox::{
     ServerDelivery,
 };
 
+/// A head for the human's own typing at a pane (`mailbox.enqueue_self`):
+/// addressed to that pane's inbox only, sender `human@<terminal>`. The same
+/// `clientId` yields the same stable ID, so a retry never queues twice.
+pub(crate) fn human_self_head(
+    inbox: &RecipientKey,
+    terminal_key: &str,
+    subject: String,
+    body: String,
+    priority: String,
+    client_id: Option<String>,
+    recipient_session: Option<String>,
+) -> Option<MailboxHead> {
+    if !matches!(priority.as_str(), "low" | "normal" | "high")
+        || !mailbox_safe_text(&subject, &body)
+        || client_id
+            .as_ref()
+            .is_some_and(|id| id.is_empty() || id.len() > 128 || id.chars().any(char::is_control))
+    {
+        return None;
+    }
+    let sender = format!("human@{terminal_key}");
+    let message_id = client_id
+        .or_else(crate::platform::random_route_epoch)
+        .unwrap_or_else(|| format!("self-{}", now_secs()));
+    let stable_id = format!(
+        "self.{}",
+        &sha256_fields(&[
+            inbox.recipient_id.as_bytes(),
+            sender.as_bytes(),
+            message_id.as_bytes()
+        ])[..32]
+    );
+    Some(MailboxHead {
+        digest: sha256_fields(&[
+            stable_id.as_bytes(),
+            &1_u64.to_be_bytes(),
+            subject.as_bytes(),
+            body.as_bytes(),
+        ]),
+        delivery_digest: sha256_fields(&[b"herdr-self-delivery", stable_id.as_bytes()]),
+        stable_id,
+        revision: 1,
+        recipient_generation: inbox.generation.clone(),
+        recipient: inbox.clone(),
+        subject,
+        body,
+        sender: sender.clone(),
+        target: terminal_key.to_string(),
+        grant_id: format!("self:{terminal_key}"),
+        message_id,
+        kind: "advisory".into(),
+        priority,
+        original_sequence: 1,
+        enqueue_epoch: 0,
+        accepted_at: now_secs(),
+        delivery: Some(ServerDelivery {
+            origin: "human_typed".into(),
+            sender_label: "human at pane".into(),
+            sender_session: None,
+            recipient_session,
+            correlation: None,
+        }),
+    })
+}
+
 /// Pi's per-head limits for the Messages path; larger sends use the PTY path.
 const MAX_SUBJECT_BYTES: usize = 160;
 const MAX_BODY_BYTES: usize = 16_384;

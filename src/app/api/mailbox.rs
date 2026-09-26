@@ -394,6 +394,7 @@ impl App {
                 | "mailbox.edit"
                 | "mailbox.resolve"
                 | "mailbox.drop"
+                | "mailbox.enqueue_self"
         ) {
             return None;
         }
@@ -426,6 +427,64 @@ impl App {
                 serde_json::to_value(result).map_err(|_| MailboxBootstrapError::InvalidRequest)
             };
             match method {
+                "mailbox.enqueue_self" => {
+                    // The human's own typing at this pane, queued in this
+                    // pane's inbox only. No recipient selector exists, so it
+                    // cannot reach any other pane, and it grants nothing.
+                    #[derive(serde::Deserialize)]
+                    #[serde(rename_all = "camelCase", deny_unknown_fields)]
+                    struct EnqueueSelfParams {
+                        protocol: String,
+                        subject: String,
+                        body: String,
+                        #[serde(default)]
+                        priority: Option<String>,
+                        #[serde(default)]
+                        client_id: Option<String>,
+                    }
+                    let params: EnqueueSelfParams = serde_json::from_value(params.clone())
+                        .map_err(|_| MailboxBootstrapError::InvalidRequest)?;
+                    protocol_ok(&params.protocol)?;
+                    let inbox = session
+                        .pane_inbox
+                        .clone()
+                        .ok_or(MailboxBootstrapError::GrantMissing)?;
+                    let head = crate::app::messages::human_self_head(
+                        &inbox,
+                        &session.caller,
+                        params.subject,
+                        params.body,
+                        params.priority.unwrap_or_else(|| "normal".into()),
+                        params.client_id,
+                        current.clone(),
+                    )
+                    .ok_or(MailboxBootstrapError::InvalidRequest)?;
+                    let stable_id = head.stable_id.clone();
+                    let existing = load()?
+                        .heads
+                        .get(&stable_id)
+                        .map(|existing| existing.delivery_digest.clone());
+                    let duplicate = existing.is_some();
+                    let receipt = match existing {
+                        // A retried clientId: the original head and receipt.
+                        Some(delivery_digest) => load()?
+                            .receipts
+                            .get(&delivery_digest)
+                            .cloned()
+                            .ok_or(MailboxBootstrapError::GrantMissing)?,
+                        None => store
+                            .append_offline_head(head)
+                            .map_err(|_| MailboxBootstrapError::InvalidRequest)?,
+                    };
+                    Ok(serde_json::json!({
+                        "type": "mailbox_enqueued",
+                        "stableId": stable_id,
+                        "revision": receipt.revision,
+                        "duplicate": duplicate,
+                        "receipt": receipt,
+                        "snapshot": view(&load()?)?,
+                    }))
+                }
                 "mailbox.snapshot" => {
                     let params: ProtocolParams = serde_json::from_value(params.clone())
                         .map_err(|_| MailboxBootstrapError::InvalidRequest)?;
