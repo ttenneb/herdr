@@ -174,10 +174,10 @@ pub(crate) enum SendRefusal {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum HeadStanding {
     Current,
-    /// Pinned to a different (or not yet known) recipient session and never
-    /// picked up: shown with `previousSession`, never claimed, until the
-    /// recipient explicitly repins (Retry) or drops it.
-    Stranded,
+    /// Pinned to a different (or not yet known) recipient session and not
+    /// yet picked up. Display only (`previousSession`): the pane's current Pi
+    /// still claims it in order (the pin never gates claiming).
+    PreviousSession,
     /// Dropped by the recipient; hidden from every view.
     Withdrawn,
 }
@@ -195,7 +195,7 @@ pub(crate) fn head_standing(
             .as_ref()
             .and_then(|delivery| delivery.recipient_session.as_deref())
         {
-            Some(pinned) if current_session != Some(pinned) => HeadStanding::Stranded,
+            Some(pinned) if current_session != Some(pinned) => HeadStanding::PreviousSession,
             _ => HeadStanding::Current,
         },
     }
@@ -300,7 +300,8 @@ pub(crate) fn filter_recipient_snapshot(
         .map(|(stable_id, _)| stable_id.clone())
         .collect();
     for state in &mut snapshot.head_states {
-        state.previous_session = standing.get(&state.stable_id) == Some(&HeadStanding::Stranded);
+        state.previous_session =
+            standing.get(&state.stable_id) == Some(&HeadStanding::PreviousSession);
     }
     snapshot.heads.retain(|head| keep.contains(&head.stable_id));
     snapshot
