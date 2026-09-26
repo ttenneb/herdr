@@ -1241,12 +1241,30 @@ mod tests {
                    "params":{"protocol":crate::mailbox_v1::PROTOCOL,"subject":"Typed","body":"typed while busy"}}),
         );
         assert_eq!(typed["result"]["type"], "mailbox_enqueued", "{typed}");
+        // A concurrently forked test child can briefly inherit a socket FD
+        // until it execs, delaying EOF; poll until the close is observed.
+        let poll_until = |listener: &mut MailboxBootstrapListener,
+                          app: &mut App,
+                          done: &dyn Fn(&App) -> bool| {
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            loop {
+                listener.poll(app).unwrap();
+                if done(app) || std::time::Instant::now() >= deadline {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        };
         drop(second);
-        listener.poll(&mut app).unwrap();
+        poll_until(&mut listener, &mut app, &|app| {
+            app.mailbox_bootstrap_bindings.len() == 1
+        });
         assert!(app.attached_messages_recipient(&sender).is_some());
         // Closing the stream releases the binding: no longer "has Messages".
         drop(client);
-        listener.poll(&mut app).unwrap();
+        poll_until(&mut listener, &mut app, &|app| {
+            app.attached_messages_recipient(&sender).is_none()
+        });
         assert!(app.attached_messages_recipient(&sender).is_none());
         std::fs::remove_dir_all(directory).ok();
     }
