@@ -1378,6 +1378,117 @@ async fn only_the_panes_attached_pi_may_settle_a_leftover_claim() {
 }
 
 #[tokio::test]
+async fn a_held_head_is_editable_while_another_head_is_claimed_and_admitted() {
+    let mut fixture = fixture();
+    let session = attach_recipient(&mut fixture);
+    let recipient = fixture.terminals[1].clone();
+    let sender = sender(&fixture);
+    for (index, body) in ["running", "waiting"].iter().enumerate() {
+        fixture
+            .app
+            .route_ordinary_send(
+                &recipient,
+                &sender,
+                plain(body),
+                &MessageSendOptions {
+                    send_new: index > 0,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+    }
+    let protocol = json!({"protocol": crate::mailbox_v1::PROTOCOL});
+    let claim = dispatch(
+        &mut fixture.app,
+        &session,
+        "mailbox.claim",
+        protocol.clone(),
+    )
+    .unwrap();
+    let claim_id = claim["claim"]["claimId"].as_str().unwrap().to_string();
+    dispatch(
+        &mut fixture.app,
+        &session,
+        "mailbox.resolve",
+        json!({"protocol": crate::mailbox_v1::PROTOCOL, "claimId": claim_id, "outcome": "admitted"}),
+    )
+    .unwrap();
+    let heads = snapshot_heads(&mut fixture.app, &session);
+    let waiting = heads
+        .iter()
+        .find(|head| head["body"] == "waiting")
+        .unwrap()
+        .clone();
+    let running = heads
+        .iter()
+        .find(|head| head["body"] == "running")
+        .unwrap()
+        .clone();
+    assert_eq!(claim["claim"]["stableId"], running["stableId"]);
+    // The recipient edits the held head while the other head's turn runs.
+    let edited = dispatch(
+        &mut fixture.app,
+        &session,
+        "mailbox.edit",
+        json!({"protocol": crate::mailbox_v1::PROTOCOL, "stableId": waiting["stableId"],
+               "revision": waiting["revision"], "digest": waiting["digest"],
+               "subject": "Message from tpm", "body": "waiting, edited mid-turn"}),
+    )
+    .unwrap();
+    let snapshot = &edited["snapshot"];
+    // The live claim is untouched and still the snapshot's outstanding claim.
+    assert_eq!(snapshot["claim"]["claimId"], json!(claim_id));
+    let state = |stable: &serde_json::Value| {
+        snapshot["headStates"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|state| &state["stableId"] == stable)
+            .unwrap()
+            .clone()
+    };
+    assert_eq!(state(&running["stableId"])["lifecycle"], "admitted");
+    assert_eq!(state(&waiting["stableId"])["lifecycle"], "held");
+    assert_eq!(state(&waiting["stableId"])["revision"], 2);
+    // The sender's --edit-pending takes the same per-head path.
+    let sender_edit = fixture
+        .app
+        .route_ordinary_send(
+            &recipient,
+            &sender,
+            plain("waiting, edited again by the sender"),
+            &MessageSendOptions {
+                edit_pending: Some(waiting["stableId"].as_str().unwrap().into()),
+                expect_revision: Some(2),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    assert!(matches!(sender_edit, SendRoute::Mailbox(ref d) if d.revision == Some(3)));
+    // The claimed head itself stays immutable.
+    assert!(dispatch(
+        &mut fixture.app,
+        &session,
+        "mailbox.edit",
+        json!({"protocol": crate::mailbox_v1::PROTOCOL, "stableId": running["stableId"],
+               "revision": running["revision"], "digest": running["digest"],
+               "subject": "x", "body": "y"}),
+    )
+    .is_err());
+    // Settling the running turn then delivers the latest edited revision.
+    dispatch(
+        &mut fixture.app,
+        &session,
+        "mailbox.resolve",
+        json!({"protocol": crate::mailbox_v1::PROTOCOL, "claimId": claim_id, "outcome": "settled"}),
+    )
+    .unwrap();
+    let next = dispatch(&mut fixture.app, &session, "mailbox.claim", protocol).unwrap();
+    assert_eq!(next["claim"]["stableId"], waiting["stableId"]);
+    assert_eq!(next["claim"]["revision"], 3);
+}
+
+#[tokio::test]
 async fn a_second_accepted_stream_never_revokes_the_first() {
     let mut fixture = fixture();
     let first = attach_recipient(&mut fixture);
@@ -1468,6 +1579,10 @@ async fn recipient_only_binding_never_grants_send_report_or_route_authority() {
     let binding = session.recipient_only.expect("recipient-only binding");
     let descriptor = crate::server::mailbox_bootstrap::descriptor_value(&session);
     assert_eq!(descriptor["binding"], "recipient_only");
+    assert!(
+        descriptor.get("recipientOnly").is_none(),
+        "only the agreed binding field"
+    );
     let queue_key = fixture.app.pane_queue_key(&fixture.terminals[1]).unwrap();
     assert_eq!(
         descriptor["grantId"],
