@@ -496,6 +496,7 @@ impl App {
         // while a wake is outstanding is a hand start.
         let relaunch = self.recipe_relaunches.contains(terminal_id);
         let mut carry_route = false;
+        let mut dropped_carry = false;
         if let Some(terminal) = self.state.terminals.get_mut(terminal_id) {
             // The durable recipe is what a later wake or restart relaunches.
             terminal.launch_recipe = recipe;
@@ -506,8 +507,11 @@ impl App {
             } else {
                 // A hand start ends a Herdr sleep and never inherits a route.
                 terminal.sleep = None;
-                terminal.route_carry = None;
+                dropped_carry = terminal.route_carry.take().is_some();
             }
+        }
+        if dropped_carry {
+            self.persist_route_carry_clear();
         }
         if carry_route {
             self.pending_route_carries.insert(

@@ -1088,6 +1088,12 @@ mod tests {
     async fn reparent_forgets_the_carried_route() {
         let (mut app, directory, child, _parent, child_pane, child_terminal) =
             ready_route_with_child_recipe();
+        app.save_session_now();
+        let saved = std::fs::read_to_string(directory.join("session.json")).unwrap();
+        assert!(
+            saved.contains("route_carry"),
+            "the carry is on disk before the revoke"
+        );
         let response = app.handle_api_request(crate::api::schema::Request {
             id: "reparent".into(),
             method: crate::api::schema::Method::DelegationReparent(
@@ -1100,6 +1106,12 @@ mod tests {
         assert!(!response.contains("\"error\""), "{response}");
         assert!(app.state.terminals[&child_terminal].route_carry.is_none());
         assert!(!app.ready_delegation_routes.contains_key(&child));
+        // QA: the clear is on disk at once, not only after the debounced save.
+        let saved = std::fs::read_to_string(directory.join("session.json")).unwrap();
+        assert!(
+            !saved.contains("route_carry"),
+            "carry cleared on disk at once"
+        );
         // A later wake of the slept child starts it but carries nothing.
         app.state.terminals.get_mut(&child_terminal).unwrap().sleep =
             Some(App::new_pane_sleep("sender".into(), 1));

@@ -92,7 +92,20 @@ impl App {
             }
         }
         if forgot {
-            self.state.mark_session_dirty();
+            self.persist_route_carry_clear();
+        }
+    }
+
+    /// A cleared carry is saved at once, not on the debounced save: after a
+    /// crash or a writer quarantine the old carry must not come back and let
+    /// a restart resume re-make a revoked route.
+    pub(crate) fn persist_route_carry_clear(&mut self) {
+        self.state.mark_session_dirty();
+        if self.no_session {
+            return;
+        }
+        if let Err(err) = self.durably_save_delegation_edge() {
+            tracing::warn!(%err, "could not persist a cleared route carry at once; the next session save will");
             self.schedule_session_save();
         }
     }
@@ -130,8 +143,7 @@ impl App {
                 if let Some(terminal) = app.state.terminals.get_mut(&terminal_id) {
                     terminal.route_carry = None;
                 }
-                app.state.mark_session_dirty();
-                app.schedule_session_save();
+                app.persist_route_carry_clear();
             };
             // Same pane: the child delegation must still be bound to this
             // terminal's pane.
