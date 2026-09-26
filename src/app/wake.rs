@@ -717,8 +717,17 @@ mod tests {
         let (mut app, _pane, terminal, _public) = app_with_shell_pane();
         app.terminal_runtimes.remove(&terminal);
         app.state.view.terminal_area = ratatui::layout::Rect::new(0, 0, 80, 24);
-        // A plain shell, independent of the developer's login shell and rc files.
-        app.state.default_shell = "/bin/sh".into();
+        // An inert "sh" that reads and discards its input: the resume command
+        // typed into it can never start a real agent.
+        let fake_shell_dir = std::env::temp_dir().join(format!(
+            "herdr-inert-shell-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::create_dir_all(&fake_shell_dir).unwrap();
+        let fake_shell = fake_shell_dir.join("sh");
+        crate::test_env::write_executable(&fake_shell, "#!/bin/sh\nwhile read -r line; do :; done\n");
+        app.state.default_shell = fake_shell.display().to_string();
         {
             let state = app.state.terminals.get_mut(&terminal).unwrap();
             // The restored snapshot: a recipe, a resume plan and a stale agent
@@ -727,7 +736,7 @@ mod tests {
                 "owner",
                 "pi",
                 &["--thinking".into(), "low".into()],
-                &[("PATH".into(), "/nonexistent".into())],
+                &[],
             );
             state.pending_agent_resume_plan = Some(crate::agent_resume::AgentResumePlan {
                 agent: "pi".into(),
@@ -765,5 +774,6 @@ mod tests {
         if let Some(runtime) = app.terminal_runtimes.remove(&terminal) {
             runtime.shutdown();
         }
+        let _ = std::fs::remove_dir_all(fake_shell_dir);
     }
 }
