@@ -401,6 +401,22 @@ test "$sid" = "$$"
         let _ = std::fs::remove_dir_all(dir);
     }
 
+    /// A child forked by a parallel test briefly inherits every descriptor,
+    /// including a just-dropped listener, until its exec closes them; during
+    /// that window a connect can still succeed. Wait for the window to end.
+    fn stops_listening(path: &Path) -> bool {
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            if !is_server_listening_at(path) {
+                return true;
+            }
+            if std::time::Instant::now() >= deadline {
+                return false;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
     #[test]
     fn is_server_listening_returns_false_for_stale_socket() {
         let dir = unique_test_dir("stale");
@@ -414,7 +430,7 @@ test "$sid" = "$$"
         }
 
         // The socket file exists but nobody is listening.
-        assert!(!is_server_listening_at(&path));
+        assert!(stops_listening(&path));
         let _ = std::fs::remove_dir_all(dir);
     }
 
@@ -428,7 +444,7 @@ test "$sid" = "$$"
         drop(UnixListener::bind(&path).unwrap());
 
         // Socket is stale — should return false.
-        assert!(!is_server_listening_at(&path));
+        assert!(stops_listening(&path));
 
         let _ = std::fs::remove_dir_all(dir);
     }
