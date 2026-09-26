@@ -84,6 +84,7 @@ impl App {
                         grant_id: session.grant_id.clone(),
                         recipient: session.recipient.clone(),
                         submit,
+                        api_peer: None,
                     },
                 )
             }
@@ -287,6 +288,7 @@ impl App {
                         grant_id: route.grant_id.clone(),
                         recipient: route.recipient.clone(),
                         submit,
+                        api_peer: None,
                     },
                 )
             }
@@ -316,6 +318,7 @@ impl App {
                         grant_id: session.grant_id.clone(),
                         recipient: session.recipient.clone(),
                         protocol: params.protocol,
+                        api_peer: None,
                     },
                 )
             }
@@ -329,6 +332,7 @@ impl App {
                         grant_id: session.grant_id.clone(),
                         recipient: session.recipient.clone(),
                         claim,
+                        api_peer: None,
                     },
                 )
             }
@@ -342,6 +346,7 @@ impl App {
                         grant_id: session.grant_id.clone(),
                         recipient: session.recipient.clone(),
                         edit,
+                        api_peer: None,
                     },
                 )
             }
@@ -355,6 +360,7 @@ impl App {
                         grant_id: session.grant_id.clone(),
                         recipient: session.recipient.clone(),
                         resolve,
+                        api_peer: None,
                     },
                 )
             }
@@ -1036,6 +1042,46 @@ impl App {
         }
     }
 
+    /// Option (A): on the main API socket every mailbox.* request must come
+    /// from the caller pane's CURRENT foreground Pi process itself (kernel
+    /// peer PID plus start time). Anyone else naming that caller is refused
+    /// with no effect. In-process requests (no peer) are server-internal.
+    pub(crate) fn refuse_unauthenticated_mailbox_caller(
+        &self,
+        id: &str,
+        caller: &str,
+        peer: Option<crate::api::schema::ApiPeer>,
+    ) -> Option<String> {
+        let authenticated = match peer {
+            None => return None,
+            Some(crate::api::schema::ApiPeer::Unknown) => false,
+            Some(crate::api::schema::ApiPeer::Process { pid, start_ticks }) => self
+                .state
+                .terminals
+                .keys()
+                .find(|terminal_id| terminal_id.to_string() == caller)
+                .and_then(|terminal_id| self.mailbox_bootstrap_foreground_job(terminal_id))
+                .and_then(|job| {
+                    crate::detect::identify_agent_process_in_job(&job)
+                        .map(|(agent, process)| (agent, process.pid))
+                })
+                .is_some_and(|(agent, foreground_pid)| {
+                    agent == crate::detect::Agent::Pi
+                        && foreground_pid == pid
+                        && self
+                            .managed_pi_process_birth(pid)
+                            .is_some_and(|birth| birth.start_ticks == start_ticks)
+                }),
+        };
+        (!authenticated).then(|| {
+            encode_error(
+                id.to_string(),
+                "mailbox_caller_unauthenticated",
+                "mailbox requests on the main socket must come from the caller pane's own foreground Pi",
+            )
+        })
+    }
+
     pub(crate) fn handle_mailbox_edit(
         &mut self,
         id: String,
@@ -1221,6 +1267,7 @@ mod tests {
                 priority: "normal".into(),
                 original_sequence: 1,
             },
+            api_peer: None,
         }
     }
 
@@ -1309,6 +1356,7 @@ mod tests {
             claim: ClaimRequest {
                 protocol: PROTOCOL.into(),
             },
+            api_peer: None,
         }
     }
 
@@ -1322,6 +1370,7 @@ mod tests {
             grant_id,
             recipient,
             protocol: PROTOCOL.into(),
+            api_peer: None,
         }
     }
 
@@ -1344,6 +1393,7 @@ mod tests {
                 subject: subject.into(),
                 body: body.into(),
             },
+            api_peer: None,
         }
     }
 
@@ -1361,6 +1411,7 @@ mod tests {
                 claim_id,
                 outcome,
             },
+            api_peer: None,
         }
     }
 
@@ -1531,6 +1582,7 @@ mod tests {
                 claim: ClaimRequest {
                     protocol: PROTOCOL.into(),
                 },
+                api_peer: None,
             }),
         });
         let replay: SuccessResponse = serde_json::from_str(&replay).expect("replay claim response");
@@ -1624,6 +1676,100 @@ mod tests {
         std::fs::remove_dir_all(directory).expect("remove mailbox directory");
     }
 
+    /// Option (A): on the main socket a mailbox.* request naming a managed
+    /// Pi as caller runs only when the connecting process IS that pane's
+    /// current foreground Pi (PID plus start time). A foreign same-user
+    /// process, an unknown peer, or a recycled PID is refused with no effect.
+    #[test]
+    fn main_socket_mailbox_requests_must_come_from_the_callers_own_pi() {
+        let (mut app, pane_id, x, directory) = app_with_active_sender();
+        let terminal_id = app.state.workspaces[0]
+            .terminal_id(pane_id)
+            .unwrap()
+            .clone();
+        let pi_pid = 4_000_000_010_u32;
+        let mut birth = crate::platform::process_birth_identity(std::process::id()).unwrap();
+        birth.start_ticks = 7;
+        app.mailbox_bootstrap_test_process_births
+            .insert(pi_pid, birth);
+        app.install_mailbox_bootstrap_test_foreground_job(
+            terminal_id,
+            crate::platform::ForegroundJob {
+                process_group_id: pi_pid,
+                processes: vec![crate::platform::ForegroundProcess {
+                    pid: pi_pid,
+                    name: "pi".into(),
+                    argv0: None,
+                    argv: Some(vec!["pi".into()]),
+                    cmdline: Some("pi".into()),
+                }],
+            },
+        );
+        let own = crate::platform::process_birth_identity(std::process::id()).unwrap();
+        let foreign = crate::api::schema::ApiPeer::Process {
+            pid: std::process::id(),
+            start_ticks: own.start_ticks,
+        };
+        let recycled = crate::api::schema::ApiPeer::Process {
+            pid: pi_pid,
+            start_ticks: 8,
+        };
+        let the_pi = crate::api::schema::ApiPeer::Process {
+            pid: pi_pid,
+            start_ticks: 7,
+        };
+        let submit_as = |peer| {
+            let mut params = active_submit(x.clone(), "7".repeat(64));
+            params.api_peer = Some(peer);
+            Method::MailboxOfflineSubmit(params)
+        };
+        let snapshot_as = |peer| {
+            let mut params =
+                mailbox_snapshot(x.clone(), format!("offline:{x}:1"), active_recipient(&x));
+            params.api_peer = Some(peer);
+            Method::MailboxSnapshot(params)
+        };
+        for peer in [foreign, recycled, crate::api::schema::ApiPeer::Unknown] {
+            for method in [submit_as(peer), snapshot_as(peer)] {
+                let response = app.handle_api_request(Request {
+                    id: "peer".into(),
+                    method,
+                });
+                let error: ErrorResponse = serde_json::from_str(&response)
+                    .unwrap_or_else(|_| panic!("refused for {peer:?}: {response}"));
+                assert_eq!(error.error.code, "mailbox_caller_unauthenticated");
+            }
+        }
+        assert!(
+            crate::mailbox::MailboxStore::open(&directory)
+                .unwrap()
+                .load()
+                .unwrap()
+                .heads
+                .is_empty(),
+            "no refused request had an effect"
+        );
+        // The pane's own Pi is served.
+        let submitted = app.handle_api_request(Request {
+            id: "own".into(),
+            method: submit_as(the_pi),
+        });
+        assert!(
+            serde_json::from_str::<SuccessResponse>(&submitted).is_ok(),
+            "{submitted}"
+        );
+        let snapshot = app.handle_api_request(Request {
+            id: "own-snapshot".into(),
+            method: snapshot_as(the_pi),
+        });
+        assert!(
+            serde_json::from_str::<SuccessResponse>(&snapshot).is_ok(),
+            "{snapshot}"
+        );
+        drop(app);
+        std::fs::remove_dir_all(directory).ok();
+    }
+
     /// Authority scope on the API path: a recipient edits only its own
     /// inbox; a sender edits only heads it sent to the named recipient; a
     /// send grant never claims, resolves or reads the recipient's messages.
@@ -1665,6 +1811,7 @@ mod tests {
                     subject: "tampered".into(),
                     body: "tampered".into(),
                 },
+                api_peer: None,
             })
         };
         let code = |app: &mut App, method: Method| {
@@ -1713,6 +1860,7 @@ mod tests {
                     claim: ClaimRequest {
                         protocol: PROTOCOL.into(),
                     },
+                    api_peer: None,
                 })
             ),
             "mailbox_not_recipient"
@@ -1730,6 +1878,7 @@ mod tests {
                         claim_id: "any".into(),
                         outcome: ResolveOutcome::Settled,
                     },
+                    api_peer: None,
                 })
             ),
             "mailbox_not_recipient"
@@ -1936,6 +2085,7 @@ mod tests {
             claim: ClaimRequest {
                 protocol: PROTOCOL.into(),
             },
+            api_peer: None,
         }
     }
 
@@ -2055,6 +2205,7 @@ mod tests {
                     claim_id: first.claim_id,
                     outcome: ResolveOutcome::Settled,
                 },
+                api_peer: None,
             }),
         });
         assert!(
@@ -2261,6 +2412,7 @@ mod tests {
                 claim: ClaimRequest {
                     protocol: PROTOCOL.into(),
                 },
+                api_peer: None,
             }),
         });
         let claimed: SuccessResponse = serde_json::from_str(&claimed).expect("claim");
@@ -2350,6 +2502,7 @@ mod tests {
                 claim: ClaimRequest {
                     protocol: PROTOCOL.into(),
                 },
+                api_peer: None,
             }),
         });
         let stale: ErrorResponse = serde_json::from_str(&stale).expect("stale B error");
@@ -2376,6 +2529,7 @@ mod tests {
                 claim: ClaimRequest {
                     protocol: PROTOCOL.into(),
                 },
+                api_peer: None,
             }),
         });
         assert!(serde_json::from_str::<SuccessResponse>(&fresh).is_ok());

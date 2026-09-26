@@ -2458,3 +2458,93 @@ async fn a_pre_upgrade_claim_without_an_execution_is_never_current() {
     .unwrap();
     assert_eq!(retried["type"], "mailbox_retried");
 }
+
+/// PM requirement for option (A): the SENDER's cross-pane edit of its waiting
+/// message goes through server-side routing (agent prompt --edit-pending),
+/// not mailbox.*, so it keeps working; a third process claiming to be the
+/// recipient on the main socket's mailbox.edit is refused with no effect.
+#[tokio::test]
+async fn cross_pane_edit_pending_works_and_a_process_posing_as_the_recipient_is_refused() {
+    let mut fixture = fixture();
+    let session = attach_recipient(&mut fixture);
+    let recipient = fixture.terminals[1].clone();
+    let sender = sender(&fixture);
+    // R is busy: it holds a claim, so S's next message waits.
+    fixture
+        .app
+        .route_ordinary_send(&recipient, &sender, plain("first"), &Default::default())
+        .unwrap();
+    dispatch(
+        &mut fixture.app,
+        &session,
+        "mailbox.claim",
+        json!({"protocol": crate::mailbox_v1::PROTOCOL}),
+    )
+    .unwrap();
+    let waiting = fixture
+        .app
+        .route_ordinary_send(
+            &recipient,
+            &sender,
+            plain("draft"),
+            &MessageSendOptions {
+                send_new: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    let crate::app::messages::SendRoute::Mailbox(waiting) = waiting else {
+        panic!("queued")
+    };
+    let stable_id = waiting.stable_id.unwrap();
+    let edited = fixture
+        .app
+        .route_ordinary_send(
+            &recipient,
+            &sender,
+            plain("final"),
+            &MessageSendOptions {
+                edit_pending: Some(stable_id.clone()),
+                expect_revision: Some(1),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    let crate::app::messages::SendRoute::Mailbox(edited) = edited else {
+        panic!("edited")
+    };
+    assert!(edited.edited);
+    assert_eq!(edited.revision, Some(2));
+    // A third process names R as the caller on the main socket.
+    let store = crate::mailbox::MailboxStore::open(&fixture.app.sender_authority_dir).unwrap();
+    let head = store.load().unwrap().heads[&stable_id].clone();
+    let own = crate::platform::process_birth_identity(std::process::id()).unwrap();
+    let response = fixture.app.handle_api_request(crate::api::schema::Request {
+        id: "posing".into(),
+        method: crate::api::schema::Method::MailboxEdit(crate::api::schema::MailboxEditParams {
+            caller: recipient.clone(),
+            grant_id: format!("offline:{recipient}:1"),
+            recipient: crate::mailbox::RecipientKey {
+                recipient_id: recipient.clone(),
+                generation: "1".into(),
+            },
+            edit: crate::mailbox_v1::Edit {
+                protocol: crate::mailbox_v1::PROTOCOL.into(),
+                stable_id: stable_id.clone(),
+                revision: head.revision,
+                digest: head.digest.clone(),
+                subject: "tampered".into(),
+                body: "tampered".into(),
+            },
+            api_peer: Some(crate::api::schema::ApiPeer::Process {
+                pid: 4_000_000_020,
+                start_ticks: own.start_ticks,
+            }),
+        }),
+    });
+    assert!(
+        response.contains("mailbox_caller_unauthenticated"),
+        "{response}"
+    );
+    assert_eq!(store.load().unwrap().heads[&stable_id], head, "unchanged");
+}

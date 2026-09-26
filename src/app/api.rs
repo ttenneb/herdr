@@ -1434,16 +1434,55 @@ impl App {
             }
             Method::HandoffSend(params) => return self.handle_handoff_send(request.id, params),
             Method::MailboxOfflineSubmit(params) => {
-                return self.handle_mailbox_offline_submit(request.id, params)
+                if let Some(refused) = self.refuse_unauthenticated_mailbox_caller(
+                    &request.id,
+                    &params.caller,
+                    params.api_peer,
+                ) {
+                    return refused;
+                }
+                return self.handle_mailbox_offline_submit(request.id, params);
             }
-            Method::MailboxClaim(params) => return self.handle_mailbox_claim(request.id, params),
+            Method::MailboxClaim(params) => {
+                if let Some(refused) = self.refuse_unauthenticated_mailbox_caller(
+                    &request.id,
+                    &params.caller,
+                    params.api_peer,
+                ) {
+                    return refused;
+                }
+                return self.handle_mailbox_claim(request.id, params);
+            }
             Method::MailboxResolve(params) => {
-                return self.handle_mailbox_resolve(request.id, params)
+                if let Some(refused) = self.refuse_unauthenticated_mailbox_caller(
+                    &request.id,
+                    &params.caller,
+                    params.api_peer,
+                ) {
+                    return refused;
+                }
+                return self.handle_mailbox_resolve(request.id, params);
             }
             Method::MailboxSnapshot(params) => {
-                return self.handle_mailbox_snapshot(request.id, params)
+                if let Some(refused) = self.refuse_unauthenticated_mailbox_caller(
+                    &request.id,
+                    &params.caller,
+                    params.api_peer,
+                ) {
+                    return refused;
+                }
+                return self.handle_mailbox_snapshot(request.id, params);
             }
-            Method::MailboxEdit(params) => return self.handle_mailbox_edit(request.id, params),
+            Method::MailboxEdit(params) => {
+                if let Some(refused) = self.refuse_unauthenticated_mailbox_caller(
+                    &request.id,
+                    &params.caller,
+                    params.api_peer,
+                ) {
+                    return refused;
+                }
+                return self.handle_mailbox_edit(request.id, params);
+            }
             Method::AgentWait(_) => {
                 return responses::encode_error(
                     request.id,

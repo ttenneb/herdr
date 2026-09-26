@@ -203,9 +203,26 @@ fn handle_connection_with_stop(
         .ok()
         .and_then(|creds| creds.pid())
         .and_then(|pid| u32::try_from(pid).ok());
+    // mailbox.* on the main socket: the exact connecting process (PID plus
+    // kernel start time, read now) is checked against the caller pane's
+    // current foreground Pi before anything runs.
+    let api_peer = || match caller_pid {
+        Some(pid) => crate::platform::process_birth_identity(pid)
+            .map(|birth| crate::api::schema::ApiPeer::Process {
+                pid,
+                start_ticks: birth.start_ticks,
+            })
+            .unwrap_or(crate::api::schema::ApiPeer::Unknown),
+        None => crate::api::schema::ApiPeer::Unknown,
+    };
     match &mut request.method {
         Method::AgentPrompt(params) => params.send.caller_pid = caller_pid,
         Method::HandoffSend(params) => params.send.caller_pid = caller_pid,
+        Method::MailboxOfflineSubmit(params) => params.api_peer = Some(api_peer()),
+        Method::MailboxClaim(params) => params.api_peer = Some(api_peer()),
+        Method::MailboxResolve(params) => params.api_peer = Some(api_peer()),
+        Method::MailboxSnapshot(params) => params.api_peer = Some(api_peer()),
+        Method::MailboxEdit(params) => params.api_peer = Some(api_peer()),
         _ => {}
     }
     let request_id = request.id.clone();

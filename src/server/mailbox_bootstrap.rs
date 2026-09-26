@@ -225,6 +225,10 @@ fn failure(request_id: Option<String>, error: MailboxBootstrapError) -> String {
             "invalid_request",
             "the bootstrap mailbox request is invalid",
         ),
+        MailboxBootstrapError::RecipientNotAllowed => (
+            "mailbox_recipient_not_allowed",
+            "a send grant can be provisioned only for your delegation parent or a direct child; reach other agents with herdr agent prompt or handoff",
+        ),
         MailboxBootstrapError::ClaimExecutionAlive => (
             "mailbox_claim_execution_alive",
             "that message is held by another Pi that is still running; it cannot be dropped, retried or recovered from here",
@@ -681,6 +685,25 @@ mod tests {
                 }],
             },
         );
+    }
+
+    /// Makes the sender (workspace 0) the delegation parent of the most
+    /// recently added recipient workspace's pane, as provision_recipient
+    /// requires.
+    fn relate_sender_and_recipient(app: &mut App) {
+        let sender_pane = app.state.workspaces[0].tabs[0].root_pane.unwrap();
+        let recipient_pane = app.state.workspaces.last().unwrap().tabs[0]
+            .root_pane
+            .unwrap();
+        let parent = app
+            .state
+            .delegations
+            .create(Some(sender_pane), None, None)
+            .unwrap();
+        app.state
+            .delegations
+            .create(Some(recipient_pane), Some(parent), None)
+            .unwrap();
     }
 
     fn active_managed_recipient(app: &mut App, directory: &Path) -> (String, String) {
@@ -2345,6 +2368,7 @@ mod tests {
                     priority: "normal".into(),
                     original_sequence: 2,
                 },
+                api_peer: None,
             },
         );
         let stale_generic: crate::api::schema::ErrorResponse = serde_json::from_str(&stale_generic)
@@ -2427,6 +2451,7 @@ mod tests {
                     priority: "normal".into(),
                     original_sequence: 2,
                 },
+                api_peer: None,
             }
         };
         let bound_grant = descriptor["result"]["parentReport"]["grantId"]
@@ -2497,6 +2522,7 @@ mod tests {
                     priority: "normal".into(),
                     original_sequence: 1,
                 },
+                api_peer: None,
             },
         );
         assert!(serde_json::from_str::<crate::api::schema::SuccessResponse>(&old).is_ok());
@@ -2642,6 +2668,7 @@ mod tests {
                     priority: "normal".into(),
                     original_sequence: 3,
                 },
+                api_peer: None,
             },
         );
         let stale_generic: crate::api::schema::ErrorResponse =
@@ -2657,6 +2684,7 @@ mod tests {
                     generation: "1".into(),
                 },
                 protocol: crate::mailbox_v1::PROTOCOL.into(),
+                api_peer: None,
             },
         );
         let parent_snapshot: serde_json::Value = serde_json::from_str(&parent_snapshot).unwrap();
@@ -2918,6 +2946,7 @@ mod tests {
                     priority: "normal".into(),
                     original_sequence: 1,
                 },
+                api_peer: None,
             },
         );
         assert!(serde_json::from_str::<crate::api::schema::SuccessResponse>(&legacy).is_ok());
@@ -3093,6 +3122,7 @@ mod tests {
                         priority: "normal".into(),
                         original_sequence: 1,
                     },
+                    api_peer: None,
                 },
             );
             assert!(serde_json::from_str::<crate::api::schema::SuccessResponse>(&response).is_ok());
@@ -3309,6 +3339,7 @@ mod tests {
     fn bootstrap_provisions_a_current_managed_recipient_and_admits_cross_submit() {
         let (mut app, directory, sender) = active_app();
         let (recipient, recipient_target) = active_managed_recipient(&mut app, &directory);
+        relate_sender_and_recipient(&mut app);
         let mut listener = listener(&directory);
         let mut client = UnixStream::connect(listener.path()).expect("connect bootstrap socket");
         client
@@ -3366,6 +3397,7 @@ mod tests {
                     priority: "normal".into(),
                     original_sequence: 1,
                 },
+                api_peer: None,
             },
         );
         let submitted: crate::api::schema::SuccessResponse =
@@ -3456,10 +3488,43 @@ mod tests {
         std::fs::remove_dir_all(directory).expect("remove test directory");
     }
 
+    /// provision_recipient is limited to the caller's own delegation edges.
+    #[test]
+    fn bootstrap_provision_refuses_an_unrelated_recipient() {
+        let (mut app, directory, _sender) = active_app();
+        let (_recipient, recipient_target) = active_managed_recipient(&mut app, &directory);
+        let mut listener = listener(&directory);
+        let mut client = UnixStream::connect(listener.path()).expect("connect bootstrap socket");
+        client
+            .set_read_timeout(Some(Duration::from_secs(1)))
+            .unwrap();
+        let descriptor = bootstrap(&mut listener, &mut app, &mut client);
+        let binding = descriptor["result"]["bindingGeneration"].as_str().unwrap();
+        let refused = exchange(
+            &mut listener,
+            &mut app,
+            &mut client,
+            json!({
+                "method": "mailbox.provision_recipient", "requestId": "unrelated",
+                "bindingGeneration": binding,
+                "params": {"target": recipient_target}
+            }),
+        );
+        assert_eq!(refused["ok"], false, "{refused}");
+        assert_eq!(refused["error"]["code"], "mailbox_recipient_not_allowed");
+        assert!(crate::mailbox::MailboxStore::open(&directory)
+            .unwrap()
+            .load()
+            .unwrap()
+            .grants
+            .is_empty());
+    }
+
     #[test]
     fn bootstrap_provision_rejects_mismatched_recipient_generation() {
         let (mut app, directory, _sender) = active_app();
         let (recipient, recipient_target) = active_managed_recipient(&mut app, &directory);
+        relate_sender_and_recipient(&mut app);
         let mut listener = listener(&directory);
         let mut client = UnixStream::connect(listener.path()).expect("connect bootstrap socket");
         client

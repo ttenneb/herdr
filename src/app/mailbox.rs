@@ -118,6 +118,9 @@ pub(crate) enum MailboxBootstrapError {
     /// The head's claim belongs to another execution that is still alive;
     /// only a gone execution's claim may be dropped, retried or recovered.
     ClaimExecutionAlive,
+    /// provision_recipient for an agent outside the caller's own delegation
+    /// edges (its parent or a direct child).
+    RecipientNotAllowed,
 }
 
 #[derive(Debug)]
@@ -879,6 +882,35 @@ impl App {
             .ok_or(MailboxBootstrapError::InvalidRequest)?;
         if recipient_terminal_id == sender_terminal_id {
             return Err(MailboxBootstrapError::InvalidRequest);
+        }
+        // Policy: a managed Pi may provision a send grant only along its own
+        // delegation edges (its parent or a direct child). Everyone else is
+        // reached through server-side routing (agent prompt, handoff).
+        let sender_pane = self.state.workspaces.iter().find_map(|workspace| {
+            workspace.tabs.iter().find_map(|tab| {
+                tab.panes
+                    .iter()
+                    .find(|(_, pane)| &pane.attached_terminal_id == sender_terminal_id)
+                    .map(|(pane_id, _)| *pane_id)
+            })
+        });
+        let live = |record: &&crate::delegation::DelegationRecord| !record.tombstone;
+        let sender_edge = sender_pane
+            .and_then(|pane| self.state.delegations.delegation_for_pane(pane))
+            .filter(live);
+        let recipient_edge = self
+            .state
+            .delegations
+            .delegation_for_pane(recipient.pane_id)
+            .filter(live);
+        let related = match (sender_edge, recipient_edge) {
+            (Some(sender), Some(recipient)) => {
+                sender.parent_id == Some(recipient.id) || recipient.parent_id == Some(sender.id)
+            }
+            _ => false,
+        };
+        if !related {
+            return Err(MailboxBootstrapError::RecipientNotAllowed);
         }
         let recipient_terminal = self
             .state
