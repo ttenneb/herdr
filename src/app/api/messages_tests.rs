@@ -1153,12 +1153,12 @@ async fn a_killed_pis_admitted_claim_needs_recovery_and_drop_or_retry_resolves_i
     )
     .unwrap();
     assert_ne!(next["claim"]["stableId"], dropped_claim["stableId"]);
-    // The new Pi cannot resolve another execution's claim.
+    // The new Pi can never re-admit (rerun) another execution's claim.
     assert!(dispatch(
         &mut fixture.app,
         &second,
         "mailbox.resolve",
-        json!({"protocol": crate::mailbox_v1::PROTOCOL, "claimId": dropped_claim["claimId"], "outcome": "settled"}),
+        json!({"protocol": crate::mailbox_v1::PROTOCOL, "claimId": dropped_claim["claimId"], "outcome": "admitted"}),
     )
     .is_err());
     let dropped = dispatch(
@@ -1330,6 +1330,51 @@ async fn recovery_is_visible_and_droppable_after_a_server_restart() {
     .unwrap();
     assert_eq!(dropped["receipt"]["resolution"]["outcome"], "settled");
     assert!(recovery_states(&mut after.app, &session).is_empty());
+}
+
+/// rc2 property, extended to pane queues and receive-only Pis: the pane's
+/// currently attached Pi may settle the claim a previous Pi left admitted;
+/// the ended Pi's binding and any other pane's Pi may not.
+#[tokio::test]
+async fn only_the_panes_attached_pi_may_settle_a_leftover_claim() {
+    let mut fixture = fixture();
+    let old = attach_recipient(&mut fixture);
+    let recipient = fixture.terminals[1].clone();
+    let sender = sender(&fixture);
+    fixture
+        .app
+        .route_ordinary_send(
+            &recipient,
+            &sender,
+            plain("left admitted"),
+            &Default::default(),
+        )
+        .unwrap();
+    let leftover = claim_and_admit(&mut fixture.app, &old);
+    fixture
+        .app
+        .release_mailbox_bootstrap_binding(&old.binding_generation);
+    fixture.execution_offset = 1;
+    let current = attach_recipient(&mut fixture);
+    let settle = json!({"protocol": crate::mailbox_v1::PROTOCOL, "claimId": leftover["claimId"], "outcome": "settled"});
+    // The ended Pi's binding is gone.
+    assert!(dispatch(&mut fixture.app, &old, "mailbox.resolve", settle.clone()).is_err());
+    // A Pi attached to another pane never sees this pane's claim.
+    let other_pane_terminal = fixture.app.state.workspaces[0]
+        .terminal_id(fixture.panes[0])
+        .unwrap()
+        .clone();
+    let other = {
+        let mut other = current.clone();
+        other.caller = other_pane_terminal.to_string();
+        other
+    };
+    assert!(dispatch(&mut fixture.app, &other, "mailbox.resolve", settle.clone()).is_err());
+    // The pane's attached Pi settles it; history records it as recovered.
+    let resolved = dispatch(&mut fixture.app, &current, "mailbox.resolve", settle).unwrap();
+    assert_eq!(resolved["resolution"]["outcome"], "settled");
+    assert_eq!(resolved["resolution"]["closedBy"], "recovered");
+    assert!(recovery_states(&mut fixture.app, &current).is_empty());
 }
 
 #[tokio::test]

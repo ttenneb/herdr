@@ -597,9 +597,10 @@ impl App {
                         .filter(|claim| {
                             recipients.contains(&claim.recipient)
                                 && !crate::mailbox::is_withdrawn_claim(claim)
-                                && crate::app::messages::claim_is_current(claim, &execution)
                         })
+                        .cloned()
                         .ok_or(MailboxBootstrapError::InvalidRequest)?;
+                    let own = crate::app::messages::claim_is_current(&claim, &execution);
                     let outcome = match resolve.outcome {
                         crate::mailbox_v1::ResolveOutcome::Admitted => {
                             crate::mailbox::ClaimResolutionOutcome::Admitted
@@ -608,8 +609,20 @@ impl App {
                             crate::mailbox::ClaimResolutionOutcome::Settled
                         }
                     };
+                    // The pane's currently attached Pi may close a claim that a
+                    // previous Pi in the same pane left claimed or admitted
+                    // (rc2 property, extended to pane queues and receive-only
+                    // Pis): settle only, never admit, recorded as recovered.
+                    // Any other caller is outside this pane's inbox and refused.
+                    if !own && outcome != crate::mailbox::ClaimResolutionOutcome::Settled {
+                        return Err(MailboxBootstrapError::InvalidRequest);
+                    }
                     let resolution = store
-                        .resolve_claim(&claim.claim_id, outcome)
+                        .resolve_claim_closed_by(
+                            &claim.claim_id,
+                            outcome,
+                            (!own).then_some("recovered"),
+                        )
                         .map_err(|_| MailboxBootstrapError::InvalidRequest)?;
                     to_value(ResponseResult::MailboxResolved { resolution })
                 }
