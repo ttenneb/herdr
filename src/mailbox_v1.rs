@@ -283,6 +283,7 @@ pub fn edit_unclaimed(
         digest: edit.digest,
         subject: edit.subject,
         body: edit.body,
+        repin_recipient_session: None,
     })
 }
 
@@ -312,6 +313,7 @@ pub fn submit_offline(
         original_sequence: submit.original_sequence,
         enqueue_epoch: 0,
         accepted_at: provenance.accepted_at,
+        delivery: None,
     };
     store.append_offline_head(head)
 }
@@ -386,6 +388,7 @@ mod tests {
             original_sequence: 1,
             enqueue_epoch: 1,
             accepted_at: 1,
+            delivery: None,
         }
     }
     #[test]

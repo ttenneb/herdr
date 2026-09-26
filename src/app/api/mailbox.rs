@@ -61,6 +61,14 @@ impl App {
         if session.history_only {
             return Err(MailboxBootstrapError::GrantRevoked);
         }
+        if let Some(result) = self.dispatch_recipient_inbox(session, method, &params) {
+            return result;
+        }
+        if session.recipient_only.is_some() {
+            // No sender, grant, bound-report or route authority without a
+            // trusted managed launch.
+            return Err(MailboxBootstrapError::GrantMissing);
+        }
         let id = "mailbox-bootstrap".to_owned();
         let response = match method {
             "mailbox.offline_submit" | "report_submit" => {
@@ -357,6 +365,225 @@ impl App {
         serde_json::to_value(success.result).map_err(|_| MailboxBootstrapError::InvalidRequest)
     }
 
+    /// Own-inbox operations that need no sender authority: previous-session
+    /// Retry/Drop for every Messages session, and the whole inbox surface for
+    /// a recipient-only session. Returns `None` for any other method.
+    fn dispatch_recipient_inbox(
+        &mut self,
+        session: &MailboxBootstrapSession,
+        method: &str,
+        params: &Value,
+    ) -> Option<Result<Value, MailboxBootstrapError>> {
+        #[derive(serde::Deserialize)]
+        #[serde(rename_all = "camelCase", deny_unknown_fields)]
+        struct ProtocolParams {
+            protocol: String,
+        }
+        #[derive(serde::Deserialize)]
+        #[serde(rename_all = "camelCase", deny_unknown_fields)]
+        struct HeadVersionParams {
+            protocol: String,
+            stable_id: String,
+            revision: u64,
+            digest: String,
+        }
+        let recipient_only = session.recipient_only.is_some();
+        let known = matches!(
+            method,
+            "mailbox.stranded" | "mailbox.adopt" | "mailbox.drop"
+        ) || (recipient_only
+            && matches!(
+                method,
+                "mailbox.snapshot" | "mailbox.claim" | "mailbox.edit" | "mailbox.resolve"
+            ));
+        if !known {
+            return None;
+        }
+        Some((|| {
+            let store = crate::mailbox::MailboxStore::open(&self.sender_authority_dir)
+                .map_err(|_| MailboxBootstrapError::GrantMissing)?;
+            let recipient = session.recipient.clone();
+            let current = self.current_agent_session_value(&session.caller);
+            let load = || {
+                store
+                    .load()
+                    .map_err(|_| MailboxBootstrapError::GrantMissing)
+            };
+            let view = |recovered: &crate::mailbox::RecoveredMailbox| {
+                crate::mailbox_v1::snapshot(recovered, &recipient)
+                    .map(|snapshot| {
+                        crate::app::messages::filter_recipient_snapshot(
+                            snapshot,
+                            recovered,
+                            current.as_deref(),
+                        )
+                    })
+                    .map_err(|_| MailboxBootstrapError::GrantMissing)
+            };
+            let stranded_head = |recovered: &crate::mailbox::RecoveredMailbox,
+                                 params: &HeadVersionParams| {
+                recovered
+                    .heads
+                    .get(&params.stable_id)
+                    .filter(|head| {
+                        head.recipient == recipient
+                            && head.revision == params.revision
+                            && head.digest == params.digest
+                            && crate::app::messages::head_standing(
+                                head,
+                                recovered,
+                                current.as_deref(),
+                            ) == crate::app::messages::HeadStanding::Stranded
+                    })
+                    .cloned()
+                    .ok_or(MailboxBootstrapError::InvalidRequest)
+            };
+            let protocol_ok = |protocol: &str| {
+                (protocol == crate::mailbox_v1::PROTOCOL)
+                    .then_some(())
+                    .ok_or(MailboxBootstrapError::InvalidRequest)
+            };
+            let to_value = |result: ResponseResult| {
+                serde_json::to_value(result).map_err(|_| MailboxBootstrapError::InvalidRequest)
+            };
+            match method {
+                "mailbox.stranded" => {
+                    let params: ProtocolParams = serde_json::from_value(params.clone())
+                        .map_err(|_| MailboxBootstrapError::InvalidRequest)?;
+                    protocol_ok(&params.protocol)?;
+                    let recovered = load()?;
+                    let heads: Vec<_> = recovered
+                        .heads
+                        .values()
+                        .filter(|head| {
+                            head.recipient == recipient
+                                && crate::app::messages::head_standing(
+                                    head,
+                                    &recovered,
+                                    current.as_deref(),
+                                ) == crate::app::messages::HeadStanding::Stranded
+                        })
+                        .cloned()
+                        .collect();
+                    Ok(serde_json::json!({
+                        "type": "mailbox_stranded",
+                        "currentSession": current,
+                        "heads": heads,
+                    }))
+                }
+                "mailbox.adopt" => {
+                    let params: HeadVersionParams = serde_json::from_value(params.clone())
+                        .map_err(|_| MailboxBootstrapError::InvalidRequest)?;
+                    protocol_ok(&params.protocol)?;
+                    let session_value =
+                        current.clone().ok_or(MailboxBootstrapError::GrantMissing)?;
+                    let head = stranded_head(&load()?, &params)?;
+                    store
+                        .edit_unclaimed_head(crate::mailbox::MailboxHeadEdit {
+                            stable_id: head.stable_id,
+                            revision: head.revision,
+                            digest: head.digest,
+                            subject: head.subject,
+                            body: head.body,
+                            repin_recipient_session: Some(session_value),
+                        })
+                        .map_err(|_| MailboxBootstrapError::InvalidRequest)?;
+                    to_value(ResponseResult::MailboxSnapshot {
+                        snapshot: view(&load()?)?,
+                    })
+                }
+                "mailbox.drop" => {
+                    let params: HeadVersionParams = serde_json::from_value(params.clone())
+                        .map_err(|_| MailboxBootstrapError::InvalidRequest)?;
+                    protocol_ok(&params.protocol)?;
+                    let head = stranded_head(&load()?, &params)?;
+                    store
+                        .withdraw_unclaimed_head(&head.stable_id, head.revision, &head.digest)
+                        .map_err(|_| MailboxBootstrapError::InvalidRequest)?;
+                    to_value(ResponseResult::MailboxSnapshot {
+                        snapshot: view(&load()?)?,
+                    })
+                }
+                "mailbox.snapshot" => {
+                    let params: ProtocolParams = serde_json::from_value(params.clone())
+                        .map_err(|_| MailboxBootstrapError::InvalidRequest)?;
+                    protocol_ok(&params.protocol)?;
+                    to_value(ResponseResult::MailboxSnapshot {
+                        snapshot: view(&load()?)?,
+                    })
+                }
+                "mailbox.claim" => {
+                    let _: crate::mailbox_v1::ClaimRequest = serde_json::from_value(params.clone())
+                        .map_err(|_| MailboxBootstrapError::InvalidRequest)?;
+                    let claim = store
+                        .claim_next_eligible(&recipient, |head| {
+                            crate::app::messages::head_claimable_by(head, current.as_deref())
+                        })
+                        .map_err(|_| MailboxBootstrapError::GrantMissing)?;
+                    to_value(ResponseResult::MailboxClaimed { claim })
+                }
+                "mailbox.edit" => {
+                    let edit: crate::mailbox_v1::Edit = serde_json::from_value(params.clone())
+                        .map_err(|_| MailboxBootstrapError::InvalidRequest)?;
+                    // Own inbox only: the edited head must be addressed here.
+                    if !load()?
+                        .heads
+                        .get(&edit.stable_id)
+                        .is_some_and(|head| head.recipient == recipient)
+                    {
+                        return Err(MailboxBootstrapError::InvalidRequest);
+                    }
+                    crate::mailbox_v1::edit_unclaimed(&store, edit)
+                        .map_err(|_| MailboxBootstrapError::InvalidRequest)?;
+                    to_value(ResponseResult::MailboxEdited {
+                        snapshot: view(&load()?)?,
+                    })
+                }
+                "mailbox.resolve" => {
+                    let resolve: crate::mailbox_v1::Resolve =
+                        serde_json::from_value(params.clone())
+                            .map_err(|_| MailboxBootstrapError::InvalidRequest)?;
+                    let recovered = load()?;
+                    let claim = recovered
+                        .claims
+                        .values()
+                        .find(|claim| claim.claim_id == resolve.claim_id)
+                        .filter(|claim| {
+                            claim.recipient == recipient
+                                && !crate::mailbox::is_withdrawn_claim(claim)
+                        })
+                        .ok_or(MailboxBootstrapError::InvalidRequest)?;
+                    let outcome = match resolve.outcome {
+                        crate::mailbox_v1::ResolveOutcome::Admitted => {
+                            crate::mailbox::ClaimResolutionOutcome::Admitted
+                        }
+                        crate::mailbox_v1::ResolveOutcome::Settled => {
+                            crate::mailbox::ClaimResolutionOutcome::Settled
+                        }
+                    };
+                    let resolution = store
+                        .resolve_claim(&claim.claim_id, outcome)
+                        .map_err(|_| MailboxBootstrapError::InvalidRequest)?;
+                    to_value(ResponseResult::MailboxResolved { resolution })
+                }
+                _ => Err(MailboxBootstrapError::InvalidRequest),
+            }
+        })())
+    }
+
+    /// Current journal marker for `mailbox.watch`: changes on every append.
+    pub(crate) fn mailbox_watch_marker(
+        &self,
+        session: &MailboxBootstrapSession,
+    ) -> Result<u64, MailboxBootstrapError> {
+        self.mailbox_bootstrap_session_current(session)?;
+        Ok(
+            crate::mailbox::MailboxStore::open(&self.sender_authority_dir)
+                .map(|store| store.journal_len())
+                .unwrap_or(0),
+        )
+    }
+
     pub(crate) fn handle_mailbox_offline_submit(
         &mut self,
         id: String,
@@ -474,11 +701,12 @@ impl App {
                 )
             }
         }
+        let current = self.current_agent_session_value(&params.recipient.recipient_id);
         let authority = self
             .offline_mailbox_authorities
             .get(&params.caller)
             .expect("current route must remain installed during serialized dispatch");
-        match authority.claim(params) {
+        match authority.claim(params, current.as_deref()) {
             Ok(claim) => encode_success(id, ResponseResult::MailboxClaimed { claim }),
             Err(crate::app::mailbox::OfflineMailboxError::CallerMismatch) => encode_error(
                 id,
@@ -517,11 +745,12 @@ impl App {
                 )
             }
         }
+        let current = self.current_agent_session_value(&params.recipient.recipient_id);
         let authority = self
             .offline_mailbox_authorities
             .get(&params.caller)
             .expect("current route must remain installed during serialized dispatch");
-        match authority.snapshot(params) {
+        match authority.snapshot(params, current.as_deref()) {
             Ok(snapshot) => encode_success(id, ResponseResult::MailboxSnapshot { snapshot }),
             Err(crate::app::mailbox::OfflineMailboxError::CallerMismatch) => encode_error(
                 id,
@@ -564,11 +793,12 @@ impl App {
                 )
             }
         }
+        let current = self.current_agent_session_value(&params.recipient.recipient_id);
         let authority = self
             .offline_mailbox_authorities
             .get(&params.caller)
             .expect("current route must remain installed during serialized dispatch");
-        match authority.edit(params) {
+        match authority.edit(params, current.as_deref()) {
             Ok(snapshot) => encode_success(id, ResponseResult::MailboxEdited { snapshot }),
             Err(crate::app::mailbox::OfflineMailboxError::CallerMismatch) => encode_error(
                 id,

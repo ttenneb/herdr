@@ -187,6 +187,64 @@ pub struct AgentPromptParams {
     pub text: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub wait: Option<AgentPromptWaitOptions>,
+    #[serde(default, flatten)]
+    pub send: MessageSendOptions,
+}
+
+/// How an ordinary send reaches the recipient.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum MessageTransport {
+    /// The recipient's Messages queue when it has a live Messages stream,
+    /// otherwise typed into the pane exactly as before.
+    Auto,
+    /// The recipient's Messages queue only; refuse if it has none.
+    Mailbox,
+    /// Typed into the pane (the pre-Messages behaviour).
+    Pty,
+}
+
+/// What to do when this sender already has an unclaimed message waiting for
+/// the same recipient.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum PendingChoice {
+    /// Replace the waiting message's subject and body.
+    EditPending,
+    /// Queue a second message.
+    SendNew,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct MessageSendOptions {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transport: Option<MessageTransport>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub on_pending: Option<PendingChoice>,
+    /// With `edit_pending`: the pending revision the sender last saw.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expect_revision: Option<u64>,
+    /// Kernel peer PID of the API connection, set by the server. Clients
+    /// cannot supply it. Used for sender attribution only, never authority.
+    #[serde(skip)]
+    #[schemars(skip)]
+    pub caller_pid: Option<u32>,
+}
+
+/// Where an ordinary send went.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct MessageDelivery {
+    /// `mailbox` or `pty`.
+    pub path: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stable_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub revision: Option<u64>,
+    #[serde(default, skip_serializing_if = "super::is_false")]
+    pub edited: bool,
+    /// True when an identical correlated send found its existing message.
+    #[serde(default, skip_serializing_if = "super::is_false")]
+    pub duplicate: bool,
 }
 
 /// Provenance of an agent's reported `agent_session`.

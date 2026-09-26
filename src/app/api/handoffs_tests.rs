@@ -86,6 +86,7 @@ async fn exact_session_handoff_uses_normal_prompt_transaction() {
         "req".into(),
         HandoffSendParams {
             envelope: envelope(identity(&app, pane)),
+            send: Default::default(),
         },
     );
     let success: SuccessResponse = serde_json::from_str(&response).unwrap();
@@ -107,7 +108,13 @@ async fn replacement_session_is_rejected_without_writing() {
     let current = identity(&app, pane);
     let mut stale = envelope(current);
     stale.recipient.agent_session.value = "replaced-session".into();
-    let response = app.handle_handoff_send("req".into(), HandoffSendParams { envelope: stale });
+    let response = app.handle_handoff_send(
+        "req".into(),
+        HandoffSendParams {
+            envelope: stale,
+            send: Default::default(),
+        },
+    );
     let success: SuccessResponse = serde_json::from_str(&response).unwrap();
     let ResponseResult::HandoffTransport { receipt } = success.result else {
         panic!("expected receipt")
@@ -209,7 +216,13 @@ async fn hand_typed_pi_reported_session_is_visible_marked_reported_and_handoffs_
         let mut envelope = envelope(identity_at(&app, from, panes[from]));
         envelope.recipient = identity_at(&app, to, panes[to]);
         envelope.message_id = format!("m-{from}-{to}");
-        let response = app.handle_handoff_send("req".into(), HandoffSendParams { envelope });
+        let response = app.handle_handoff_send(
+            "req".into(),
+            HandoffSendParams {
+                envelope,
+                send: Default::default(),
+            },
+        );
         let success: SuccessResponse = serde_json::from_str(&response).unwrap();
         let ResponseResult::HandoffTransport { receipt } = success.result else {
             panic!("expected receipt")

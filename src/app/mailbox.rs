@@ -46,6 +46,19 @@ pub(crate) struct MailboxBootstrapSession {
         Option<crate::delegation::DelegationId>,
     )>,
     context: TrustedMailboxChannelContext,
+    /// Set only for a Pi without a trusted managed launch (hand-typed or a
+    /// Collection helper), accepted when `[experimental]
+    /// unmanaged_pi_messages` is on. Such a session may read, claim, edit and
+    /// resolve only its own inbox; it never gets sender, grant, bound-report
+    /// or route authority.
+    pub(crate) recipient_only: Option<RecipientOnlyBinding>,
+}
+
+/// The exact foreground Pi execution a recipient-only session is bound to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct RecipientOnlyBinding {
+    pub(crate) foreground_pid: u32,
+    pub(crate) start_ticks: u64,
 }
 
 /// Ephemeral readiness earned only by a durably acknowledged graph snapshot.
@@ -240,19 +253,23 @@ impl OfflineMailboxAuthority {
     pub(crate) fn claim(
         &self,
         params: crate::api::schema::MailboxClaimParams,
+        current_session: Option<&str>,
     ) -> Result<Option<crate::mailbox::Claim>, OfflineMailboxError> {
         crate::mailbox_v1::validate_request(&crate::mailbox_v1::Request::Claim(params.claim))
             .map_err(OfflineMailboxError::Transport)?;
         let capability =
             self.capability_for(&params.caller, &params.grant_id, &params.recipient)?;
         self.store
-            .claim_next(&capability.recipient)
+            .claim_next_eligible(&capability.recipient, |head| {
+                crate::app::messages::head_claimable_by(head, current_session)
+            })
             .map_err(OfflineMailboxError::Store)
     }
 
     pub(crate) fn snapshot(
         &self,
         params: crate::api::schema::MailboxSnapshotParams,
+        current_session: Option<&str>,
     ) -> Result<crate::mailbox_v1::Snapshot, OfflineMailboxError> {
         crate::mailbox_v1::validate_request(&crate::mailbox_v1::Request::List(
             crate::mailbox_v1::List {
@@ -265,12 +282,20 @@ impl OfflineMailboxAuthority {
             self.capability_for(&params.caller, &params.grant_id, &params.recipient)?;
         let recovered = self.store.load().map_err(OfflineMailboxError::Store)?;
         crate::mailbox_v1::snapshot(&recovered, &capability.recipient)
+            .map(|snapshot| {
+                crate::app::messages::filter_recipient_snapshot(
+                    snapshot,
+                    &recovered,
+                    current_session,
+                )
+            })
             .map_err(OfflineMailboxError::Store)
     }
 
     pub(crate) fn edit(
         &self,
         params: crate::api::schema::MailboxEditParams,
+        current_session: Option<&str>,
     ) -> Result<crate::mailbox_v1::Snapshot, OfflineMailboxError> {
         crate::mailbox_v1::validate_request(&crate::mailbox_v1::Request::Edit(params.edit.clone()))
             .map_err(OfflineMailboxError::Transport)?;
@@ -282,6 +307,13 @@ impl OfflineMailboxAuthority {
         // callers receive server authority rather than an optimistic local edit.
         let recovered = self.store.load().map_err(OfflineMailboxError::Store)?;
         crate::mailbox_v1::snapshot(&recovered, &capability.recipient)
+            .map(|snapshot| {
+                crate::app::messages::filter_recipient_snapshot(
+                    snapshot,
+                    &recovered,
+                    current_session,
+                )
+            })
             .map_err(OfflineMailboxError::Store)
     }
 
@@ -882,6 +914,13 @@ impl App {
         self.mailbox_bootstrap_discovery_address = listener_path
             .is_absolute()
             .then(|| listener_path.display().to_string());
+        // With unmanaged Pi Messages on, every pane shell carries the
+        // (authority-free) address so a typed `pi` can find the listener.
+        crate::integration::set_pane_mailbox_bootstrap_address(
+            self.unmanaged_pi_messages
+                .then(|| self.mailbox_bootstrap_discovery_address.clone())
+                .flatten(),
+        );
     }
 
     pub(crate) fn pi_mailbox_bootstrap_launch_environment(
@@ -970,6 +1009,137 @@ impl App {
         &mut self,
         socket_fd: RawFd,
     ) -> Result<MailboxBootstrapSession, MailboxBootstrapError> {
+        let trusted = self.accept_trusted_mailbox_bootstrap_stream(socket_fd);
+        match trusted {
+            Err(MailboxBootstrapError::GrantMissing | MailboxBootstrapError::PeerRejected)
+                if self.unmanaged_pi_messages =>
+            {
+                self.accept_recipient_only_mailbox_bootstrap_stream(socket_fd)
+                    .map_err(|_| trusted.unwrap_err())
+            }
+            other => other,
+        }
+    }
+
+    /// Recipient-only acceptance: the peer (same UID) must be, or descend
+    /// from, the Pi process in a pane's current foreground job, and that pane
+    /// must have no trusted managed sender authority of its own.
+    fn accept_recipient_only_mailbox_bootstrap_stream(
+        &mut self,
+        socket_fd: RawFd,
+    ) -> Result<MailboxBootstrapSession, MailboxBootstrapError> {
+        let candidates: Vec<(String, u32)> = self
+            .state
+            .terminals
+            .iter()
+            .filter(|(_, terminal)| {
+                terminal.effective_known_agent() == Some(crate::detect::Agent::Pi)
+            })
+            .filter_map(|(terminal_id, _)| {
+                let key = terminal_id.to_string();
+                if self.active_pi_sender_generation(&key).is_some() {
+                    return None;
+                }
+                let job = self.mailbox_bootstrap_foreground_job(terminal_id)?;
+                let (agent, process) = crate::detect::identify_agent_process_in_job(&job)?;
+                (agent == crate::detect::Agent::Pi && process.pid != 0)
+                    .then_some((key, process.pid))
+            })
+            .collect();
+        for (terminal_key, foreground_pid) in candidates {
+            let entropy = crate::platform::random_route_epoch();
+            let binding_generation =
+                self.mailbox_bootstrap_binding_candidate(entropy.as_deref())?;
+            let recipient = SessionGeneration {
+                session: terminal_key.clone(),
+                generation: 0,
+                delegation_id: crate::delegation::DelegationId::alloc()
+                    .map_err(|_| MailboxBootstrapError::GrantMissing)?,
+            };
+            let Ok(context) = TrustedMailboxChannelContext::from_verified_local_socket(
+                socket_fd,
+                recipient,
+                binding_generation.clone(),
+                foreground_pid,
+                0,
+            ) else {
+                continue;
+            };
+            let Some(birth) = self.managed_pi_process_birth(foreground_pid) else {
+                continue;
+            };
+            self.next_mailbox_bootstrap_binding = self
+                .next_mailbox_bootstrap_binding
+                .checked_add(1)
+                .ok_or(MailboxBootstrapError::GrantMissing)?;
+            if !self
+                .used_mailbox_bootstrap_nonces
+                .insert(entropy.ok_or(MailboxBootstrapError::GrantMissing)?)
+            {
+                return Err(MailboxBootstrapError::GrantMissing);
+            }
+            let session = MailboxBootstrapSession {
+                caller: terminal_key.clone(),
+                parent_report: None,
+                history_only: false,
+                history_edge: None,
+                recipient: crate::mailbox::RecipientKey {
+                    recipient_id: terminal_key.clone(),
+                    generation: "1".into(),
+                },
+                grant_id: format!("recipient-only:{terminal_key}"),
+                active_execution_generation: 0,
+                binding_generation: binding_generation.clone(),
+                context,
+                recipient_only: Some(RecipientOnlyBinding {
+                    foreground_pid,
+                    start_ticks: birth.start_ticks,
+                }),
+            };
+            self.mailbox_bootstrap_bindings
+                .insert(binding_generation, session.clone());
+            return Ok(session);
+        }
+        Err(MailboxBootstrapError::PeerRejected)
+    }
+
+    /// A recipient-only session stays current only while its exact Pi
+    /// execution is still the pane's foreground Pi and the switch is on.
+    fn recipient_only_binding_current(&self, session: &MailboxBootstrapSession) -> bool {
+        let Some(binding) = session.recipient_only else {
+            return false;
+        };
+        self.unmanaged_pi_messages
+            && self.active_pi_sender_generation(&session.caller).is_none()
+            && self
+                .state
+                .terminals
+                .keys()
+                .find(|terminal_id| terminal_id.to_string() == session.caller)
+                .and_then(|terminal_id| self.mailbox_bootstrap_foreground_job(terminal_id))
+                .is_some_and(|job| {
+                    crate::detect::identify_agent_process_in_job(&job).is_some_and(
+                        |(agent, process)| {
+                            agent == crate::detect::Agent::Pi
+                                && process.pid == binding.foreground_pid
+                        },
+                    )
+                })
+            && self
+                .managed_pi_process_birth(binding.foreground_pid)
+                .is_some_and(|birth| birth.start_ticks == binding.start_ticks)
+    }
+
+    /// Releases the binding of a closed bootstrap stream so "has Messages"
+    /// reflects live connections only.
+    pub(crate) fn release_mailbox_bootstrap_binding(&mut self, binding_generation: &str) {
+        self.mailbox_bootstrap_bindings.remove(binding_generation);
+    }
+
+    fn accept_trusted_mailbox_bootstrap_stream(
+        &mut self,
+        socket_fd: RawFd,
+    ) -> Result<MailboxBootstrapSession, MailboxBootstrapError> {
         let candidates = self.live_mailbox_bootstrap_candidates();
         if candidates.is_empty() {
             return Err(MailboxBootstrapError::GrantMissing);
@@ -1053,6 +1223,7 @@ impl App {
                 active_execution_generation: candidate.process_generation,
                 binding_generation: binding_generation.clone(),
                 context,
+                recipient_only: None,
             };
             self.mailbox_bootstrap_bindings
                 .insert(binding_generation, session.clone());
@@ -1071,6 +1242,16 @@ impl App {
         else {
             return Err(MailboxBootstrapError::GrantMissing);
         };
+        if session.recipient_only.is_some() {
+            return if issued == session
+                && issued.context().binding().id() == session.binding_generation
+                && self.recipient_only_binding_current(session)
+            {
+                Ok(())
+            } else {
+                Err(MailboxBootstrapError::GrantRevoked)
+            };
+        }
         if issued != session
             || issued.context().binding().id() != session.binding_generation
             || (session.history_only
@@ -1168,22 +1349,28 @@ impl App {
         if protocol != crate::mailbox_v1::PROTOCOL {
             return Err(MailboxBootstrapError::InvalidRequest);
         }
-        if self.history_delegation_edge(&session.caller) != session.history_edge
-            || self.active_pi_sender_generation(&session.caller)
-                != Some(session.active_execution_generation)
-            || !self.history_foreground_matches(session)
+        if session.recipient_only.is_none()
+            && (self.history_delegation_edge(&session.caller) != session.history_edge
+                || self.active_pi_sender_generation(&session.caller)
+                    != Some(session.active_execution_generation)
+                || !self.history_foreground_matches(session))
         {
             return Err(MailboxBootstrapError::GrantRevoked);
         }
         let store = crate::mailbox::MailboxStore::open(&self.sender_authority_dir)
             .map_err(|_| MailboxBootstrapError::GrantMissing)?;
-        let mut snapshot = crate::mailbox_v1::snapshot(
-            &store
-                .load()
-                .map_err(|_| MailboxBootstrapError::GrantMissing)?,
-            &session.recipient,
-        )
-        .map_err(|_| MailboxBootstrapError::GrantMissing)?;
+        let recovered = store
+            .load()
+            .map_err(|_| MailboxBootstrapError::GrantMissing)?;
+        let mut snapshot = crate::mailbox_v1::snapshot(&recovered, &session.recipient)
+            .map_err(|_| MailboxBootstrapError::GrantMissing)?;
+        // Withdrawn (dropped) heads are settled but never part of history.
+        let current = self.current_agent_session_value(&session.caller);
+        snapshot = crate::app::messages::filter_recipient_snapshot(
+            snapshot,
+            &recovered,
+            current.as_deref(),
+        );
         let settled: std::collections::HashSet<_> = snapshot
             .head_states
             .iter()

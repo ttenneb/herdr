@@ -558,7 +558,10 @@ fn execute(args: &RunArgs, receipt: &mut RunReceipt) -> i32 {
     };
     let response = match super::send_request(&Request {
         id: format!("cli:{}:assignment", receipt.run_id),
-        method: Method::HandoffSend(HandoffSendParams { envelope }),
+        method: Method::HandoffSend(HandoffSendParams {
+            envelope,
+            send: Default::default(),
+        }),
     }) {
         Ok(value) => value,
         Err(err) => {

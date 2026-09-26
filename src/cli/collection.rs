@@ -190,6 +190,7 @@ fn helper_launch(parsed: ParsedHelperLaunch) -> std::io::Result<i32> {
                     target: pane_id.clone(),
                     text: assignment,
                     wait: None,
+                    send: Default::default(),
                 }),
             });
             let prompt_error = match prompt {

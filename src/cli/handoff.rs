@@ -73,7 +73,10 @@ fn send(source: &str) -> std::io::Result<i32> {
     }
     let response = super::send_request(&Request {
         id: "cli:handoff:send".into(),
-        method: Method::HandoffSend(HandoffSendParams { envelope }),
+        method: Method::HandoffSend(HandoffSendParams {
+            envelope,
+            send: Default::default(),
+        }),
     })?;
     let admitted =
         response["result"]["receipt"]["outcome"].as_str() == Some("runtime_transaction_admitted");

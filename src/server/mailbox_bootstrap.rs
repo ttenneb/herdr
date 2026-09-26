@@ -42,6 +42,13 @@ pub(crate) struct MailboxBootstrapDescriptor {
     /// cannot expose pending heads or mint a grant for old work.
     pub history_snapshot: ReportSubmitAdvertisement,
     pub history_only: bool,
+    /// True for a Pi without a trusted managed launch: own inbox only.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub recipient_only: bool,
+    /// Own-inbox methods beyond the v1 set: `mailbox.watch` (long-poll),
+    /// `mailbox.stranded`, `mailbox.adopt` and `mailbox.drop`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub messages: Option<MessagesAdvertisement>,
     /// Offered only when the server can validate an exact active delegation
     /// parent. Admission here is a durable mailbox receipt, not Pi Gate
     /// admission or the parent's acceptance of the report.
@@ -54,6 +61,16 @@ pub(crate) struct MailboxBootstrapDescriptor {
     pub active_execution_generation: u64,
     pub binding_generation: String,
     pub request_id_policy: &'static str,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct MessagesAdvertisement {
+    pub watch_method: &'static str,
+    pub stranded_method: &'static str,
+    pub adopt_method: &'static str,
+    pub drop_method: &'static str,
+    pub protocol: &'static str,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -84,15 +101,25 @@ impl MailboxBootstrapDescriptor {
     fn from_session(session: &MailboxBootstrapSession, endpoint: &Path) -> Self {
         Self {
             protocol_version: MAILBOX_BOOTSTRAP_PROTOCOL_VERSION,
-            report_submit: (!session.history_only).then_some(ReportSubmitAdvertisement {
-                method: "report_submit",
-                protocol: crate::mailbox_v1::PROTOCOL,
-            }),
+            report_submit: (!session.history_only && session.recipient_only.is_none()).then_some(
+                ReportSubmitAdvertisement {
+                    method: "report_submit",
+                    protocol: crate::mailbox_v1::PROTOCOL,
+                },
+            ),
             history_snapshot: ReportSubmitAdvertisement {
                 method: "mailbox.history_snapshot",
                 protocol: crate::mailbox_v1::PROTOCOL,
             },
             history_only: session.history_only,
+            recipient_only: session.recipient_only.is_some(),
+            messages: (!session.history_only).then_some(MessagesAdvertisement {
+                watch_method: "mailbox.watch",
+                stranded_method: "mailbox.stranded",
+                adopt_method: "mailbox.adopt",
+                drop_method: "mailbox.drop",
+                protocol: crate::mailbox_v1::PROTOCOL,
+            }),
             parent_report: session
                 .parent_report
                 .as_ref()
@@ -185,6 +212,27 @@ struct AcceptedMailboxConnection {
     stream: UnixStream,
     input: Vec<u8>,
     session: Option<MailboxBootstrapSession>,
+    /// One parked `mailbox.watch` long-poll, answered from `poll`.
+    watch: Option<ParkedWatch>,
+}
+
+struct ParkedWatch {
+    request_id: Option<String>,
+    after_marker: u64,
+    deadline: std::time::Instant,
+}
+
+/// `mailbox.watch` waits at most this long before answering `changed:false`.
+const MAX_WATCH_TIMEOUT_MS: u64 = 30_000;
+const DEFAULT_WATCH_TIMEOUT_MS: u64 = 25_000;
+
+fn watch_response(request_id: Option<String>, changed: bool, marker: u64) -> String {
+    serde_json::to_string(&BootstrapSuccess {
+        ok: true,
+        request_id,
+        result: serde_json::json!({"type": "mailbox_watch", "changed": changed, "marker": marker}),
+    })
+    .unwrap_or_else(|_| failure(None, MailboxBootstrapError::GrantMissing))
 }
 
 /// A HeadlessServer-owned listener.  It is nonblocking; accepted streams are
@@ -237,6 +285,7 @@ impl MailboxBootstrapListener {
                             stream,
                             input: Vec::new(),
                             session: None,
+                            watch: None,
                         },
                     );
                 }
@@ -279,16 +328,45 @@ impl MailboxBootstrapListener {
                     .and_then(|frame| serde_json::from_str::<BootstrapRequest>(frame).ok());
                 let response = match request {
                     Some(request) => Self::handle_request(app, connection, request),
-                    None => failure(None, MailboxBootstrapError::InvalidRequest),
+                    None => Some(failure(None, MailboxBootstrapError::InvalidRequest)),
+                };
+                let Some(response) = response else {
+                    continue;
                 };
                 if write_response(&mut connection.stream, &response).is_err() {
                     closed.push(*id);
                     break;
                 }
             }
+            // Answer a parked watch once the journal changed, the session is
+            // no longer current, or its deadline passed.
+            if let (Some(watch), Some(session)) = (&connection.watch, &connection.session) {
+                let response = match app.mailbox_watch_marker(session) {
+                    Ok(marker) if marker != watch.after_marker => {
+                        Some(watch_response(watch.request_id.clone(), true, marker))
+                    }
+                    Ok(marker) if std::time::Instant::now() >= watch.deadline => {
+                        Some(watch_response(watch.request_id.clone(), false, marker))
+                    }
+                    Ok(_) => None,
+                    Err(error) => Some(failure(watch.request_id.clone(), error)),
+                };
+                if let Some(response) = response {
+                    connection.watch = None;
+                    if write_response(&mut connection.stream, &response).is_err() {
+                        closed.push(*id);
+                    }
+                }
+            }
         }
         for id in closed {
-            self.accepted.remove(&id);
+            if let Some(session) = self
+                .accepted
+                .remove(&id)
+                .and_then(|connection| connection.session)
+            {
+                app.release_mailbox_bootstrap_binding(&session.binding_generation);
+            }
         }
         Ok(())
     }
@@ -297,37 +375,79 @@ impl MailboxBootstrapListener {
         app: &mut App,
         connection: &mut AcceptedMailboxConnection,
         request: BootstrapRequest,
-    ) -> String {
+    ) -> Option<String> {
         let request_id = request.request_id;
         if request.method == "bootstrap" {
             if connection.session.is_some() {
-                return failure(request_id, MailboxBootstrapError::InvalidRequest);
+                return Some(failure(request_id, MailboxBootstrapError::InvalidRequest));
             }
             let session = match app.accept_mailbox_bootstrap_stream(connection.stream.as_raw_fd()) {
                 Ok(session) => session,
-                Err(error) => return failure(request_id, error),
+                Err(error) => return Some(failure(request_id, error)),
             };
             let descriptor = MailboxBootstrapDescriptor::from_session(
                 &session,
                 &mailbox_bootstrap_socket_path(),
             );
             connection.session = Some(session);
-            return serde_json::to_string(&BootstrapSuccess {
-                ok: true,
-                request_id,
-                result: descriptor,
-            })
-            .unwrap_or_else(|_| failure(None, MailboxBootstrapError::GrantMissing));
+            return Some(
+                serde_json::to_string(&BootstrapSuccess {
+                    ok: true,
+                    request_id,
+                    result: descriptor,
+                })
+                .unwrap_or_else(|_| failure(None, MailboxBootstrapError::GrantMissing)),
+            );
         }
 
         let Some(session) = connection.session.as_ref() else {
-            return failure(request_id, MailboxBootstrapError::GrantMissing);
+            return Some(failure(request_id, MailboxBootstrapError::GrantMissing));
         };
         if request.binding_generation.as_deref() != Some(&session.binding_generation) {
-            return failure(request_id, MailboxBootstrapError::GrantRevoked);
+            return Some(failure(request_id, MailboxBootstrapError::GrantRevoked));
+        }
+        if request.method == "mailbox.watch" {
+            #[derive(Deserialize)]
+            #[serde(rename_all = "camelCase", deny_unknown_fields)]
+            struct WatchParams {
+                protocol: String,
+                #[serde(default)]
+                after_marker: Option<u64>,
+                #[serde(default)]
+                timeout_ms: Option<u64>,
+            }
+            let Ok(params) = serde_json::from_value::<WatchParams>(request.params) else {
+                return Some(failure(request_id, MailboxBootstrapError::InvalidRequest));
+            };
+            if params.protocol != crate::mailbox_v1::PROTOCOL
+                || session.history_only
+                || connection.watch.is_some()
+            {
+                return Some(failure(request_id, MailboxBootstrapError::InvalidRequest));
+            }
+            let marker = match app.mailbox_watch_marker(session) {
+                Ok(marker) => marker,
+                Err(error) => return Some(failure(request_id, error)),
+            };
+            return match params.after_marker {
+                Some(after) if after == marker => {
+                    let timeout = params
+                        .timeout_ms
+                        .unwrap_or(DEFAULT_WATCH_TIMEOUT_MS)
+                        .min(MAX_WATCH_TIMEOUT_MS);
+                    connection.watch = Some(ParkedWatch {
+                        request_id,
+                        after_marker: after,
+                        deadline: std::time::Instant::now()
+                            + std::time::Duration::from_millis(timeout),
+                    });
+                    None
+                }
+                after => Some(watch_response(request_id, after.is_some(), marker)),
+            };
         }
         let result = app.dispatch_mailbox_bootstrap(session, &request.method, request.params);
-        match result {
+        Some(match result {
             Ok(result) => serde_json::to_string(&BootstrapSuccess {
                 ok: true,
                 request_id,
@@ -335,7 +455,7 @@ impl MailboxBootstrapListener {
             })
             .unwrap_or_else(|_| failure(None, MailboxBootstrapError::GrantMissing)),
             Err(error) => failure(request_id, error),
-        }
+        })
     }
 }
 

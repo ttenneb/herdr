@@ -87,12 +87,17 @@ pub struct HandoffValidateParams {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct HandoffSendParams {
     pub envelope: HerdrHandoff,
+    #[serde(default, flatten)]
+    pub send: super::MessageSendOptions,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum HandoffTransportOutcome {
     RuntimeTransactionAdmitted,
+    /// Durably queued in the recipient's Messages; the recipient runs it when
+    /// it next picks up work.
+    MailboxAdmitted,
     SenderIdentityMismatch,
     RecipientIdentityMismatch,
     RecipientNotReady,
@@ -116,6 +121,8 @@ pub struct HandoffTransportReceipt {
     pub target_state_change_seq: u64,
     pub outcome: HandoffTransportOutcome,
     pub detail: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delivery: Option<super::MessageDelivery>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

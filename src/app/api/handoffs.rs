@@ -62,6 +62,7 @@ impl App {
             target_state_change_seq,
             outcome,
             detail,
+            delivery: None,
         };
 
         if !self.identity_matches_current(&envelope.sender) {
@@ -186,6 +187,24 @@ impl App {
                 },
             );
         }
+        if expected_agent == crate::detect::Agent::Pi
+            && params.send.transport != Some(crate::api::schema::MessageTransport::Pty)
+            && self
+                .attached_messages_recipient(&terminal_id.to_string())
+                .is_some()
+        {
+            if let Some(response) =
+                self.handoff_via_messages(&id, &envelope, &params.send, &receipt)
+            {
+                return response;
+            }
+        } else if params.send.transport == Some(crate::api::schema::MessageTransport::Mailbox) {
+            return encode_error(
+                id,
+                "messages_unavailable",
+                "the recipient has no live Messages connection",
+            );
+        }
         if expected_agent == crate::detect::Agent::GithubCopilot {
             let focus = match crate::ghostty::encode_focus(crate::ghostty::FocusEvent::Gained) {
                 Ok(focus) => focus,
@@ -278,6 +297,81 @@ impl App {
         encode_success(id, ResponseResult::HandoffTransport {
             receipt: receipt(HandoffTransportOutcome::RuntimeTransactionAdmitted, "Herdr runtime admitted the complete prompt transaction; Pi/gate/agent acknowledgement is unknown".into()),
         })
+    }
+
+    /// Queues a validated handoff in the recipient's Messages. Returns `None`
+    /// to continue on the unchanged PTY path (for example, text outside
+    /// Messages limits). The legacy report-bypass journaling above runs first.
+    fn handoff_via_messages(
+        &self,
+        id: &str,
+        envelope: &crate::api::schema::HerdrHandoff,
+        options: &crate::api::schema::MessageSendOptions,
+        receipt: &dyn Fn(HandoffTransportOutcome, String) -> HandoffTransportReceipt,
+    ) -> Option<String> {
+        let sender_label = self
+            .current_identity_info(&envelope.sender)
+            .and_then(|agent| agent.name)
+            .unwrap_or_else(|| envelope.sender.pane_id.clone());
+        let sender = crate::app::messages::SenderAttribution {
+            terminal: Some(envelope.sender.terminal_id.clone()),
+            label: sender_label.clone(),
+            session: Some(envelope.sender.agent_session.value.clone()),
+        };
+        let kind = match envelope.kind {
+            crate::api::schema::HandoffKind::Assignment => "assignment",
+            crate::api::schema::HandoffKind::Blocker => "blocker",
+            _ => "advisory",
+        };
+        let summary_line = envelope.summary.lines().next().unwrap_or_default();
+        let message = crate::app::messages::OutgoingMessage {
+            origin: "handoff",
+            subject: crate::app::messages::subject_for(
+                &format!("Handoff ({kind}) from"),
+                &format!("{sender_label}: {summary_line}"),
+            ),
+            body: envelope.prompt_text(),
+            priority: "normal".into(),
+            kind: kind.into(),
+            message_id: Some(format!("handoff:{}", envelope.message_id)),
+            correlation: envelope.correlation_id.as_ref().map(|key| {
+                crate::mailbox::SendCorrelation {
+                    namespace: "handoff".into(),
+                    key: key.clone(),
+                    revision: 1,
+                }
+            }),
+            replace_pending: false,
+        };
+        let options = crate::api::schema::MessageSendOptions {
+            transport: Some(crate::api::schema::MessageTransport::Mailbox),
+            ..options.clone()
+        };
+        let recipient_terminal = envelope.recipient.terminal_id.clone();
+        match self.route_ordinary_send(&recipient_terminal, &sender, message, &options) {
+            Ok(crate::app::messages::SendRoute::Mailbox(delivery)) => {
+                let mut receipt = receipt(
+                    HandoffTransportOutcome::MailboxAdmitted,
+                    "queued durably in the recipient's Messages; the recipient runs it when it next picks up work".into(),
+                );
+                receipt.delivery = Some(delivery);
+                Some(encode_success(
+                    id.to_string(),
+                    ResponseResult::HandoffTransport { receipt },
+                ))
+            }
+            Ok(crate::app::messages::SendRoute::Pty) => None,
+            Err(crate::app::messages::SendRefusal::MailboxUnavailable(_)) => None,
+            Err(refusal) => crate::app::messages::pending_error_json(id.to_string(), &refusal)
+                .or_else(|| match refusal {
+                    crate::app::messages::SendRefusal::Store(message) => Some(encode_error(
+                        id.to_string(),
+                        "mailbox_store_failed",
+                        message,
+                    )),
+                    _ => None,
+                }),
+        }
     }
 
     fn current_identity_info(&self, identity: &CanonicalHerdrIdentity) -> Option<AgentInfo> {

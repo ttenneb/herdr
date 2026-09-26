@@ -108,6 +108,58 @@ impl App {
                 ),
             );
         }
+        if expected_agent == crate::detect::Agent::Pi {
+            let terminal_key = terminal_id.to_string();
+            let sender = self.attribute_sender(params.send.caller_pid);
+            let message = crate::app::messages::parse_structured_prompt(&params.text)
+                .unwrap_or_else(|| crate::app::messages::OutgoingMessage {
+                    origin: "agent_prompt",
+                    subject: crate::app::messages::subject_for("Message from", &sender.label),
+                    body: params.text.clone(),
+                    priority: "normal".into(),
+                    kind: "advisory".into(),
+                    message_id: None,
+                    correlation: None,
+                    replace_pending: false,
+                });
+            match self.route_ordinary_send(&terminal_key, &sender, message, &params.send) {
+                Ok(crate::app::messages::SendRoute::Pty) => {}
+                Ok(crate::app::messages::SendRoute::Mailbox(delivery)) => {
+                    let Some(agent) = self.agent_info(resolved.ws_idx, resolved.pane_id) else {
+                        return agent_not_found(id, &params.target);
+                    };
+                    return encode_success(
+                        id,
+                        ResponseResult::AgentPrompted {
+                            agent,
+                            delivery: Some(delivery),
+                        },
+                    );
+                }
+                Err(refusal) => {
+                    if let Some(json) =
+                        crate::app::messages::pending_error_json(id.clone(), &refusal)
+                    {
+                        return json;
+                    }
+                    return match refusal {
+                        crate::app::messages::SendRefusal::MailboxUnavailable(message) => {
+                            encode_error(id, "messages_unavailable", message)
+                        }
+                        crate::app::messages::SendRefusal::Store(message) => {
+                            encode_error(id, "mailbox_store_failed", message)
+                        }
+                        _ => encode_error(id, "agent_prompt_failed", "send refused"),
+                    };
+                }
+            }
+        } else if params.send.transport == Some(crate::api::schema::MessageTransport::Mailbox) {
+            return encode_error(
+                id,
+                "messages_unavailable",
+                "only Pi recipients have a Messages queue",
+            );
+        }
         if expected_agent == crate::detect::Agent::GithubCopilot {
             // Copilot ignores synthetic Enter after focus loss until it receives focus gained.
             let focus = match crate::ghostty::encode_focus(crate::ghostty::FocusEvent::Gained) {
@@ -148,7 +200,13 @@ impl App {
         let Some(agent) = self.agent_info(resolved.ws_idx, resolved.pane_id) else {
             return agent_not_found(id, &params.target);
         };
-        encode_success(id, ResponseResult::AgentPrompted { agent })
+        encode_success(
+            id,
+            ResponseResult::AgentPrompted {
+                agent,
+                delivery: None,
+            },
+        )
     }
 
     pub(super) fn handle_agent_read(
@@ -1446,6 +1504,7 @@ mod tests {
                 target: public_pane_id.clone(),
                 text: "resume".into(),
                 wait: None,
+                send: Default::default(),
             },
         );
         let failed: crate::api::schema::ErrorResponse = serde_json::from_str(&failed).unwrap();
@@ -1534,6 +1593,7 @@ mod tests {
                 target: public_pane_id,
                 text: "A != B".into(),
                 wait: None,
+                send: Default::default(),
             },
         );
         let success: SuccessResponse = serde_json::from_str(&response).unwrap();
@@ -1565,6 +1625,7 @@ mod tests {
                 target: "reviewer".into(),
                 text: "A != B".into(),
                 wait: None,
+                send: Default::default(),
             },
         );
         let raw_response: SuccessResponse = serde_json::from_str(&raw_response).unwrap();
@@ -1589,6 +1650,7 @@ mod tests {
                 target: "opencode".into(),
                 text: "wrong target".into(),
                 wait: None,
+                send: Default::default(),
             },
         );
         let error: crate::api::schema::ErrorResponse = serde_json::from_str(&rejected).unwrap();
@@ -1621,6 +1683,7 @@ mod tests {
                     target: target.clone(),
                     text: text.into(),
                     wait: None,
+                    send: Default::default(),
                 },
             );
             assert!(serde_json::from_str::<SuccessResponse>(&response).is_ok());
@@ -1655,6 +1718,7 @@ mod tests {
                 target,
                 text: "first".into(),
                 wait: None,
+                send: Default::default(),
             },
         );
         assert!(serde_json::from_str::<SuccessResponse>(&response).is_ok());
@@ -1702,6 +1766,7 @@ mod tests {
                 target: "reviewer".into(),
                 text: "unrelated prompt".into(),
                 wait: None,
+                send: Default::default(),
             },
         );
 
@@ -1743,6 +1808,7 @@ mod tests {
                 target: "reviewer".into(),
                 text: "A != B".into(),
                 wait: None,
+                send: Default::default(),
             },
         );
         let success: SuccessResponse = serde_json::from_str(&response).unwrap();
@@ -1861,6 +1927,7 @@ mod tests {
                 target: "reviewer".into(),
                 text: "A != B".into(),
                 wait: None,
+                send: Default::default(),
             },
         );
         let error: crate::api::schema::ErrorResponse = serde_json::from_str(&response).unwrap();

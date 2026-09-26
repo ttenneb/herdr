@@ -1004,6 +1004,11 @@ impl Default for RemoteConfig {
 pub struct ExperimentalConfig {
     /// Allow launching herdr inside an existing herdr pane. Default: false.
     pub allow_nested: bool,
+    /// Give Pis started without a trusted managed launch (typed `pi`,
+    /// Collection helpers) a recipient-only Messages connection: they may read,
+    /// claim and edit their own inbox, never send, report or join a route.
+    /// Default: false.
+    pub unmanaged_pi_messages: bool,
     /// Experimental local Kitty graphics rendering for attached clients. Default: false.
     pub kitty_graphics: bool,
     /// Persist pane screen history to session-history.json. Default: false.

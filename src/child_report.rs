@@ -950,6 +950,7 @@ mod tests {
             original_sequence: 1,
             enqueue_epoch: 1,
             accepted_at: 1,
+            delivery: None,
         };
         m.heads.insert(head.stable_id.clone(), head.clone());
         assert_eq!(

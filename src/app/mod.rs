@@ -21,6 +21,7 @@ mod git_refresh;
 mod ids;
 mod input;
 mod mailbox;
+pub(crate) mod messages;
 pub(crate) use mailbox::{MailboxBootstrapError, MailboxBootstrapSession};
 pub(crate) mod pane_graphics;
 mod popup;
@@ -156,6 +157,9 @@ pub struct App {
     /// Discovery address published only by a ready Headless-owned listener.
     /// It is injected into Pi launches but is never mailbox authority.
     pub(crate) mailbox_bootstrap_discovery_address: Option<String>,
+    /// `[experimental] unmanaged_pi_messages`: accept recipient-only Messages
+    /// streams from Pis without a trusted managed launch.
+    pub(crate) unmanaged_pi_messages: bool,
     /// Test-only foreground-job observations. Production always reads the
     /// terminal runtime; tests retain the same authority and candidate path.
     #[cfg(test)]
@@ -897,6 +901,7 @@ impl App {
             used_mailbox_bootstrap_nonces: HashSet::new(),
             next_mailbox_bootstrap_binding: 1,
             mailbox_bootstrap_discovery_address: None,
+            unmanaged_pi_messages: config.experimental.unmanaged_pi_messages,
             #[cfg(test)]
             mailbox_bootstrap_test_foreground_jobs: HashMap::new(),
             #[cfg(test)]
@@ -1725,6 +1730,12 @@ impl App {
             self.state.switch_ascii_input_source_in_prefix =
                 config.experimental.switch_ascii_input_source_in_prefix;
             self.persist_pane_history = config.experimental.pane_history;
+            self.unmanaged_pi_messages = config.experimental.unmanaged_pi_messages;
+            crate::integration::set_pane_mailbox_bootstrap_address(
+                self.unmanaged_pi_messages
+                    .then(|| self.mailbox_bootstrap_discovery_address.clone())
+                    .flatten(),
+            );
             self.state.pane_history_persistence = config.experimental.pane_history;
             if !self.persist_pane_history {
                 crate::persist::clear_history();

@@ -4,7 +4,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use interprocess::local_socket::traits::{ListenerExt as _, Stream as _};
+use interprocess::local_socket::traits::{ListenerExt as _, Stream as _, StreamCommon as _};
 use tracing::{debug, error, info, warn};
 
 #[cfg(all(test, unix))]
@@ -179,7 +179,7 @@ fn handle_connection_with_stop(
         return Ok(());
     }
 
-    let request = match serde_json::from_str::<Request>(line) {
+    let mut request = match serde_json::from_str::<Request>(line) {
         Ok(request) => request,
         Err(request_error) => {
             write_json_line_allow_disconnect(
@@ -196,6 +196,18 @@ fn handle_connection_with_stop(
         }
     };
 
+    // Sender attribution for ordinary sends comes from the kernel peer, never
+    // from the request body (the field is not deserializable).
+    let caller_pid = stream
+        .peer_creds()
+        .ok()
+        .and_then(|creds| creds.pid())
+        .and_then(|pid| u32::try_from(pid).ok());
+    match &mut request.method {
+        Method::AgentPrompt(params) => params.send.caller_pid = caller_pid,
+        Method::HandoffSend(params) => params.send.caller_pid = caller_pid,
+        _ => {}
+    }
     let request_id = request.id.clone();
     let method = api_method_name(&request.method);
     let changes_ui = request_changes_ui(&request);

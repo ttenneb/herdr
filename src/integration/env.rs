@@ -25,8 +25,26 @@ pub(crate) const GROK_CONFIG_DIR_ENV_VAR: &str = "GROK_CONFIG_DIR";
 pub(crate) const GROK_HOME_ENV_VAR: &str = "GROK_HOME";
 pub(crate) const HERMES_HOME_ENV_VAR: &str = "HERMES_HOME";
 
+static PANE_MAILBOX_BOOTSTRAP_ADDRESS: std::sync::RwLock<Option<String>> =
+    std::sync::RwLock::new(None);
+
+/// Discovery address for Pis typed into any pane (`[experimental]
+/// unmanaged_pi_messages`). It conveys no authority.
+pub(crate) fn set_pane_mailbox_bootstrap_address(address: Option<String>) {
+    if let Ok(mut current) = PANE_MAILBOX_BOOTSTRAP_ADDRESS.write() {
+        *current = address;
+    }
+}
+
 pub(crate) fn apply_pane_base_env(cmd: &mut CommandBuilder) {
     cmd.env(crate::api::SOCKET_PATH_ENV_VAR, crate::api::socket_path());
+    if let Some(address) = PANE_MAILBOX_BOOTSTRAP_ADDRESS
+        .read()
+        .ok()
+        .and_then(|address| address.clone())
+    {
+        cmd.env("HERDR_MAILBOX_BOOTSTRAP_ADDRESS", address);
+    }
     if let Ok(executable) = std::env::current_exe() {
         cmd.env("HERDR_BIN_PATH", executable);
     }

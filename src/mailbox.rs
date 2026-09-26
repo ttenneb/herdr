@@ -44,6 +44,47 @@ pub struct MailboxHead {
     pub original_sequence: u64,
     pub enqueue_epoch: u64,
     pub accepted_at: u64,
+    /// Present only on heads the server minted from an ordinary send
+    /// (`agent prompt`, structured prompt, `handoff send`). Additive: older
+    /// journals and Pi peers ignore it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delivery: Option<ServerDelivery>,
+}
+
+/// Server-owned send metadata for a head minted from an ordinary agent send.
+/// Attribution only: none of these values grant mailbox authority.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct ServerDelivery {
+    /// `agent_prompt`, `structured_prompt` or `handoff`.
+    pub origin: String,
+    /// Display label for the sending pane or agent, or `external`.
+    pub sender_label: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sender_session: Option<String>,
+    /// The recipient's `agent_session` value when the head was sent. A head
+    /// pinned to a session is only claimable by that session; another
+    /// session sees it as stranded and must explicitly adopt or drop it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recipient_session: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub correlation: Option<SendCorrelation>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct SendCorrelation {
+    pub namespace: String,
+    pub key: String,
+    pub revision: u64,
+}
+
+/// Claim IDs with this prefix record a recipient's explicit Drop of a
+/// stranded head. They are never delivered and never claimable.
+pub const WITHDRAWN_CLAIM_PREFIX: &str = "withdrawn:";
+
+pub fn is_withdrawn_claim(claim: &Claim) -> bool {
+    claim.claim_id.starts_with(WITHDRAWN_CLAIM_PREFIX)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -64,6 +105,9 @@ pub struct MailboxHeadEdit {
     pub digest: String,
     pub subject: String,
     pub body: String,
+    /// Re-pin a server-sent head to this recipient session (Retry/adopt of a
+    /// stranded head). The caller must have verified the recipient.
+    pub repin_recipient_session: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -557,13 +601,19 @@ impl MailboxStore {
                 &edit.subject,
                 &edit.body,
             );
-            let next = MailboxHead {
+            let mut next = MailboxHead {
                 revision,
                 digest,
                 subject: edit.subject,
                 body: edit.body,
                 ..current.clone()
             };
+            if let Some(session) = edit.repin_recipient_session {
+                let Some(delivery) = next.delivery.as_mut() else {
+                    return Err(MailboxError::InvalidRecord);
+                };
+                delivery.recipient_session = Some(session);
+            }
             validate_head(&next)?;
             let record = MailboxHeadEditRecord {
                 expected_stable_id: current.stable_id.clone(),
@@ -612,6 +662,16 @@ impl MailboxStore {
     /// its next unclaimed head. This prevents a replay from creating a second
     /// consumer execution record.
     pub fn claim_next(&self, recipient: &RecipientKey) -> Result<Option<Claim>, MailboxError> {
+        self.claim_next_eligible(recipient, |_| true)
+    }
+
+    /// As `claim_next`, but a new claim is taken only for a head the caller's
+    /// current recipient execution may receive (see `ServerDelivery`).
+    pub fn claim_next_eligible(
+        &self,
+        recipient: &RecipientKey,
+        eligible: impl Fn(&MailboxHead) -> bool,
+    ) -> Result<Option<Claim>, MailboxError> {
         self.with_exclusive_lock(|| {
             let recovered = self.load()?;
             if let Some(existing) = recovered
@@ -619,6 +679,7 @@ impl MailboxStore {
                 .values()
                 .find(|claim| {
                     &claim.recipient == recipient
+                        && !is_withdrawn_claim(claim)
                         && !matches!(
                             recovered.resolutions.get(&claim.claim_id),
                             Some(ClaimResolution {
@@ -635,7 +696,9 @@ impl MailboxStore {
                 .heads
                 .values()
                 .filter(|head| {
-                    &head.recipient == recipient && !recovered.claims.contains_key(&head.stable_id)
+                    &head.recipient == recipient
+                        && !recovered.claims.contains_key(&head.stable_id)
+                        && eligible(head)
                 })
                 // Priority wins; within a tier use the server-minted enqueue epoch,
                 // never caller-provided sequence or the stable-ID map ordering.
@@ -665,6 +728,52 @@ impl MailboxStore {
                 claim: claim.clone(),
             })?;
             Ok(Some(claim))
+        })
+    }
+
+    /// Byte length of the journal; any append changes it (`mailbox.watch`).
+    pub fn journal_len(&self) -> u64 {
+        std::fs::metadata(&self.stream_path)
+            .map(|metadata| metadata.len())
+            .unwrap_or(0)
+    }
+
+    /// Records the recipient's explicit Drop of an unclaimed head as one
+    /// withdrawn claim plus its settlement. Withdrawn heads leave every
+    /// current and history view and are never delivered.
+    pub fn withdraw_unclaimed_head(
+        &self,
+        stable_id: &str,
+        revision: u64,
+        digest: &str,
+    ) -> Result<(), MailboxError> {
+        self.with_exclusive_lock(|| {
+            let recovered = self.load()?;
+            let head = recovered
+                .heads
+                .get(stable_id)
+                .ok_or(MailboxError::EditConflict)?;
+            if head.revision != revision || head.digest != digest {
+                return Err(MailboxError::EditConflict);
+            }
+            if recovered.claims.contains_key(stable_id) {
+                return Err(MailboxError::HeadClaimed);
+            }
+            let claim = Claim {
+                claim_id: format!("{WITHDRAWN_CLAIM_PREFIX}{stable_id}"),
+                recipient: head.recipient.clone(),
+                stable_id: head.stable_id.clone(),
+                revision: head.revision,
+                digest: head.digest.clone(),
+            };
+            let claim_id = claim.claim_id.clone();
+            self.append_synced(&MailboxRecord::Claim { claim })?;
+            self.append_synced(&MailboxRecord::Resolution {
+                resolution: ClaimResolution {
+                    claim_id,
+                    outcome: ClaimResolutionOutcome::Settled,
+                },
+            })
         })
     }
 
@@ -877,6 +986,7 @@ impl RecoveredMailbox {
             || edit.head.original_sequence != current.original_sequence
             || edit.head.enqueue_epoch != current.enqueue_epoch
             || edit.head.accepted_at != current.accepted_at
+            || !same_delivery_except_pin(&edit.head.delivery, &current.delivery)
             || edit.head.subject.is_empty()
             || edit.head.body.is_empty()
             || edit.head.digest
@@ -913,6 +1023,19 @@ impl RecoveredMailbox {
             .insert(receipt.delivery_digest.clone(), receipt);
         self.heads.insert(edit.head.stable_id.clone(), edit.head);
         Ok(())
+    }
+}
+
+fn same_delivery_except_pin(a: &Option<ServerDelivery>, b: &Option<ServerDelivery>) -> bool {
+    match (a, b) {
+        (None, None) => true,
+        (Some(a), Some(b)) => {
+            a.origin == b.origin
+                && a.sender_label == b.sender_label
+                && a.sender_session == b.sender_session
+                && a.correlation == b.correlation
+        }
+        _ => false,
     }
 }
 
@@ -1048,6 +1171,7 @@ mod tests {
                 digest: original.digest.clone(),
                 subject: "edited".into(),
                 body: "edited body".into(),
+                repin_recipient_session: None,
             })
             .unwrap();
         let recovered = store.load().unwrap();
@@ -1144,6 +1268,7 @@ mod tests {
             original_sequence: 1,
             enqueue_epoch: 1,
             accepted_at: 1,
+            delivery: None,
         }
     }
     fn receipt(head: &MailboxHead) -> AdmissionReceipt {
