@@ -3269,3 +3269,53 @@ async fn pis_editor_has_text_report_wins_over_the_count() {
         });
     assert_eq!(fixture.app.state.terminals[&terminal].editor_has_text, None);
 }
+
+/// VQRO 1a: a bracketed paste ending in a newline stays in the unsent
+/// draft; Esc and a modified Enter do not prove the editor empty; only a
+/// real, unmodified Enter clears.
+#[tokio::test]
+async fn only_a_real_enter_clears_the_draft() {
+    use crossterm::event::{KeyCode, KeyModifiers};
+    let mut fixture = fixture();
+    let focused = fixture.app.state.workspaces[0]
+        .terminal_id(fixture.panes[0])
+        .unwrap()
+        .clone();
+    let key = |code, modifiers| {
+        crate::raw_input::RawInputEvent::Key(crate::input::TerminalKey::new(code, modifiers))
+    };
+    fixture.app.route_client_events(
+        vec![crate::raw_input::RawInputEvent::Paste(
+            "pasted line\n".into(),
+        )],
+        false,
+    );
+    assert!(
+        fixture.app.pane_draft_pending(&focused),
+        "paste ending in a newline"
+    );
+    for (code, modifiers) in [
+        (KeyCode::Esc, KeyModifiers::NONE),
+        (KeyCode::Enter, KeyModifiers::SHIFT),
+        (KeyCode::Enter, KeyModifiers::ALT),
+        (KeyCode::Char('j'), KeyModifiers::CONTROL),
+    ] {
+        fixture
+            .app
+            .route_client_events(vec![key(code, modifiers)], false);
+        assert!(
+            fixture.app.pane_draft_pending(&focused),
+            "{code:?} {modifiers:?} must not clear the draft"
+        );
+    }
+    fixture
+        .app
+        .route_client_events(vec![key(KeyCode::Enter, KeyModifiers::NONE)], false);
+    assert!(!fixture.app.pane_draft_pending(&focused));
+    // A pasted lone newline is still unsent input.
+    fixture.app.route_client_events(
+        vec![crate::raw_input::RawInputEvent::Paste("\n".into())],
+        false,
+    );
+    assert!(fixture.app.pane_draft_pending(&focused));
+}
