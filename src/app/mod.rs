@@ -637,7 +637,7 @@ impl App {
         let latest_release_notes = crate::release_notes::load_latest();
         let update_available = latest_release_notes
             .as_ref()
-            .filter(|notes| notes.preview)
+            .filter(|notes| notes.preview && !crate::build_info::is_custom_channel())
             .map(|notes| notes.version.clone());
         let latest_release_notes_available = latest_release_notes.is_some();
         let update_install_command = crate::update::update_install_command().to_string();

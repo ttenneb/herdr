@@ -581,7 +581,9 @@ impl App {
     }
 
     pub(crate) fn run_auto_update_check(&mut self) {
-        if !background_update_check_enabled(self.no_session, self.update_version_check_enabled) {
+        if !background_update_check_enabled(self.no_session, self.update_version_check_enabled)
+            || crate::build_info::is_custom_channel()
+        {
             self.next_auto_update_check = None;
             return;
         }

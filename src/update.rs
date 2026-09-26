@@ -2068,7 +2068,22 @@ fn homebrew_cellar_keg_root(path: &Path) -> Option<PathBuf> {
 // ---------------------------------------------------------------------------
 
 /// Manual self-update command (`herdr update`).
+/// `herdr update` refuses to replace a custom-channel build (see
+/// [`crate::build_info::is_custom_channel_name`]) with an upstream release.
+fn custom_channel_update_refusal(channel: &str, version: &str) -> Option<String> {
+    crate::build_info::is_custom_channel_name(channel).then(|| {
+        format!(
+            "herdr {version} is a custom `{channel}` build; `herdr update` would replace it with an upstream release. Install updates for this build through its release runbook."
+        )
+    })
+}
+
 pub fn self_update(options: SelfUpdateOptions) -> Result<Version, String> {
+    if let Some(refusal) =
+        custom_channel_update_refusal(crate::build_info::channel(), &crate::build_info::version())
+    {
+        return Err(refusal);
+    }
     let channel = UpdateChannel::configured();
 
     if is_homebrew_managed_install() {
@@ -2201,6 +2216,22 @@ fn print_outdated_integration_notice_with_updated_binary(updated_exe: &Path) {
 /// Background update check: only surface availability and release notes.
 /// Runs in a background thread at startup.
 pub fn auto_update(events: tokio::sync::mpsc::Sender<crate::events::AppEvent>) {
+    auto_update_for_channel(crate::build_info::channel(), events);
+}
+
+fn auto_update_for_channel(
+    build_channel: &str,
+    events: tokio::sync::mpsc::Sender<crate::events::AppEvent>,
+) {
+    // A custom-channel build never announces an upstream release as its
+    // update, not even the local fake-update override.
+    if crate::build_info::is_custom_channel_name(build_channel) {
+        tracing::info!(
+            channel = build_channel,
+            "skipping update check for a custom build channel"
+        );
+        return;
+    }
     crate::logging::update_check_started();
     if let Ok(version) = env::var(FAKE_UPDATE_VERSION_ENV) {
         let version = version.trim();
@@ -2430,6 +2461,43 @@ mod tests {
             sha256: None,
             notes_body: "### Changed\n- One".to_string(),
         }
+    }
+
+    #[test]
+    fn custom_channel_build_refuses_self_update() {
+        let refusal =
+            custom_channel_update_refusal("stabilized", "0.8.4-stabilized.rc3.4a1ba76").unwrap();
+        assert!(refusal.contains("0.8.4-stabilized.rc3.4a1ba76"));
+        assert!(refusal.contains("custom `stabilized` build"));
+        assert!(refusal.contains("runbook"));
+        assert_eq!(custom_channel_update_refusal("stable", "0.8.4"), None);
+        assert_eq!(
+            custom_channel_update_refusal("preview", "0.8.4-preview.1"),
+            None
+        );
+    }
+
+    #[test]
+    fn custom_channel_background_check_never_reports_an_update() {
+        let _guard = crate::test_env::lock();
+        let config_home = set_test_config_home("custom-channel-notice");
+        std::env::set_var(FAKE_UPDATE_VERSION_ENV, "99.0.0");
+        // Control: the same fake release is announced on the stable line.
+        let (tx, mut rx) = tokio::sync::mpsc::channel(4);
+        auto_update_for_channel("stable", tx);
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(crate::events::AppEvent::UpdateReady { .. })
+        ));
+        let (tx, mut rx) = tokio::sync::mpsc::channel(4);
+        auto_update_for_channel("stabilized", tx);
+        assert!(
+            rx.try_recv().is_err(),
+            "a custom channel must not see an update-available notice"
+        );
+        std::env::remove_var(FAKE_UPDATE_VERSION_ENV);
+        std::env::remove_var("XDG_CONFIG_HOME");
+        let _ = fs::remove_dir_all(config_home);
     }
 
     fn set_test_config_home(name: &str) -> PathBuf {
