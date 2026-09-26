@@ -184,6 +184,17 @@ impl App {
                 "only Pi recipients have a Messages queue",
             );
         }
+        // Typed while older messages still wait in this pane's queue (the
+        // typed fallback): never silently; the sender is told how many.
+        let queued_ahead = self.unsettled_queue_len(&terminal_id.to_string());
+        if queued_ahead > 0 {
+            tracing::warn!(
+                terminal = %terminal_id,
+                queued_ahead,
+                "messages: typing a new message ahead of messages still queued in this pane"
+            );
+        }
+        let typed_ahead_of_queued = (queued_ahead > 0).then_some(queued_ahead);
         // Never type into the human's unsent draft: hold the delivery (in
         // order) until the pane's editor is clear.
         if self.typed_delivery_must_wait(&terminal_id) {
@@ -206,6 +217,7 @@ impl App {
                     delivery: Some(crate::api::schema::MessageDelivery {
                         path: "pty_deferred".into(),
                         deferral_id: Some(deferral_id),
+                        typed_ahead_of_queued,
                         stable_id: None,
                         revision: None,
                         edited: false,
@@ -226,7 +238,15 @@ impl App {
             id,
             ResponseResult::AgentPrompted {
                 agent,
-                delivery: None,
+                delivery: typed_ahead_of_queued.map(|queued| crate::api::schema::MessageDelivery {
+                    path: "pty".into(),
+                    typed_ahead_of_queued: Some(queued),
+                    deferral_id: None,
+                    stable_id: None,
+                    revision: None,
+                    edited: false,
+                    duplicate: false,
+                }),
             },
         )
     }

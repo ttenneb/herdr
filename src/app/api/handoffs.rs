@@ -274,6 +274,15 @@ impl App {
             }
         }
         let prompt = envelope.prompt_text();
+        let queued_ahead = self.unsettled_queue_len(&terminal_id.to_string());
+        if queued_ahead > 0 {
+            tracing::warn!(
+                terminal = %terminal_id,
+                queued_ahead,
+                "messages: typing a handoff ahead of messages still queued in this pane"
+            );
+        }
+        let typed_ahead_of_queued = (queued_ahead > 0).then_some(queued_ahead);
         // Never type into the human's unsent draft: hold it (in order).
         if self.typed_delivery_must_wait(&terminal_id) {
             let sender = crate::app::messages::SenderAttribution {
@@ -299,6 +308,7 @@ impl App {
             held.delivery = Some(crate::api::schema::MessageDelivery {
                 path: "pty_deferred".into(),
                 deferral_id: Some(deferral_id),
+                typed_ahead_of_queued,
                 stable_id: None,
                 revision: None,
                 edited: false,
@@ -337,9 +347,18 @@ impl App {
             self.commit_archived_member_input(restore);
         }
         self.acknowledge_terminal_input(&terminal_id);
-        encode_success(id, ResponseResult::HandoffTransport {
-            receipt: receipt(HandoffTransportOutcome::RuntimeTransactionAdmitted, "Herdr runtime admitted the complete prompt transaction; Pi/gate/agent acknowledgement is unknown".into()),
-        })
+        let mut admitted = receipt(HandoffTransportOutcome::RuntimeTransactionAdmitted, "Herdr runtime admitted the complete prompt transaction; Pi/gate/agent acknowledgement is unknown".into());
+        admitted.delivery =
+            typed_ahead_of_queued.map(|queued| crate::api::schema::MessageDelivery {
+                path: "pty".into(),
+                typed_ahead_of_queued: Some(queued),
+                deferral_id: None,
+                stable_id: None,
+                revision: None,
+                edited: false,
+                duplicate: false,
+            });
+        encode_success(id, ResponseResult::HandoffTransport { receipt: admitted })
     }
 
     /// Queues a validated handoff in the recipient's Messages. Returns `None`

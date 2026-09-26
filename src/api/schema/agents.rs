@@ -235,6 +235,10 @@ pub struct MessageDelivery {
     /// or `delivery.deferred_failed` event.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub deferral_id: Option<String>,
+    /// For a typed delivery (`pty`/`pty_deferred`) to a pane whose Messages
+    /// queue still holds older messages: how many it was typed ahead of.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub typed_ahead_of_queued: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stable_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

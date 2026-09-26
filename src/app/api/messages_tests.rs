@@ -2647,10 +2647,10 @@ async fn a_live_pi_without_messages_after_30s_gets_new_messages_typed() {
     let ResponseResult::AgentPrompted { delivery, .. } = success.result else {
         panic!("prompted")
     };
-    assert_ne!(
-        delivery.map(|delivery| delivery.path),
-        Some("mailbox".into())
-    );
+    // Typed, and the sender is told it went ahead of the queued message.
+    let delivery = delivery.expect("typed-ahead delivery");
+    assert_eq!(delivery.path, "pty");
+    assert_eq!(delivery.typed_ahead_of_queued, Some(1));
     // The early head still waits in the queue.
     let heads = crate::mailbox::MailboxStore::open(&fixture.directory)
         .unwrap()

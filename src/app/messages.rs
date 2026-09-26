@@ -618,6 +618,34 @@ impl App {
         false
     }
 
+    /// Messages still waiting in this pane's queue (held, or claimed and not
+    /// settled; dropped ones excluded).
+    pub(crate) fn unsettled_queue_len(&self, terminal_key: &str) -> u64 {
+        let Ok(recovered) = MailboxStore::open(&self.sender_authority_dir).and_then(|s| s.load())
+        else {
+            return 0;
+        };
+        let recipients = self.inbox_recipients(terminal_key);
+        recovered
+            .heads
+            .values()
+            .filter(|head| recipients.contains(&head.recipient))
+            .filter(|head| match recovered.claims.get(&head.stable_id) {
+                None => true,
+                Some(claim) => {
+                    !is_withdrawn_claim(claim)
+                        && !matches!(
+                            recovered.resolutions.get(&claim.claim_id),
+                            Some(crate::mailbox::ClaimResolution {
+                                outcome: crate::mailbox::ClaimResolutionOutcome::Settled,
+                                ..
+                            })
+                        )
+                }
+            })
+            .count() as u64
+    }
+
     /// Level-triggered backlog sweep: every sleeping Pi pane that still has
     /// unsettled heads and no attached Pi gets a wake request. The first sweep
     /// after server start is tagged `restore_backlog`. wake_pane coalesces
@@ -988,6 +1016,7 @@ impl App {
         if let Some(existing) = recovered.heads.get(&stable_id) {
             return Ok(SendRoute::Mailbox(MessageDelivery {
                 deferral_id: None,
+                typed_ahead_of_queued: None,
                 path: "mailbox".into(),
                 stable_id: Some(existing.stable_id.clone()),
                 revision: Some(existing.revision),
@@ -1088,6 +1117,7 @@ impl App {
                 })?;
             return Ok(SendRoute::Mailbox(MessageDelivery {
                 deferral_id: None,
+                typed_ahead_of_queued: None,
                 path: "mailbox".into(),
                 stable_id: Some(edited.stable_id),
                 revision: Some(edited.revision),
@@ -1135,6 +1165,7 @@ impl App {
             .map_err(|error| SendRefusal::Store(error.to_string()))?;
         Ok(SendRoute::Mailbox(MessageDelivery {
             deferral_id: None,
+            typed_ahead_of_queued: None,
             path: "mailbox".into(),
             stable_id: Some(receipt.stable_id),
             revision: Some(receipt.revision),
