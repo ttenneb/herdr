@@ -274,6 +274,38 @@ impl App {
             }
         }
         let prompt = envelope.prompt_text();
+        // Never type into the human's unsent draft: hold it (in order).
+        if self.typed_delivery_must_wait(&terminal_id) {
+            let sender = crate::app::messages::SenderAttribution {
+                terminal: Some(envelope.sender.terminal_id.clone()),
+                label: self
+                    .current_identity_info(&envelope.sender)
+                    .and_then(|agent| agent.name)
+                    .unwrap_or_else(|| envelope.sender.pane_id.clone()),
+                session: Some(envelope.sender.agent_session.value.clone()),
+            };
+            let deferral_id = self.defer_typed_delivery(
+                terminal_id.clone(),
+                prompt,
+                expected_agent,
+                envelope.recipient.pane_id.clone(),
+                sender,
+                "handoff",
+            );
+            let mut held = receipt(
+                HandoffTransportOutcome::DeferredHumanDraft,
+                "the recipient pane has unsent human input; Herdr types the handoff when it clears (up to 10 minutes)".into(),
+            );
+            held.delivery = Some(crate::api::schema::MessageDelivery {
+                path: "pty_deferred".into(),
+                deferral_id: Some(deferral_id),
+                stable_id: None,
+                revision: None,
+                edited: false,
+                duplicate: false,
+            });
+            return encode_success(id, ResponseResult::HandoffTransport { receipt: held });
+        }
         let (text, enter) = crate::app::api_helpers::encode_api_submission_parts(runtime, &prompt);
         let result = runtime.try_send_prompt_transaction(
             Bytes::from(text),

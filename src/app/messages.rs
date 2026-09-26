@@ -587,6 +587,8 @@ impl App {
     }
 
     fn pi_process_age(&self, pid: u32, start_ticks: u64) -> Option<std::time::Duration> {
+        #[cfg(not(test))]
+        let _ = pid;
         #[cfg(test)]
         if let Some(age) = self.messages_test_process_ages.get(&pid) {
             return Some(*age);
@@ -980,6 +982,7 @@ impl App {
         );
         if let Some(existing) = recovered.heads.get(&stable_id) {
             return Ok(SendRoute::Mailbox(MessageDelivery {
+                deferral_id: None,
                 path: "mailbox".into(),
                 stable_id: Some(existing.stable_id.clone()),
                 revision: Some(existing.revision),
@@ -1079,6 +1082,7 @@ impl App {
                     error => SendRefusal::Store(error.to_string()),
                 })?;
             return Ok(SendRoute::Mailbox(MessageDelivery {
+                deferral_id: None,
                 path: "mailbox".into(),
                 stable_id: Some(edited.stable_id),
                 revision: Some(edited.revision),
@@ -1125,6 +1129,7 @@ impl App {
             .append_offline_head(head)
             .map_err(|error| SendRefusal::Store(error.to_string()))?;
         Ok(SendRoute::Mailbox(MessageDelivery {
+            deferral_id: None,
             path: "mailbox".into(),
             stable_id: Some(receipt.stable_id),
             revision: Some(receipt.revision),

@@ -228,8 +228,13 @@ pub struct MessageSendOptions {
 /// Where an ordinary send went.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct MessageDelivery {
-    /// `mailbox` or `pty`.
+    /// `mailbox`, `pty`, or `pty_deferred` (held while the recipient pane has
+    /// unsent human input; see `deferral_id`).
     pub path: String,
+    /// For `pty_deferred`: the ID in the later `delivery.deferred_delivered`
+    /// or `delivery.deferred_failed` event.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deferral_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stable_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

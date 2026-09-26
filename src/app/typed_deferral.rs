@@ -1,0 +1,445 @@
+//! Draft guard for typed (PTY) delivery.
+//!
+//! Typing a message into a pane whose editor holds the human's unsent text
+//! appends to that draft, and the submit Enter sends both. Herdr therefore
+//! keeps a per-pane estimate of pending human input since the last Enter
+//! (only human input forwarded from an attached client counts), and while it
+//! is positive every typed delivery to the pane is held in memory, in order,
+//! and typed as soon as it drops to zero. After [`TYPED_DEFERRAL_LIMIT`] a
+//! held delivery fails with `agent_input_busy`, reported to the sender. When
+//! a Pi publishes its own "editor has unsent text" flag, that wins for Pi
+//! panes (not wired yet).
+
+use std::time::{Duration, Instant};
+
+use bytes::Bytes;
+use crossterm::event::{KeyCode, KeyModifiers};
+
+use super::App;
+use crate::terminal::TerminalId;
+
+/// How long a typed delivery waits for the human's draft to clear.
+pub(crate) const TYPED_DEFERRAL_LIMIT: Duration = Duration::from_secs(600);
+const TYPED_SUBMIT_DELAY: Duration = Duration::from_millis(300);
+
+/// Pending human input in one pane since its last Enter (an estimate).
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct HumanDraft {
+    pub count: usize,
+    /// The agent process generation the count belongs to; a new agent
+    /// process starts with an empty editor.
+    pub process_generation: Option<u64>,
+}
+
+/// One held typed delivery.
+#[derive(Debug, Clone)]
+pub(crate) struct TypedDeferral {
+    pub id: String,
+    pub terminal_id: TerminalId,
+    pub text: String,
+    pub expected_agent: crate::detect::Agent,
+    /// Target as the sender named it (for messages and logs).
+    pub target: String,
+    pub sender: crate::app::messages::SenderAttribution,
+    pub origin: &'static str,
+    pub deadline: Instant,
+}
+
+/// How a human keystroke changes the draft estimate.
+fn key_effect(key: &crate::input::TerminalKey) -> Option<isize> {
+    if key.kind == crossterm::event::KeyEventKind::Release {
+        return Some(0);
+    }
+    let control = key.modifiers.contains(KeyModifiers::CONTROL);
+    let alt = key.modifiers.contains(KeyModifiers::ALT);
+    match key.code {
+        KeyCode::Enter | KeyCode::Esc => None,
+        KeyCode::Char(c) if control && matches!(c.to_ascii_lowercase(), 'c' | 'u' | 'j' | 'm') => {
+            None
+        }
+        KeyCode::Char(_) if control || alt => Some(0),
+        KeyCode::Char(_) => Some(
+            key.generated_text
+                .as_ref()
+                .map_or(1, |text| text.chars().count().max(1)) as isize,
+        ),
+        KeyCode::Backspace => Some(-1),
+        _ => Some(0),
+    }
+}
+
+fn new_deferral_id() -> String {
+    crate::platform::random_route_epoch()
+        .map(|hex| format!("defer.{hex}"))
+        .unwrap_or_else(|| {
+            use std::sync::atomic::{AtomicU64, Ordering};
+            static NEXT: AtomicU64 = AtomicU64::new(0);
+            format!(
+                "defer.{:016x}{:016x}",
+                std::process::id(),
+                NEXT.fetch_add(1, Ordering::Relaxed)
+            )
+        })
+}
+
+impl App {
+    fn terminal_of_pane(&self, pane_id: crate::layout::PaneId) -> Option<TerminalId> {
+        let (ws_idx, _) = self.find_pane(pane_id)?;
+        self.state.terminal_id_for_pane(ws_idx, pane_id)
+    }
+
+    /// A human key forwarded from an attached client reached this terminal.
+    pub(crate) fn note_human_key(
+        &mut self,
+        terminal_id: &TerminalId,
+        key: &crate::input::TerminalKey,
+    ) {
+        match key_effect(key) {
+            None => self.clear_human_draft(terminal_id),
+            Some(0) => {}
+            Some(delta) => {
+                let draft = self.human_drafts.entry(terminal_id.clone()).or_default();
+                draft.count = draft.count.saturating_add_signed(delta);
+                if draft.process_generation.is_none() {
+                    draft.process_generation = self
+                        .state
+                        .terminals
+                        .get(terminal_id)
+                        .and_then(|terminal| terminal.managed_agent_generation());
+                }
+                if draft.count == 0 {
+                    self.clear_human_draft(terminal_id);
+                }
+            }
+        }
+    }
+
+    /// Human text (a paste or a text commit) reached this terminal.
+    pub(crate) fn note_human_text(&mut self, terminal_id: &TerminalId, text: &str) {
+        let added = text.chars().filter(|c| !c.is_control()).count();
+        if text.ends_with('\r') || text.ends_with('\n') {
+            // A committed line was submitted with it.
+            self.clear_human_draft(terminal_id);
+            return;
+        }
+        if added > 0 {
+            let draft = self.human_drafts.entry(terminal_id.clone()).or_default();
+            draft.count = draft.count.saturating_add(added);
+        }
+    }
+
+    fn clear_human_draft(&mut self, terminal_id: &TerminalId) {
+        let had = self.human_drafts.remove(terminal_id).is_some();
+        if had
+            || self
+                .typed_deferrals
+                .iter()
+                .any(|d| &d.terminal_id == terminal_id)
+        {
+            self.flush_typed_deferrals(Instant::now());
+        }
+    }
+
+    /// Agent process changes clear the pane's draft estimate.
+    pub(crate) fn note_agent_process_event(&mut self, event: &crate::events::AppEvent) {
+        match event {
+            crate::events::AppEvent::AgentProcessDetected {
+                pane_id,
+                process_generation,
+                ..
+            } => {
+                if let Some(terminal_id) = self.terminal_of_pane(*pane_id) {
+                    if self
+                        .human_drafts
+                        .get(&terminal_id)
+                        .is_some_and(|draft| draft.process_generation != Some(*process_generation))
+                    {
+                        self.clear_human_draft(&terminal_id);
+                    }
+                }
+            }
+            crate::events::AppEvent::StateChanged {
+                pane_id,
+                process_exited: true,
+                ..
+            }
+            | crate::events::AppEvent::PaneDied { pane_id, .. } => {
+                if let Some(terminal_id) = self.terminal_of_pane(*pane_id) {
+                    self.clear_human_draft(&terminal_id);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Whether the pane's editor may hold the human's unsent text.
+    pub(crate) fn pane_draft_pending(&self, terminal_id: &TerminalId) -> bool {
+        self.human_drafts
+            .get(terminal_id)
+            .is_some_and(|draft| draft.count > 0)
+    }
+
+    /// Whether a typed delivery to this terminal must be held: a draft is
+    /// pending, or earlier held deliveries still wait (order is kept).
+    pub(crate) fn typed_delivery_must_wait(&self, terminal_id: &TerminalId) -> bool {
+        self.pane_draft_pending(terminal_id)
+            || self
+                .typed_deferrals
+                .iter()
+                .any(|deferral| &deferral.terminal_id == terminal_id)
+    }
+
+    pub(crate) fn defer_typed_delivery(
+        &mut self,
+        terminal_id: TerminalId,
+        text: String,
+        expected_agent: crate::detect::Agent,
+        target: String,
+        sender: crate::app::messages::SenderAttribution,
+        origin: &'static str,
+    ) -> String {
+        let id = new_deferral_id();
+        tracing::info!(
+            deferral = %id,
+            terminal = %terminal_id,
+            sender = %sender.label,
+            "typed delivery held: the pane has unsent human input"
+        );
+        self.typed_deferrals.push(TypedDeferral {
+            id: id.clone(),
+            terminal_id,
+            text,
+            expected_agent,
+            target,
+            sender,
+            origin,
+            deadline: Instant::now() + TYPED_DEFERRAL_LIMIT,
+        });
+        id
+    }
+
+    pub(crate) fn next_typed_deferral_deadline(&self) -> Option<Instant> {
+        self.typed_deferrals.iter().map(|d| d.deadline).min()
+    }
+
+    /// Types held deliveries whose pane has no pending draft (in order) and
+    /// fails those past their deadline.
+    pub(crate) fn flush_typed_deferrals(&mut self, now: Instant) -> bool {
+        if self.typed_deferrals.is_empty() {
+            return false;
+        }
+        let pending = std::mem::take(&mut self.typed_deferrals);
+        let mut keep = Vec::new();
+        let mut blocked: Vec<TerminalId> = Vec::new();
+        let mut changed = false;
+        for deferral in pending {
+            if blocked.contains(&deferral.terminal_id) {
+                keep.push(deferral);
+                continue;
+            }
+            if self.pane_draft_pending(&deferral.terminal_id) {
+                if now >= deferral.deadline {
+                    self.fail_typed_deferral(
+                        &deferral,
+                        "agent_input_busy",
+                        "the recipient pane had unsent human input for 10 minutes; the message was not typed",
+                    );
+                    changed = true;
+                } else {
+                    blocked.push(deferral.terminal_id.clone());
+                    keep.push(deferral);
+                }
+                continue;
+            }
+            match self.type_submission(
+                &deferral.terminal_id,
+                deferral.expected_agent,
+                &deferral.text,
+            ) {
+                Ok(()) => {
+                    tracing::info!(deferral = %deferral.id, "held typed delivery typed");
+                    self.emit_deferral_event(&deferral, "delivered", None, None);
+                }
+                Err((code, message)) => self.fail_typed_deferral(&deferral, code, &message),
+            }
+            changed = true;
+        }
+        keep.extend(std::mem::take(&mut self.typed_deferrals));
+        self.typed_deferrals = keep;
+        changed
+    }
+
+    /// On server stop: every held delivery fails (the hold is in memory).
+    pub(crate) fn drop_typed_deferrals_on_stop(&mut self) {
+        for deferral in std::mem::take(&mut self.typed_deferrals) {
+            self.fail_typed_deferral(
+                &deferral,
+                "agent_input_busy",
+                "the Herdr server stopped while the message waited for the recipient's unsent input; it was not typed",
+            );
+        }
+    }
+
+    fn fail_typed_deferral(&mut self, deferral: &TypedDeferral, code: &str, message: &str) {
+        tracing::warn!(
+            deferral = %deferral.id,
+            terminal = %deferral.terminal_id,
+            target = %deferral.target,
+            sender = %deferral.sender.label,
+            sender_terminal = ?deferral.sender.terminal,
+            code,
+            "held typed delivery failed: {message}"
+        );
+        self.emit_deferral_event(deferral, "failed", Some(code), Some(message));
+        // A sender Pi with Messages learns it in its own inbox (durable).
+        let Some(sender_terminal) = deferral.sender.terminal.clone() else {
+            return;
+        };
+        if !self.pane_takes_messages(&sender_terminal) {
+            return;
+        }
+        let excerpt: String = deferral.text.chars().take(2000).collect();
+        let note = crate::app::messages::OutgoingMessage {
+            origin: deferral.origin,
+            subject: format!("Not delivered to {}", deferral.target),
+            body: format!(
+                "Your message to {} was not delivered ({code}): {message}.\n\nMessage:\n{excerpt}",
+                deferral.target
+            ),
+            priority: "normal".into(),
+            kind: "advisory".into(),
+            message_id: Some(format!("{}.failed", deferral.id)),
+            correlation: None,
+            replace_pending: false,
+        };
+        let herdr = crate::app::messages::SenderAttribution {
+            terminal: None,
+            label: "herdr".into(),
+            session: None,
+        };
+        let options = crate::api::schema::MessageSendOptions {
+            send_new: true,
+            ..Default::default()
+        };
+        if let Err(err) = self.route_ordinary_send(&sender_terminal, &herdr, note, &options) {
+            tracing::warn!(deferral = %deferral.id, ?err, "could not queue the failure note for the sender");
+        }
+    }
+
+    fn emit_deferral_event(
+        &mut self,
+        deferral: &TypedDeferral,
+        outcome: &str,
+        code: Option<&str>,
+        message: Option<&str>,
+    ) {
+        let (pane_id, workspace_id) = self
+            .state
+            .workspaces
+            .iter()
+            .enumerate()
+            .find_map(|(ws_idx, workspace)| {
+                workspace.tabs.iter().find_map(|tab| {
+                    tab.panes
+                        .iter()
+                        .find(|(_, pane)| pane.attached_terminal_id == deferral.terminal_id)
+                        .map(|(pane_id, _)| (ws_idx, *pane_id))
+                })
+            })
+            .map(|(ws_idx, pane_id)| {
+                (
+                    self.public_pane_id(ws_idx, pane_id).unwrap_or_default(),
+                    self.public_workspace_id(ws_idx),
+                )
+            })
+            .unwrap_or_default();
+        let (event, data) = match outcome {
+            "delivered" => (
+                crate::api::schema::EventKind::DeliveryDeferredDelivered,
+                crate::api::schema::EventData::DeliveryDeferredDelivered {
+                    deferral_id: deferral.id.clone(),
+                    pane_id,
+                    workspace_id,
+                    terminal_id: deferral.terminal_id.to_string(),
+                },
+            ),
+            _ => (
+                crate::api::schema::EventKind::DeliveryDeferredFailed,
+                crate::api::schema::EventData::DeliveryDeferredFailed {
+                    deferral_id: deferral.id.clone(),
+                    pane_id,
+                    workspace_id,
+                    terminal_id: deferral.terminal_id.to_string(),
+                    sender: deferral.sender.label.clone(),
+                    sender_terminal_id: deferral.sender.terminal.clone(),
+                    code: code.unwrap_or("agent_input_busy").to_string(),
+                    message: message.unwrap_or_default().to_string(),
+                },
+            ),
+        };
+        self.emit_event(crate::api::schema::EventEnvelope { event, data });
+    }
+
+    /// Types one prompt submission into the terminal's agent, after checking
+    /// it still hosts the expected agent.
+    pub(crate) fn type_submission(
+        &mut self,
+        terminal_id: &TerminalId,
+        expected_agent: crate::detect::Agent,
+        text: &str,
+    ) -> Result<(), (&'static str, String)> {
+        let located = self
+            .state
+            .workspaces
+            .iter()
+            .enumerate()
+            .find_map(|(ws_idx, workspace)| {
+                workspace.tabs.iter().find_map(|tab| {
+                    tab.panes
+                        .iter()
+                        .find(|(_, pane)| &pane.attached_terminal_id == terminal_id)
+                        .map(|(pane_id, _)| (ws_idx, *pane_id))
+                })
+            });
+        let Some((ws_idx, pane_id)) = located else {
+            return Err(("agent_not_found", "the recipient pane is gone".into()));
+        };
+        let Some(runtime) = self.lookup_runtime_sender(ws_idx, pane_id) else {
+            return Err((
+                "agent_not_found",
+                "the recipient pane has no terminal".into(),
+            ));
+        };
+        if !super::agents::runtime_hosts_agent(runtime, expected_agent) {
+            return Err((
+                "agent_not_ready",
+                "the recipient agent is no longer the pane foreground process".into(),
+            ));
+        }
+        if expected_agent == crate::detect::Agent::GithubCopilot {
+            let focus = crate::ghostty::encode_focus(crate::ghostty::FocusEvent::Gained)
+                .map_err(|err| ("agent_prompt_failed", err.to_string()))?;
+            runtime
+                .try_send_bytes(Bytes::from(focus))
+                .map_err(|err| ("agent_prompt_failed", err.to_string()))?;
+        }
+        let (text, enter) = crate::app::api_helpers::encode_api_submission_parts(runtime, text);
+        runtime
+            .try_send_prompt_transaction(Bytes::from(text), Bytes::from(enter), TYPED_SUBMIT_DELAY)
+            .map_err(|err| {
+                let code = match err {
+                    crate::pane::PromptTransactionAdmissionError::Full => "agent_prompt_queue_full",
+                    crate::pane::PromptTransactionAdmissionError::PayloadTooLarge => {
+                        "agent_prompt_payload_too_large"
+                    }
+                    _ => "agent_prompt_failed",
+                };
+                (code, err.to_string())
+            })?;
+        if let Some(restore) = self.begin_archived_member_input(ws_idx, pane_id) {
+            self.commit_archived_member_input(restore);
+        }
+        self.acknowledge_terminal_input(terminal_id);
+        Ok(())
+    }
+}

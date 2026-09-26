@@ -215,8 +215,44 @@ pub(super) fn prompt_agent(
         api_tx,
         None,
     );
-    let Ok(prompted) = agent_from_response(&request_id, &prompt_response) else {
-        return Ok(Some(prompt_response));
+    // A delivery held for the recipient's unsent input: --wait first waits
+    // for it to be typed (or fail with agent_input_busy).
+    let deferral_id = serde_json::from_str::<serde_json::Value>(&prompt_response)
+        .ok()
+        .and_then(|value| {
+            (value["result"]["delivery"]["path"] == "pty_deferred")
+                .then(|| {
+                    value["result"]["delivery"]["deferral_id"]
+                        .as_str()
+                        .map(str::to_string)
+                })
+                .flatten()
+        });
+    let prompted = if let Some(deferral_id) = deferral_id {
+        match wait_for_typed_deferral(
+            &request_id,
+            &deferral_id,
+            last_event_sequence,
+            stream,
+            event_hub,
+            running,
+        )? {
+            DeferralWait::Stopped => return Ok(None),
+            DeferralWait::Failed(response) => return Ok(Some(response)),
+            DeferralWait::Delivered => match agent_get(&request_id, &target, api_tx) {
+                Ok(agent) => agent,
+                Err(response) => {
+                    return serde_json::to_string(&response)
+                        .map(Some)
+                        .map_err(std::io::Error::other)
+                }
+            },
+        }
+    } else {
+        let Ok(prompted) = agent_from_response(&request_id, &prompt_response) else {
+            return Ok(Some(prompt_response));
+        };
+        prompted
     };
     let effect_limit_ms = if serde_json::from_str::<serde_json::Value>(&prompt_response)
         .ok()
@@ -694,6 +730,73 @@ fn agent_wait_probe_error(response: ErrorResponse) -> std::io::Result<String> {
         return agent_wait_not_running(response.id);
     }
     serde_json::to_string(&response).map_err(std::io::Error::other)
+}
+
+enum DeferralWait {
+    Delivered,
+    Failed(String),
+    Stopped,
+}
+
+/// Waits (bounded by the hold limit plus a margin) for the held typed
+/// delivery's outcome event.
+fn wait_for_typed_deferral(
+    request_id: &str,
+    deferral_id: &str,
+    after_sequence: u64,
+    stream: &mut LocalStream,
+    event_hub: &EventHub,
+    running: &Arc<AtomicBool>,
+) -> std::io::Result<DeferralWait> {
+    let deadline = std::time::Instant::now()
+        + crate::app::typed_deferral::TYPED_DEFERRAL_LIMIT
+        + std::time::Duration::from_secs(30);
+    let mut seen = after_sequence;
+    loop {
+        if should_stop_connection(stream, running)? {
+            return Ok(DeferralWait::Stopped);
+        }
+        // A history gap (truncation) skips ahead; the deadline still bounds.
+        let events = event_hub.checked_events_after(seen).unwrap_or_else(|_| {
+            seen = event_hub.current_sequence();
+            Vec::new()
+        });
+        for (sequence, envelope) in events {
+            seen = sequence;
+            match envelope.data {
+                crate::api::schema::EventData::DeliveryDeferredDelivered {
+                    deferral_id: id,
+                    ..
+                } if id == deferral_id => return Ok(DeferralWait::Delivered),
+                crate::api::schema::EventData::DeliveryDeferredFailed {
+                    deferral_id: id,
+                    code,
+                    message,
+                    ..
+                } if id == deferral_id => {
+                    return serde_json::to_string(&ErrorResponse {
+                        id: request_id.to_string(),
+                        error: ErrorBody { code, message },
+                    })
+                    .map(|json| DeferralWait::Failed(json))
+                    .map_err(std::io::Error::other);
+                }
+                _ => {}
+            }
+        }
+        if std::time::Instant::now() >= deadline {
+            return serde_json::to_string(&ErrorResponse {
+                id: request_id.to_string(),
+                error: ErrorBody {
+                    code: "agent_input_busy".into(),
+                    message: "the held message was not typed before the deadline".into(),
+                },
+            })
+            .map(DeferralWait::Failed)
+            .map_err(std::io::Error::other);
+        }
+        std::thread::sleep(CONNECTION_POLL_INTERVAL);
+    }
 }
 
 pub(super) fn wait_for_event(

@@ -10,6 +10,7 @@ use crate::app::App;
 
 use super::responses::{encode_error, encode_error_body, encode_success};
 
+#[cfg(test)]
 const AGENT_PROMPT_SUBMIT_DELAY: Duration = Duration::from_millis(300);
 
 impl App {
@@ -183,43 +184,41 @@ impl App {
                 "only Pi recipients have a Messages queue",
             );
         }
-        if expected_agent == crate::detect::Agent::GithubCopilot {
-            // Copilot ignores synthetic Enter after focus loss until it receives focus gained.
-            let focus = match crate::ghostty::encode_focus(crate::ghostty::FocusEvent::Gained) {
-                Ok(focus) => focus,
-                Err(err) => return encode_error(id, "agent_prompt_failed", err.to_string()),
-            };
-            if let Err(err) = runtime.try_send_bytes(Bytes::from(focus)) {
-                return encode_error(id, "agent_prompt_failed", err.to_string());
-            }
-        }
-        let (text, enter) =
-            crate::app::api_helpers::encode_api_submission_parts(runtime, &params.text);
-        let result = self
-            .lookup_runtime_sender(resolved.ws_idx, resolved.pane_id)
-            .expect("runtime was just verified")
-            .try_send_prompt_transaction(
-                Bytes::from(text),
-                Bytes::from(enter),
-                AGENT_PROMPT_SUBMIT_DELAY,
+        // Never type into the human's unsent draft: hold the delivery (in
+        // order) until the pane's editor is clear.
+        if self.typed_delivery_must_wait(&terminal_id) {
+            let sender = self.attribute_sender(params.send.caller_pid);
+            let deferral_id = self.defer_typed_delivery(
+                terminal_id.clone(),
+                params.text.clone(),
+                expected_agent,
+                params.target.clone(),
+                sender,
+                "agent_prompt",
             );
-        if let Err(err) = result {
-            let code = match err {
-                crate::pane::PromptTransactionAdmissionError::Full => "agent_prompt_queue_full",
-                crate::pane::PromptTransactionAdmissionError::PayloadTooLarge => {
-                    "agent_prompt_payload_too_large"
-                }
-                crate::pane::PromptTransactionAdmissionError::InputFull
-                | crate::pane::PromptTransactionAdmissionError::Closed => "agent_prompt_failed",
+            let Some(agent) = self.agent_info(resolved.ws_idx, resolved.pane_id) else {
+                return agent_not_found(id, &params.target);
             };
-            return encode_error(id, code, err.to_string());
+            return encode_success(
+                id,
+                ResponseResult::AgentPrompted {
+                    agent,
+                    delivery: Some(crate::api::schema::MessageDelivery {
+                        path: "pty_deferred".into(),
+                        deferral_id: Some(deferral_id),
+                        stable_id: None,
+                        revision: None,
+                        edited: false,
+                        duplicate: false,
+                    }),
+                },
+            );
         }
-        // A response means this runtime admitted the complete transaction. Only then
-        // may prompt input restore an archived collection member.
-        if let Some(restore) = self.begin_archived_member_input(resolved.ws_idx, resolved.pane_id) {
-            self.commit_archived_member_input(restore);
+        if let Err((code, message)) =
+            self.type_submission(&terminal_id, expected_agent, &params.text)
+        {
+            return encode_error(id, code, message);
         }
-        self.acknowledge_terminal_input(&terminal_id);
         let Some(agent) = self.agent_info(resolved.ws_idx, resolved.pane_id) else {
             return agent_not_found(id, &params.target);
         };

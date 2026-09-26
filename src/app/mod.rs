@@ -33,6 +33,7 @@ mod tab_bar_status;
 mod terminal_targets;
 mod terminal_titles;
 mod theme_sync;
+pub(crate) mod typed_deferral;
 pub(crate) mod wake;
 mod window_title;
 mod worktrees;
@@ -151,6 +152,10 @@ pub struct App {
     /// Ephemeral server-owned managed start evidence; never restored from a pane snapshot.
     pub(crate) managed_pi_launches: HashMap<crate::terminal::TerminalId, agents::ManagedPiLaunch>,
     pub(crate) pane_wakes: HashMap<crate::terminal::TerminalId, wake::OutstandingWake>,
+    /// Per-pane estimate of the human's unsent input (typed-delivery guard).
+    pub(crate) human_drafts: HashMap<crate::terminal::TerminalId, typed_deferral::HumanDraft>,
+    /// Typed deliveries held while a draft is pending, in arrival order.
+    pub(crate) typed_deferrals: Vec<typed_deferral::TypedDeferral>,
     pub(crate) pane_wake_cooldowns: HashMap<crate::terminal::TerminalId, Instant>,
     /// Next level-triggered sweep of sleeping panes with a queued backlog;
     /// `None` until the first (post-start, `restore_backlog`) sweep ran.
@@ -933,6 +938,8 @@ impl App {
             mailbox_bootstrap_bindings: BTreeMap::new(),
             managed_pi_launches: HashMap::new(),
             pane_wakes: HashMap::new(),
+            human_drafts: HashMap::new(),
+            typed_deferrals: Vec::new(),
             pane_wake_cooldowns: HashMap::new(),
             next_backlog_sweep: None,
             server_started_at: Instant::now(),
@@ -1909,9 +1916,14 @@ impl App {
     ) {
         match plan {
             input::RepeatPlan::Forwarded(target) => {
+                let repeat = key.kind == crossterm::event::KeyEventKind::Repeat;
+                let counted = key.clone();
                 let result = self.forward_terminal_key_to_target_headless(&target, key);
                 if result.delivered() {
                     self.acknowledge_terminal_input(&target.terminal_id);
+                    if repeat {
+                        self.note_human_key(&target.terminal_id, &counted);
+                    }
                 } else if !result.succeeded() {
                     self.input_leases.remove(&lease_key);
                 }
@@ -1931,6 +1943,8 @@ impl App {
                             self.forward_terminal_key_to_target_headless(target, key.clone());
                         if result.delivered() {
                             self.acknowledge_terminal_input(&target.terminal_id);
+                            let target_terminal = target.terminal_id.clone();
+                            self.note_human_key(&target_terminal, &key);
                         } else if !result.succeeded() {
                             self.input_leases.remove(&lease_key);
                             break;
@@ -2034,6 +2048,7 @@ impl App {
                             };
                             if let Some(target) = &target {
                                 self.acknowledge_terminal_input(&target.terminal_id);
+                                self.note_human_key(&target.terminal_id, &key);
                             }
                             let resulting_context = self.terminal_input_context();
                             let plan = self.input_leases.complete_press(
@@ -2100,9 +2115,11 @@ impl App {
                                         ws_idx,
                                         focused,
                                     ) {
+                                        let pasted = text.clone();
                                         if runtime.try_send_paste(text).is_ok() {
                                             if let Some(terminal_id) = terminal_id {
                                                 self.acknowledge_terminal_input(&terminal_id);
+                                                self.note_human_text(&terminal_id, &pasted);
                                             }
                                         }
                                     }

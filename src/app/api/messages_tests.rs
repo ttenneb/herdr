@@ -2664,3 +2664,273 @@ async fn a_live_pi_without_messages_after_30s_gets_new_messages_typed() {
     fixture.app.messages_attached_pis.insert((old_pi, 11));
     assert!(fixture.app.pane_takes_messages(&key));
 }
+
+fn human_key(
+    app: &mut App,
+    terminal: &crate::terminal::TerminalId,
+    code: crossterm::event::KeyCode,
+) {
+    let key = crate::input::TerminalKey::new(code, crossterm::event::KeyModifiers::NONE);
+    app.note_human_key(terminal, &key);
+}
+
+fn deferral_events(app: &App, after: u64) -> Vec<crate::api::schema::EventData> {
+    app.event_hub
+        .events_after(after)
+        .into_iter()
+        .filter(|(_, event)| {
+            matches!(
+                event.event,
+                crate::api::schema::EventKind::DeliveryDeferredDelivered
+                    | crate::api::schema::EventKind::DeliveryDeferredFailed
+            )
+        })
+        .map(|(_, event)| event.data)
+        .collect()
+}
+
+fn prompt_pane(
+    fixture: &mut Fixture,
+    text: &str,
+    transport: Option<MessageTransport>,
+) -> serde_json::Value {
+    let target = fixture.app.public_pane_id(1, fixture.panes[1]).unwrap();
+    let response = fixture.app.handle_agent_prompt(
+        "p".into(),
+        AgentPromptParams {
+            target,
+            text: text.into(),
+            wait: None,
+            send: MessageSendOptions {
+                transport,
+                ..Default::default()
+            },
+        },
+    );
+    serde_json::from_str(&response).unwrap()
+}
+
+/// On a Pi pane with Messages nothing is ever typed, even while the human
+/// has a draft: the message is queued.
+#[tokio::test]
+async fn a_messages_pi_pane_is_never_typed_into() {
+    let mut fixture = fixture();
+    attach_recipient(&mut fixture);
+    let terminal = fixture.app.state.workspaces[1]
+        .terminal_id(fixture.panes[1])
+        .unwrap()
+        .clone();
+    human_key(
+        &mut fixture.app,
+        &terminal,
+        crossterm::event::KeyCode::Char('d'),
+    );
+    let response = prompt_pane(&mut fixture, "queued", None);
+    assert_eq!(
+        response["result"]["delivery"]["path"], "mailbox",
+        "{response}"
+    );
+    assert!(fixture.rx[1].try_recv().is_err(), "nothing typed");
+}
+
+/// Typed fallback: a human draft holds typed deliveries (auto and explicit
+/// pty, in order) until Enter clears it; backspacing to empty is no draft;
+/// API keys and typed deliveries never count as a draft.
+#[tokio::test]
+async fn typed_delivery_waits_for_the_humans_draft_then_types_in_order() {
+    use crossterm::event::KeyCode;
+    let mut fixture = fixture();
+    let terminal = fixture.app.state.workspaces[1]
+        .terminal_id(fixture.panes[1])
+        .unwrap()
+        .clone();
+    // No Messages in this pane: sends are typed.
+    assert!(!fixture.app.pane_takes_messages(&fixture.terminals[1]));
+    // Typed and fully backspaced: no draft.
+    for _ in 0..3 {
+        human_key(&mut fixture.app, &terminal, KeyCode::Char('x'));
+    }
+    for _ in 0..4 {
+        human_key(&mut fixture.app, &terminal, KeyCode::Backspace);
+    }
+    assert!(!fixture.app.pane_draft_pending(&terminal));
+    // API send-keys never counts as human input.
+    let target = fixture.app.public_pane_id(1, fixture.panes[1]).unwrap();
+    fixture.app.handle_agent_send_keys(
+        "keys".into(),
+        crate::api::schema::AgentSendKeysParams {
+            target: target.clone(),
+            keys: vec!["a".into(), "b".into()],
+            expected_terminal_id: None,
+            expected_name: None,
+        },
+    );
+    assert!(!fixture.app.pane_draft_pending(&terminal));
+    while fixture.rx[1].try_recv().is_ok() {}
+    // The human starts a draft.
+    human_key(&mut fixture.app, &terminal, KeyCode::Char('h'));
+    human_key(&mut fixture.app, &terminal, KeyCode::Char('i'));
+    assert!(fixture.app.pane_draft_pending(&terminal));
+    let sequence = fixture.app.event_hub.current_sequence();
+    let first = prompt_pane(&mut fixture, "first", None);
+    let second = prompt_pane(&mut fixture, "second", Some(MessageTransport::Pty));
+    for response in [&first, &second] {
+        assert_eq!(
+            response["result"]["delivery"]["path"], "pty_deferred",
+            "{response}"
+        );
+        assert!(response["result"]["delivery"]["deferral_id"]
+            .as_str()
+            .unwrap()
+            .starts_with("defer."));
+    }
+    assert!(
+        fixture.rx[1].try_recv().is_err(),
+        "nothing typed into the draft"
+    );
+    // Enter submits the human's draft; the held messages follow, in order.
+    human_key(&mut fixture.app, &terminal, KeyCode::Enter);
+    assert!(fixture.app.typed_deferrals.is_empty());
+    let mut typed = Vec::new();
+    while let Ok(Some(bytes)) =
+        tokio::time::timeout(std::time::Duration::from_secs(2), fixture.rx[1].recv()).await
+    {
+        typed.push(String::from_utf8_lossy(&bytes).to_string());
+        if typed.iter().filter(|chunk| chunk.contains('\r')).count() >= 2 {
+            break;
+        }
+    }
+    let joined = typed.concat();
+    let (a, b) = (
+        joined.find("first").unwrap(),
+        joined.find("second").unwrap(),
+    );
+    assert!(a < b, "in order: {joined:?}");
+    let events = deferral_events(&fixture.app, sequence);
+    assert_eq!(events.len(), 2);
+    assert!(events.iter().all(|event| matches!(
+        event,
+        crate::api::schema::EventData::DeliveryDeferredDelivered { .. }
+    )));
+    // The typed delivery itself did not create a draft.
+    assert!(!fixture.app.pane_draft_pending(&terminal));
+    let direct = prompt_pane(&mut fixture, "direct", None);
+    assert!(
+        direct["result"]["delivery"].is_null(),
+        "typed at once: {direct}"
+    );
+}
+
+/// After 10 minutes a held delivery fails with agent_input_busy; a sender
+/// Pi with Messages gets the failure in its inbox. An agent process exit
+/// clears the draft.
+#[tokio::test]
+async fn a_held_delivery_fails_after_the_limit_and_the_sender_is_told() {
+    use crossterm::event::KeyCode;
+    let mut fixture = fixture();
+    let terminal = fixture.app.state.workspaces[1]
+        .terminal_id(fixture.panes[1])
+        .unwrap()
+        .clone();
+    let sender_terminal = fixture.app.state.workspaces[0]
+        .terminal_id(fixture.panes[0])
+        .unwrap()
+        .clone();
+    fixture
+        .app
+        .state
+        .terminals
+        .get_mut(&sender_terminal)
+        .unwrap()
+        .messages_capable = true;
+    human_key(&mut fixture.app, &terminal, KeyCode::Char('z'));
+    let sequence = fixture.app.event_hub.current_sequence();
+    let id = fixture.app.defer_typed_delivery(
+        terminal.clone(),
+        "never typed".into(),
+        Agent::Pi,
+        "recipient".into(),
+        sender(&fixture),
+        "agent_prompt",
+    );
+    fixture.app.typed_deferrals[0].deadline =
+        std::time::Instant::now() - std::time::Duration::from_secs(1);
+    assert!(fixture.app.flush_typed_deferrals(std::time::Instant::now()));
+    assert!(fixture.app.typed_deferrals.is_empty());
+    assert!(fixture.rx[1].try_recv().is_err(), "never typed");
+    let events = deferral_events(&fixture.app, sequence);
+    let [crate::api::schema::EventData::DeliveryDeferredFailed {
+        deferral_id,
+        code,
+        sender_terminal_id,
+        ..
+    }] = events.as_slice()
+    else {
+        panic!("one failure event: {events:?}")
+    };
+    assert_eq!(deferral_id, &id);
+    assert_eq!(code, "agent_input_busy");
+    assert_eq!(
+        sender_terminal_id.as_deref(),
+        Some(fixture.terminals[0].as_str())
+    );
+    let heads = crate::mailbox::MailboxStore::open(&fixture.directory)
+        .unwrap()
+        .load()
+        .unwrap()
+        .heads;
+    let note = heads
+        .values()
+        .find(|head| head.subject.starts_with("Not delivered"))
+        .expect("failure note in the sender's inbox");
+    assert!(note.body.contains("agent_input_busy") && note.body.contains("never typed"));
+    // An agent process exit clears the draft.
+    fixture
+        .app
+        .handle_internal_event(crate::events::AppEvent::StateChanged {
+            pane_id: fixture.panes[1],
+            agent: None,
+            state: AgentState::Idle,
+            visible_blocker: false,
+            visible_working: false,
+            process_exited: true,
+            observed_at: std::time::Instant::now(),
+        });
+    assert!(!fixture.app.pane_draft_pending(&terminal));
+}
+
+/// Human keys and pastes from an attached client reach the draft estimate.
+#[tokio::test]
+async fn client_keys_and_pastes_count_as_the_humans_draft() {
+    use crossterm::event::{KeyCode, KeyModifiers};
+    let mut fixture = fixture();
+    let focused = fixture.app.state.workspaces[0]
+        .terminal_id(fixture.panes[0])
+        .unwrap()
+        .clone();
+    let key = |code| {
+        crate::raw_input::RawInputEvent::Key(crate::input::TerminalKey::new(
+            code,
+            KeyModifiers::NONE,
+        ))
+    };
+    fixture
+        .app
+        .route_client_events(vec![key(KeyCode::Char('a'))], false);
+    assert!(fixture.app.pane_draft_pending(&focused));
+    fixture
+        .app
+        .route_client_events(vec![key(KeyCode::Enter)], false);
+    assert!(!fixture.app.pane_draft_pending(&focused));
+    fixture.app.route_client_events(
+        vec![crate::raw_input::RawInputEvent::Paste("pasted text".into())],
+        false,
+    );
+    assert!(fixture.app.pane_draft_pending(&focused));
+    let ctrl_u = crate::raw_input::RawInputEvent::Key(crate::input::TerminalKey::new(
+        KeyCode::Char('u'),
+        KeyModifiers::CONTROL,
+    ));
+    fixture.app.route_client_events(vec![ctrl_u], false);
+    assert!(!fixture.app.pane_draft_pending(&focused));
+}
