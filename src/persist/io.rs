@@ -545,6 +545,7 @@ mod tests {
         drop(lease);
     }
 
+    #[cfg(unix)]
     #[test]
     fn exclusive_session_writer_denies_competing_stale_saver() {
         let path = temp_session_path("exclusive-writer");
