@@ -1249,8 +1249,19 @@ mod tests {
         listener.poll(&mut app).unwrap();
         assert!(app.attached_messages_recipient(&sender).is_some());
         // Closing the stream releases the binding: no longer "has Messages".
+        // A child forked by a parallel test can hold a copy of the client
+        // socket until its exec, delaying EOF; poll until it arrives.
         drop(client);
-        listener.poll(&mut app).unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            listener.poll(&mut app).unwrap();
+            if app.attached_messages_recipient(&sender).is_none()
+                || std::time::Instant::now() >= deadline
+            {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
         assert!(app.attached_messages_recipient(&sender).is_none());
         std::fs::remove_dir_all(directory).ok();
     }
