@@ -3281,8 +3281,16 @@ async fn pis_editor_has_text_report_wins_over_the_count() {
         .unwrap()
         .unwrap();
     assert!(String::from_utf8_lossy(&typed).contains("held by Pi's flag"));
-    // Pi's "clear" also wins over a positive Herdr count.
+    // QA batch 3 #3: a stale Pi "false" does not override fresh keys (OR)...
     human_key(&mut fixture.app, &terminal, KeyCode::Char('q'));
+    assert!(fixture.app.pane_draft_pending(&terminal));
+    // ...a repeated false (no edge) leaves Herdr's flag...
+    report_editor(&mut fixture, false);
+    assert!(fixture.app.pane_draft_pending(&terminal));
+    // ...and Pi's true→false edge clears it.
+    report_editor(&mut fixture, true);
+    assert!(fixture.app.pane_draft_pending(&terminal));
+    report_editor(&mut fixture, false);
     assert!(!fixture.app.pane_draft_pending(&terminal));
     // The report is dropped when the agent process exits.
     report_editor(&mut fixture, true);

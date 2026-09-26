@@ -134,7 +134,7 @@ impl App {
         }
     }
 
-    fn clear_human_draft(&mut self, terminal_id: &TerminalId) {
+    pub(crate) fn clear_human_draft(&mut self, terminal_id: &TerminalId) {
         let had = self.human_drafts.remove(terminal_id).is_some();
         if had
             || self
@@ -181,19 +181,24 @@ impl App {
         }
     }
 
-    /// Whether the pane's editor may hold the human's unsent text. A Pi's
-    /// own `editor_has_text` report wins; otherwise Herdr's input count.
+    /// Whether the pane's editor may hold the human's unsent text: a Pi's
+    /// `editor_has_text=true` report, OR Herdr's own key-based flag (a stale
+    /// false from Pi never overrides fresh keys; Pi's true→false edge clears
+    /// Herdr's flag when it arrives).
     pub(crate) fn pane_draft_pending(&self, terminal_id: &TerminalId) -> bool {
-        if let Some(reported) = self.state.terminals.get(terminal_id).and_then(|terminal| {
-            (terminal.effective_known_agent() == Some(crate::detect::Agent::Pi))
-                .then_some(terminal.editor_has_text)
-                .flatten()
-        }) {
-            return reported;
-        }
-        self.human_drafts
+        let reported = self
+            .state
+            .terminals
             .get(terminal_id)
-            .is_some_and(|draft| draft.count > 0)
+            .is_some_and(|terminal| {
+                terminal.effective_known_agent() == Some(crate::detect::Agent::Pi)
+                    && terminal.editor_has_text == Some(true)
+            });
+        reported
+            || self
+                .human_drafts
+                .get(terminal_id)
+                .is_some_and(|draft| draft.count > 0)
     }
 
     /// Whether a typed delivery to this terminal must be held: a draft is
