@@ -72,7 +72,10 @@ fn env_name_allowed(name: &str) -> bool {
         "COOKIE",
     ]
     .iter()
-    .any(|needle| upper.contains(needle));
+    .any(|needle| upper.contains(needle))
+        || ["_KEY", "_PAT", "_TOKEN", "_SECRET", "_PASS", "_PASSWORD"]
+            .iter()
+            .any(|suffix| upper.ends_with(suffix));
     allowed && !credential
 }
 
@@ -169,13 +172,20 @@ fn args_carry_prompt(args: &[String]) -> bool {
             index += 2;
             continue;
         }
-        if PI_OPTIONAL_VALUE_FLAGS.contains(&arg)
-            || (arg.starts_with("--") && !arg.contains('=') && !PI_BOOLEAN_FLAGS.contains(&arg))
-        {
-            // Unknown long flags also consume a following bare value.
+        if PI_OPTIONAL_VALUE_FLAGS.contains(&arg) {
             let consumes =
                 next.is_some_and(|value| !value.starts_with('-') && !value.starts_with('@'));
             index += if consumes { 2 } else { 1 };
+            continue;
+        }
+        if arg.starts_with("--") && !arg.contains('=') && !PI_BOOLEAN_FLAGS.contains(&arg) {
+            // An unknown long flag followed by a bare token is unclear: Pi may
+            // take the token as the flag's value or as a message. Unclear
+            // counts as a prompt, so no recipe.
+            if next.is_some_and(|value| !value.starts_with('-')) {
+                return true;
+            }
+            index += 1;
             continue;
         }
         if arg.starts_with('-') {
@@ -285,6 +295,11 @@ mod tests {
                 ("HTTPS_PROXY", "http://proxy:8080"),
                 ("PI_REGISTRY", "https://user:pass@registry.example/npm"),
                 ("PI_AUTH_TOKEN", "x"),
+                ("PI_GITHUB_PAT", "x"),
+                ("PI_SIGNING_KEY", "x"),
+                ("PI_DB_PASS", "x"),
+                ("PI_CLIENT_SECRET", "x"),
+                ("PI_ADMIN_PASSWORD", "x"),
                 ("OPENAI_BASE_URL", "https://api.example"),
             ]),
         )
@@ -321,6 +336,8 @@ mod tests {
             &["--print"],
             &["--verbose", "do X"],
             &["-c", "continue with X"],
+            &["--some-extension-flag", "value"],
+            &["--unknown", "do X"],
         ] {
             assert_eq!(
                 LaunchRecipe::capture("a", "pi", &args(refused), &[]),
@@ -339,7 +356,8 @@ mod tests {
             ][..],
             &["--name", "owner", "--model", "anthropic/claude"],
             &["--verbose", "--offline"],
-            &["--some-extension-flag", "value", "--session=s.jsonl"],
+            &["--some-extension-flag=value", "--session=s.jsonl"],
+            &["--some-extension-flag", "--offline"],
             &["--"],
         ] {
             assert!(
