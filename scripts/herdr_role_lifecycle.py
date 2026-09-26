@@ -43,6 +43,11 @@ MAX_ACK_ID_BYTES = 256
 MAX_UNIX_SOCKET_PATH_BYTES = 100
 
 
+DEFAULT_QUIET_SECONDS = 60.0
+# Reserved --env key: Herdr never sleeps or wakes a pane launched with it.
+LIFECYCLE_ROLE_ENV = "HERDR_LIFECYCLE_ROLE"
+
+
 class LifecycleError(RuntimeError):
     pass
 
@@ -723,11 +728,41 @@ def managed_generation(role: dict[str, Any], activation: dict[str, Any]) -> str:
     return "g" + hashlib.sha256(material).hexdigest()[:31]
 
 
-def lifecycle_run(role: dict[str, Any], durable_root: Path, poll_seconds: float, idle_timeout: float, activation_path: Path | None = None) -> None:
+def wait_for_role_lock(lock_stream: Any, deadline: float, poll_seconds: float) -> None:
+    """A queued activation that starts while the current run still owns the role
+    waits for it (bounded) instead of failing and being restarted by systemd."""
+    while True:
+        try:
+            fcntl.flock(lock_stream, fcntl.LOCK_EX | fcntl.LOCK_NB); return
+        except BlockingIOError as exc:
+            if time.monotonic() >= deadline: raise LifecycleError("another lifecycle manager owns this role") from exc
+            extend_start_timeout(poll_seconds)
+            time.sleep(poll_seconds)
+
+
+def extend_start_timeout(poll_seconds: float) -> None:
+    """While still waiting before READY=1, ask systemd for more start time."""
+    if os.environ.get("NOTIFY_SOCKET"):
+        try: notify({}, f"EXTEND_TIMEOUT_USEC={int(max(poll_seconds, 1.0) * 4_000_000)}", "STATUS=waiting for the role lock or a hibernated pane")
+        except LifecycleError: pass
+
+
+def wait_for_hibernated_pane(role: dict[str, Any], deadline: float, poll_seconds: float) -> dict[str, Any]:
+    """The previous generation may still be exiting when the lock is released."""
+    while True:
+        state = preflight_agent_state(role); assert_identity(role, state, require_ready=False)
+        if state.get("agent_status") in {"unknown", "exited", None} and state.get("agent") is None: return state
+        if time.monotonic() >= deadline: return state
+        extend_start_timeout(poll_seconds)
+        time.sleep(poll_seconds)
+
+
+def lifecycle_run(role: dict[str, Any], durable_root: Path, poll_seconds: float, idle_timeout: float, activation_path: Path | None = None, *, lock_wait_seconds: float = 0.0, quiet_seconds: float = DEFAULT_QUIET_SECONDS) -> None:
     state_dir = Path(role["stateDir"]); state_dir.mkdir(mode=0o700, parents=True, exist_ok=True); os.chmod(state_dir, 0o700)
     lock_stream = (state_dir / "manager.lock").open("a+")
-    try: fcntl.flock(lock_stream, fcntl.LOCK_EX | fcntl.LOCK_NB)
-    except BlockingIOError as exc: raise LifecycleError("another lifecycle manager owns this role") from exc
+    wait_deadline = time.monotonic() + max(lock_wait_seconds, 0.0)
+    try: wait_for_role_lock(lock_stream, wait_deadline, max(poll_seconds, 0.05))
+    except BaseException: lock_stream.close(); raise
     try:
         if (state_dir / "relaunch-inhibit.json").exists():
             update_queued_lifecycle_record(activation_path, "relaunch_inhibited")
@@ -738,7 +773,7 @@ def lifecycle_run(role: dict[str, Any], durable_root: Path, poll_seconds: float,
             previous = read_json(current_path)
             if previous.get("executionId") == activation["executionId"] and previous.get("phase") in TERMINAL_STATES: raise LifecycleInhibited("activation executionId is already terminal and cannot be replayed")
         herdr = role["executables"]["herdr"]
-        initial = preflight_agent_state(role); assert_identity(role, initial, require_ready=False)
+        initial = wait_for_hibernated_pane(role, wait_deadline, max(poll_seconds, 0.05))
         if initial.get("agent_status") not in {"unknown", "exited", None} or initial.get("agent") is not None:
             atomic_json(state_dir / "relaunch-inhibit.json", receipt(role, "relaunch_inhibited", executionId=activation["executionId"], detail="pane was not provably hibernated before start"))
             update_queued_lifecycle_record(activation_path, "ambiguous_live_process_inhibited")
@@ -748,6 +783,7 @@ def lifecycle_run(role: dict[str, Any], durable_root: Path, poll_seconds: float,
         atomic_json(current_path, receipt(role, "validated", executionId=activation["executionId"], activationDigest=activation["activationDigest"], promptDigest=activation["promptDigest"], issuer=activation["issuer"], senderRoute=activation["senderRoute"], parentRoute=activation["parentRoute"], generation=generation, preStartIdentity=activation["preStartIdentity"], gateAdmission="unknown", modelExecution="unknown", todoAcceptance="unknown"))
         argv = [herdr, "agent", "start", generation, "--kind", "pi", "--pane", role["paneId"], "--timeout", "30000"]
         for assignment in tasking_child_environment(durable_root): argv += ["--env", assignment]
+        argv += ["--env", f"{LIFECYCLE_ROLE_ENV}={role['roleId']}"]
         argv += ["--", *launch_args(role)[1:]]
         launch_env = herdr_environment(role); launch_env["PATH"] = str(Path(role["executables"]["pi"]).parent) + os.pathsep + launch_env.get("PATH", "")
         try:
@@ -765,6 +801,9 @@ def lifecycle_run(role: dict[str, Any], durable_root: Path, poll_seconds: float,
         notify(role, "READY=1", "WATCHDOG=1", "STATUS=Pi interactive; activation transport accepted"); heartbeat(role, "executing", state_dir, f"execution={activation['executionId']}")
         try:
             deadline = time.monotonic() + idle_timeout; observed_activity = False
+            # A turn that fails at once (for example no API key) consumes the
+            # prompt without any state change; a quiet idle period completes it.
+            quiet_since: float | None = None; last_sequence = baseline_seq
             while time.monotonic() < deadline:
                 time.sleep(poll_seconds)
                 live = agent_from(run_json([herdr, "agent", "get", role["paneId"]], env=herdr_environment(role))); assert_identity(role, live, require_ready=False, expected_name=generation)
@@ -772,6 +811,12 @@ def lifecycle_run(role: dict[str, Any], durable_root: Path, poll_seconds: float,
                 if status in {"working", "blocked"} or sequence > baseline_seq: observed_activity = True
                 heartbeat(role, "executing", state_dir, f"status={status} sequence={sequence}")
                 if observed_activity and status in {"idle", "done"}: break
+                if not observed_activity and status in {"idle", "done"} and sequence == last_sequence:
+                    quiet_since = time.monotonic() if quiet_since is None else quiet_since
+                    if time.monotonic() - quiet_since >= quiet_seconds: break
+                else:
+                    quiet_since = None
+                last_sequence = sequence
             else: raise LifecycleError("Pi did not return to idle before the execution timeout")
             exact_hibernate(role, generation, timeout=15)
         except Exception as failure:
@@ -779,7 +824,7 @@ def lifecycle_run(role: dict[str, Any], durable_root: Path, poll_seconds: float,
             atomic_json(current_path, receipt(role, "failed", executionId=activation["executionId"], generation=generation, rollbackDisposition=disposition, error=str(failure), gateAdmission="unknown", modelExecution="unknown", todoAcceptance="unknown"))
             update_queued_lifecycle_record(activation_path, f"failed_rollback_{disposition}")
             raise LifecycleError(f"execution/hibernate failure; rollback {disposition}: {failure}") from failure
-        atomic_json(current_path, receipt(role, "completed", executionId=activation["executionId"], activationDigest=activation["activationDigest"], promptDigest=activation["promptDigest"], generation=generation, runtimeTransportAccepted=True, gateAdmission="unknown", modelExecution="unknown", reportAcceptance="unknown", todoAcceptance="unknown", hibernated=True)); heartbeat(role, "hibernated", state_dir, f"execution={activation['executionId']}")
+        atomic_json(current_path, receipt(role, "completed", executionId=activation["executionId"], activationDigest=activation["activationDigest"], promptDigest=activation["promptDigest"], generation=generation, runtimeTransportAccepted=True, turnObserved=observed_activity, gateAdmission="unknown", modelExecution="unknown", reportAcceptance="unknown", todoAcceptance="unknown", hibernated=True)); heartbeat(role, "hibernated", state_dir, f"execution={activation['executionId']}")
         update_queued_lifecycle_record(activation_path, "completed")
     finally: lock_stream.close()
 
@@ -852,11 +897,14 @@ def start_queued_input_service(role: dict[str, Any], activation_id: str, durable
                 return queued_start_result(activation_id, "uncertain", unit, prior.get("receiptId"), "explicit same-ID start recovery is required")
             return queued_start_result(activation_id, "rejected", unit, prior.get("receiptId"), "exact service start is terminal")
         receipt_id = hashlib.sha256(f"queued-service-start:{record['receiptId']}:{unit}".encode()).hexdigest()
-        command = [systemctl_path, "--user", "start", unit]
+        # --no-block: success means systemd queued the start job. The run itself
+        # records its own lifecycle outcome; a queued job that waits for the
+        # role lock is never misreported as a rejected start.
+        command = [systemctl_path, "--user", "start", "--no-block", unit]
         record["serviceStart"] = {"outcome": "uncertain", "receiptId": receipt_id, "unit": unit, "command": command, "attemptedAtEpochMs": int(time.time() * 1000)}
         atomic_json(record_path, record)
         try:
-            completed = runner(command, check=False, capture_output=True, text=True, timeout=75)
+            completed = runner(command, check=False, capture_output=True, text=True, timeout=15)
         except (OSError, subprocess.TimeoutExpired) as exc:
             return queued_start_result(activation_id, "uncertain", unit, receipt_id, f"service start acknowledgement is uncertain: {exc}")
         if fault == "lost_ack":
@@ -865,7 +913,7 @@ def start_queued_input_service(role: dict[str, Any], activation_id: str, durable
             record["serviceStart"].update({"outcome": "rejected", "completedAtEpochMs": int(time.time() * 1000), "reason": (completed.stderr or "systemctl start failed").strip()[:2048]})
             atomic_json(record_path, record)
             return queued_start_result(activation_id, "rejected", unit, receipt_id, record["serviceStart"]["reason"])
-        record["serviceStart"].update({"outcome": "accepted", "completedAtEpochMs": int(time.time() * 1000)})
+        record["serviceStart"].update({"outcome": "accepted", "acknowledgement": "systemd_job_queued", "completedAtEpochMs": int(time.time() * 1000)})
         atomic_json(record_path, record)
         return queued_start_result(activation_id, "accepted", unit, receipt_id)
     finally:
@@ -1078,6 +1126,7 @@ def parser() -> argparse.ArgumentParser:
         item = sub.add_parser(name); item.add_argument("--manifest", required=True); item.add_argument("--durable-root", default="/home")
         if name == "run":
             item.add_argument("--poll-seconds", type=float, default=2.0); item.add_argument("--execution-timeout", type=float, default=14400.0); item.add_argument("--activation-id")
+            item.add_argument("--lock-wait-seconds", type=float, default=300.0); item.add_argument("--quiet-seconds", type=float, default=DEFAULT_QUIET_SECONDS)
         if name in {"render-unit", "render-queued-unit"}: item.add_argument("--manager", required=True)
         if name in {"schedule-queued-input", "recover-queued-input"}:
             item.add_argument("--request", required=True); item.add_argument("--issuer", required=True)
@@ -1094,7 +1143,7 @@ def main(argv: list[str] | None = None) -> int:
         role = load_manifest(Path(args.manifest), Path(args.durable_root))
         if args.command == "validate": print(json.dumps({"valid": True, "roleId": role["roleId"], "humanFacing": role["humanFacing"]}, sort_keys=True))
         elif args.command == "launch-argv": print(json.dumps({"argv": launch_args(role), "humanFacingGranted": role["humanFacing"]}, sort_keys=True))
-        elif args.command == "render-unit": print(render_unit(role, Path(args.manager)), end="")
+        elif args.command == "render-unit": raise LifecycleError("the static role unit is disabled; use render-queued-unit")
         elif args.command == "render-queued-unit": print(render_queued_unit(role, Path(args.manager)), end="")
         elif args.command == "queued-start-schema": print(json.dumps(queued_service_start_schema(), sort_keys=True, indent=2))
         elif args.command == "parent-ack-schema": print(json.dumps(parent_ack_schemas(), sort_keys=True, indent=2))
@@ -1113,11 +1162,11 @@ def main(argv: list[str] | None = None) -> int:
             request = decode_json(request_data, "parent acknowledgement request")
             print(json.dumps(deliver_parent_acknowledgement(role, request, Path(args.durable_root), recover=args.command == "recover-parent-ack"), sort_keys=True))
         else:
-            activation_path = None
-            if args.activation_id:
-                if not ACTIVATION_ID.fullmatch(args.activation_id): raise LifecycleError("--activation-id is invalid")
-                activation_path = queue_record_paths(role, args.activation_id)[1]
-            lifecycle_run(role, Path(args.durable_root), args.poll_seconds, args.execution_timeout, activation_path)
+            if not args.activation_id:
+                raise LifecycleError("static activation replay is disabled: run only as a queued @instance with --activation-id")
+            if not ACTIVATION_ID.fullmatch(args.activation_id): raise LifecycleError("--activation-id is invalid")
+            activation_path = queue_record_paths(role, args.activation_id)[1]
+            lifecycle_run(role, Path(args.durable_root), args.poll_seconds, args.execution_timeout, activation_path, lock_wait_seconds=args.lock_wait_seconds, quiet_seconds=args.quiet_seconds)
         return 0
     except LifecycleInhibited as exc:
         print(f"herdr-role-lifecycle: {exc}", file=sys.stderr); return 0
