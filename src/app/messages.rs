@@ -268,6 +268,13 @@ pub(crate) fn inbox_snapshot(
             .heads
             .get(&state.stable_id)
             .is_some_and(crate::mailbox::is_typed_history);
+        if typed_history {
+            // Projected by mailbox_v1 as settled/closedBy typed; no claim.
+            state.claim_execution = None;
+            state.claim_execution_alive = None;
+            state.recovery_needed = false;
+            continue;
+        }
         state.recovery_needed = !typed_history
             && state.claim_execution.as_deref() == Some("other")
             && state.claim_execution_alive == Some(false)

@@ -3749,6 +3749,38 @@ async fn a_partly_written_typed_history_row_is_never_delivered_or_recovered() {
         !snapshot.to_string().contains("\"recoveryNeeded\":true"),
         "never offered for recovery: {snapshot}"
     );
+    // Projection: both torn rows read as settled, closedBy "typed", with no
+    // claim exposed and no held row, in snapshot and history.
+    for stable_id in ["typed.headonly", "typed.withclaim"] {
+        let state = snapshot["snapshot"]["headStates"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|state| state["stableId"] == stable_id)
+            .unwrap_or_else(|| panic!("{stable_id} listed: {snapshot}"));
+        assert_eq!(state["lifecycle"], "settled", "{state}");
+        assert_eq!(state["closedBy"], "typed");
+        assert!(state.get("claimId").is_none(), "{state}");
+        assert!(state.get("claimExecution").is_none(), "{state}");
+    }
+    assert!(snapshot["snapshot"]
+        .get("claim")
+        .is_none_or(|claim| claim.is_null()));
+    let history = fixture
+        .app
+        .dispatch_mailbox_bootstrap(
+            &session,
+            "mailbox.history_snapshot",
+            json!({"protocol": protocol}),
+        )
+        .expect("history")
+        .to_string();
+    for stable_id in ["typed.headonly", "typed.withclaim"] {
+        assert!(
+            history.contains(stable_id),
+            "{stable_id} in history: {history}"
+        );
+    }
     assert!(dispatch(
         &mut fixture.app,
         &session,

@@ -213,6 +213,24 @@ pub fn snapshot(
     let head_states: Vec<HeadState> = heads
         .iter()
         .map(|head: &MailboxHead| {
+            // A typed-delivery history row is settled with closedBy "typed"
+            // whatever part of its write survived (head only, or head and
+            // claim): it was typed, never queued, and exposes no claim.
+            if crate::mailbox::is_typed_history(head) {
+                return HeadState {
+                    stable_id: head.stable_id.clone(),
+                    revision: head.revision,
+                    digest: head.digest.clone(),
+                    lifecycle: HeadLifecycle::Settled,
+                    claim_id: None,
+                    recipient_session: None,
+                    previous_session: false,
+                    claim_execution: None,
+                    recovery_needed: false,
+                    claim_execution_alive: None,
+                    closed_by: Some("typed".into()),
+                };
+            }
             let claim = recovered.claims.get(&head.stable_id);
             let resolution = claim.and_then(|claim| recovered.resolutions.get(&claim.claim_id));
             let lifecycle = match (claim, resolution.map(|resolution| resolution.outcome)) {
