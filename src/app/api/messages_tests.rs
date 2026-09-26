@@ -863,6 +863,113 @@ fn claims_are_bound_to_the_claiming_execution() {
     std::fs::remove_dir_all(directory).ok();
 }
 
+/// #135/#118 continuity: messages queued for a pane survive a Herdr server
+/// restart. The restored pane keeps its queue key (restore test in
+/// persist::restore), and the same pane's Pi receives each message exactly
+/// once, one claim at a time in priority order.
+#[tokio::test]
+async fn queued_messages_survive_a_server_restart_and_arrive_exactly_once() {
+    let mut before = fixture();
+    let terminal_id = before.app.state.workspaces[1]
+        .terminal_id(before.panes[1])
+        .unwrap()
+        .clone();
+    before
+        .app
+        .state
+        .terminals
+        .get_mut(&terminal_id)
+        .unwrap()
+        .messages_capable = true;
+    let queue_key = before.app.pane_queue_key(&before.terminals[1]).unwrap();
+    let sender = sender(&before);
+    let recipient = before.terminals[1].clone();
+    for (index, body) in ["low one", "high one", "normal one"].iter().enumerate() {
+        let mut message = plain(body);
+        message.priority = ["low", "high", "normal"][index].into();
+        before
+            .app
+            .route_ordinary_send(
+                &recipient,
+                &sender,
+                message,
+                &MessageSendOptions {
+                    send_new: index > 0,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+    }
+    // Server restart: a fresh App over the same durable state. The pane is
+    // restored with its persisted queue key and a new terminal ID.
+    let mut after = fixture();
+    std::fs::remove_dir_all(&after.directory).ok();
+    after.app.sender_authority_dir = before.directory.clone();
+    let restored_terminal = after.app.state.workspaces[1]
+        .terminal_id(after.panes[1])
+        .unwrap()
+        .clone();
+    assert_ne!(
+        restored_terminal.to_string(),
+        recipient,
+        "terminal IDs are re-minted"
+    );
+    {
+        let terminal = after
+            .app
+            .state
+            .terminals
+            .get_mut(&restored_terminal)
+            .unwrap();
+        terminal.queue_key = queue_key.clone();
+        terminal.messages_capable = true;
+    }
+    let session = attach_recipient(&mut after);
+    let mut delivered = Vec::new();
+    loop {
+        let claim = dispatch(
+            &mut after.app,
+            &session,
+            "mailbox.claim",
+            json!({"protocol": crate::mailbox_v1::PROTOCOL}),
+        )
+        .unwrap();
+        if claim["claim"].is_null() {
+            break;
+        }
+        // One at a time: the same outstanding claim until it settles.
+        let again = dispatch(
+            &mut after.app,
+            &session,
+            "mailbox.claim",
+            json!({"protocol": crate::mailbox_v1::PROTOCOL}),
+        )
+        .unwrap();
+        assert_eq!(again["claim"], claim["claim"]);
+        let claim_id = claim["claim"]["claimId"].as_str().unwrap().to_string();
+        for outcome in ["admitted", "settled"] {
+            dispatch(
+                &mut after.app,
+                &session,
+                "mailbox.resolve",
+                json!({"protocol": crate::mailbox_v1::PROTOCOL, "claimId": claim_id, "outcome": outcome}),
+            )
+            .unwrap();
+        }
+        let recovered = crate::mailbox::MailboxStore::open(&before.directory)
+            .unwrap()
+            .load()
+            .unwrap();
+        delivered.push(
+            recovered.heads[claim["claim"]["stableId"].as_str().unwrap()]
+                .body
+                .clone(),
+        );
+    }
+    assert_eq!(delivered, vec!["high one", "normal one", "low one"]);
+    std::fs::remove_dir_all(&after.directory).ok();
+}
+
 #[tokio::test]
 async fn a_second_accepted_stream_never_revokes_the_first() {
     let mut fixture = fixture();

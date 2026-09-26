@@ -5417,6 +5417,22 @@ pub fn run_server() -> io::Result<()> {
         .build()
         .map_err(io::Error::other)?;
 
+    // Restored pane shells are spawned while the App is built, before the
+    // bootstrap listener binds. Give them the (authority-free) discovery
+    // address now so a Pi typed into a restored pane can attach its queue.
+    if loaded_config
+        .config
+        .experimental
+        .unmanaged_pi_messages
+        .unwrap_or(true)
+    {
+        crate::integration::set_pane_mailbox_bootstrap_address(Some(
+            crate::server::mailbox_bootstrap::mailbox_bootstrap_socket_path()
+                .display()
+                .to_string(),
+        ));
+    }
+
     let result = rt.block_on(async {
         // Create the App (with AppState, event channels, etc.).
         let mut app = app::App::new(
