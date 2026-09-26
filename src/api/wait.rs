@@ -18,6 +18,10 @@ use crate::api::{ApiRequestSender, EventHub};
 use crate::ipc::LocalStream;
 
 const AGENT_PROMPT_EFFECT_TIMEOUT_MS: u64 = 5_000;
+/// An idle Pi picks a queued Messages head up on its own poll (up to 8 s
+/// between polls before it uses `mailbox.watch`), so allow longer than for
+/// typed input before calling the prompt stalled.
+const MAILBOX_PROMPT_EFFECT_TIMEOUT_MS: u64 = 15_000;
 
 pub(super) fn wait_for_output(
     request_id: String,
@@ -214,6 +218,14 @@ pub(super) fn prompt_agent(
     let Ok(prompted) = agent_from_response(&request_id, &prompt_response) else {
         return Ok(Some(prompt_response));
     };
+    let effect_limit_ms = if serde_json::from_str::<serde_json::Value>(&prompt_response)
+        .ok()
+        .is_some_and(|value| value["result"]["delivery"]["path"] == "mailbox")
+    {
+        MAILBOX_PROMPT_EFFECT_TIMEOUT_MS
+    } else {
+        AGENT_PROMPT_EFFECT_TIMEOUT_MS
+    };
     if !agent_wait_identity_matches(
         &prompted,
         &before_prompt.terminal_id,
@@ -230,14 +242,12 @@ pub(super) fn prompt_agent(
     let mut after_state_change_seq = Some(prompt_state_change_seq);
 
     if initial.agent_status != crate::api::schema::AgentStatus::Working {
-        let effect_timeout_ms = wait
-            .timeout_ms
-            .map_or(AGENT_PROMPT_EFFECT_TIMEOUT_MS, |timeout_ms| {
-                timeout_ms.min(AGENT_PROMPT_EFFECT_TIMEOUT_MS)
-            });
+        let effect_timeout_ms = wait.timeout_ms.map_or(effect_limit_ms, |timeout_ms| {
+            timeout_ms.min(effect_limit_ms)
+        });
         let timeout_kind = if wait
             .timeout_ms
-            .is_some_and(|timeout_ms| timeout_ms <= AGENT_PROMPT_EFFECT_TIMEOUT_MS)
+            .is_some_and(|timeout_ms| timeout_ms <= effect_limit_ms)
         {
             AgentWaitTimeoutKind::Status
         } else {

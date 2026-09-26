@@ -366,8 +366,7 @@ async fn second_send_asks_the_sender_to_edit_or_send_new() {
                 && receipt["digest"] == head["digest"]
                 && receipt["deliveryDigest"] == head["deliveryDigest"]));
     }
-    // After the recipient picks one up, --edit-pending on a new send falls
-    // back to pending_claimed only when nothing is left to edit.
+    // The recipient can still claim normally after sender edits.
     let claim = dispatch(
         &mut fixture.app,
         &session,
