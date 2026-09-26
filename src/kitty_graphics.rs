@@ -150,7 +150,24 @@ pub(crate) fn set_enabled(enabled: bool) {
     KITTY_GRAPHICS_ENABLED.store(enabled, Ordering::Release);
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Per-thread override for unit tests: every App::new sets the process-wide
+    /// flag from its config, so a test that needs graphics on must not depend on it.
+    static TEST_ENABLED: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
+/// Force kitty graphics on or off for the current test thread only.
+#[cfg(test)]
+pub(crate) fn set_enabled_for_test(enabled: Option<bool>) {
+    TEST_ENABLED.with(|cell| cell.set(enabled));
+}
+
 pub(crate) fn is_enabled() -> bool {
+    #[cfg(test)]
+    if let Some(enabled) = TEST_ENABLED.with(std::cell::Cell::get) {
+        return enabled;
+    }
     KITTY_GRAPHICS_ENABLED.load(Ordering::Acquire)
 }
 
