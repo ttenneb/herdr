@@ -34,7 +34,7 @@ impl App {
                 if thread.join().is_err() {
                     self.session_writer_healthy
                         .store(false, std::sync::atomic::Ordering::Release);
-                    self.ready_delegation_routes.clear();
+                    self.revoke_all_delegation_routes();
                     tracing::warn!("session writer panicked; report routes quarantined");
                 }
             }
@@ -108,7 +108,7 @@ impl App {
             if thread.join().is_err() {
                 self.session_writer_healthy
                     .store(false, std::sync::atomic::Ordering::Release);
-                self.ready_delegation_routes.clear();
+                self.revoke_all_delegation_routes();
                 tracing::warn!("session writer panicked; report routes quarantined");
             }
         }
@@ -168,7 +168,7 @@ impl App {
         if result.is_err() {
             self.session_writer_healthy
                 .store(false, std::sync::atomic::Ordering::Release);
-            self.ready_delegation_routes.clear();
+            self.revoke_all_delegation_routes();
         } else {
             self.session_writer_healthy
                 .store(true, std::sync::atomic::Ordering::Release);

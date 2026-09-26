@@ -65,6 +65,38 @@ impl App {
         }
     }
 
+    /// Tear down `child`'s ready route and forget its carried route, so no
+    /// later wake or restart resume can re-create a route nobody re-made.
+    pub(crate) fn revoke_delegation_route(&mut self, child: DelegationId) {
+        self.ready_delegation_routes.remove(&child);
+        self.forget_route_carries(|carry| parse_id(&carry.child_delegation) == Ok(child));
+    }
+
+    /// Tear down every ready route (a session-writer quarantine) and forget
+    /// every carried route.
+    pub(crate) fn revoke_all_delegation_routes(&mut self) {
+        self.ready_delegation_routes.clear();
+        self.forget_route_carries(|_| true);
+    }
+
+    fn forget_route_carries(
+        &mut self,
+        matches: impl Fn(&crate::launch_recipe::RouteCarry) -> bool,
+    ) {
+        let mut forgot = false;
+        for terminal in self.state.terminals.values_mut() {
+            if terminal.route_carry.as_ref().is_some_and(&matches) {
+                terminal.route_carry = None;
+                self.pending_route_carries.remove(&terminal.id);
+                forgot = true;
+            }
+        }
+        if forgot {
+            self.state.mark_session_dirty();
+            self.schedule_session_save();
+        }
+    }
+
     pub(crate) fn next_route_carry_deadline(
         &self,
         now: std::time::Instant,
@@ -277,7 +309,7 @@ impl App {
             Err(message) => return encode_error(id, "invalid_delegation_id", message),
         };
         let Some(mut shape) = self.ready_route_shape(child, parent) else {
-            self.ready_delegation_routes.remove(&child);
+            self.revoke_delegation_route(child);
             return encode_error(
                 id,
                 "route_not_ready",
@@ -297,7 +329,7 @@ impl App {
         {
             self.session_writer_healthy
                 .store(false, std::sync::atomic::Ordering::Release);
-            self.ready_delegation_routes.clear();
+            self.revoke_all_delegation_routes();
         }
         if let Some(existing) = self.ready_delegation_routes.get(&child) {
             let mut same = shape.clone();
@@ -318,19 +350,23 @@ impl App {
                 );
             }
         }
+        // Any failure from here on leaves the route torn down, carry included.
         self.ready_delegation_routes.remove(&child);
         let Some(epoch) = crate::platform::random_route_epoch() else {
+            self.revoke_delegation_route(child);
             return encode_error(id, "route_not_ready", "server route epoch unavailable");
         };
         if let Err(err) = self.durably_save_delegation_edge() {
+            self.revoke_delegation_route(child);
             return encode_error(id, "route_persistence_failed", err.to_string());
         }
-        let Some(mut current) = self.ready_route_shape(child, parent) else {
+        let Some(mut current) = self
+            .ready_route_shape(child, parent)
+            .filter(|current| *current == shape)
+        else {
+            self.revoke_delegation_route(child);
             return encode_error(id, "route_not_ready", "edge changed during durable save");
         };
-        if current != shape {
-            return encode_error(id, "route_not_ready", "edge changed during durable save");
-        }
         shape.epoch = epoch.clone();
         current.epoch = epoch.clone();
         // Remember the route on the child's pane, so a same-session recipe
@@ -470,7 +506,8 @@ impl App {
             .get(delegation_id)
             .and_then(|record| record.parent_id)
             .map(|value| value.to_string());
-        self.ready_delegation_routes.remove(&delegation_id);
+        // A reparent revokes the route; a later wake must not re-create it.
+        self.revoke_delegation_route(delegation_id);
         if let Err(err) = self.state.delegations.reparent(delegation_id, parent_id) {
             return delegation_error(id, err);
         }

@@ -491,8 +491,10 @@ impl App {
         terminal_id: &crate::terminal::TerminalId,
         recipe: Option<crate::launch_recipe::LaunchRecipe>,
     ) {
-        let relaunch = self.recipe_relaunches.contains(terminal_id)
-            || self.pane_wakes.contains_key(terminal_id);
+        // Only a start made from the recipe itself (set exactly around the
+        // wake's or resume's start_agent call) is a relaunch. A hand start
+        // while a wake is outstanding is a hand start.
+        let relaunch = self.recipe_relaunches.contains(terminal_id);
         let mut carry_route = false;
         if let Some(terminal) = self.state.terminals.get_mut(terminal_id) {
             // The durable recipe is what a later wake or restart relaunches.

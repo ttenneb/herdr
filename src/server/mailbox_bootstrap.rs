@@ -1055,6 +1055,112 @@ mod tests {
         let _ = std::fs::remove_dir_all(directory);
     }
 
+    /// Review finding 8 on 7e858344: a reparent revokes the route and its
+    /// carry, so a later recipe relaunch re-creates nothing.
+    #[tokio::test]
+    async fn reparent_forgets_the_carried_route() {
+        let (mut app, directory, child, _parent, child_pane, child_terminal) =
+            ready_route_with_child_recipe();
+        let response = app.handle_api_request(crate::api::schema::Request {
+            id: "reparent".into(),
+            method: crate::api::schema::Method::DelegationReparent(
+                crate::api::schema::DelegationReparentParams {
+                    delegation_id: child.to_string(),
+                    parent_id: None,
+                },
+            ),
+        });
+        assert!(!response.contains("\"error\""), "{response}");
+        assert!(app.state.terminals[&child_terminal].route_carry.is_none());
+        assert!(!app.ready_delegation_routes.contains_key(&child));
+        // A later wake of the slept child starts it but carries nothing.
+        app.state.terminals.get_mut(&child_terminal).unwrap().sleep =
+            Some(App::new_pane_sleep("sender".into(), 1));
+        let public = app.public_pane_id(0, child_pane).unwrap();
+        let outcome = app.wake_pane(
+            &public,
+            crate::app::wake::WakeTrigger {
+                cause: crate::app::wake::WakeCause::HeadAppended,
+                recipient_id: child_terminal.to_string(),
+                head_id: "h".into(),
+            },
+        );
+        assert!(
+            matches!(outcome, crate::app::wake::WakeOutcome::Started { .. }),
+            "{outcome:?}"
+        );
+        assert!(app.pending_route_carries.is_empty());
+        relaunched_pi_attaches(&mut app, child_pane, &child_terminal, 2);
+        assert!(!app.ready_delegation_routes.contains_key(&child));
+        drop(app);
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    /// Review finding 8 on 7e858344: any route teardown (here route-ready
+    /// failing while the child is gone) forgets the carry too.
+    #[tokio::test]
+    async fn a_failed_route_ready_forgets_the_carried_route() {
+        let (mut app, directory, child, parent, _child_pane, child_terminal) =
+            ready_route_with_child_recipe();
+        // The fixture's child Pi has exited, so the route is not ready now.
+        let response = app.handle_api_request(crate::api::schema::Request {
+            id: "route-ready".into(),
+            method: crate::api::schema::Method::DelegationRouteReady(
+                crate::api::schema::DelegationRouteReadyParams {
+                    child_delegation_id: child.to_string(),
+                    expected_parent_delegation_id: parent.to_string(),
+                },
+            ),
+        });
+        assert!(response.contains("route_not_ready"), "{response}");
+        assert!(app.state.terminals[&child_terminal].route_carry.is_none());
+        drop(app);
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    /// Review finding 9 on 7e858344: a hand agent.start while a wake is
+    /// outstanding is a hand start: it ends the sleep and inherits no route.
+    #[tokio::test]
+    async fn a_hand_start_during_an_outstanding_wake_is_a_hand_start() {
+        let (mut app, directory, _child, _parent, child_pane, child_terminal) =
+            ready_route_with_child_recipe();
+        app.state.terminals.get_mut(&child_terminal).unwrap().sleep =
+            Some(App::new_pane_sleep("sender".into(), 1));
+        app.pane_wakes.insert(
+            child_terminal.clone(),
+            crate::app::wake::OutstandingWake {
+                wake_id: "outstanding".into(),
+                pane_key: "pane:outstanding".into(),
+                generation: 9,
+                trigger: crate::app::wake::WakeTrigger {
+                    cause: crate::app::wake::WakeCause::HeadAppended,
+                    recipient_id: "pane:outstanding".into(),
+                    head_id: "h".into(),
+                },
+                deadline: std::time::Instant::now() + Duration::from_secs(60),
+                retried: false,
+            },
+        );
+        let started = app.handle_api_request(crate::api::schema::Request {
+            id: "hand-start".into(),
+            method: crate::api::schema::Method::AgentStart(crate::api::schema::AgentStartParams {
+                name: "sender".into(),
+                kind: "pi".into(),
+                pane_id: app.public_pane_id(0, child_pane).unwrap(),
+                args: Vec::new(),
+                env: Vec::new(),
+                timeout_ms: None,
+            }),
+        });
+        assert!(!started.contains("\"error\""), "{started}");
+        let terminal = &app.state.terminals[&child_terminal];
+        assert!(terminal.sleep.is_none(), "a hand start ends the sleep");
+        assert!(terminal.route_carry.is_none(), "and inherits no route");
+        assert!(app.pending_route_carries.is_empty());
+        drop(app);
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
     fn listener(directory: &Path) -> MailboxBootstrapListener {
         std::fs::create_dir_all(directory).expect("create test directory");
         MailboxBootstrapListener::bind_at(directory.join("mailbox.sock")).expect("bind listener")
