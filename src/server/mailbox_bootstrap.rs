@@ -229,6 +229,10 @@ fn failure(request_id: Option<String>, error: MailboxBootstrapError) -> String {
             code,
             "the server refused or failed the mailbox request; see the code",
         ),
+        MailboxBootstrapError::ClaimExecutionAlive => (
+            "mailbox_claim_execution_alive",
+            "that message is held by another Pi that is still running; it cannot be dropped, retried or recovered from here",
+        ),
         MailboxBootstrapError::HeadOutOfScope => (
             "mailbox_head_out_of_scope",
             "that message is not in this pane's own inbox; nothing was changed",

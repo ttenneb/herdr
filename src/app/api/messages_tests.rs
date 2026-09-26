@@ -907,7 +907,8 @@ fn claims_are_bound_to_the_claiming_execution() {
         "A still sees only its own claim"
     );
     let recovered = store.load().unwrap();
-    let view = crate::app::messages::inbox_snapshot(&recovered, &keys, "pid:2:2", None).unwrap();
+    let view = crate::app::messages::inbox_snapshot(&recovered, &keys, "pid:2:2", None, &|_| false)
+        .unwrap();
     let marks: std::collections::HashMap<_, _> = view
         .head_states
         .iter()
@@ -979,6 +980,12 @@ async fn queued_messages_survive_a_server_restart_and_arrive_exactly_once() {
             .unwrap();
         terminal.queue_key = queue_key.clone();
         terminal.messages_capable = true;
+    }
+    // The wake integration point resolves the restart-stable key (bare or
+    // `pane:` form) to the restored pane's CURRENT terminal.
+    for key in [queue_key.clone(), format!("pane:{queue_key}")] {
+        let (_, _, terminal) = after.app.resolve_wake_pane_key(&key).expect("resolves");
+        assert_eq!(terminal, restored_terminal, "{key}");
     }
     let session = attach_recipient(&mut after);
     let mut delivered = Vec::new();
@@ -2157,4 +2164,141 @@ async fn a_stream_never_touches_another_panes_heads() {
     let after = store.load().unwrap();
     assert_eq!(after.heads, before.heads, "nothing was changed");
     assert!(after.resolutions.is_empty());
+}
+
+/// A claim held by another execution is recoverable (drop, retry, settle)
+/// by the pane's attached Pi only when that execution is gone; a live other
+/// execution's claim is shown as alive and refused.
+#[tokio::test]
+async fn only_a_gone_executions_claim_can_be_dropped_or_retried() {
+    let mut fixture = fixture();
+    let session = attach_recipient(&mut fixture);
+    let recipient = fixture.terminals[1].clone();
+    let sender = sender(&fixture);
+    for (index, body) in ["live", "gone-drop", "gone-retry"].iter().enumerate() {
+        fixture
+            .app
+            .route_ordinary_send(
+                &recipient,
+                &sender,
+                plain(body),
+                &MessageSendOptions {
+                    send_new: index > 0,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+    }
+    let store = crate::mailbox::MailboxStore::open(&fixture.app.sender_authority_dir).unwrap();
+    let recovered = store.load().unwrap();
+    let head_of = |body: &str| {
+        recovered
+            .heads
+            .values()
+            .find(|head| head.body.contains(body))
+            .cloned()
+            .unwrap()
+    };
+    // A live other Pi process (known birth) and two gone ones (no process).
+    let live_pid = 4_000_000_001_u32;
+    let mut birth = crate::platform::process_birth_identity(std::process::id()).unwrap();
+    birth.start_ticks = 5;
+    fixture
+        .app
+        .mailbox_bootstrap_test_process_births
+        .insert(live_pid, birth);
+    for (body, execution) in [
+        ("live", format!("pid:{live_pid}:5")),
+        ("gone-drop", "pid:4000000002:5".to_string()),
+        ("gone-retry", "pid:4000000003:5".to_string()),
+    ] {
+        let head = head_of(body);
+        store
+            .claim(crate::mailbox::Claim {
+                claim_id: format!("claim-{body}"),
+                recipient: head.recipient.clone(),
+                stable_id: head.stable_id.clone(),
+                revision: head.revision,
+                digest: head.digest.clone(),
+                execution: Some(execution),
+            })
+            .unwrap();
+    }
+    let snapshot = dispatch(
+        &mut fixture.app,
+        &session,
+        "mailbox.snapshot",
+        json!({"protocol": crate::mailbox_v1::PROTOCOL}),
+    )
+    .unwrap();
+    let state_of = |body: &str| {
+        let id = head_of(body).stable_id;
+        snapshot["snapshot"]["headStates"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|state| state["stableId"] == json!(id))
+            .cloned()
+            .unwrap()
+    };
+    assert_eq!(state_of("live")["claimExecution"], "other");
+    assert_eq!(state_of("live")["claimExecutionAlive"], true);
+    assert!(state_of("live").get("recoveryNeeded").is_none());
+    assert_eq!(state_of("gone-drop")["claimExecutionAlive"], false);
+    assert_eq!(state_of("gone-drop")["recoveryNeeded"], true);
+
+    let protocol = crate::mailbox_v1::PROTOCOL;
+    let live = head_of("live");
+    for (method, params) in [
+        (
+            "mailbox.drop",
+            json!({"protocol": protocol, "stableId": live.stable_id, "expectedRevision": 1}),
+        ),
+        (
+            "mailbox.retry",
+            json!({"protocol": protocol, "stableId": live.stable_id, "expectedRevision": 1}),
+        ),
+        (
+            "mailbox.resolve",
+            json!({"protocol": protocol, "claimId": "claim-live", "outcome": "settled"}),
+        ),
+    ] {
+        assert!(
+            matches!(
+                dispatch(&mut fixture.app, &session, method, params),
+                Err(crate::app::MailboxBootstrapError::ClaimExecutionAlive)
+            ),
+            "{method} must refuse a live execution's claim"
+        );
+    }
+    assert!(
+        store.load().unwrap().resolutions.is_empty(),
+        "nothing changed"
+    );
+    // Gone executions: Drop and Retry both work, with durable receipts.
+    let dropped = dispatch(
+        &mut fixture.app,
+        &session,
+        "mailbox.drop",
+        json!({"protocol": protocol, "stableId": head_of("gone-drop").stable_id, "expectedRevision": 1}),
+    )
+    .unwrap();
+    assert_eq!(dropped["type"], "mailbox_dropped");
+    let retried = dispatch(
+        &mut fixture.app,
+        &session,
+        "mailbox.retry",
+        json!({"protocol": protocol, "stableId": head_of("gone-retry").stable_id, "expectedRevision": 1}),
+    )
+    .unwrap();
+    assert_eq!(retried["type"], "mailbox_retried");
+    // The retried message is held again and is the next claim here.
+    let claim = dispatch(
+        &mut fixture.app,
+        &session,
+        "mailbox.claim",
+        json!({"protocol": protocol}),
+    )
+    .unwrap();
+    assert_eq!(claim["claim"]["stableId"], retried["newStableId"]);
 }

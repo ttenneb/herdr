@@ -13587,6 +13587,13 @@
                 "null"
               ]
             },
+            "claimExecutionAlive": {
+              "description": "For `claimExecution:\"other\"`: whether that execution is still alive.\nA live other execution's claim is never droppable or retryable here.",
+              "type": [
+                "boolean",
+                "null"
+              ]
+            },
             "claimId": {
               "type": [
                 "string",

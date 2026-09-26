@@ -137,31 +137,35 @@ impl App {
         &self,
         pane_key: &str,
     ) -> Option<(usize, crate::layout::PaneId, TerminalId)> {
-        let queue_key = pane_key.strip_prefix("pane:").unwrap_or(pane_key);
-        if let Some(terminal) = self.state.terminals.values().find(|terminal| {
-            crate::terminal::state::valid_queue_key(queue_key) && terminal.queue_key == queue_key
-        }) {
-            let (ws_idx, pane_id) = self.pane_of_terminal(&terminal.id)?;
-            return Some((ws_idx, pane_id, terminal.id.clone()));
+        // Accepts the durable queue key bare (32 hex) or as the recipient
+        // form `pane:<queueKey>`, and otherwise a current public pane ID.
+        let bare = (pane_key.len() == 32 && pane_key.bytes().all(|b| b.is_ascii_hexdigit()))
+            .then_some(pane_key);
+        if let Some(queue_key) = pane_key.strip_prefix("pane:").or(bare) {
+            let terminal_id = self
+                .state
+                .terminals
+                .values()
+                .find(|terminal| terminal.queue_key == queue_key)?
+                .id
+                .clone();
+            return self
+                .state
+                .workspaces
+                .iter()
+                .enumerate()
+                .find_map(|(ws_idx, workspace)| {
+                    workspace.tabs.iter().find_map(|tab| {
+                        tab.panes
+                            .iter()
+                            .find(|(_, pane)| pane.attached_terminal_id == terminal_id)
+                            .map(|(pane_id, _)| (ws_idx, *pane_id, terminal_id.clone()))
+                    })
+                });
         }
         let (ws_idx, pane_id) = self.parse_current_public_pane_id(pane_key)?;
         let terminal_id = self.state.workspaces.get(ws_idx)?.terminal_id(pane_id)?;
         Some((ws_idx, pane_id, terminal_id.clone()))
-    }
-
-    fn pane_of_terminal(&self, terminal_id: &TerminalId) -> Option<(usize, crate::layout::PaneId)> {
-        self.state
-            .workspaces
-            .iter()
-            .enumerate()
-            .find_map(|(ws_idx, workspace)| {
-                workspace.tabs.iter().find_map(|tab| {
-                    tab.panes
-                        .iter()
-                        .find(|(_, pane)| &pane.attached_terminal_id == terminal_id)
-                        .map(|(pane_id, _)| (ws_idx, *pane_id))
-                })
-            })
     }
 
     /// Whether the pane of this terminal is the parent of a ready delegation

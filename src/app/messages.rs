@@ -211,6 +211,7 @@ pub(crate) fn inbox_snapshot(
     recipients: &[RecipientKey],
     execution: &str,
     current_session: Option<&str>,
+    execution_alive: &dyn Fn(&str) -> bool,
 ) -> Result<crate::mailbox_v1::Snapshot, crate::mailbox::MailboxError> {
     let mut out = crate::mailbox_v1::Snapshot {
         heads: Vec::new(),
@@ -248,7 +249,16 @@ pub(crate) fn inbox_snapshot(
                 "other".into()
             }
         });
+        state.claim_execution_alive =
+            (state.claim_execution.as_deref() == Some("other")).then(|| {
+                recovered
+                    .claims
+                    .get(&state.stable_id)
+                    .and_then(|claim| claim.execution.as_deref())
+                    .is_some_and(execution_alive)
+            });
         state.recovery_needed = state.claim_execution.as_deref() == Some("other")
+            && state.claim_execution_alive == Some(false)
             && matches!(
                 state.lifecycle,
                 crate::mailbox_v1::HeadLifecycle::Claimed
@@ -445,6 +455,33 @@ pub(crate) fn session_execution(session: &crate::app::MailboxBootstrapSession) -
 }
 
 impl App {
+    /// Whether a claiming execution still runs: `pid:<pid>:<ticks>` while
+    /// that exact process lives; `managed:<terminal>:<generation>` while that
+    /// generation holds the pane's Active sender authority.
+    pub(crate) fn execution_alive(&self, execution: &str) -> bool {
+        if let Some(rest) = execution.strip_prefix("pid:") {
+            let Some((pid, ticks)) = rest.split_once(':') else {
+                return false;
+            };
+            let (Ok(pid), Ok(ticks)) = (pid.parse::<u32>(), ticks.parse::<u64>()) else {
+                return false;
+            };
+            return self
+                .managed_pi_process_birth(pid)
+                .is_some_and(|birth| birth.start_ticks == ticks);
+        }
+        if let Some(rest) = execution.strip_prefix("managed:") {
+            let Some((terminal, generation)) = rest.rsplit_once(':') else {
+                return false;
+            };
+            let Ok(generation) = generation.parse::<u64>() else {
+                return false;
+            };
+            return self.exact_active_mailbox_authority_for(terminal, generation);
+        }
+        false
+    }
+
     /// Every recipient key a pane's inbox covers: its durable queue key and
     /// the legacy terminal key used by older Pi-to-Pi grants.
     pub(crate) fn inbox_recipients(&self, terminal_key: &str) -> Vec<RecipientKey> {

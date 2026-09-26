@@ -425,12 +425,28 @@ impl App {
                     .load()
                     .map_err(|_| MailboxBootstrapError::GrantMissing)
             };
+            // Other executions holding claims in this inbox that are still
+            // alive (liveness does not change within one request).
+            let live_others: std::collections::HashSet<String> = load()?
+                .claims
+                .values()
+                .filter(|claim| recipients.contains(&claim.recipient))
+                .filter_map(|claim| claim.execution.clone())
+                .filter(|owner| *owner != execution && self.execution_alive(owner))
+                .collect();
+            let held_by_live_other = |claim: &crate::mailbox::Claim| {
+                claim
+                    .execution
+                    .as_deref()
+                    .is_some_and(|owner| live_others.contains(owner))
+            };
             let view = |recovered: &crate::mailbox::RecoveredMailbox| {
                 crate::app::messages::inbox_snapshot(
                     recovered,
                     &recipients,
                     &execution,
                     current.as_deref(),
+                    &|owner| live_others.contains(owner),
                 )
                 .map_err(|_| MailboxBootstrapError::GrantMissing)
             };
@@ -481,6 +497,9 @@ impl App {
                         })
                         .cloned()
                         .ok_or(MailboxBootstrapError::InvalidRequest)?;
+                    if held_by_live_other(&claim) {
+                        return Err(MailboxBootstrapError::ClaimExecutionAlive);
+                    }
                     let already_settled = matches!(
                         recovered.resolutions.get(&claim.claim_id),
                         Some(crate::mailbox::ClaimResolution {
@@ -693,6 +712,9 @@ impl App {
                         .cloned()
                         .ok_or(MailboxBootstrapError::InvalidRequest)?;
                     let own = crate::app::messages::claim_is_current(&claim, &execution);
+                    if !own && held_by_live_other(&claim) {
+                        return Err(MailboxBootstrapError::ClaimExecutionAlive);
+                    }
                     let outcome = match resolve.outcome {
                         crate::mailbox_v1::ResolveOutcome::Admitted => {
                             crate::mailbox::ClaimResolutionOutcome::Admitted
@@ -735,6 +757,13 @@ impl App {
                         })
                         .cloned()
                         .ok_or(MailboxBootstrapError::InvalidRequest)?;
+                    if recovered
+                        .claims
+                        .get(&head.stable_id)
+                        .is_some_and(|claim| held_by_live_other(claim))
+                    {
+                        return Err(MailboxBootstrapError::ClaimExecutionAlive);
+                    }
                     match recovered.claims.get(&head.stable_id).cloned() {
                         None => store
                             .withdraw_unclaimed_head(&head.stable_id, head.revision, &head.digest)

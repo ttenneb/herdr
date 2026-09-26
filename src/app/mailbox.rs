@@ -118,6 +118,9 @@ pub(crate) enum MailboxBootstrapError {
     /// The named head or claim exists but is outside this session's own
     /// pane inbox; nothing was changed.
     HeadOutOfScope,
+    /// The head's claim belongs to another execution that is still alive;
+    /// only a gone execution's claim may be dropped, retried or recovered.
+    ClaimExecutionAlive,
 }
 
 /// Error codes a mailbox handler may return that are passed through to the
@@ -134,6 +137,7 @@ const PASSTHROUGH_CODES: &[&str] = &[
     "mailbox_edit_claimed",
     "mailbox_edit_conflict",
     "mailbox_head_out_of_scope",
+    "mailbox_claim_execution_alive",
     "mailbox_resolve_failed",
     "mailbox_snapshot_failed",
     "report_route_required",
@@ -1417,6 +1421,14 @@ impl App {
         Ok(())
     }
 
+    pub(crate) fn exact_active_mailbox_authority_for(
+        &self,
+        sender_key: &str,
+        generation: u64,
+    ) -> bool {
+        self.exact_active_mailbox_authority(sender_key, generation)
+    }
+
     fn exact_active_mailbox_authority(&self, sender_key: &str, generation: u64) -> bool {
         let Some(authority) = self.offline_mailbox_authorities.get(sender_key) else {
             return false;
@@ -1516,6 +1528,7 @@ impl App {
             &self.inbox_recipients(&session.caller),
             &crate::app::messages::session_execution(session),
             current.as_deref(),
+            &|execution| self.execution_alive(execution),
         )
         .map_err(|_| MailboxBootstrapError::GrantMissing)?;
         let settled: std::collections::HashSet<_> = snapshot
