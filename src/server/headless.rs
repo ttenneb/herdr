@@ -5693,9 +5693,14 @@ mod tests {
         // Another test may briefly point TMPDIR at an over-long directory; hold
         // the shared env guard while choosing and binding the socket path.
         let env_guard = crate::test_env::shared();
+        // Parallel tests can read the same clock value; the counter keeps each
+        // socket directory distinct.
+        static NEXT_TEST_SERVER: std::sync::atomic::AtomicU64 =
+            std::sync::atomic::AtomicU64::new(0);
         let dir = std::env::temp_dir().join(format!(
-            "hh-{}-{}",
+            "hh-{}-{}-{}",
             std::process::id(),
+            NEXT_TEST_SERVER.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|d| d.as_nanos())
