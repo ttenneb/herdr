@@ -152,12 +152,13 @@ pub struct App {
     pub(crate) managed_pi_launches: HashMap<crate::terminal::TerminalId, agents::ManagedPiLaunch>,
     pub(crate) pane_wakes: HashMap<crate::terminal::TerminalId, wake::OutstandingWake>,
     pub(crate) pane_wake_cooldowns: HashMap<crate::terminal::TerminalId, Instant>,
+    /// Next level-triggered sweep of sleeping panes with a queued backlog;
+    /// `None` until the first (post-start, `restore_backlog`) sweep ran.
+    pub(crate) next_backlog_sweep: Option<Instant>,
+    pub(crate) server_started_at: Instant,
     /// Terminals whose current start is a recipe relaunch (wake or resume).
     pub(crate) recipe_relaunches: HashSet<crate::terminal::TerminalId>,
     pub(crate) pending_route_carries: HashMap<crate::terminal::TerminalId, Instant>,
-    pub(crate) wake_sweep_done: bool,
-    pub(crate) wake_sweep_deadline: Option<Instant>,
-    pub(crate) wake_sweep_settled: HashSet<crate::terminal::TerminalId>,
     pub(crate) pending_managed_resumes:
         HashMap<crate::terminal::TerminalId, agent_resume::PendingManagedResume>,
     /// Opaque per-process mailbox namespace; absent entropy disables bootstrap.
@@ -927,11 +928,10 @@ impl App {
             managed_pi_launches: HashMap::new(),
             pane_wakes: HashMap::new(),
             pane_wake_cooldowns: HashMap::new(),
+            next_backlog_sweep: None,
+            server_started_at: Instant::now(),
             recipe_relaunches: HashSet::new(),
             pending_route_carries: HashMap::new(),
-            wake_sweep_done: false,
-            wake_sweep_deadline: None,
-            wake_sweep_settled: HashSet::new(),
             pending_managed_resumes: HashMap::new(),
             mailbox_bootstrap_boot_nonce: crate::platform::random_route_epoch(),
             used_mailbox_bootstrap_nonces: HashSet::new(),

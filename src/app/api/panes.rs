@@ -1805,6 +1805,9 @@ impl App {
                 }
             });
         let terminal_id = self.state.terminal_id_for_pane(ws_idx, pane_id);
+        // The later PaneDied cannot find a removed pane, so retire the pane's
+        // managed launch record and Active mailbox authority now.
+        self.invalidate_offline_mailbox_authority_for_pane(pane_id, None);
         let should_close_workspace = {
             let Some(ws) = self.state.workspaces.get_mut(ws_idx) else {
                 return Err(pane_not_found(id, &target.pane_id));

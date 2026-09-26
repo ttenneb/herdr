@@ -175,6 +175,13 @@ impl App {
             match self.route_ordinary_send(&terminal_key, &sender, message, &params.send) {
                 Ok(crate::app::messages::SendRoute::Pty) => {}
                 Ok(crate::app::messages::SendRoute::Mailbox(delivery)) => {
+                    // Parity with typed input: a queued message restores an
+                    // archived Collection member.
+                    if let Some(restore) =
+                        self.begin_archived_member_input(resolved.ws_idx, resolved.pane_id)
+                    {
+                        self.commit_archived_member_input(restore);
+                    }
                     if let Some(stable_id) = delivery.stable_id.clone() {
                         self.request_pane_wake_if_detached(&terminal_key, &stable_id);
                     }
@@ -1715,6 +1722,71 @@ mod tests {
         assert!(!app.state.terminals[&terminal_id].is_agent_terminal());
 
         std::fs::remove_file(authority_path).expect("remove authority blocker");
+    }
+
+    /// Parity with typed input: a message queued in an archived Collection
+    /// member's Messages queue restores the member.
+    #[tokio::test]
+    async fn a_queued_message_restores_an_archived_member() {
+        let mut app = app_with_agent();
+        let directory = std::env::temp_dir().join(format!(
+            "herdr-archived-queue-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&directory).unwrap();
+        app.sender_authority_dir = directory.clone();
+        let pane_id = app.state.workspaces[0].tabs[0].root_pane.unwrap();
+        let collection = app.state.workspaces[0]
+            .create_collection_near(
+                0,
+                crate::layout::LayoutLeaf::Pane(pane_id),
+                ratatui::layout::Direction::Horizontal,
+                0.5,
+                None,
+            )
+            .unwrap();
+        app.state.workspaces[0]
+            .collect_pane(pane_id, collection)
+            .unwrap();
+        app.state.workspaces[0]
+            .set_collection_member_archived(pane_id, collection, true)
+            .unwrap();
+        let terminal_id = app.state.workspaces[0].tabs[0].panes[&pane_id]
+            .attached_terminal_id
+            .clone();
+        let terminal = app.state.terminals.get_mut(&terminal_id).unwrap();
+        terminal.set_agent_name("reviewer".into());
+        terminal.set_detected_state(Some(Agent::Pi), AgentState::Idle);
+        // Its Pi attached Messages before, so the send is queued, not typed.
+        terminal.messages_capable = true;
+        let (runtime, mut rx) =
+            crate::terminal::TerminalRuntime::test_with_channel_capacity(80, 24, 4);
+        app.state.insert_test_runtime(pane_id, runtime);
+        let public_pane_id = app.public_pane_id(0, pane_id).unwrap();
+        let response = app.handle_agent_prompt(
+            "queued".into(),
+            AgentPromptParams {
+                target: public_pane_id,
+                text: "resume".into(),
+                wait: None,
+                send: Default::default(),
+            },
+        );
+        let success: SuccessResponse = serde_json::from_str(&response).unwrap();
+        let ResponseResult::AgentPrompted { delivery, .. } = success.result else {
+            panic!("prompted")
+        };
+        assert_eq!(delivery.unwrap().path, "mailbox");
+        assert!(rx.try_recv().is_err(), "queued, not typed");
+        assert!(!app.state.workspaces[0].tabs[0]
+            .collection(collection)
+            .unwrap()
+            .is_archived(pane_id));
+        std::fs::remove_dir_all(directory).ok();
     }
 
     #[tokio::test]

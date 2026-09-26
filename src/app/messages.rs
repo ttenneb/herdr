@@ -53,6 +53,7 @@ pub(crate) fn retry_head(head: &MailboxHead, claim: &crate::mailbox::Claim) -> M
 pub(crate) fn human_self_head(
     inbox: &RecipientKey,
     terminal_key: &str,
+    pane_label: &str,
     subject: String,
     body: String,
     priority: String,
@@ -104,7 +105,7 @@ pub(crate) fn human_self_head(
         accepted_at: now_secs(),
         delivery: Some(ServerDelivery {
             origin: "human_typed".into(),
-            sender_label: "human at pane".into(),
+            sender_label: format!("human at {pane_label}"),
             sender_session: None,
             recipient_session,
             correlation: None,
@@ -462,6 +463,23 @@ impl App {
         keys
     }
 
+    /// The current public pane ID of the pane showing this terminal.
+    pub(crate) fn public_pane_for_terminal(&self, terminal_key: &str) -> Option<String> {
+        self.state
+            .workspaces
+            .iter()
+            .enumerate()
+            .find_map(|(ws_idx, workspace)| {
+                workspace.tabs.iter().find_map(|tab| {
+                    tab.panes
+                        .iter()
+                        .find(|(_, pane)| pane.attached_terminal_id.to_string() == terminal_key)
+                        .map(|(pane_id, _)| (ws_idx, *pane_id))
+                })
+            })
+            .and_then(|(ws_idx, pane_id)| self.public_pane_id(ws_idx, pane_id))
+    }
+
     pub(crate) fn pane_queue_key(&self, terminal_key: &str) -> Option<String> {
         self.state
             .terminals
@@ -487,9 +505,102 @@ impl App {
         {
             return false;
         }
+        // A Pi Herdr put to sleep (`herdr agent sleep`) keeps its queue; a
+        // message for it wakes it.
+        if terminal.sleep.is_some()
+            && terminal
+                .launch_recipe
+                .as_ref()
+                .is_some_and(|recipe| recipe.kind == "pi")
+        {
+            return true;
+        }
         // A Pi attached right now, or a pane whose Pi attached before and is
         // restarting or asleep. A Pi that never attached keeps typed input.
         self.attached_messages_recipient(terminal_key).is_some() || terminal.messages_capable
+    }
+
+    /// Runs the backlog sweep from the server tick: first a few seconds after
+    /// start (restored shells need to reach their prompt), then every 30 s.
+    pub(crate) fn maybe_sweep_sleeping_backlog(&mut self, now: std::time::Instant) -> bool {
+        const FIRST_SWEEP_AFTER: std::time::Duration = std::time::Duration::from_secs(3);
+        const SWEEP_EVERY: std::time::Duration = std::time::Duration::from_secs(30);
+        let first = self.next_backlog_sweep.is_none();
+        let due = self
+            .next_backlog_sweep
+            .unwrap_or(self.server_started_at + FIRST_SWEEP_AFTER);
+        if now < due {
+            return false;
+        }
+        self.next_backlog_sweep = Some(now + SWEEP_EVERY);
+        self.sweep_sleeping_backlog(first);
+        false
+    }
+
+    /// Level-triggered backlog sweep: every sleeping Pi pane that still has
+    /// unsettled heads and no attached Pi gets a wake request. The first sweep
+    /// after server start is tagged `restore_backlog`. wake_pane coalesces
+    /// and cools down, so repeating the sweep is safe.
+    pub(crate) fn sweep_sleeping_backlog(&mut self, first: bool) {
+        let store = match MailboxStore::open(&self.sender_authority_dir) {
+            Ok(store) => store,
+            Err(_) => return,
+        };
+        let Ok(recovered) = store.load() else {
+            return;
+        };
+        let sleeping: Vec<(String, String)> = self
+            .state
+            .terminals
+            .values()
+            .filter(|terminal| terminal.sleep.is_some())
+            .map(|terminal| (terminal.id.to_string(), terminal.queue_key.clone()))
+            .collect();
+        for (terminal_key, queue_key) in sleeping {
+            if self.attached_messages_recipient(&terminal_key).is_some() {
+                continue;
+            }
+            let recipients = self.inbox_recipients(&terminal_key);
+            let Some(head) = recovered
+                .heads
+                .values()
+                .filter(|head| recipients.contains(&head.recipient))
+                .filter(|head| match recovered.claims.get(&head.stable_id) {
+                    None => true,
+                    Some(claim) => {
+                        !is_withdrawn_claim(claim)
+                            && !matches!(
+                                recovered.resolutions.get(&claim.claim_id),
+                                Some(crate::mailbox::ClaimResolution {
+                                    outcome: crate::mailbox::ClaimResolutionOutcome::Settled,
+                                    ..
+                                })
+                            )
+                    }
+                })
+                .min_by_key(|head| head.enqueue_epoch)
+            else {
+                continue;
+            };
+            let recipient = format!("pane:{queue_key}");
+            let outcome = self.wake_pane(
+                &recipient,
+                crate::app::wake::WakeTrigger {
+                    cause: if first {
+                        crate::app::wake::WakeCause::RestoreBacklog
+                    } else {
+                        crate::app::wake::WakeCause::HeadAppended
+                    },
+                    recipient_id: recipient.clone(),
+                    head_id: head.stable_id.clone(),
+                },
+            );
+            tracing::info!(
+                recipient,
+                ?outcome,
+                "messages: backlog wake for a sleeping pane"
+            );
+        }
     }
 
     /// A public pane ID whose pane has a Messages queue but no agent process
@@ -502,7 +613,33 @@ impl App {
         if options.transport == Some(MessageTransport::Pty) {
             return None;
         }
-        let (ws_idx, pane_id) = self.parse_current_public_pane_id(target)?;
+        let (ws_idx, pane_id) = self.parse_current_public_pane_id(target).or_else(|| {
+            // A sleeping agent is still addressed by the name it slept under.
+            let terminal_id = self
+                .state
+                .terminals
+                .values()
+                .find(|terminal| {
+                    terminal
+                        .sleep
+                        .as_ref()
+                        .is_some_and(|sleep| sleep.agent_name == target)
+                })?
+                .id
+                .clone();
+            self.state
+                .workspaces
+                .iter()
+                .enumerate()
+                .find_map(|(ws_idx, workspace)| {
+                    workspace.tabs.iter().find_map(|tab| {
+                        tab.panes
+                            .iter()
+                            .find(|(_, pane)| pane.attached_terminal_id == terminal_id)
+                            .map(|(pane_id, _)| (ws_idx, *pane_id))
+                    })
+                })
+        })?;
         let resolved = self.terminal_target_for_pane(ws_idx, pane_id)?;
         self.pane_takes_messages(&resolved.terminal_id)
             .then_some(resolved)
@@ -572,6 +709,24 @@ impl App {
         };
         let workspace_id = self.public_workspace_id(ws_idx);
         tracing::info!(pane = %public_pane, stable_id, "messages: wake requested for a pane with no attached Pi");
+        // Only a pane Herdr itself put to sleep is woken (wake_pane refuses
+        // or coalesces everything else); other panes just keep the queue.
+        let asleep =
+            self.state.terminals.values().any(|terminal| {
+                terminal.id.to_string() == terminal_key && terminal.sleep.is_some()
+            });
+        if asleep {
+            let recipient = format!("pane:{queue_key}");
+            let outcome = self.wake_pane(
+                &recipient,
+                crate::app::wake::WakeTrigger {
+                    cause: crate::app::wake::WakeCause::HeadAppended,
+                    recipient_id: recipient.clone(),
+                    head_id: stable_id.to_string(),
+                },
+            );
+            tracing::info!(pane = %public_pane, ?outcome, "messages: wake_pane for a queued head");
+        }
         self.emit_event(crate::api::schema::EventEnvelope {
             event: crate::api::schema::EventKind::PaneWakeRequested,
             data: crate::api::schema::EventData::PaneWakeRequested {
@@ -583,7 +738,6 @@ impl App {
                 reason: "message_queued".into(),
             },
         });
-        self.wake_on_requested(terminal_key, stable_id);
     }
 
     /// The server-issued recipient key of a live, current, non-history
@@ -766,10 +920,12 @@ impl App {
             }
             Some(head)
         } else if let Some(wanted) = options.edit_pending.as_deref() {
+            // `--edit-pending` without a stableId edits the newest waiting
+            // message (pending is newest first).
             match pending
                 .iter()
                 .copied()
-                .find(|head| head.stable_id == wanted)
+                .find(|head| wanted.is_empty() || head.stable_id == wanted)
             {
                 Some(head) => Some(head),
                 None => return Err(SendRefusal::PendingChanged(listed(&pending))),
@@ -794,6 +950,7 @@ impl App {
                     subject: message.subject,
                     body: message.body,
                     repin_recipient_session: None,
+                    priority: None,
                 })
                 .map_err(|error| match error {
                     crate::mailbox::MailboxError::EditConflict
@@ -862,7 +1019,7 @@ pub(crate) fn pending_error_json(id: String, refusal: &SendRefusal) -> Option<St
     let (code, message, pending) = match refusal {
         SendRefusal::PendingExists(pending) => (
             "pending_exists",
-            "you already have messages waiting for this recipient; resend with --edit-pending <stableId> or --send-new",
+            "you already have messages waiting for this recipient; resend with --edit-pending (newest, or a stableId) or --send-new",
             pending,
         ),
         SendRefusal::PendingChanged(pending) => (
@@ -873,7 +1030,9 @@ pub(crate) fn pending_error_json(id: String, refusal: &SendRefusal) -> Option<St
         _ => return None,
     };
     let error = serde_json::json!({"code": code, "message": message,
-                                   "pending": serde_json::to_value(pending).ok()?});
+                                   "pending": serde_json::to_value(pending).ok()?,
+                                   "pendingCount": pending.len(),
+                                   "newest": pending.first().map(serde_json::to_value).transpose().ok()?});
     Some(serde_json::json!({"id": id, "error": error}).to_string())
 }
 

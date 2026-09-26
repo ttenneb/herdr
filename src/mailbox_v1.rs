@@ -311,6 +311,7 @@ pub fn edit_unclaimed(
         subject: edit.subject,
         body: edit.body,
         repin_recipient_session: None,
+        priority: None,
     })
 }
 

@@ -75,6 +75,8 @@ pub(crate) struct MessagesAdvertisement {
     pub drop_method: &'static str,
     /// Re-deliver a head an ended Pi execution left in recovery.
     pub retry_method: &'static str,
+    /// Change a held head's priority.
+    pub reprioritize_method: &'static str,
     /// The human's own typing at this pane, queued in this pane's inbox only.
     pub enqueue_self_method: &'static str,
     pub protocol: &'static str,
@@ -142,6 +144,7 @@ impl MailboxBootstrapDescriptor {
                 inbox: session.pane_inbox.clone(),
                 drop_method: "mailbox.drop",
                 retry_method: "mailbox.retry",
+                reprioritize_method: "mailbox.reprioritize",
                 enqueue_self_method: "mailbox.enqueue_self",
                 protocol: crate::mailbox_v1::PROTOCOL,
             }),

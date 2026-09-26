@@ -409,6 +409,7 @@ impl App {
                 | "mailbox.resolve"
                 | "mailbox.drop"
                 | "mailbox.retry"
+                | "mailbox.reprioritize"
                 | "mailbox.enqueue_self"
         ) {
             return None;
@@ -508,6 +509,61 @@ impl App {
                         "snapshot": view(&load()?)?,
                     }))
                 }
+                "mailbox.reprioritize" => {
+                    // The recipient's explicit priority change on a held head
+                    // in its own pane inbox: a new revision (F3 receipt), and
+                    // claim order follows the new priority.
+                    #[derive(serde::Deserialize)]
+                    #[serde(rename_all = "camelCase", deny_unknown_fields)]
+                    struct ReprioritizeParams {
+                        protocol: String,
+                        stable_id: String,
+                        expected_revision: u64,
+                        priority: String,
+                    }
+                    let params: ReprioritizeParams = serde_json::from_value(params.clone())
+                        .map_err(|_| MailboxBootstrapError::InvalidRequest)?;
+                    protocol_ok(&params.protocol)?;
+                    if !matches!(params.priority.as_str(), "low" | "normal" | "high") {
+                        return Err(MailboxBootstrapError::InvalidRequest);
+                    }
+                    let recovered = load()?;
+                    let head = recovered
+                        .heads
+                        .get(&params.stable_id)
+                        .filter(|head| {
+                            recipients.contains(&head.recipient)
+                                && head.revision == params.expected_revision
+                                && !recovered.claims.contains_key(&head.stable_id)
+                        })
+                        .cloned()
+                        .ok_or(MailboxBootstrapError::InvalidRequest)?;
+                    let edited = store
+                        .edit_unclaimed_head(crate::mailbox::MailboxHeadEdit {
+                            stable_id: head.stable_id,
+                            revision: head.revision,
+                            digest: head.digest,
+                            subject: head.subject,
+                            body: head.body,
+                            repin_recipient_session: None,
+                            priority: Some(params.priority),
+                        })
+                        .map_err(|_| MailboxBootstrapError::InvalidRequest)?;
+                    let recovered = load()?;
+                    let receipt = recovered
+                        .receipts
+                        .get(&edited.delivery_digest)
+                        .cloned()
+                        .ok_or(MailboxBootstrapError::GrantMissing)?;
+                    Ok(serde_json::json!({
+                        "type": "mailbox_reprioritized",
+                        "stableId": edited.stable_id,
+                        "revision": edited.revision,
+                        "priority": edited.priority,
+                        "receipt": receipt,
+                        "snapshot": view(&recovered)?,
+                    }))
+                }
                 "mailbox.enqueue_self" => {
                     // The human's own typing at this pane, queued in this
                     // pane's inbox only. No recipient selector exists, so it
@@ -530,9 +586,13 @@ impl App {
                         .pane_inbox
                         .clone()
                         .ok_or(MailboxBootstrapError::GrantMissing)?;
+                    let pane_label = self
+                        .public_pane_for_terminal(&session.caller)
+                        .unwrap_or_else(|| session.caller.clone());
                     let head = crate::app::messages::human_self_head(
                         &inbox,
                         &session.caller,
+                        &pane_label,
                         params.subject,
                         params.body,
                         params.priority.unwrap_or_else(|| "normal".into()),

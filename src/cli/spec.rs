@@ -141,8 +141,10 @@ fn handoff_command() -> Command {
                 )
                 .arg(
                     option("edit-pending", "STABLE_ID")
+                        .num_args(0..=1)
+                        .default_missing_value("")
                         .conflicts_with("send-new")
-                        .help("Replace the text of your waiting message with this stableId (from a pending_exists result)"),
+                        .help("Replace the text of your newest waiting message to this recipient, or of the one with this stableId"),
                 )
                 .arg(flag("send-new").help("If your earlier message is still waiting, queue this one as well"))
                 .arg(
@@ -704,8 +706,10 @@ fn agent_command() -> Command {
                 )
                 .arg(
                     option("edit-pending", "STABLE_ID")
+                        .num_args(0..=1)
+                        .default_missing_value("")
                         .conflicts_with("send-new")
-                        .help("Replace the text of your waiting message with this stableId (from a pending_exists result)"),
+                        .help("Replace the text of your newest waiting message to this recipient, or of the one with this stableId"),
                 )
                 .arg(flag("send-new").help("If your earlier message is still waiting, queue this one as well"))
                 .arg(

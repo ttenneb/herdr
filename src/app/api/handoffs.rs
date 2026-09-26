@@ -237,6 +237,9 @@ impl App {
                 {
                     self.request_pane_wake_if_detached(&terminal_id.to_string(), &stable_id);
                 }
+                if let Some(restore) = self.begin_archived_member_input(ws_idx, pane_id) {
+                    self.commit_archived_member_input(restore);
+                }
                 return response;
             }
         } else if params.send.transport == Some(crate::api::schema::MessageTransport::Mailbox) {

@@ -636,48 +636,7 @@ impl App {
     }
 }
 
-/// How long after startup the backlog sweep keeps retrying slept panes whose
-/// shell is not at its prompt yet.
-pub(crate) const WAKE_SWEEP_WINDOW: Duration = Duration::from_secs(30);
-const WAKE_SWEEP_POLL: Duration = Duration::from_millis(500);
-
 impl App {
-    /// The restart-stable wake key of this terminal's pane: its queue key.
-    fn wake_pane_key_for_terminal(&self, terminal_id: &TerminalId) -> Option<String> {
-        self.pane_of_terminal(terminal_id)?;
-        Some(self.state.terminals.get(terminal_id)?.queue_key.clone())
-    }
-
-    /// The single wake call per queued head. Called from the
-    /// `pane.wake_requested` emit point (`request_pane_wake_if_detached`),
-    /// which already checked that no Pi is attached. Only a pane Herdr put to
-    /// sleep is woken; Duplicate and Refused outcomes are expected and ignored.
-    pub(crate) fn wake_on_requested(&mut self, terminal_key: &str, head_id: &str) {
-        let Some(terminal) = self
-            .state
-            .terminals
-            .values()
-            .find(|terminal| terminal.id.to_string() == terminal_key)
-        else {
-            return;
-        };
-        if terminal.sleep.is_none() {
-            return;
-        }
-        let terminal_id = terminal.id.clone();
-        let Some(pane_key) = self.wake_pane_key_for_terminal(&terminal_id) else {
-            return;
-        };
-        let _ = self.wake_pane(
-            &pane_key,
-            WakeTrigger {
-                cause: WakeCause::HeadAppended,
-                recipient_id: format!("pane:{pane_key}"),
-                head_id: head_id.to_string(),
-            },
-        );
-    }
-
     /// The terminal whose pane inbox covers this mailbox recipient ID (its
     /// `pane:<queueKey>` or its legacy terminal key).
     pub(crate) fn terminal_for_recipient(&self, recipient_id: &str) -> Option<String> {
@@ -715,6 +674,7 @@ impl App {
 
     /// The first unsettled head in the pane's inbox (its queue key and the
     /// legacy terminal key).
+    #[cfg(test)]
     fn first_unsettled_head(&self, terminal_id: &TerminalId) -> Option<String> {
         let store = crate::mailbox::MailboxStore::open(&self.sender_authority_dir).ok()?;
         let recovered = store.load().ok()?;
@@ -726,71 +686,18 @@ impl App {
             .map(|state| state.stable_id)
     }
 
-    pub(crate) fn next_wake_sweep_deadline(&self, now: Instant) -> Option<Instant> {
-        (!self.wake_sweep_done
-            && self
-                .state
-                .terminals
-                .values()
-                .any(|terminal| terminal.sleep.is_some()))
-        .then(|| now + WAKE_SWEEP_POLL)
-    }
-
-    /// Startup backlog sweep (level-triggered): every slept pane that still
-    /// has unsettled heads is woken with `RestoreBacklog`. Panes whose shell
-    /// is not at its prompt yet are retried until the sweep window closes.
-    pub(crate) fn run_wake_backlog_sweep(&mut self, now: Instant) -> bool {
-        if self.wake_sweep_done {
-            return false;
-        }
-        let deadline = *self
-            .wake_sweep_deadline
-            .get_or_insert(now + WAKE_SWEEP_WINDOW);
-        let candidates: Vec<TerminalId> = self
-            .state
+    /// When the server loop must next run the sleeping-pane backlog sweep
+    /// (`maybe_sweep_sleeping_backlog`): only while some pane is asleep.
+    pub(crate) fn next_wake_sweep_deadline(&self, _now: Instant) -> Option<Instant> {
+        const FIRST_SWEEP_AFTER: Duration = Duration::from_secs(3);
+        self.state
             .terminals
             .values()
-            .filter(|terminal| terminal.sleep.is_some())
-            .map(|terminal| terminal.id.clone())
-            .filter(|terminal| {
-                !self.pane_wakes.contains_key(terminal)
-                    && !self.wake_sweep_settled.contains(terminal)
+            .any(|terminal| terminal.sleep.is_some())
+            .then(|| {
+                self.next_backlog_sweep
+                    .unwrap_or(self.server_started_at + FIRST_SWEEP_AFTER)
             })
-            .collect();
-        let mut changed = false;
-        let mut waiting = false;
-        for terminal_id in candidates {
-            let Some(head_id) = self.first_unsettled_head(&terminal_id) else {
-                self.wake_sweep_settled.insert(terminal_id);
-                continue;
-            };
-            let Some(pane_key) = self.wake_pane_key_for_terminal(&terminal_id) else {
-                self.wake_sweep_settled.insert(terminal_id);
-                continue;
-            };
-            let outcome = self.wake_pane(
-                &pane_key,
-                WakeTrigger {
-                    cause: WakeCause::RestoreBacklog,
-                    recipient_id: format!("pane:{pane_key}"),
-                    head_id,
-                },
-            );
-            match outcome {
-                WakeOutcome::Refused {
-                    reason: WakeRefusal::PaneNotAtIdleShell | WakeRefusal::CoolingDown { .. },
-                    ..
-                } => waiting = true,
-                _ => {
-                    self.wake_sweep_settled.insert(terminal_id);
-                    changed = true;
-                }
-            }
-        }
-        if !waiting || now >= deadline {
-            self.wake_sweep_done = true;
-        }
-        changed
     }
 }
 
@@ -1151,9 +1058,21 @@ mod tests {
             .expect("the head woke the pane")
             .clone();
         assert_eq!(outstanding.trigger.cause, WakeCause::HeadAppended);
+        // Exactly one wake call (one durable record) for the appended head.
+        let wake_records = |app: &App| {
+            std::fs::read_dir(app.sender_authority_dir.join("pane-wakes"))
+                .map(|entries| {
+                    entries
+                        .filter_map(Result::ok)
+                        .filter(|entry| entry.file_name().to_string_lossy().ends_with(".json"))
+                        .count()
+                })
+                .unwrap_or(0)
+        };
+        assert_eq!(wake_records(&app), 1, "one wake call per append");
         // The wake is keyed by the pane's restart-stable queue key.
         let queue_key = app.state.terminals[&terminal].queue_key.clone();
-        assert_eq!(outstanding.pane_key, queue_key);
+        assert_eq!(outstanding.pane_key, format!("pane:{queue_key}"));
         assert_eq!(
             outstanding.trigger.recipient_id,
             format!("pane:{queue_key}")
@@ -1170,6 +1089,7 @@ mod tests {
         }
         let second = prompt(&mut app, "owner", "second task");
         assert_eq!(second["result"]["delivery"]["path"], "mailbox", "{second}");
+        assert_eq!(wake_records(&app), 2, "the second append coalesces once");
         assert_eq!(
             app.pane_wakes[&terminal].wake_id, outstanding.wake_id,
             "coalesced"
@@ -1541,11 +1461,9 @@ mod tests {
         );
         pi_exits(&mut app, pane);
         // Nothing queued yet: the sweep leaves the pane asleep.
-        assert!(!app.run_wake_backlog_sweep(Instant::now()));
+        app.sweep_sleeping_backlog(true);
         assert!(app.pane_wakes.is_empty());
         // A head queued before the "restart", with the hook not yet run.
-        app.wake_sweep_done = false;
-        app.wake_sweep_settled.clear();
         app.pane_wake_cooldowns.clear();
         let recipient = crate::app::messages::pane_recipient(
             &app.pane_queue_key(&terminal.to_string()).unwrap(),
@@ -1576,7 +1494,7 @@ mod tests {
         ));
         assert!(recipient.recipient_id.starts_with("pane:"));
         while input.try_recv().is_ok() {}
-        assert!(app.run_wake_backlog_sweep(Instant::now()));
+        app.sweep_sleeping_backlog(true);
         let outstanding = app
             .pane_wakes
             .get(&terminal)
