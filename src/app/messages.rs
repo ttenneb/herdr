@@ -558,7 +558,7 @@ impl App {
             .map(|terminal| (terminal.id.to_string(), terminal.queue_key.clone()))
             .collect();
         for (terminal_key, queue_key) in sleeping {
-            if self.attached_messages_recipient(&terminal_key).is_some() {
+            if !self.pane_wake_can_act(&terminal_key) {
                 continue;
             }
             let recipients = self.inbox_recipients(&terminal_key);
@@ -682,6 +682,48 @@ impl App {
 
     /// Wake hook: a head was appended for a pane with no attached Pi. Emits
     /// `pane.wake_requested`; the sleep/wake owner (#25) acts on it.
+    /// Whether a wake_pane call for this pane could launch now. wake_pane
+    /// writes a durable record for every call (refusals and duplicates too),
+    /// so the hook and the level-triggered sweep only call it when it could
+    /// act: slept, no outstanding wake, not cooling down, no live agent, and
+    /// an idle shell.
+    fn pane_wake_can_act(&self, terminal_key: &str) -> bool {
+        if self.attached_messages_recipient(terminal_key).is_some() {
+            return false;
+        }
+        let Some((terminal_id, _)) = self
+            .state
+            .terminals
+            .iter()
+            .find(|(id, terminal)| id.to_string() == terminal_key && terminal.sleep.is_some())
+        else {
+            return false;
+        };
+        if self.pane_wakes.contains_key(terminal_id)
+            || self
+                .pane_wake_cooldowns
+                .get(terminal_id)
+                .is_some_and(|until| std::time::Instant::now() < *until)
+        {
+            return false;
+        }
+        #[cfg(test)]
+        if self
+            .terminal_runtimes
+            .get(terminal_id)
+            .is_some_and(|runtime| runtime.child_pid().is_none())
+        {
+            // Test runtimes have no process to inspect; wake_pane decides.
+            return true;
+        }
+        self.terminal_runtimes
+            .get(terminal_id)
+            .is_some_and(|runtime| {
+                !super::agents::runtime_has_live_agent(runtime)
+                    && super::agents::runtime_at_idle_shell(runtime)
+            })
+    }
+
     pub(crate) fn request_pane_wake_if_detached(&mut self, terminal_key: &str, stable_id: &str) {
         if self.attached_messages_recipient(terminal_key).is_some() {
             return;
@@ -712,11 +754,7 @@ impl App {
         tracing::info!(pane = %public_pane, stable_id, "messages: wake requested for a pane with no attached Pi");
         // Only a pane Herdr itself put to sleep is woken (wake_pane refuses
         // or coalesces everything else); other panes just keep the queue.
-        let asleep =
-            self.state.terminals.values().any(|terminal| {
-                terminal.id.to_string() == terminal_key && terminal.sleep.is_some()
-            });
-        if asleep {
+        if self.pane_wake_can_act(terminal_key) {
             let recipient = format!("pane:{queue_key}");
             let outcome = self.wake_pane(
                 &recipient,

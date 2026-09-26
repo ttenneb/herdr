@@ -1580,9 +1580,11 @@ async fn a_message_for_a_sleeping_pane_wakes_it_by_its_durable_key() {
     fixture
         .app
         .request_pane_wake_if_detached(&fixture.terminals[1].clone(), "second");
-    assert!(wake_records(&fixture)
-        .iter()
-        .any(|record| record["outcome"] == "duplicate"));
+    // The second message joins the outstanding wake without another call:
+    // one wake, one durable record, no duplicate records.
+    let records = wake_records(&fixture);
+    assert_eq!(records.len(), 1, "{records:?}");
+    assert!(fixture.app.pane_wakes.contains_key(&terminal_id));
 }
 
 /// A pane that is not asleep (hand-quit Pi, hand-typed pi, helper) is never
@@ -1661,9 +1663,8 @@ async fn the_backlog_sweep_wakes_a_sleeping_pane_with_queued_messages() {
     fixture
         .app
         .maybe_sweep_sleeping_backlog(start + std::time::Duration::from_secs(40));
-    assert!(wake_records(&fixture)
-        .iter()
-        .any(|record| record["outcome"] == "duplicate"));
+    // A repeat sweep while the wake is outstanding writes no record.
+    assert_eq!(wake_records(&fixture).len(), 1);
 }
 
 /// Final sender contract (a6d1b1f8): error.pending is the array of waiting
