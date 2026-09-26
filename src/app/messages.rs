@@ -949,13 +949,14 @@ impl App {
             };
         };
         let recipient = pane_recipient(&queue_key);
+        // A pane that takes Messages is never typed into, whatever the text:
+        // typing would merge into the human's unsent editor draft (and put a
+        // raw structured-prompt envelope there). Oversize or unsafe text is
+        // refused; the sender shortens or splits it.
         if !mailbox_safe_text(&message.subject, &message.body) {
-            return match transport {
-                MessageTransport::Mailbox => Err(SendRefusal::MailboxUnavailable(
-                    "the message exceeds Messages limits or contains control characters",
-                )),
-                _ => Ok(SendRoute::Pty),
-            };
+            return Err(SendRefusal::MailboxUnavailable(
+                "the message exceeds Messages limits (subject 160 bytes on one line, body 16 KiB) or contains control characters; it was not sent",
+            ));
         }
         let store = MailboxStore::open(&self.sender_authority_dir)
             .map_err(|error| SendRefusal::Store(error.to_string()))?;

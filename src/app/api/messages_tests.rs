@@ -2664,3 +2664,52 @@ async fn a_live_pi_without_messages_after_30s_gets_new_messages_typed() {
     fixture.app.messages_attached_pis.insert((old_pi, 11));
     assert!(fixture.app.pane_takes_messages(&key));
 }
+
+/// Draft defect: a pane that takes Messages is never typed into. Text that
+/// Messages cannot carry (oversize body, multi-line or oversize structured
+/// subject) is refused, not typed over the human's unsent editor draft.
+#[tokio::test]
+async fn a_messages_pi_is_never_typed_into_even_for_text_messages_cannot_carry() {
+    let mut fixture = fixture();
+    let terminal_id = fixture.app.state.workspaces[1]
+        .terminal_id(fixture.panes[1])
+        .unwrap()
+        .clone();
+    fixture
+        .app
+        .state
+        .terminals
+        .get_mut(&terminal_id)
+        .unwrap()
+        .set_detected_state(Some(Agent::Pi), AgentState::Idle);
+    let _session = attach_recipient(&mut fixture);
+    let target = fixture.app.public_pane_id(1, fixture.panes[1]).unwrap();
+    let oversize = "x".repeat(16 * 1024 + 1);
+    let control = "bell \u{7} here".to_string();
+    for text in [oversize, control] {
+        let response: serde_json::Value = serde_json::from_str(&fixture.app.handle_agent_prompt(
+            "req".into(),
+            AgentPromptParams {
+                target: target.clone(),
+                text,
+                wait: None,
+                send: MessageSendOptions::default(),
+            },
+        ))
+        .unwrap();
+        assert_eq!(
+            response["error"]["code"], "messages_unavailable",
+            "{response}"
+        );
+    }
+    assert!(
+        fixture.rx[1].try_recv().is_err(),
+        "nothing was typed into the Messages Pi's editor"
+    );
+    assert!(crate::mailbox::MailboxStore::open(&fixture.directory)
+        .unwrap()
+        .load()
+        .unwrap()
+        .heads
+        .is_empty());
+}

@@ -405,7 +405,10 @@ impl App {
                 ))
             }
             Ok(crate::app::messages::SendRoute::Pty) => None,
-            Err(crate::app::messages::SendRefusal::MailboxUnavailable(_)) => None,
+            // The recipient takes Messages: never fall back to typing into it.
+            Err(crate::app::messages::SendRefusal::MailboxUnavailable(message)) => Some(
+                encode_error(id.to_string(), "messages_unavailable", message),
+            ),
             Err(refusal) => crate::app::messages::pending_error_json(id.to_string(), &refusal)
                 .or_else(|| match refusal {
                     crate::app::messages::SendRefusal::Store(message) => Some(encode_error(
