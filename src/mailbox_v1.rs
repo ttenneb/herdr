@@ -140,6 +140,10 @@ pub struct HeadState {
     /// `other` when another (for example an exited) Pi does.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub claim_execution: Option<String>,
+    /// For `claimExecution:"other"`: whether that execution is still alive.
+    /// A live other execution's claim is never droppable or retryable here.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub claim_execution_alive: Option<bool>,
     /// A claim left claimed or admitted (uncertain) by another, ended Pi
     /// execution: never auto-rerun, resolved only by explicit Retry or Drop.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
@@ -230,6 +234,7 @@ pub fn snapshot(
                 previous_session: false,
                 claim_execution: None,
                 recovery_needed: false,
+                claim_execution_alive: None,
                 closed_by: resolution.and_then(|resolution| resolution.closed_by.clone()),
             }
         })

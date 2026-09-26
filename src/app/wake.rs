@@ -132,7 +132,11 @@ impl App {
         &self,
         pane_key: &str,
     ) -> Option<(usize, crate::layout::PaneId, TerminalId)> {
-        if let Some(queue_key) = pane_key.strip_prefix("pane:") {
+        // Accepts the durable queue key bare (32 hex) or as the recipient
+        // form `pane:<queueKey>`, and otherwise a current public pane ID.
+        let bare = (pane_key.len() == 32 && pane_key.bytes().all(|b| b.is_ascii_hexdigit()))
+            .then_some(pane_key);
+        if let Some(queue_key) = pane_key.strip_prefix("pane:").or(bare) {
             let terminal_id = self
                 .state
                 .terminals
