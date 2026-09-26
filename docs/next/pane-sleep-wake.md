@@ -25,7 +25,12 @@ The sleep record is persisted. After a server restart, a slept pane stays asleep
 
 ## Wake
 
-When a message is queued for a slept pane that has no attached Pi, the mailbox calls `App::wake_pane(pane_key, trigger_head)`. The wake:
+The mailbox calls `App::wake_pane(pane_key, trigger_head)` in two situations. The trigger's `cause` records which:
+
+- `head_appended`: a message is queued for a slept pane that has no attached Pi;
+- `restore_backlog`: after a server restart, the mailbox sweeps slept panes that still have unsettled heads.
+
+Both are level-triggered. The wake:
 
 - relaunches the recipe through the managed launch path (`start_agent`), in the same pane and terminal, so the mailbox recipient stays the same. The Pi gets a new sender generation and resumes its `--session`. No prompt is sent: the Gate drains the queue;
 - acts only if the pane has a sleep record, a recipe and an idle shell, has no live agent, and is not lifecycle-owned;

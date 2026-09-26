@@ -1323,6 +1323,7 @@ mod tests {
         });
 
         let trigger = || crate::app::wake::WakeTrigger {
+            cause: crate::app::wake::WakeCause::HeadAppended,
             recipient_id: sender_key.clone(),
             head_id: "stable-1".into(),
         };

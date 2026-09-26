@@ -26,9 +26,22 @@ pub(crate) const WAKE_ATTACH_TIMEOUT: Duration = Duration::from_secs(60);
 /// After a failed or timed-out wake, further wakes for the pane wait this long.
 pub(crate) const WAKE_FAILURE_COOLDOWN: Duration = Duration::from_secs(30);
 
+/// Why the mailbox asks for a wake. Both are level-triggered: the caller asks
+/// whenever a slept pane has unsettled heads; wake_pane refuses or coalesces.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum WakeCause {
+    /// A head was appended for the pane's recipient.
+    HeadAppended,
+    /// After a server restart, the mailbox sweeps slept panes that still have
+    /// unsettled heads.
+    RestoreBacklog,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct WakeTrigger {
+    pub cause: WakeCause,
     pub recipient_id: String,
     pub head_id: String,
 }
@@ -540,6 +553,7 @@ mod tests {
 
     fn trigger() -> WakeTrigger {
         WakeTrigger {
+            cause: WakeCause::HeadAppended,
             recipient_id: "r".into(),
             head_id: "h".into(),
         }
@@ -642,6 +656,54 @@ mod tests {
             app.state.terminals[&terminal].sleep.is_some(),
             "still asleep"
         );
+    }
+
+    /// After a restart a slept pane is restored asleep (not resumed); the
+    /// mailbox's backlog sweep then wakes it with RestoreBacklog.
+    #[tokio::test]
+    async fn restore_backlog_sweep_wakes_a_pane_restored_asleep() {
+        let (mut app, _pane, terminal, public) = app_with_shell_pane();
+        let (runtime, mut input) = crate::terminal::TerminalRuntime::test_with_channel(80, 24);
+        app.terminal_runtimes.insert(terminal.clone(), runtime);
+        {
+            // What restore leaves for a slept pane: recipe and sleep, no
+            // resume plan and no agent.
+            let state = app.state.terminals.get_mut(&terminal).unwrap();
+            state.launch_recipe = crate::launch_recipe::LaunchRecipe::capture(
+                "owner",
+                "pi",
+                &["--thinking".into(), "low".into()],
+                &[],
+            );
+            state.sleep = Some(App::new_pane_sleep("owner".into(), 1));
+            assert!(state.pending_agent_resume_plan.is_none());
+        }
+        let sweep = WakeTrigger {
+            cause: WakeCause::RestoreBacklog,
+            recipient_id: terminal.to_string(),
+            head_id: "backlog-1".into(),
+        };
+        let WakeOutcome::Started {
+            wake_id,
+            generation,
+        } = app.wake_pane(&public, sweep.clone())
+        else {
+            panic!("the backlog sweep wakes the slept pane")
+        };
+        assert_eq!(generation, 1);
+        assert!(input.try_recv().is_ok(), "one launch");
+        let record: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(app.pane_wake_dir().join(format!("{wake_id}.json"))).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(record["trigger"]["cause"], "restore_backlog");
+        assert_eq!(record["outcome"], "started");
+        // A second sweep before the Pi attaches coalesces.
+        assert!(matches!(
+            app.wake_pane(&public, sweep),
+            WakeOutcome::Duplicate { .. }
+        ));
+        assert!(input.try_recv().is_err());
     }
 
     #[cfg(unix)]
