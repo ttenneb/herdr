@@ -1488,6 +1488,178 @@ async fn a_held_head_is_editable_while_another_head_is_claimed_and_admitted() {
     assert_eq!(next["claim"]["revision"], 3);
 }
 
+/// Puts pane 1 to sleep the way `herdr agent sleep` leaves it: a Pi launch
+/// recipe, a sleep record, no agent process, and a fresh shell runtime.
+fn put_recipient_to_sleep(fixture: &mut Fixture) -> tokio::sync::mpsc::Receiver<Bytes> {
+    let terminal_id = fixture.app.state.workspaces[1]
+        .terminal_id(fixture.panes[1])
+        .unwrap()
+        .clone();
+    let (runtime, input) = crate::terminal::TerminalRuntime::test_with_channel(80, 24);
+    fixture
+        .app
+        .terminal_runtimes
+        .insert(terminal_id.clone(), runtime);
+    let terminal = fixture.app.state.terminals.get_mut(&terminal_id).unwrap();
+    terminal.set_detected_state(None, AgentState::Unknown);
+    terminal.launch_recipe = crate::launch_recipe::LaunchRecipe::capture("owner", "pi", &[], &[]);
+    terminal.sleep = Some(App::new_pane_sleep("owner".into(), 1));
+    input
+}
+
+fn wake_records(fixture: &Fixture) -> Vec<serde_json::Value> {
+    std::fs::read_dir(fixture.directory.join("pane-wakes"))
+        .map(|entries| {
+            entries
+                .filter_map(|entry| entry.ok())
+                .filter(|entry| entry.path().extension().is_some_and(|ext| ext == "json"))
+                .map(|entry| serde_json::from_slice(&std::fs::read(entry.path()).unwrap()).unwrap())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// A head appended for a pane Herdr put to sleep calls wake_pane with the
+/// pane's durable key; the message waits in the queue for the woken Pi.
+#[tokio::test]
+async fn a_message_for_a_sleeping_pane_wakes_it_by_its_durable_key() {
+    let mut fixture = fixture();
+    let mut launch = put_recipient_to_sleep(&mut fixture);
+    let queue_key = fixture.app.pane_queue_key(&fixture.terminals[1]).unwrap();
+    // Addressed by the name it slept under.
+    let response = fixture.app.handle_agent_prompt(
+        "req".into(),
+        AgentPromptParams {
+            target: "owner".into(),
+            text: "please continue".into(),
+            wait: None,
+            send: MessageSendOptions::default(),
+        },
+    );
+    let success: SuccessResponse = serde_json::from_str(&response).unwrap();
+    let ResponseResult::AgentPrompted { delivery, .. } = success.result else {
+        panic!("prompted")
+    };
+    assert_eq!(delivery.unwrap().path, "mailbox");
+    let records = wake_records(&fixture);
+    assert_eq!(records.len(), 1, "{records:?}");
+    assert_eq!(records[0]["paneKey"], format!("pane:{queue_key}"));
+    assert_eq!(records[0]["trigger"]["cause"], "head_appended");
+    assert_eq!(
+        records[0]["trigger"]["recipientId"],
+        format!("pane:{queue_key}")
+    );
+    assert!(
+        launch.try_recv().is_ok(),
+        "the managed launch was submitted"
+    );
+    let terminal_id = fixture.app.state.workspaces[1]
+        .terminal_id(fixture.panes[1])
+        .unwrap()
+        .clone();
+    assert!(fixture.app.pane_wakes.contains_key(&terminal_id));
+    // A second message coalesces into the outstanding wake.
+    fixture
+        .app
+        .route_ordinary_send(
+            &fixture.terminals[1].clone(),
+            &sender(&fixture),
+            plain("and this"),
+            &MessageSendOptions {
+                send_new: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    fixture
+        .app
+        .request_pane_wake_if_detached(&fixture.terminals[1].clone(), "second");
+    assert!(wake_records(&fixture)
+        .iter()
+        .any(|record| record["outcome"] == "duplicate"));
+}
+
+/// A pane that is not asleep (hand-quit Pi, hand-typed pi, helper) is never
+/// woken: its message just waits for the next Pi.
+#[tokio::test]
+async fn a_pane_not_put_to_sleep_is_never_woken() {
+    let mut fixture = fixture();
+    let terminal_id = fixture.app.state.workspaces[1]
+        .terminal_id(fixture.panes[1])
+        .unwrap()
+        .clone();
+    {
+        let terminal = fixture.app.state.terminals.get_mut(&terminal_id).unwrap();
+        terminal.messages_capable = true;
+        terminal.set_detected_state(None, AgentState::Unknown);
+    }
+    let target = fixture.app.public_pane_id(1, fixture.panes[1]).unwrap();
+    fixture.app.handle_agent_prompt(
+        "req".into(),
+        AgentPromptParams {
+            target,
+            text: "wait for the next Pi".into(),
+            wait: None,
+            send: MessageSendOptions::default(),
+        },
+    );
+    assert!(wake_records(&fixture).is_empty());
+    assert!(fixture.app.pane_wakes.is_empty());
+}
+
+/// After a server restart a slept pane is restored asleep; the first backlog
+/// sweep wakes it with restore_backlog, and repeated sweeps coalesce.
+#[tokio::test]
+async fn the_backlog_sweep_wakes_a_sleeping_pane_with_queued_messages() {
+    let mut fixture = fixture();
+    let _launch = put_recipient_to_sleep(&mut fixture);
+    let queue_key = fixture.app.pane_queue_key(&fixture.terminals[1]).unwrap();
+    // A head queued while the server was down (written straight to the store).
+    crate::mailbox::MailboxStore::open(&fixture.directory)
+        .unwrap()
+        .append_offline_head(crate::mailbox::MailboxHead {
+            stable_id: "send.backlog".into(),
+            revision: 1,
+            digest: "a".repeat(64),
+            delivery_digest: "b".repeat(64),
+            recipient: crate::app::messages::pane_recipient(&queue_key),
+            subject: "s".into(),
+            body: "queued before restart".into(),
+            recipient_generation: "1".into(),
+            sender: "external".into(),
+            target: fixture.terminals[1].clone(),
+            grant_id: "send:external".into(),
+            message_id: "m".into(),
+            kind: "advisory".into(),
+            priority: "normal".into(),
+            original_sequence: 1,
+            enqueue_epoch: 0,
+            accepted_at: 1,
+            delivery: None,
+        })
+        .unwrap();
+    let start = fixture.app.server_started_at;
+    assert!(!fixture.app.maybe_sweep_sleeping_backlog(start));
+    assert!(
+        wake_records(&fixture).is_empty(),
+        "not before the first-sweep delay"
+    );
+    fixture
+        .app
+        .maybe_sweep_sleeping_backlog(start + std::time::Duration::from_secs(4));
+    let records = wake_records(&fixture);
+    assert_eq!(records.len(), 1, "{records:?}");
+    assert_eq!(records[0]["trigger"]["cause"], "restore_backlog");
+    assert_eq!(records[0]["trigger"]["headId"], "send.backlog");
+    assert_eq!(records[0]["outcome"], "started");
+    fixture
+        .app
+        .maybe_sweep_sleeping_backlog(start + std::time::Duration::from_secs(40));
+    assert!(wake_records(&fixture)
+        .iter()
+        .any(|record| record["outcome"] == "duplicate"));
+}
+
 #[tokio::test]
 async fn a_second_accepted_stream_never_revokes_the_first() {
     let mut fixture = fixture();

@@ -125,13 +125,35 @@ fn new_wake_id() -> String {
 }
 
 impl App {
-    /// The restart-stable pane key is resolved here and only here. In
-    /// next-maint the key is the current public pane ID; the restart-stable key
-    /// design replaces this body.
+    /// The restart-stable pane key is resolved here and only here: the pane's
+    /// durable Messages recipient (`pane:<queueKey>`, persisted in
+    /// session.json), or a current public pane ID.
     pub(crate) fn resolve_wake_pane_key(
         &self,
         pane_key: &str,
     ) -> Option<(usize, crate::layout::PaneId, TerminalId)> {
+        if let Some(queue_key) = pane_key.strip_prefix("pane:") {
+            let terminal_id = self
+                .state
+                .terminals
+                .values()
+                .find(|terminal| terminal.queue_key == queue_key)?
+                .id
+                .clone();
+            return self
+                .state
+                .workspaces
+                .iter()
+                .enumerate()
+                .find_map(|(ws_idx, workspace)| {
+                    workspace.tabs.iter().find_map(|tab| {
+                        tab.panes
+                            .iter()
+                            .find(|(_, pane)| pane.attached_terminal_id == terminal_id)
+                            .map(|(pane_id, _)| (ws_idx, *pane_id, terminal_id.clone()))
+                    })
+                });
+        }
         let (ws_idx, pane_id) = self.parse_current_public_pane_id(pane_key)?;
         let terminal_id = self.state.workspaces.get(ws_idx)?.terminal_id(pane_id)?;
         Some((ws_idx, pane_id, terminal_id.clone()))

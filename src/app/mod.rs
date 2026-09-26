@@ -152,6 +152,10 @@ pub struct App {
     pub(crate) managed_pi_launches: HashMap<crate::terminal::TerminalId, agents::ManagedPiLaunch>,
     pub(crate) pane_wakes: HashMap<crate::terminal::TerminalId, wake::OutstandingWake>,
     pub(crate) pane_wake_cooldowns: HashMap<crate::terminal::TerminalId, Instant>,
+    /// Next level-triggered sweep of sleeping panes with a queued backlog;
+    /// `None` until the first (post-start, `restore_backlog`) sweep ran.
+    pub(crate) next_backlog_sweep: Option<Instant>,
+    pub(crate) server_started_at: Instant,
     /// Terminals whose current start is a recipe relaunch (wake or resume).
     pub(crate) recipe_relaunches: HashSet<crate::terminal::TerminalId>,
     pub(crate) pending_route_carries: HashMap<crate::terminal::TerminalId, Instant>,
@@ -924,6 +928,8 @@ impl App {
             managed_pi_launches: HashMap::new(),
             pane_wakes: HashMap::new(),
             pane_wake_cooldowns: HashMap::new(),
+            next_backlog_sweep: None,
+            server_started_at: Instant::now(),
             recipe_relaunches: HashSet::new(),
             pending_route_carries: HashMap::new(),
             pending_managed_resumes: HashMap::new(),
