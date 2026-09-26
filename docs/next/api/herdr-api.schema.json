@@ -1659,6 +1659,13 @@
                 "null"
               ]
             },
+            "editor_has_text": {
+              "description": "The agent's last reported \"editor has unsent text\" (Pi only).",
+              "type": [
+                "boolean",
+                "null"
+              ]
+            },
             "focused": {
               "type": "boolean"
             },
@@ -4921,6 +4928,13 @@
             "agent_session_path": {
               "type": [
                 "string",
+                "null"
+              ]
+            },
+            "editor_has_text": {
+              "description": "Pi only, edge-triggered: whether the agent's editor holds unsent text.\nWhile true, Herdr holds typed deliveries to the pane.",
+              "type": [
+                "boolean",
                 "null"
               ]
             },
@@ -10930,6 +10944,13 @@
                 "null"
               ]
             },
+            "editor_has_text": {
+              "description": "The agent's last reported \"editor has unsent text\" (Pi only).",
+              "type": [
+                "boolean",
+                "null"
+              ]
+            },
             "focused": {
               "type": "boolean"
             },
@@ -11791,6 +11812,13 @@
             "display_agent": {
               "type": [
                 "string",
+                "null"
+              ]
+            },
+            "editor_has_text": {
+              "description": "The agent's last reported \"editor has unsent text\" (Pi only).",
+              "type": [
+                "boolean",
                 "null"
               ]
             },
@@ -14498,6 +14526,13 @@
             "display_agent": {
               "type": [
                 "string",
+                "null"
+              ]
+            },
+            "editor_has_text": {
+              "description": "The agent's last reported \"editor has unsent text\" (Pi only).",
+              "type": [
+                "boolean",
                 "null"
               ]
             },

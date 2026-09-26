@@ -573,6 +573,7 @@ impl App {
             agent_session: terminal_agent_session_info(terminal),
             scroll,
             revision: terminal.revision,
+            editor_has_text: terminal.editor_has_text,
         })
     }
 

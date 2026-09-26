@@ -131,6 +131,9 @@ pub struct TerminalState {
     /// (hand quit, restart), so a Messages-capable pane is still addressed by
     /// that name and its messages queue instead of failing agent_not_found.
     pub messages_agent_name: Option<String>,
+    /// The agent's last `editor_has_text` report (Pi, edge-triggered). Runtime
+    /// only; cleared when the agent process exits.
+    pub editor_has_text: Option<bool>,
     pub id: TerminalId,
     pub cwd: PathBuf,
     pub detected_agent: Option<Agent>,
@@ -198,6 +201,7 @@ impl TerminalState {
             queue_key: mint_queue_key(),
             messages_capable: false,
             messages_agent_name: None,
+            editor_has_text: None,
             id,
             cwd,
             detected_agent: None,

@@ -1164,7 +1164,7 @@ fn parse_pane_wait_output_args(args: &[String]) -> Result<PaneWaitForOutputParam
 }
 
 fn pane_report_agent(args: &[String]) -> std::io::Result<i32> {
-    const USAGE: &str = "usage: herdr pane report-agent <pane_id> --source ID --agent LABEL --state idle|working|blocked|unknown [--message TEXT] [--seq N] [--agent-session-id ID] [--agent-session-path PATH]";
+    const USAGE: &str = "usage: herdr pane report-agent <pane_id> --source ID --agent LABEL --state idle|working|blocked|unknown [--message TEXT] [--seq N] [--agent-session-id ID] [--agent-session-path PATH] [--editor-has-text true|false]";
 
     let args = super::expand_equals_args(
         args,
@@ -1176,8 +1176,10 @@ fn pane_report_agent(args: &[String]) -> std::io::Result<i32> {
             "--seq",
             "--agent-session-id",
             "--agent-session-path",
+            "--editor-has-text",
         ],
     );
+    let mut editor_has_text = None;
     let mut pane_id = None;
     let mut source = None;
     let mut agent = None;
@@ -1246,6 +1248,17 @@ fn pane_report_agent(args: &[String]) -> std::io::Result<i32> {
                 agent_session_path = Some(value.clone());
                 index += 2;
             }
+            "--editor-has-text" => {
+                editor_has_text = match args.get(index + 1).map(String::as_str) {
+                    Some("true") => Some(true),
+                    Some("false") => Some(false),
+                    _ => {
+                        eprintln!("--editor-has-text requires true or false");
+                        return Ok(2);
+                    }
+                };
+                index += 2;
+            }
             option if option.starts_with('-') => {
                 eprintln!("unknown option: {option}");
                 return Ok(2);
@@ -1290,6 +1303,7 @@ fn pane_report_agent(args: &[String]) -> std::io::Result<i32> {
         seq,
         agent_session_id,
         agent_session_path,
+        editor_has_text,
     }))
 }
 

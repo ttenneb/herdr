@@ -1095,6 +1095,7 @@ mod tests {
             agent_session: None,
             scroll: None,
             revision: 0,
+            editor_has_text: None,
         }
     }
 

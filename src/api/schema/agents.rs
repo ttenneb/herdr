@@ -264,6 +264,9 @@ pub enum AgentSessionTrust {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct AgentInfo {
+    /// The agent's last reported "editor has unsent text" (Pi only).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub editor_has_text: Option<bool>,
     pub terminal_id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,

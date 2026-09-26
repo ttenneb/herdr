@@ -931,6 +931,7 @@ impl App {
             cwd: pane.cwd,
             foreground_cwd: pane.foreground_cwd,
             revision: pane.revision,
+            editor_has_text: pane.editor_has_text,
         })
     }
 

@@ -12600,6 +12600,7 @@ next_tab = ""
                     seq: Some(19),
                     agent_session_id: None,
                     agent_session_path: None,
+                    editor_has_text: None,
                 }),
             },
             respond_to,

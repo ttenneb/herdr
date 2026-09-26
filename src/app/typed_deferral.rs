@@ -165,6 +165,9 @@ impl App {
             }
             | crate::events::AppEvent::PaneDied { pane_id, .. } => {
                 if let Some(terminal_id) = self.terminal_of_pane(*pane_id) {
+                    if let Some(terminal) = self.state.terminals.get_mut(&terminal_id) {
+                        terminal.editor_has_text = None;
+                    }
                     self.clear_human_draft(&terminal_id);
                 }
             }
@@ -172,8 +175,16 @@ impl App {
         }
     }
 
-    /// Whether the pane's editor may hold the human's unsent text.
+    /// Whether the pane's editor may hold the human's unsent text. A Pi's
+    /// own `editor_has_text` report wins; otherwise Herdr's input count.
     pub(crate) fn pane_draft_pending(&self, terminal_id: &TerminalId) -> bool {
+        if let Some(reported) = self.state.terminals.get(terminal_id).and_then(|terminal| {
+            (terminal.effective_known_agent() == Some(crate::detect::Agent::Pi))
+                .then_some(terminal.editor_has_text)
+                .flatten()
+        }) {
+            return reported;
+        }
         self.human_drafts
             .get(terminal_id)
             .is_some_and(|draft| draft.count > 0)

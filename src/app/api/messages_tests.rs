@@ -3197,3 +3197,75 @@ async fn external_senders_cannot_replace_each_others_waiting_messages() {
     let _ = child.kill();
     let _ = child.wait();
 }
+
+fn report_editor(fixture: &mut Fixture, has_text: bool) {
+    let pane_id = fixture.app.public_pane_id(1, fixture.panes[1]).unwrap();
+    let response = fixture.app.handle_pane_report_agent(
+        "editor".into(),
+        crate::api::schema::PaneReportAgentParams {
+            pane_id,
+            source: "herdr:pi".into(),
+            agent: "pi".into(),
+            state: crate::api::schema::PaneAgentState::Idle,
+            message: None,
+            seq: None,
+            agent_session_id: None,
+            agent_session_path: None,
+            editor_has_text: Some(has_text),
+        },
+    );
+    assert!(response.contains("\"result\""), "{response}");
+}
+
+/// Pi's own `editor_has_text` report wins over Herdr's input count for a
+/// Pi pane, and is shown on agent get and pane get.
+#[tokio::test]
+async fn pis_editor_has_text_report_wins_over_the_count() {
+    use crossterm::event::KeyCode;
+    let mut fixture = fixture();
+    let terminal = fixture.app.state.workspaces[1]
+        .terminal_id(fixture.panes[1])
+        .unwrap()
+        .clone();
+    // Pi says its editor has text; Herdr counted nothing.
+    report_editor(&mut fixture, true);
+    assert!(fixture.app.pane_draft_pending(&terminal));
+    let target = fixture.app.public_pane_id(1, fixture.panes[1]).unwrap();
+    let got = fixture.app.handle_agent_get(
+        "get".into(),
+        crate::api::schema::AgentTarget {
+            target: target.clone(),
+        },
+    );
+    let got: serde_json::Value = serde_json::from_str(&got).unwrap();
+    assert_eq!(got["result"]["agent"]["editor_has_text"], true, "{got}");
+    let pane = fixture.app.pane_info(1, fixture.panes[1]).unwrap();
+    assert_eq!(pane.editor_has_text, Some(true));
+    let held = prompt_pane(&mut fixture, "held by Pi's flag", None);
+    assert_eq!(held["result"]["delivery"]["path"], "pty_deferred", "{held}");
+    // Pi reports the editor clear: the held message is typed at once.
+    report_editor(&mut fixture, false);
+    assert!(fixture.app.typed_deferrals.is_empty());
+    let typed = tokio::time::timeout(std::time::Duration::from_secs(2), fixture.rx[1].recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(String::from_utf8_lossy(&typed).contains("held by Pi's flag"));
+    // Pi's "clear" also wins over a positive Herdr count.
+    human_key(&mut fixture.app, &terminal, KeyCode::Char('q'));
+    assert!(!fixture.app.pane_draft_pending(&terminal));
+    // The report is dropped when the agent process exits.
+    report_editor(&mut fixture, true);
+    fixture
+        .app
+        .handle_internal_event(crate::events::AppEvent::StateChanged {
+            pane_id: fixture.panes[1],
+            agent: None,
+            state: AgentState::Idle,
+            visible_blocker: false,
+            visible_working: false,
+            process_exited: true,
+            observed_at: std::time::Instant::now(),
+        });
+    assert_eq!(fixture.app.state.terminals[&terminal].editor_has_text, None);
+}

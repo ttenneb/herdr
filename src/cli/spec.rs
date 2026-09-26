@@ -1006,6 +1006,11 @@ fn report_agent_command() -> Command {
         .arg(option("seq", "N"))
         .arg(option("agent-session-id", "ID"))
         .arg(path_option("agent-session-path", "PATH"))
+        .arg(
+            option("editor-has-text", "BOOL")
+                .value_parser(["true", "false"])
+                .help("Pi: whether the agent's editor holds unsent text (edge-triggered)"),
+        )
 }
 
 fn report_agent_session_command() -> Command {
