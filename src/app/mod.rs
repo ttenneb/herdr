@@ -192,9 +192,9 @@ pub struct App {
     /// generation) without building that state.
     #[cfg(test)]
     pub(crate) messages_test_live_executions: std::collections::HashSet<String>,
-    /// Pi processes (PID, birth tick) that attached a Messages stream during
-    /// their life. Runtime only.
-    pub(crate) messages_attached_pis: std::collections::HashSet<(u32, u64)>,
+    /// Pi processes (PID, birth tick) that attached a Messages stream, with
+    /// when their last stream closed (None while one is open). Runtime only.
+    pub(crate) messages_attached_pis: HashMap<(u32, u64), Option<Instant>>,
     pub event_tx: mpsc::Sender<AppEvent>,
     pub(crate) event_rx: mpsc::Receiver<AppEvent>,
     pub(crate) api_rx: tokio::sync::mpsc::UnboundedReceiver<crate::api::ApiRequestMessage>,
@@ -963,7 +963,7 @@ impl App {
             messages_test_process_ages: HashMap::new(),
             #[cfg(test)]
             messages_test_live_executions: std::collections::HashSet::new(),
-            messages_attached_pis: std::collections::HashSet::new(),
+            messages_attached_pis: HashMap::new(),
             event_tx,
             event_rx,
             last_git_remote_status_refresh: Instant::now() - GIT_REMOTE_STATUS_REFRESH_INTERVAL,

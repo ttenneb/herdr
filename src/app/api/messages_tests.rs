@@ -2659,7 +2659,7 @@ async fn a_live_pi_without_messages_after_30s_gets_new_messages_typed() {
         .heads;
     assert_eq!(heads.len(), 1);
     // A Pi that attached once keeps queueing even with its stream down.
-    fixture.app.messages_attached_pis.insert((old_pi, 11));
+    fixture.app.messages_attached_pis.insert((old_pi, 11), None);
     assert!(fixture.app.pane_takes_messages(&key));
 }
 
@@ -3070,4 +3070,41 @@ async fn a_stopped_or_backgrounded_old_pi_is_not_alive() {
     );
     let _ = child.kill();
     let _ = child.wait();
+}
+
+/// QA 2b #3b: a Pi that attached once but whose streams have been closed for
+/// more than 30 s (its Messages extension died) gets new messages typed.
+#[tokio::test]
+async fn a_pi_whose_messages_streams_closed_over_30s_ago_gets_typed_input() {
+    let mut fixture = fixture();
+    let session = attach_recipient(&mut fixture);
+    let key = fixture.terminals[1].clone();
+    let pi = fixture.app.foreground_pi_identity(&key).expect("pane Pi");
+    fixture
+        .app
+        .messages_test_process_ages
+        .insert(pi.0, std::time::Duration::from_secs(300));
+    assert!(fixture.app.pane_takes_messages(&key), "attached");
+    fixture
+        .app
+        .release_mailbox_bootstrap_binding(&session.binding_generation);
+    assert!(
+        fixture.app.messages_attached_pis[&pi].is_some(),
+        "closing time recorded"
+    );
+    assert!(
+        fixture.app.pane_takes_messages(&key),
+        "within 30 s: still queued"
+    );
+    fixture.app.messages_attached_pis.insert(
+        pi,
+        Some(std::time::Instant::now() - std::time::Duration::from_secs(31)),
+    );
+    assert!(
+        !fixture.app.pane_takes_messages(&key),
+        "streams closed for over 30 s: typed"
+    );
+    // Re-attaching clears it.
+    attach_recipient(&mut fixture);
+    assert!(fixture.app.pane_takes_messages(&key));
 }

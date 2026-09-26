@@ -1253,7 +1253,7 @@ impl App {
         // Remember that this exact Pi process attached (the typed fallback
         // never applies to it, even while its stream reconnects).
         if let Some(pi) = self.foreground_pi_identity(terminal_key) {
-            self.messages_attached_pis.insert(pi);
+            self.messages_attached_pis.insert(pi, None);
         }
         let mut flipped = false;
         if let Some(terminal) = self
@@ -1300,7 +1300,24 @@ impl App {
     /// Releases the binding of a closed bootstrap stream so "has Messages"
     /// reflects live connections only.
     pub(crate) fn release_mailbox_bootstrap_binding(&mut self, binding_generation: &str) {
-        self.mailbox_bootstrap_bindings.remove(binding_generation);
+        let Some(session) = self.mailbox_bootstrap_bindings.remove(binding_generation) else {
+            return;
+        };
+        // The pane's Pi closed its last stream: remember when, so a Pi whose
+        // Messages extension died falls back to typed input after 30 s.
+        let still_open = self
+            .mailbox_bootstrap_bindings
+            .values()
+            .any(|other| other.caller == session.caller);
+        if !still_open {
+            let pi = session
+                .recipient_only
+                .map(|binding| (binding.foreground_pid, binding.start_ticks))
+                .or_else(|| self.foreground_pi_identity(&session.caller));
+            if let Some(closed) = pi.and_then(|pi| self.messages_attached_pis.get_mut(&pi)) {
+                closed.get_or_insert_with(std::time::Instant::now);
+            }
+        }
     }
 
     fn accept_trusted_mailbox_bootstrap_stream(

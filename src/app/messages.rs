@@ -575,7 +575,13 @@ impl App {
         // messages typed again; queued heads wait for the next Messages Pi.
         // A pane with no Pi (plain shell, restarting) keeps queueing.
         if let Some((pid, start_ticks)) = self.foreground_pi_identity(terminal_key) {
-            if !self.messages_attached_pis.contains(&(pid, start_ticks))
+            let attached = self
+                .messages_attached_pis
+                .get(&(pid, start_ticks))
+                .is_some_and(|closed| {
+                    closed.is_none_or(|since| since.elapsed() < MESSAGES_ATTACH_GRACE)
+                });
+            if !attached
                 && self
                     .pi_process_age(pid, start_ticks)
                     .is_some_and(|age| age >= MESSAGES_ATTACH_GRACE)
