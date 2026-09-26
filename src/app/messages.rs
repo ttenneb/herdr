@@ -74,7 +74,8 @@ pub(crate) enum SendRefusal {
 pub(crate) enum HeadStanding {
     Current,
     /// Pinned to a different (or not yet known) recipient session and never
-    /// picked up; shown only through `mailbox.stranded` for Retry/Drop.
+    /// picked up: shown with `previousSession`, never claimed, until the
+    /// recipient explicitly repins (Retry) or drops it.
     Stranded,
     /// Dropped by the recipient; hidden from every view.
     Withdrawn,
@@ -111,19 +112,31 @@ pub(crate) fn head_claimable_by(head: &MailboxHead, current_session: Option<&str
     }
 }
 
-/// Removes withdrawn and stranded heads (with their states and receipts) from
-/// a recipient view. The remaining view is internally consistent.
+/// Removes withdrawn heads (with their states and receipts) from a recipient
+/// view and marks held heads pinned to another session `previousSession`.
 pub(crate) fn filter_recipient_snapshot(
     mut snapshot: crate::mailbox_v1::Snapshot,
     recovered: &RecoveredMailbox,
     current_session: Option<&str>,
 ) -> crate::mailbox_v1::Snapshot {
-    let keep: std::collections::HashSet<String> = snapshot
+    let standing: std::collections::HashMap<String, HeadStanding> = snapshot
         .heads
         .iter()
-        .filter(|head| head_standing(head, recovered, current_session) == HeadStanding::Current)
-        .map(|head| head.stable_id.clone())
+        .map(|head| {
+            (
+                head.stable_id.clone(),
+                head_standing(head, recovered, current_session),
+            )
+        })
         .collect();
+    let keep: std::collections::HashSet<String> = standing
+        .iter()
+        .filter(|(_, standing)| **standing != HeadStanding::Withdrawn)
+        .map(|(stable_id, _)| stable_id.clone())
+        .collect();
+    for state in &mut snapshot.head_states {
+        state.previous_session = standing.get(&state.stable_id) == Some(&HeadStanding::Stranded);
+    }
     snapshot.heads.retain(|head| keep.contains(&head.stable_id));
     snapshot
         .head_states
@@ -389,19 +402,37 @@ impl App {
         pending.sort_by_key(|head| std::cmp::Reverse(head.enqueue_epoch));
         let listed =
             |pending: &[&MailboxHead]| pending.iter().map(|head| pending_view(head)).collect();
+        // The newest head from this sender to this recipient with the same
+        // correlation namespace and key, in any lifecycle except dropped.
         let correlated = message.correlation.as_ref().and_then(|correlation| {
-            pending.iter().copied().find(|head| {
-                head.delivery
-                    .as_ref()
-                    .and_then(|delivery| delivery.correlation.as_ref())
-                    .is_some_and(|existing| {
-                        existing.namespace == correlation.namespace
-                            && existing.key == correlation.key
-                    })
-            })
+            recovered
+                .heads
+                .values()
+                .filter(|head| {
+                    head.recipient == recipient
+                        && head.sender == sender_key
+                        && !recovered
+                            .claims
+                            .get(&head.stable_id)
+                            .is_some_and(is_withdrawn_claim)
+                        && head
+                            .delivery
+                            .as_ref()
+                            .and_then(|delivery| delivery.correlation.as_ref())
+                            .is_some_and(|existing| {
+                                existing.namespace == correlation.namespace
+                                    && existing.key == correlation.key
+                            })
+                })
+                .max_by_key(|head| head.enqueue_epoch)
         });
-        let edit_target = if message.replace_pending && correlated.is_some() {
-            correlated
+        // `replace_pending` edits the correlated head while it waits; once it
+        // was picked up the sender must decide again (never auto-send).
+        let edit_target = if let (true, Some(head)) = (message.replace_pending, correlated) {
+            if recovered.claims.contains_key(&head.stable_id) {
+                return Err(SendRefusal::PendingChanged(listed(&pending)));
+            }
+            Some(head)
         } else if let Some(wanted) = options.edit_pending.as_deref() {
             match pending
                 .iter()

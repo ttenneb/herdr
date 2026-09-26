@@ -15,7 +15,7 @@ A structured prompt with `supersession.mode = replace_pending` edits its own wai
 Handoffs keep their exact `HERDR HANDOFF v1` text as the body, and plain prompts use the subject "Message from <sender>". Senders are attributed from the calling process's pane; that attribution is never authority.
 
 ## Restarting Pi
-A message is tied to the recipient's Pi session at send time. After a restart, messages for the old session never run on their own. The recipient's Messages lists them through `mailbox.stranded`, and the human can Retry (`mailbox.adopt`) or Drop (`mailbox.drop`) each one.
+A message is tied to the recipient's Pi session at send time. After a restart, messages for the old session stay visible with `headStates[].previousSession = true` (and `recipientSession`), but `mailbox.claim` skips them, so they never run on their own and never block newer messages. The recipient explicitly Retries (`mailbox.repin`, which repins to the current session as a new revision with its admitted receipt) or Drops (`mailbox.drop`, a durable withdrawn claim, settled) each one, with `expectedRevision`.
 
 ## Pis without a trusted launch
 With `[experimental] unmanaged_pi_messages = true` (default false), a typed `pi` or a Collection helper also gets Messages.
@@ -27,4 +27,6 @@ With `[experimental] unmanaged_pi_messages = true` (default false), a typed `pi`
 Editing a waiting message now records an admitted receipt for the new revision, so the recipient's current list and settled history stay valid.
 
 ## For Pi integrators
-New stream methods: `mailbox.watch` (long-poll), `mailbox.stranded`, `mailbox.adopt` and `mailbox.drop`. They are advertised under `messages` in the bootstrap descriptor.
+- The descriptor carries `binding`: `managed`, `history_only` or `recipient_only`. A recipient-only descriptor has a recipient-scoped `grantId` and no `reportSubmit` or `parentReport`.
+- `messages` advertises `watchMethod` (`mailbox.watch`, max `watchMaxWaitMs` 30000), `repinMethod` and `dropMethod`.
+- `mailbox.watch {protocol, afterCursor?, waitMs?}` returns `{type:"mailbox_watch", changed, cursor}`. Use a dedicated second accepted stream: additional streams never revoke earlier ones.

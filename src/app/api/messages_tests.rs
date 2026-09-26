@@ -460,6 +460,21 @@ async fn structured_prompt_header_becomes_head_fields_and_replace_pending_edits(
     assert_eq!(heads.len(), 1);
     assert_eq!(heads[0]["body"], "body r2");
     assert_eq!(heads[0]["priority"], "high");
+    // Once the correlated head was picked up, replace_pending asks again.
+    dispatch(
+        &mut fixture.app,
+        &session,
+        "mailbox.claim",
+        json!({"protocol": crate::mailbox_v1::PROTOCOL}),
+    )
+    .unwrap();
+    let late = crate::app::messages::parse_structured_prompt(&header(3, true)).unwrap();
+    assert!(matches!(
+        fixture
+            .app
+            .route_ordinary_send(&recipient, &sender, late, &Default::default()),
+        Err(SendRefusal::PendingChanged(_))
+    ));
     assert!(crate::app::messages::parse_structured_prompt("plain text").is_none());
 }
 
@@ -518,12 +533,12 @@ async fn handoff_to_a_recipient_with_messages_is_queued_with_the_exact_envelope_
 }
 
 #[tokio::test]
-async fn previous_session_heads_never_run_and_can_be_adopted_or_dropped() {
+async fn previous_session_heads_never_run_and_can_be_repinned_or_dropped() {
     let mut fixture = fixture();
     let session = attach_recipient(&mut fixture);
     let recipient = fixture.terminals[1].clone();
     let sender = sender(&fixture);
-    for (index, body) in ["keep me", "drop me"].iter().enumerate() {
+    for (index, body) in ["keep me", "drop me", "later"].iter().enumerate() {
         fixture
             .app
             .route_ordinary_send(
@@ -536,19 +551,48 @@ async fn previous_session_heads_never_run_and_can_be_adopted_or_dropped() {
                 },
             )
             .unwrap();
+        if index == 1 {
+            // The human restarts Pi in the pane: a new session is reported.
+            report_session(
+                &mut fixture.app,
+                1,
+                fixture.panes[1],
+                "/sessions/s1-b.jsonl",
+                20,
+            );
+        }
     }
-    // The human restarts Pi in the pane: a new session is reported.
-    report_session(
+    let snapshot = dispatch(
         &mut fixture.app,
-        1,
-        fixture.panes[1],
-        "/sessions/s1-b.jsonl",
-        20,
+        &session,
+        "mailbox.snapshot",
+        json!({"protocol": crate::mailbox_v1::PROTOCOL}),
+    )
+    .unwrap()["snapshot"]
+        .clone();
+    let heads = snapshot["heads"].as_array().unwrap().clone();
+    let states = snapshot["headStates"].as_array().unwrap().clone();
+    assert_eq!(heads.len(), 3, "previous-session heads stay visible");
+    let state_of = |body: &str| {
+        let head = heads.iter().find(|head| head["body"] == body).unwrap();
+        states
+            .iter()
+            .find(|state| state["stableId"] == head["stableId"])
+            .unwrap()
+            .clone()
+    };
+    assert_eq!(state_of("keep me")["previousSession"], true);
+    assert_eq!(
+        state_of("keep me")["recipientSession"],
+        "/sessions/s1-a.jsonl"
     );
-    assert!(
-        snapshot_heads(&mut fixture.app, &session).is_empty(),
-        "never shown as current"
+    assert_eq!(state_of("drop me")["previousSession"], true);
+    assert!(state_of("later").get("previousSession").is_none());
+    assert_eq!(
+        state_of("later")["recipientSession"],
+        "/sessions/s1-b.jsonl"
     );
+    // Claim skips the previous-session heads instead of blocking on them.
     let claim = dispatch(
         &mut fixture.app,
         &session,
@@ -556,17 +600,18 @@ async fn previous_session_heads_never_run_and_can_be_adopted_or_dropped() {
         json!({"protocol": crate::mailbox_v1::PROTOCOL}),
     )
     .unwrap();
-    assert!(claim["claim"].is_null(), "never claimed automatically");
-    let stranded = dispatch(
-        &mut fixture.app,
-        &session,
-        "mailbox.stranded",
-        json!({"protocol": crate::mailbox_v1::PROTOCOL}),
-    )
-    .unwrap();
-    assert_eq!(stranded["currentSession"], "/sessions/s1-b.jsonl");
-    let heads = stranded["heads"].as_array().unwrap().clone();
-    assert_eq!(heads.len(), 2);
+    let later = heads.iter().find(|head| head["body"] == "later").unwrap();
+    assert_eq!(claim["claim"]["stableId"], later["stableId"]);
+    let claim_id = claim["claim"]["claimId"].as_str().unwrap().to_string();
+    for outcome in ["admitted", "settled"] {
+        dispatch(
+            &mut fixture.app,
+            &session,
+            "mailbox.resolve",
+            json!({"protocol": crate::mailbox_v1::PROTOCOL, "claimId": claim_id, "outcome": outcome}),
+        )
+        .unwrap();
+    }
     let pick = |body: &str| {
         heads
             .iter()
@@ -574,48 +619,50 @@ async fn previous_session_heads_never_run_and_can_be_adopted_or_dropped() {
             .unwrap()
             .clone()
     };
-    let version = |head: &serde_json::Value| {
+    let version = |head: &serde_json::Value, revision: u64| {
         json!({"protocol": crate::mailbox_v1::PROTOCOL, "stableId": head["stableId"],
-               "revision": head["revision"], "digest": head["digest"]})
+               "expectedRevision": revision})
     };
-    dispatch(
-        &mut fixture.app,
-        &session,
-        "mailbox.adopt",
-        version(&pick("keep me")),
-    )
-    .unwrap();
-    dispatch(
-        &mut fixture.app,
-        &session,
-        "mailbox.drop",
-        version(&pick("drop me")),
-    )
-    .unwrap();
-    let current = snapshot_heads(&mut fixture.app, &session);
-    assert_eq!(current.len(), 1);
-    assert_eq!(current[0]["body"], "keep me");
-    assert_eq!(
-        current[0]["delivery"]["recipientSession"],
-        "/sessions/s1-b.jsonl"
-    );
-    let stranded = dispatch(
-        &mut fixture.app,
-        &session,
-        "mailbox.stranded",
-        json!({"protocol": crate::mailbox_v1::PROTOCOL}),
-    )
-    .unwrap();
-    assert!(stranded["heads"].as_array().unwrap().is_empty());
-    // A current (non-stranded) head cannot be dropped through this path.
+    // Stale expectedRevision is refused.
     assert!(dispatch(
         &mut fixture.app,
         &session,
-        "mailbox.drop",
-        version(&current[0])
+        "mailbox.repin",
+        version(&pick("keep me"), 9)
     )
     .is_err());
-    // The dropped head never appears in history either.
+    let repinned = dispatch(
+        &mut fixture.app,
+        &session,
+        "mailbox.repin",
+        version(&pick("keep me"), 1),
+    )
+    .unwrap();
+    assert_eq!(repinned["type"], "mailbox_repinned");
+    assert_eq!(repinned["revision"], 2);
+    assert_eq!(repinned["receipt"]["revision"], 2);
+    assert_eq!(repinned["receipt"]["status"], "admitted");
+    assert_eq!(repinned["recipientSession"], "/sessions/s1-b.jsonl");
+    let dropped = dispatch(
+        &mut fixture.app,
+        &session,
+        "mailbox.drop",
+        version(&pick("drop me"), 1),
+    )
+    .unwrap();
+    assert_eq!(dropped["type"], "mailbox_dropped");
+    assert_eq!(dropped["receipt"]["resolution"]["outcome"], "settled");
+    let current = snapshot_heads(&mut fixture.app, &session);
+    let bodies: Vec<_> = current.iter().map(|head| head["body"].clone()).collect();
+    assert!(!bodies.contains(&json!("drop me")));
+    assert!(bodies.contains(&json!("keep me")));
+    // A current-session head cannot be repinned or dropped.
+    let kept = current
+        .iter()
+        .find(|head| head["body"] == "keep me")
+        .unwrap();
+    assert!(dispatch(&mut fixture.app, &session, "mailbox.drop", version(kept, 2)).is_err());
+    // The repinned head is now claimable; the dropped one never appears in history.
     let claim = dispatch(
         &mut fixture.app,
         &session,
@@ -623,6 +670,7 @@ async fn previous_session_heads_never_run_and_can_be_adopted_or_dropped() {
         json!({"protocol": crate::mailbox_v1::PROTOCOL}),
     )
     .unwrap();
+    assert_eq!(claim["claim"]["stableId"], kept["stableId"]);
     let claim_id = claim["claim"]["claimId"].as_str().unwrap().to_string();
     for outcome in ["admitted", "settled"] {
         dispatch(
@@ -640,13 +688,73 @@ async fn previous_session_heads_never_run_and_can_be_adopted_or_dropped() {
         json!({"protocol": crate::mailbox_v1::PROTOCOL}),
     )
     .unwrap();
-    let bodies: Vec<_> = history["snapshot"]["heads"]
+    let mut bodies: Vec<_> = history["snapshot"]["heads"]
         .as_array()
         .unwrap()
         .iter()
-        .map(|head| head["body"].clone())
+        .map(|head| head["body"].as_str().unwrap().to_string())
         .collect();
-    assert_eq!(bodies, vec![json!("keep me")]);
+    bodies.sort();
+    assert_eq!(bodies, vec!["keep me", "later"]);
+}
+
+#[tokio::test]
+async fn a_second_accepted_stream_never_revokes_the_first() {
+    let mut fixture = fixture();
+    let first = attach_recipient(&mut fixture);
+    let recipient = fixture.terminals[1].clone();
+    let sender = sender(&fixture);
+    fixture
+        .app
+        .route_ordinary_send(&recipient, &sender, plain("one"), &Default::default())
+        .unwrap();
+    let claim = dispatch(
+        &mut fixture.app,
+        &first,
+        "mailbox.claim",
+        json!({"protocol": crate::mailbox_v1::PROTOCOL}),
+    )
+    .unwrap();
+    // Pi opens a dedicated watch stream for the same execution.
+    let pair = std::os::unix::net::UnixStream::pair().unwrap();
+    let second = fixture
+        .app
+        .accept_mailbox_bootstrap_stream(pair.0.as_raw_fd())
+        .expect("second stream accepted");
+    assert_ne!(second.binding_generation, first.binding_generation);
+    assert!(fixture
+        .app
+        .mailbox_bootstrap_session_current(&first)
+        .is_ok());
+    assert!(fixture
+        .app
+        .mailbox_bootstrap_session_current(&second)
+        .is_ok());
+    // The first stream's outstanding claim still resolves through it.
+    let claim_id = claim["claim"]["claimId"].as_str().unwrap().to_string();
+    for outcome in ["admitted", "settled"] {
+        dispatch(
+            &mut fixture.app,
+            &first,
+            "mailbox.resolve",
+            json!({"protocol": crate::mailbox_v1::PROTOCOL, "claimId": claim_id, "outcome": outcome}),
+        )
+        .unwrap();
+    }
+    assert!(fixture.app.mailbox_watch_marker(&second).is_ok());
+    // Closing the watch stream releases only its own binding.
+    fixture
+        .app
+        .release_mailbox_bootstrap_binding(&second.binding_generation);
+    assert!(fixture
+        .app
+        .mailbox_bootstrap_session_current(&first)
+        .is_ok());
+    assert!(fixture
+        .app
+        .attached_messages_recipient(&recipient)
+        .is_some());
+    drop(pair);
 }
 
 #[tokio::test]
@@ -678,6 +786,19 @@ async fn recipient_only_binding_never_grants_send_report_or_route_authority() {
         .is_err());
     let session = attach_recipient(&mut fixture);
     let binding = session.recipient_only.expect("recipient-only binding");
+    let descriptor = crate::server::mailbox_bootstrap::descriptor_value(&session);
+    assert_eq!(descriptor["binding"], "recipient_only");
+    assert_eq!(
+        descriptor["grantId"],
+        format!("recipient-only:{}", fixture.terminals[1])
+    );
+    for absent in ["reportSubmit", "parentReport"] {
+        assert!(
+            descriptor.get(absent).is_none(),
+            "{absent} must not be advertised"
+        );
+    }
+    assert_eq!(descriptor["messages"]["repinMethod"], "mailbox.repin");
     assert_eq!(binding.foreground_pid, pid);
     assert!(session.parent_report.is_none());
     for (method, params) in [

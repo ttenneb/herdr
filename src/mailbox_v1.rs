@@ -129,6 +129,13 @@ pub struct HeadState {
     pub lifecycle: HeadLifecycle,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub claim_id: Option<String>,
+    /// The recipient Pi session a server-sent head is pinned to.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recipient_session: Option<String>,
+    /// True for a held head pinned to a different session than the viewing
+    /// recipient's current one: shown, never claimed, until Retry or Drop.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub previous_session: bool,
 }
 
 pub fn snapshot(
@@ -204,6 +211,11 @@ pub fn snapshot(
                 digest: head.digest.clone(),
                 lifecycle,
                 claim_id: claim.map(|claim| claim.claim_id.clone()),
+                recipient_session: head
+                    .delivery
+                    .as_ref()
+                    .and_then(|delivery| delivery.recipient_session.clone()),
+                previous_session: false,
             }
         })
         .collect();

@@ -384,18 +384,15 @@ impl App {
         struct HeadVersionParams {
             protocol: String,
             stable_id: String,
-            revision: u64,
-            digest: String,
+            expected_revision: u64,
         }
         let recipient_only = session.recipient_only.is_some();
-        let known = matches!(
-            method,
-            "mailbox.stranded" | "mailbox.adopt" | "mailbox.drop"
-        ) || (recipient_only
-            && matches!(
-                method,
-                "mailbox.snapshot" | "mailbox.claim" | "mailbox.edit" | "mailbox.resolve"
-            ));
+        let known = matches!(method, "mailbox.repin" | "mailbox.drop")
+            || (recipient_only
+                && matches!(
+                    method,
+                    "mailbox.snapshot" | "mailbox.claim" | "mailbox.edit" | "mailbox.resolve"
+                ));
         if !known {
             return None;
         }
@@ -427,8 +424,7 @@ impl App {
                     .get(&params.stable_id)
                     .filter(|head| {
                         head.recipient == recipient
-                            && head.revision == params.revision
-                            && head.digest == params.digest
+                            && head.revision == params.expected_revision
                             && crate::app::messages::head_standing(
                                 head,
                                 recovered,
@@ -447,50 +443,41 @@ impl App {
                 serde_json::to_value(result).map_err(|_| MailboxBootstrapError::InvalidRequest)
             };
             match method {
-                "mailbox.stranded" => {
-                    let params: ProtocolParams = serde_json::from_value(params.clone())
-                        .map_err(|_| MailboxBootstrapError::InvalidRequest)?;
-                    protocol_ok(&params.protocol)?;
-                    let recovered = load()?;
-                    let heads: Vec<_> = recovered
-                        .heads
-                        .values()
-                        .filter(|head| {
-                            head.recipient == recipient
-                                && crate::app::messages::head_standing(
-                                    head,
-                                    &recovered,
-                                    current.as_deref(),
-                                ) == crate::app::messages::HeadStanding::Stranded
-                        })
-                        .cloned()
-                        .collect();
-                    Ok(serde_json::json!({
-                        "type": "mailbox_stranded",
-                        "currentSession": current,
-                        "heads": heads,
-                    }))
-                }
-                "mailbox.adopt" => {
+                "mailbox.repin" => {
                     let params: HeadVersionParams = serde_json::from_value(params.clone())
                         .map_err(|_| MailboxBootstrapError::InvalidRequest)?;
                     protocol_ok(&params.protocol)?;
                     let session_value =
                         current.clone().ok_or(MailboxBootstrapError::GrantMissing)?;
                     let head = stranded_head(&load()?, &params)?;
-                    store
+                    let repinned = store
                         .edit_unclaimed_head(crate::mailbox::MailboxHeadEdit {
                             stable_id: head.stable_id,
                             revision: head.revision,
                             digest: head.digest,
                             subject: head.subject,
                             body: head.body,
-                            repin_recipient_session: Some(session_value),
+                            repin_recipient_session: Some(session_value.clone()),
                         })
                         .map_err(|_| MailboxBootstrapError::InvalidRequest)?;
-                    to_value(ResponseResult::MailboxSnapshot {
-                        snapshot: view(&load()?)?,
-                    })
+                    let recovered = load()?;
+                    let receipt = recovered
+                        .receipts
+                        .get(&repinned.delivery_digest)
+                        .filter(|receipt| {
+                            receipt.revision == repinned.revision
+                                && receipt.digest == repinned.digest
+                        })
+                        .cloned()
+                        .ok_or(MailboxBootstrapError::GrantMissing)?;
+                    Ok(serde_json::json!({
+                        "type": "mailbox_repinned",
+                        "stableId": repinned.stable_id,
+                        "revision": repinned.revision,
+                        "recipientSession": session_value,
+                        "receipt": receipt,
+                        "snapshot": view(&recovered)?,
+                    }))
                 }
                 "mailbox.drop" => {
                     let params: HeadVersionParams = serde_json::from_value(params.clone())
@@ -500,9 +487,25 @@ impl App {
                     store
                         .withdraw_unclaimed_head(&head.stable_id, head.revision, &head.digest)
                         .map_err(|_| MailboxBootstrapError::InvalidRequest)?;
-                    to_value(ResponseResult::MailboxSnapshot {
-                        snapshot: view(&load()?)?,
-                    })
+                    let recovered = load()?;
+                    let claim = recovered
+                        .claims
+                        .get(&head.stable_id)
+                        .filter(|claim| crate::mailbox::is_withdrawn_claim(claim))
+                        .cloned()
+                        .ok_or(MailboxBootstrapError::GrantMissing)?;
+                    let resolution = recovered
+                        .resolutions
+                        .get(&claim.claim_id)
+                        .cloned()
+                        .ok_or(MailboxBootstrapError::GrantMissing)?;
+                    Ok(serde_json::json!({
+                        "type": "mailbox_dropped",
+                        "stableId": head.stable_id,
+                        "revision": head.revision,
+                        "receipt": {"claim": claim, "resolution": resolution},
+                        "snapshot": view(&recovered)?,
+                    }))
                 }
                 "mailbox.snapshot" => {
                     let params: ProtocolParams = serde_json::from_value(params.clone())

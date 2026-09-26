@@ -42,11 +42,12 @@ pub(crate) struct MailboxBootstrapDescriptor {
     /// cannot expose pending heads or mint a grant for old work.
     pub history_snapshot: ReportSubmitAdvertisement,
     pub history_only: bool,
-    /// True for a Pi without a trusted managed launch: own inbox only.
-    #[serde(skip_serializing_if = "std::ops::Not::not")]
-    pub recipient_only: bool,
+    /// `managed` (trusted managed launch), `history_only`, or
+    /// `recipient_only` (no trusted launch: own inbox only, and no sender,
+    /// report or route advertisement is ever present).
+    pub binding: &'static str,
     /// Own-inbox methods beyond the v1 set: `mailbox.watch` (long-poll),
-    /// `mailbox.stranded`, `mailbox.adopt` and `mailbox.drop`.
+    /// `mailbox.repin` (Retry) and `mailbox.drop` (Drop).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub messages: Option<MessagesAdvertisement>,
     /// Offered only when the server can validate an exact active delegation
@@ -67,8 +68,8 @@ pub(crate) struct MailboxBootstrapDescriptor {
 #[serde(rename_all = "camelCase")]
 pub(crate) struct MessagesAdvertisement {
     pub watch_method: &'static str,
-    pub stranded_method: &'static str,
-    pub adopt_method: &'static str,
+    pub watch_max_wait_ms: u64,
+    pub repin_method: &'static str,
     pub drop_method: &'static str,
     pub protocol: &'static str,
 }
@@ -97,6 +98,16 @@ pub(crate) struct ParentReportAdvertisement {
     pub grant_id: String,
 }
 
+/// The descriptor a session would receive, as JSON (tests and diagnostics).
+#[cfg(test)]
+pub(crate) fn descriptor_value(session: &MailboxBootstrapSession) -> Value {
+    serde_json::to_value(MailboxBootstrapDescriptor::from_session(
+        session,
+        &mailbox_bootstrap_socket_path(),
+    ))
+    .expect("descriptor serializes")
+}
+
 impl MailboxBootstrapDescriptor {
     fn from_session(session: &MailboxBootstrapSession, endpoint: &Path) -> Self {
         Self {
@@ -112,11 +123,17 @@ impl MailboxBootstrapDescriptor {
                 protocol: crate::mailbox_v1::PROTOCOL,
             },
             history_only: session.history_only,
-            recipient_only: session.recipient_only.is_some(),
+            binding: if session.recipient_only.is_some() {
+                "recipient_only"
+            } else if session.history_only {
+                "history_only"
+            } else {
+                "managed"
+            },
             messages: (!session.history_only).then_some(MessagesAdvertisement {
                 watch_method: "mailbox.watch",
-                stranded_method: "mailbox.stranded",
-                adopt_method: "mailbox.adopt",
+                watch_max_wait_ms: MAX_WATCH_TIMEOUT_MS,
+                repin_method: "mailbox.repin",
                 drop_method: "mailbox.drop",
                 protocol: crate::mailbox_v1::PROTOCOL,
             }),
@@ -226,11 +243,11 @@ struct ParkedWatch {
 const MAX_WATCH_TIMEOUT_MS: u64 = 30_000;
 const DEFAULT_WATCH_TIMEOUT_MS: u64 = 25_000;
 
-fn watch_response(request_id: Option<String>, changed: bool, marker: u64) -> String {
+fn watch_response(request_id: Option<String>, changed: bool, cursor: u64) -> String {
     serde_json::to_string(&BootstrapSuccess {
         ok: true,
         request_id,
-        result: serde_json::json!({"type": "mailbox_watch", "changed": changed, "marker": marker}),
+        result: serde_json::json!({"type": "mailbox_watch", "changed": changed, "cursor": cursor}),
     })
     .unwrap_or_else(|_| failure(None, MailboxBootstrapError::GrantMissing))
 }
@@ -412,9 +429,9 @@ impl MailboxBootstrapListener {
             struct WatchParams {
                 protocol: String,
                 #[serde(default)]
-                after_marker: Option<u64>,
+                after_cursor: Option<u64>,
                 #[serde(default)]
-                timeout_ms: Option<u64>,
+                wait_ms: Option<u64>,
             }
             let Ok(params) = serde_json::from_value::<WatchParams>(request.params) else {
                 return Some(failure(request_id, MailboxBootstrapError::InvalidRequest));
@@ -429,10 +446,16 @@ impl MailboxBootstrapListener {
                 Ok(marker) => marker,
                 Err(error) => return Some(failure(request_id, error)),
             };
-            return match params.after_marker {
+            if params
+                .wait_ms
+                .is_some_and(|wait| wait > MAX_WATCH_TIMEOUT_MS)
+            {
+                return Some(failure(request_id, MailboxBootstrapError::InvalidRequest));
+            }
+            return match params.after_cursor {
                 Some(after) if after == marker => {
                     let timeout = params
-                        .timeout_ms
+                        .wait_ms
                         .unwrap_or(DEFAULT_WATCH_TIMEOUT_MS)
                         .min(MAX_WATCH_TIMEOUT_MS);
                     connection.watch = Some(ParkedWatch {
@@ -826,7 +849,8 @@ mod tests {
             descriptor["result"]["messages"]["watchMethod"],
             "mailbox.watch"
         );
-        assert!(descriptor["result"].get("recipientOnly").is_none());
+        assert_eq!(descriptor["result"]["messages"]["watchMaxWaitMs"], 30000);
+        assert_eq!(descriptor["result"]["binding"], "managed");
         let binding = descriptor["result"]["bindingGeneration"]
             .as_str()
             .unwrap()
@@ -840,10 +864,10 @@ mod tests {
                    "params":{"protocol":crate::mailbox_v1::PROTOCOL}}),
         );
         assert_eq!(first["result"]["changed"], false);
-        let marker = first["result"]["marker"].as_u64().unwrap();
+        let marker = first["result"]["cursor"].as_u64().unwrap();
         // Parked: no response while nothing changes.
         let frame = json!({"method":"mailbox.watch","requestId":"w1","bindingGeneration":binding,
-            "params":{"protocol":crate::mailbox_v1::PROTOCOL,"afterMarker":marker,"timeoutMs":5000}});
+            "params":{"protocol":crate::mailbox_v1::PROTOCOL,"afterCursor":marker,"waitMs":5000}});
         client.write_all(format!("{frame}\n").as_bytes()).unwrap();
         listener.poll(&mut app).unwrap();
         client
@@ -896,7 +920,27 @@ mod tests {
         let response: Value = serde_json::from_slice(&response).unwrap();
         assert_eq!(response["requestId"], "w1");
         assert_eq!(response["result"]["changed"], true);
-        assert_ne!(response["result"]["marker"].as_u64().unwrap(), marker);
+        assert_ne!(response["result"]["cursor"].as_u64().unwrap(), marker);
+        // C1: a second accepted stream (Pi's dedicated watch stream) never
+        // revokes the first stream's binding.
+        let mut second = UnixStream::connect(listener.path()).expect("second stream");
+        second
+            .set_read_timeout(Some(Duration::from_secs(1)))
+            .unwrap();
+        let second_descriptor = bootstrap(&mut listener, &mut app, &mut second);
+        assert_eq!(second_descriptor["ok"], true);
+        assert_ne!(second_descriptor["result"]["bindingGeneration"], binding);
+        let still = exchange(
+            &mut listener,
+            &mut app,
+            &mut client,
+            json!({"method":"mailbox.snapshot","requestId":"s-after","bindingGeneration":binding,
+                   "params":{"protocol":crate::mailbox_v1::PROTOCOL}}),
+        );
+        assert_eq!(still["ok"], true, "{still}");
+        drop(second);
+        listener.poll(&mut app).unwrap();
+        assert!(app.attached_messages_recipient(&sender).is_some());
         // Closing the stream releases the binding: no longer "has Messages".
         drop(client);
         listener.poll(&mut app).unwrap();
