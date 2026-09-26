@@ -84,6 +84,65 @@ pub(crate) fn shared() -> EnvGuard {
     }
 }
 
+/// Test builds only: where `config_dir()` and `state_dir()` resolve when a
+/// test has not deliberately pointed them somewhere.
+///
+/// Those directories follow `XDG_CONFIG_HOME`, `XDG_STATE_HOME` and `HOME`,
+/// which tests holding [`lock`] replace. Any other test that reaches them
+/// (a plugin registry refresh on an event, a session save, a manifest cache)
+/// would otherwise write into whichever test directory is set right now, or
+/// read and write the developer's real config and state dirs. The environment
+/// is honoured only for a [`lock`] holder that set `xdg_var` or `HOME`; every
+/// other caller gets a private per-process directory.
+pub(crate) fn sandbox_dir(kind: &str, xdg_var: &str) -> Option<std::path::PathBuf> {
+    if HELD.with(Cell::get) == Held::Exclusive
+        && (std::env::var_os(xdg_var).is_some() || home_overridden())
+    {
+        return None;
+    }
+    static ROOT: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
+    let root = ROOT.get_or_init(|| {
+        std::env::temp_dir().join(format!("herdr-test-home-{}", std::process::id()))
+    });
+    Some(root.join(kind))
+}
+
+/// Whether `HOME` differs from the account's home directory.
+fn home_overridden() -> bool {
+    let Some(home) = std::env::var_os("HOME") else {
+        return true;
+    };
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        let mut buffer = vec![0u8; 16 * 1024];
+        let mut entry: libc::passwd = unsafe { std::mem::zeroed() };
+        let mut result: *mut libc::passwd = std::ptr::null_mut();
+        // SAFETY: getpwuid_r writes only into `entry` and `buffer`, whose
+        // sizes are passed; `result` is null or points at `entry`.
+        let status = unsafe {
+            libc::getpwuid_r(
+                libc::getuid(),
+                &mut entry,
+                buffer.as_mut_ptr().cast(),
+                buffer.len(),
+                &mut result,
+            )
+        };
+        if status != 0 || result.is_null() || entry.pw_dir.is_null() {
+            return true;
+        }
+        // SAFETY: pw_dir is a NUL-terminated string inside `buffer`.
+        let account_home = unsafe { std::ffi::CStr::from_ptr(entry.pw_dir) };
+        account_home.to_bytes() != home.as_bytes()
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = home;
+        false
+    }
+}
+
 /// Write an owner-only executable script without this process ever holding a
 /// writable descriptor on it.
 ///
@@ -121,6 +180,26 @@ pub(crate) fn write_executable(path: &std::path::Path, contents: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn config_and_state_dirs_follow_the_environment_only_under_the_lock() {
+        let sandboxed = crate::config::config_dir();
+        assert!(sandboxed.starts_with(sandbox_dir("config", "XDG_CONFIG_HOME").unwrap()));
+        assert!(
+            crate::config::state_dir().starts_with(sandbox_dir("state", "XDG_STATE_HOME").unwrap())
+        );
+        let _guard = lock();
+        let previous = std::env::var_os("XDG_CONFIG_HOME");
+        std::env::set_var("XDG_CONFIG_HOME", "/nonexistent/xdg-config");
+        assert_eq!(
+            crate::config::config_dir(),
+            std::path::Path::new("/nonexistent/xdg-config").join(crate::config::app_dir_name())
+        );
+        match previous {
+            Some(value) => std::env::set_var("XDG_CONFIG_HOME", value),
+            None => std::env::remove_var("XDG_CONFIG_HOME"),
+        }
+    }
 
     #[test]
     fn guards_nest_on_one_thread() {

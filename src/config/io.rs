@@ -28,6 +28,10 @@ pub fn app_dir_name() -> &'static str {
 }
 
 pub fn config_dir() -> PathBuf {
+    #[cfg(test)]
+    if let Some(dir) = crate::test_env::sandbox_dir("config", "XDG_CONFIG_HOME") {
+        return dir.join(app_dir_name());
+    }
     if let Ok(dir) = std::env::var("XDG_CONFIG_HOME") {
         return PathBuf::from(dir).join(app_dir_name());
     }
@@ -35,6 +39,10 @@ pub fn config_dir() -> PathBuf {
 }
 
 pub fn state_dir() -> PathBuf {
+    #[cfg(test)]
+    if let Some(dir) = crate::test_env::sandbox_dir("state", "XDG_STATE_HOME") {
+        return dir.join(app_dir_name());
+    }
     if let Ok(dir) = std::env::var("XDG_STATE_HOME") {
         return PathBuf::from(dir).join(app_dir_name());
     }
