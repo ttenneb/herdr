@@ -186,7 +186,7 @@ impl App {
                     {
                         if let Some(terminal_id) = terminal_id {
                             self.acknowledge_terminal_input(&terminal_id);
-                            self.note_human_text(&terminal_id, text);
+                            self.note_human_text(&terminal_id, text, false);
                         }
                     }
                 }
@@ -278,7 +278,7 @@ impl App {
                     let pasted = text.clone();
                     let sent = rt.send_paste(text).await.is_ok();
                     if sent {
-                        self.note_human_text(&terminal_id, &pasted);
+                        self.note_human_text(&terminal_id, &pasted, true);
                     }
                     return sent.then_some(terminal_id);
                 }

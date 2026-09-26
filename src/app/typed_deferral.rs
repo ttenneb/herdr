@@ -53,10 +53,12 @@ fn key_effect(key: &crate::input::TerminalKey) -> Option<isize> {
     let control = key.modifiers.contains(KeyModifiers::CONTROL);
     let alt = key.modifiers.contains(KeyModifiers::ALT);
     match key.code {
-        KeyCode::Enter | KeyCode::Esc => None,
-        KeyCode::Char(c) if control && matches!(c.to_ascii_lowercase(), 'c' | 'u' | 'j' | 'm') => {
-            None
-        }
+        // Only a real, unmodified Enter submits. A modified Enter (Shift,
+        // Alt, Ctrl) inserts a newline in most agent editors; Esc proves
+        // nothing about the editor's content.
+        KeyCode::Enter if key.modifiers.is_empty() => None,
+        KeyCode::Enter => Some(1),
+        KeyCode::Char(c) if control && matches!(c.to_ascii_lowercase(), 'c' | 'u') => None,
         KeyCode::Char(_) if control || alt => Some(0),
         KeyCode::Char(_) => Some(
             key.generated_text
@@ -114,14 +116,15 @@ impl App {
         }
     }
 
-    /// Human text (a paste or a text commit) reached this terminal.
-    pub(crate) fn note_human_text(&mut self, terminal_id: &TerminalId, text: &str) {
-        let added = text.chars().filter(|c| !c.is_control()).count();
-        if text.ends_with('\r') || text.ends_with('\n') {
-            // A committed line was submitted with it.
+    /// Human text reached this terminal: a paste (`paste`: bracketed, so a
+    /// trailing newline stays in the unsent draft) or a text commit, where a
+    /// trailing carriage return is a raw Enter byte that submits.
+    pub(crate) fn note_human_text(&mut self, terminal_id: &TerminalId, text: &str, paste: bool) {
+        if !paste && text.ends_with('\r') {
             self.clear_human_draft(terminal_id);
             return;
         }
+        let added = text.chars().filter(|c| *c != '\u{1b}').count();
         if added > 0 {
             let draft = self.human_drafts.entry(terminal_id.clone()).or_default();
             draft.count = draft.count.saturating_add(added);
