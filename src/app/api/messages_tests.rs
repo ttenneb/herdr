@@ -1859,6 +1859,30 @@ async fn a_second_accepted_stream_never_revokes_the_first() {
         .accept_mailbox_bootstrap_stream(pair.0.as_raw_fd())
         .expect("second stream accepted");
     assert_ne!(second.binding_generation, first.binding_generation);
+    // This fixture is a hand-typed Pi: both streams are recipient-only and
+    // both advertise the watch.
+    for session in [&first, &second] {
+        assert!(session.recipient_only.is_some());
+        let descriptor = crate::server::mailbox_bootstrap::descriptor_value(session);
+        assert_eq!(descriptor["binding"], "recipient_only");
+        assert_eq!(descriptor["messages"]["watchMethod"], "mailbox.watch");
+        assert_eq!(descriptor["messages"]["watchMaxWaitMs"], 30000);
+    }
+    // The watch stream sees the next append while the first stays current.
+    let watched = fixture.app.mailbox_watch_marker(&second).unwrap();
+    fixture
+        .app
+        .route_ordinary_send(
+            &recipient,
+            &sender,
+            plain("two"),
+            &MessageSendOptions {
+                send_new: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    assert_ne!(fixture.app.mailbox_watch_marker(&second).unwrap(), watched);
     assert!(fixture
         .app
         .mailbox_bootstrap_session_current(&first)
