@@ -76,6 +76,39 @@ impl App {
                 },
             );
         }
+        // A recipient Herdr put to sleep is not refused: the handoff is queued
+        // in its Messages and the queued head wakes the pane.
+        if let Some(terminal_id) = self.sleeping_recipient_terminal(&envelope.recipient) {
+            let asleep = || {
+                encode_success(
+                    id.clone(),
+                    ResponseResult::HandoffTransport {
+                        receipt: receipt(
+                            HandoffTransportOutcome::RecipientNotReady,
+                            "recipient is asleep; only a Messages handoff can reach it".into(),
+                        ),
+                    },
+                )
+            };
+            if params.send.transport == Some(crate::api::schema::MessageTransport::Pty) {
+                return asleep();
+            }
+            let Some(response) = self.handoff_via_messages(&id, &envelope, &params.send, &receipt)
+            else {
+                return asleep();
+            };
+            let stable_id = serde_json::from_str::<serde_json::Value>(&response)
+                .ok()
+                .and_then(|value| {
+                    value["result"]["receipt"]["delivery"]["stable_id"]
+                        .as_str()
+                        .map(str::to_string)
+                });
+            if let Some(stable_id) = stable_id {
+                self.wake_for_appended_head(&terminal_id, stable_id);
+            }
+            return response;
+        }
         if recipient_info
             .as_ref()
             .is_none_or(|agent| !identity_matches(agent, &envelope.recipient))

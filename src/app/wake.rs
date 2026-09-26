@@ -579,6 +579,27 @@ impl App {
         }
     }
 
+    /// The terminal of a handoff recipient that Herdr put to sleep, if the
+    /// envelope names exactly that pane, terminal and the session file its
+    /// recipe resumes (the woken Pi keeps that identity).
+    pub(crate) fn sleeping_recipient_terminal(
+        &self,
+        identity: &crate::api::schema::CanonicalHerdrIdentity,
+    ) -> Option<TerminalId> {
+        let (ws_idx, pane_id) = self.parse_current_public_pane_id(&identity.pane_id)?;
+        let pane = self.pane_info(ws_idx, pane_id)?;
+        if pane.workspace_id != identity.workspace_id || pane.terminal_id != identity.terminal_id {
+            return None;
+        }
+        let terminal_id = self.state.workspaces[ws_idx].terminal_id(pane_id)?.clone();
+        let terminal = self.state.terminals.get(&terminal_id)?;
+        terminal.sleep.as_ref()?;
+        let recipe = terminal.launch_recipe.as_ref()?;
+        let session = super::agents::explicit_pi_session_path(&recipe.args)?;
+        (identity.agent_session.agent == "pi" && identity.agent_session.value == session)
+            .then_some(terminal_id)
+    }
+
     fn first_unsettled_head(&self, terminal_id: &TerminalId) -> Option<String> {
         let recipient = crate::mailbox::RecipientKey {
             recipient_id: terminal_id.to_string(),
@@ -1011,6 +1032,146 @@ mod tests {
         expected.sort();
         ran.sort();
         assert_eq!(ran, expected);
+    }
+
+    /// A handoff to an agent Herdr put to sleep is queued in its Messages and
+    /// wakes the pane; it is not refused because the target sleeps.
+    #[tokio::test]
+    async fn handoff_to_a_sleeping_agent_is_queued_and_wakes_it() {
+        let (mut app, pane, terminal, public) = app_with_shell_pane();
+        // Sender: a second workspace with a reported Pi.
+        app.state
+            .workspaces
+            .push(crate::workspace::Workspace::test_new("sender"));
+        app.state.ensure_test_terminals();
+        let sender_pane = app.state.workspaces[1].tabs[0].root_pane.unwrap();
+        let sender_terminal = app.state.workspaces[1]
+            .terminal_id(sender_pane)
+            .unwrap()
+            .clone();
+        app.state
+            .terminals
+            .get_mut(&sender_terminal)
+            .unwrap()
+            .set_detected_state(
+                Some(crate::detect::Agent::Pi),
+                crate::detect::AgentState::Idle,
+            );
+        let (sender_runtime, _sender_input) =
+            crate::terminal::TerminalRuntime::test_with_channel(80, 24);
+        app.terminal_runtimes
+            .insert(sender_terminal.clone(), sender_runtime);
+        let sender_public = app.public_pane_id(1, sender_pane).unwrap();
+        request(
+            &mut app,
+            crate::api::schema::Method::PaneReportAgentSession(
+                crate::api::schema::PaneReportAgentSessionParams {
+                    pane_id: sender_public,
+                    source: "herdr:pi".into(),
+                    agent: "pi".into(),
+                    seq: Some(1),
+                    agent_session_id: None,
+                    agent_session_path: Some("/sessions/sender.jsonl".into()),
+                    session_start_source: Some("startup".into()),
+                },
+            ),
+        );
+        // Recipient: a managed agent whose recipe resumes /sessions/owner.jsonl,
+        // put to sleep.
+        let mut input = start(&mut app, &public, Vec::new());
+        app.state
+            .terminals
+            .get_mut(&terminal)
+            .unwrap()
+            .launch_recipe = crate::launch_recipe::LaunchRecipe::capture(
+            "owner",
+            "pi",
+            &["--session".into(), "/sessions/owner.jsonl".into()],
+            &[],
+        );
+        pi_attaches(&mut app, pane, 1);
+        let slept = request(
+            &mut app,
+            crate::api::schema::Method::AgentSleep(AgentTarget {
+                target: "owner".into(),
+            }),
+        );
+        assert!(slept.get("error").is_none(), "{slept}");
+        pi_exits(&mut app, pane);
+        while input.try_recv().is_ok() {}
+
+        let sender_info = app.agent_info(1, sender_pane).unwrap();
+        let recipient_pane = app.pane_info(0, pane).unwrap();
+        let identity = |workspace_id: String, pane_id: String, terminal_id: String, value: &str| {
+            crate::api::schema::CanonicalHerdrIdentity {
+                workspace_id,
+                pane_id,
+                terminal_id,
+                agent_session: crate::api::schema::AgentSessionInfo {
+                    source: "herdr:pi".into(),
+                    agent: "pi".into(),
+                    kind: crate::agent_resume::AgentSessionRefKind::Path,
+                    value: value.into(),
+                },
+            }
+        };
+        let envelope = crate::api::schema::HerdrHandoff {
+            version: 1,
+            message_id: "handoff-sleep-1".into(),
+            created_at: "unix:1".into(),
+            sender: identity(
+                sender_info.workspace_id,
+                sender_info.pane_id,
+                sender_info.terminal_id,
+                "/sessions/sender.jsonl",
+            ),
+            recipient: identity(
+                recipient_pane.workspace_id,
+                recipient_pane.pane_id,
+                recipient_pane.terminal_id,
+                "/sessions/owner.jsonl",
+            ),
+            kind: crate::api::schema::HandoffKind::Assignment,
+            correlation_id: None,
+            reply_to_id: None,
+            task: None,
+            summary: "work while I sleep".into(),
+            artifact_refs: vec![],
+        };
+        let send = |app: &mut App, transport| {
+            request(
+                app,
+                crate::api::schema::Method::HandoffSend(crate::api::schema::HandoffSendParams {
+                    envelope: envelope.clone(),
+                    send: crate::api::schema::MessageSendOptions {
+                        transport,
+                        ..Default::default()
+                    },
+                }),
+            )
+        };
+        let pty = send(&mut app, Some(crate::api::schema::MessageTransport::Pty));
+        assert_eq!(
+            pty["result"]["receipt"]["outcome"], "recipient_not_ready",
+            "{pty}"
+        );
+        assert!(app.pane_wakes.is_empty() && input.try_recv().is_err());
+        let queued = send(&mut app, None);
+        assert_eq!(
+            queued["result"]["receipt"]["outcome"], "mailbox_admitted",
+            "{queued}"
+        );
+        assert_eq!(queued["result"]["receipt"]["delivery"]["path"], "mailbox");
+        assert_eq!(
+            app.pane_wakes.get(&terminal).map(|wake| wake.trigger.cause),
+            Some(WakeCause::HeadAppended)
+        );
+        assert!(input.try_recv().is_ok(), "one launch");
+        assert!(input.try_recv().is_err(), "nothing typed");
+        assert!(
+            app.first_unsettled_head(&terminal).is_some(),
+            "the handoff is queued"
+        );
     }
 
     #[tokio::test]
