@@ -279,12 +279,12 @@ pub(crate) fn inbox_snapshot(
     Ok(out)
 }
 
-/// Legacy claims without an execution belong to whichever Pi holds the pane.
+/// A claim is this execution's only when it names this execution. A legacy
+/// claim with no execution (written before per-execution claims) counts as
+/// another, gone execution's: it is never silently resumed or re-run by a
+/// new Pi, only settled, retried or dropped explicitly.
 pub(crate) fn claim_is_current(claim: &crate::mailbox::Claim, execution: &str) -> bool {
-    claim
-        .execution
-        .as_deref()
-        .is_none_or(|owner| owner == execution)
+    claim.execution.as_deref() == Some(execution)
 }
 
 /// Removes withdrawn heads (with their states and receipts) from a recipient

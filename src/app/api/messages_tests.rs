@@ -2352,3 +2352,109 @@ async fn a_named_agent_with_no_attached_pi_still_receives_queued_messages() {
         "a hand quit is never woken"
     );
 }
+
+/// Upgrade safety: a claim written before per-execution claims (no
+/// execution) is never the new Pi's own. The new Pi is not handed it to run
+/// again, skips it and takes the next head; the old claim shows as another,
+/// gone execution's (recovery needed) and only an explicit Retry, Drop or
+/// settle resolves it.
+#[tokio::test]
+async fn a_pre_upgrade_claim_without_an_execution_is_never_current() {
+    let mut fixture = fixture();
+    let session = attach_recipient(&mut fixture);
+    let recipient = fixture.terminals[1].clone();
+    let sender = sender(&fixture);
+    for (index, body) in ["admitted before the upgrade", "queued after"]
+        .iter()
+        .enumerate()
+    {
+        fixture
+            .app
+            .route_ordinary_send(
+                &recipient,
+                &sender,
+                plain(body),
+                &MessageSendOptions {
+                    send_new: index > 0,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+    }
+    let store = crate::mailbox::MailboxStore::open(&fixture.app.sender_authority_dir).unwrap();
+    let old = store
+        .load()
+        .unwrap()
+        .heads
+        .values()
+        .find(|head| head.body.contains("before the upgrade"))
+        .cloned()
+        .unwrap();
+    store
+        .claim(crate::mailbox::Claim {
+            claim_id: "legacy-claim".into(),
+            recipient: old.recipient.clone(),
+            stable_id: old.stable_id.clone(),
+            revision: old.revision,
+            digest: old.digest.clone(),
+            execution: None,
+        })
+        .unwrap();
+    store
+        .resolve_claim(
+            "legacy-claim",
+            crate::mailbox::ClaimResolutionOutcome::Admitted,
+        )
+        .unwrap();
+    let protocol = crate::mailbox_v1::PROTOCOL;
+    let claim = dispatch(
+        &mut fixture.app,
+        &session,
+        "mailbox.claim",
+        json!({"protocol": protocol}),
+    )
+    .unwrap();
+    assert_ne!(
+        claim["claim"]["stableId"],
+        json!(old.stable_id),
+        "the old admitted claim is never handed to the new Pi"
+    );
+    let snapshot = dispatch(
+        &mut fixture.app,
+        &session,
+        "mailbox.snapshot",
+        json!({"protocol": protocol}),
+    )
+    .unwrap();
+    let state = snapshot["snapshot"]["headStates"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|state| state["stableId"] == json!(old.stable_id))
+        .cloned()
+        .unwrap();
+    assert_eq!(state["claimExecution"], "other");
+    assert_eq!(state["claimExecutionAlive"], false);
+    assert_eq!(state["recoveryNeeded"], true);
+    assert_ne!(
+        snapshot["snapshot"]["claim"]["stableId"],
+        json!(old.stable_id),
+        "not presented as this Pi's current claim"
+    );
+    // It can be admitted by nobody here, only settled/retried/dropped.
+    assert!(dispatch(
+        &mut fixture.app,
+        &session,
+        "mailbox.resolve",
+        json!({"protocol": protocol, "claimId": "legacy-claim", "outcome": "admitted"}),
+    )
+    .is_err());
+    let retried = dispatch(
+        &mut fixture.app,
+        &session,
+        "mailbox.retry",
+        json!({"protocol": protocol, "stableId": old.stable_id, "expectedRevision": old.revision}),
+    )
+    .unwrap();
+    assert_eq!(retried["type"], "mailbox_retried");
+}
