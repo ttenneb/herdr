@@ -112,6 +112,9 @@ pub(crate) enum MailboxBootstrapError {
     GrantRevoked,
     PeerRejected,
     InvalidRequest,
+    /// The named head or claim exists but is outside this session's own
+    /// pane inbox; nothing was changed.
+    HeadOutOfScope,
 }
 
 #[derive(Debug)]
@@ -125,6 +128,13 @@ pub(crate) enum OfflineMailboxInstallError {
 pub(crate) enum OfflineMailboxError {
     CallerMismatch,
     CapabilityMismatch,
+    /// The head exists but is outside what this capability may touch: not
+    /// in the caller's own inbox, and not a head the caller itself sent to
+    /// the named recipient.
+    HeadOutOfScope,
+    /// A send grant to another recipient cannot claim or resolve that
+    /// recipient's messages.
+    NotRecipient,
     Replay,
     Transport(TransportError),
     Store(crate::mailbox::MailboxError),
@@ -252,6 +262,47 @@ impl OfflineMailboxAuthority {
         }
     }
 
+    /// Through a send grant a caller sees only the heads it sent itself;
+    /// through its own inbox capability, everything in its inbox.
+    fn sender_view(
+        &self,
+        mut snapshot: crate::mailbox_v1::Snapshot,
+        recovered: &crate::mailbox::RecoveredMailbox,
+        own_inbox: bool,
+    ) -> crate::mailbox_v1::Snapshot {
+        if own_inbox {
+            return snapshot;
+        }
+        let mine = |stable_id: &str| {
+            recovered
+                .heads
+                .get(stable_id)
+                .is_some_and(|head| head.sender == self.sender_key)
+        };
+        snapshot.heads.retain(|head| head.sender == self.sender_key);
+        snapshot.head_states.retain(|state| mine(&state.stable_id));
+        snapshot.receipts.retain(|receipt| mine(&receipt.stable_id));
+        snapshot.claim = None;
+        snapshot
+    }
+
+    /// The capability for the caller's own inbox (as opposed to a send grant
+    /// to another recipient).
+    fn owns_inbox(&self, capability: &OfflineMailboxCapability) -> bool {
+        capability.recipient.recipient_id == self.sender_key
+    }
+
+    /// Edit scope: a recipient edits heads in its own inbox; a sender edits
+    /// only heads it sent itself, to the recipient named in the request.
+    fn may_edit(
+        &self,
+        capability: &OfflineMailboxCapability,
+        head: &crate::mailbox::MailboxHead,
+    ) -> bool {
+        head.recipient == capability.recipient
+            && (self.owns_inbox(capability) || head.sender == self.sender_key)
+    }
+
     pub(crate) fn claim(
         &self,
         params: crate::api::schema::MailboxClaimParams,
@@ -261,6 +312,9 @@ impl OfflineMailboxAuthority {
             .map_err(OfflineMailboxError::Transport)?;
         let capability =
             self.capability_for(&params.caller, &params.grant_id, &params.recipient)?;
+        if !self.owns_inbox(capability) {
+            return Err(OfflineMailboxError::NotRecipient);
+        }
         self.store
             .claim_next(&capability.recipient)
             .map_err(OfflineMailboxError::Store)
@@ -281,7 +335,9 @@ impl OfflineMailboxAuthority {
         let capability =
             self.capability_for(&params.caller, &params.grant_id, &params.recipient)?;
         let recovered = self.store.load().map_err(OfflineMailboxError::Store)?;
+        let own_inbox = self.owns_inbox(capability);
         crate::mailbox_v1::snapshot(&recovered, &capability.recipient)
+            .map(|snapshot| self.sender_view(snapshot, &recovered, own_inbox))
             .map(|snapshot| {
                 crate::app::messages::filter_recipient_snapshot(
                     snapshot,
@@ -301,12 +357,25 @@ impl OfflineMailboxAuthority {
             .map_err(OfflineMailboxError::Transport)?;
         let capability =
             self.capability_for(&params.caller, &params.grant_id, &params.recipient)?;
+        if let Some(head) = self
+            .store
+            .load()
+            .map_err(OfflineMailboxError::Store)?
+            .heads
+            .get(&params.edit.stable_id)
+        {
+            if !self.may_edit(capability, head) {
+                return Err(OfflineMailboxError::HeadOutOfScope);
+            }
+        }
         crate::mailbox_v1::edit_unclaimed(&self.store, params.edit)
             .map_err(OfflineMailboxError::Store)?;
         // Read from the durable stream after the edit's sync before responding;
         // callers receive server authority rather than an optimistic local edit.
         let recovered = self.store.load().map_err(OfflineMailboxError::Store)?;
+        let own_inbox = self.owns_inbox(capability);
         crate::mailbox_v1::snapshot(&recovered, &capability.recipient)
+            .map(|snapshot| self.sender_view(snapshot, &recovered, own_inbox))
             .map(|snapshot| {
                 crate::app::messages::filter_recipient_snapshot(
                     snapshot,
@@ -327,6 +396,9 @@ impl OfflineMailboxAuthority {
         .map_err(OfflineMailboxError::Transport)?;
         let capability =
             self.capability_for(&params.caller, &params.grant_id, &params.recipient)?;
+        if !self.owns_inbox(capability) {
+            return Err(OfflineMailboxError::NotRecipient);
+        }
         let claim = self
             .store
             .load()

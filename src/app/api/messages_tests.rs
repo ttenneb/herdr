@@ -185,6 +185,41 @@ fn dispatch(
     app.dispatch_mailbox_bootstrap(session, method, params)
 }
 
+pub(crate) fn scoped_test_head(
+    stable_id: &str,
+    sender: &str,
+    recipient: &crate::mailbox::RecipientKey,
+    digest_char: char,
+) -> crate::mailbox::MailboxHead {
+    crate::mailbox::MailboxHead {
+        stable_id: stable_id.into(),
+        revision: 1,
+        digest: digest_char.to_string().repeat(64),
+        delivery_digest: format!("{stable_id}-delivery")
+            .bytes()
+            .map(|b| format!("{:x}", b % 16))
+            .collect::<String>()
+            .chars()
+            .chain(std::iter::repeat('0'))
+            .take(64)
+            .collect(),
+        recipient: recipient.clone(),
+        subject: "original".into(),
+        body: "original body".into(),
+        recipient_generation: recipient.generation.clone(),
+        sender: sender.into(),
+        target: recipient.recipient_id.clone(),
+        grant_id: format!("test-grant-{stable_id}"),
+        message_id: format!("message-{stable_id}"),
+        kind: "advisory".into(),
+        priority: "normal".into(),
+        original_sequence: 1,
+        enqueue_epoch: 0,
+        accepted_at: 1,
+        delivery: None,
+    }
+}
+
 fn snapshot_heads(app: &mut App, session: &MailboxBootstrapSession) -> Vec<serde_json::Value> {
     let value = dispatch(
         app,
@@ -2053,4 +2088,73 @@ async fn watch_marker_changes_on_every_append_and_bindings_release() {
         .app
         .attached_messages_recipient(&recipient)
         .is_none());
+}
+
+/// Authority scope on the Messages stream (the same code serves managed and
+/// recipient-only sessions): edit, drop, reprioritize, retry and resolve of
+/// a head addressed to another pane are refused and change nothing.
+#[tokio::test]
+async fn a_stream_never_touches_another_panes_heads() {
+    let mut fixture = fixture();
+    let x = attach_recipient(&mut fixture);
+    let y = crate::mailbox::RecipientKey {
+        recipient_id: fixture.terminals[0].clone(),
+        generation: "1".into(),
+    };
+    let store = crate::mailbox::MailboxStore::open(&fixture.app.sender_authority_dir).unwrap();
+    store
+        .append_offline_head(scoped_test_head("for-y", "term_z", &y, 'b'))
+        .unwrap();
+    let before = store.load().unwrap();
+    let protocol = crate::mailbox_v1::PROTOCOL;
+    for (method, params) in [
+        (
+            "mailbox.edit",
+            json!({"protocol": protocol, "stableId": "for-y", "revision": 1,
+                   "digest": "b".repeat(64), "subject": "tampered", "body": "tampered"}),
+        ),
+        (
+            "mailbox.drop",
+            json!({"protocol": protocol, "stableId": "for-y", "expectedRevision": 1}),
+        ),
+        (
+            "mailbox.reprioritize",
+            json!({"protocol": protocol, "stableId": "for-y", "expectedRevision": 1, "priority": "high"}),
+        ),
+        (
+            "mailbox.retry",
+            json!({"protocol": protocol, "stableId": "for-y", "expectedRevision": 1}),
+        ),
+    ] {
+        assert!(
+            matches!(
+                dispatch(&mut fixture.app, &x, method, params),
+                Err(crate::app::MailboxBootstrapError::HeadOutOfScope)
+            ),
+            "{method} must refuse a head addressed to another pane"
+        );
+    }
+    // A claim held in Y's inbox cannot be resolved from X's stream either.
+    store
+        .claim(crate::mailbox::Claim {
+            claim_id: "y-claim".into(),
+            stable_id: "for-y".into(),
+            revision: 1,
+            digest: "b".repeat(64),
+            recipient: y.clone(),
+            execution: None,
+        })
+        .unwrap();
+    assert!(matches!(
+        dispatch(
+            &mut fixture.app,
+            &x,
+            "mailbox.resolve",
+            json!({"protocol": protocol, "claimId": "y-claim", "outcome": "settled"}),
+        ),
+        Err(crate::app::MailboxBootstrapError::HeadOutOfScope)
+    ));
+    let after = store.load().unwrap();
+    assert_eq!(after.heads, before.heads, "nothing was changed");
+    assert!(after.resolutions.is_empty());
 }
