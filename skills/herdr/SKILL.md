@@ -125,6 +125,17 @@ Submit work through the agent surface:
 herdr agent prompt reviewer "Review the current diff and report only actionable findings." --wait --timeout 120000
 ```
 
+**Pi panes queue.** Every Pi in a Herdr pane has a Messages queue, including a Pi the human started by typing `pi`. `agent prompt` to a Pi puts the text in that queue and returns at once with `delivery.path: "mailbox"` and a `stable_id`. This also works while the Pi is busy, asleep or restarting, and after its Pi has exited: the pane ID, or the agent's last name, still addresses the queue. Don't add `--wait` for a Pi. The Pi runs each queued message once, in order.
+
+While your earlier message to the same Pi is still waiting, a new send returns exit 4 with `pending_exists` and lists your waiting messages, newest first. Choose one:
+
+```bash
+herdr agent prompt reviewer "<corrected text>" --edit-pending <stable_id>   # replace the waiting text
+herdr agent prompt reviewer "<another message>" --send-new                   # queue this one as well
+```
+
+If the Pi picked the message up in the meantime, `--edit-pending` returns exit 4 with `pending_claimed`; send a follow-up instead. The rest of this section describes typed input to other agents.
+
 `agent prompt` honors the pane's live bracketed-paste mode and sends text followed by encoded Enter after a short delay. It rejects an agent already waiting at an approval or question dialog with `agent_blocked` before sending any input. Inspect the blocked UI and ask the user before answering it. For normal agent work, `--wait` is enough: it waits for the first settled `idle`, `done`, or `blocked` state. Do not repeat those defaults with `--until`.
 
 A prompt sent from a non-working state must produce an observed lifecycle change within five seconds. Otherwise Herdr returns `agent_prompt_stalled` instead of waiting indefinitely. This wait tracks lifecycle state, not an individual turn; if the agent is already working, completion of the active turn may satisfy it.
@@ -136,6 +147,8 @@ herdr agent wait reviewer --until blocked --timeout 120000
 ```
 
 Without `--until`, standalone `agent wait` uses the same settled-state defaults as `agent prompt --wait`.
+
+`herdr agent sleep <name>` stops an idle managed agent (one started with `agent start`) and keeps its name, recipe and queue. The next message queued for its pane wakes it in the same terminal on the same session; there is no separate wake command. Herdr refuses to put a parent of active child delegation routes to sleep, and never wakes a Pi the human quit or started by hand.
 
 Use logical keys for interactive agent UI controls:
 
