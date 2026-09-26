@@ -3562,3 +3562,56 @@ async fn oversize_text_to_a_messages_pane_is_refused_not_typed() {
         .heads
         .is_empty());
 }
+
+/// QA batch 3, 1b+: a held message is also pinned to the addressed agent
+/// name and agent session; a rename or a new session fails it with
+/// agent_replaced instead of typing.
+#[tokio::test]
+async fn a_held_message_fails_when_the_agent_name_or_session_changes() {
+    use crossterm::event::KeyCode;
+    for change in ["name", "session"] {
+        let mut fixture = fixture();
+        let terminal = fixture.app.state.workspaces[1]
+            .terminal_id(fixture.panes[1])
+            .unwrap()
+            .clone();
+        fixture
+            .app
+            .state
+            .terminals
+            .get_mut(&terminal)
+            .unwrap()
+            .set_agent_name("worker".into());
+        human_key(&mut fixture.app, &terminal, KeyCode::Char('d'));
+        let sequence = fixture.app.event_hub.current_sequence();
+        let held = prompt_pane(&mut fixture, "for worker", None);
+        assert_eq!(held["result"]["delivery"]["path"], "pty_deferred", "{held}");
+        if change == "name" {
+            fixture
+                .app
+                .state
+                .terminals
+                .get_mut(&terminal)
+                .unwrap()
+                .set_agent_name("someone-else".into());
+        } else {
+            report_session(
+                &mut fixture.app,
+                1,
+                fixture.panes[1],
+                "/sessions/s1-new.jsonl",
+                99,
+            );
+        }
+        human_key(&mut fixture.app, &terminal, KeyCode::Enter);
+        assert!(fixture.rx[1].try_recv().is_err(), "{change}: never typed");
+        let events = deferral_events(&fixture.app, sequence);
+        assert!(
+            matches!(
+                events.as_slice(),
+                [crate::api::schema::EventData::DeliveryDeferredFailed { code, .. }] if code == "agent_replaced"
+            ),
+            "{change}: {events:?}"
+        );
+    }
+}
