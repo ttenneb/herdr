@@ -228,16 +228,12 @@ pub struct MessageSendOptions {
 /// Where an ordinary send went.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct MessageDelivery {
-    /// `mailbox`, `pty`, or `pty_deferred` (held while the recipient pane has
-    /// unsent human input; see `deferral_id`). Kept for compatibility; see
-    /// `method`.
+    /// `mailbox` (queued in the pane's Messages), `pty` (typed into the
+    /// pane), or `pty_deferred` (held while the recipient pane has unsent
+    /// human input; see `deferral_id`).
     pub path: String,
-    /// How the message was delivered: `queued` (the pane's Messages queue),
-    /// `typed` (typed into the pane) or `pty_deferred` (held, typed later).
-    #[serde(default)]
-    pub method: String,
-    /// Why: `messages` for queued; for typed or held: `explicit_pty`,
-    /// `no_messages`, `not_pi`, `fallback_30s`, or `oversized`.
+    /// Why: `messages` for `mailbox`; for `pty` or `pty_deferred`:
+    /// `explicit_pty`, `no_messages`, `not_pi`, or `fallback_30s`.
     #[serde(default)]
     pub reason: String,
     /// Whether the sender can still edit it (a queued message not yet

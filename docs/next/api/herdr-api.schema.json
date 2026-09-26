@@ -14377,18 +14377,13 @@
             "edited": {
               "type": "boolean"
             },
-            "method": {
-              "default": "",
-              "description": "How the message was delivered: `queued` (the pane's Messages queue),\n`typed` (typed into the pane) or `pty_deferred` (held, typed later).",
-              "type": "string"
-            },
             "path": {
-              "description": "`mailbox`, `pty`, or `pty_deferred` (held while the recipient pane has\nunsent human input; see `deferral_id`). Kept for compatibility; see\n`method`.",
+              "description": "`mailbox` (queued in the pane's Messages), `pty` (typed into the\npane), or `pty_deferred` (held while the recipient pane has unsent\nhuman input; see `deferral_id`).",
               "type": "string"
             },
             "reason": {
               "default": "",
-              "description": "Why: `messages` for queued; for typed or held: `explicit_pty`,\n`no_messages`, `not_pi`, `fallback_30s`, or `oversized`.",
+              "description": "Why: `messages` for `mailbox`; for `pty` or `pty_deferred`:\n`explicit_pty`, `no_messages`, `not_pi`, or `fallback_30s`.",
               "type": "string"
             },
             "revision": {

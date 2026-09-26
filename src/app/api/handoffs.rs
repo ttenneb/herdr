@@ -210,9 +210,8 @@ impl App {
                 return response;
             }
         } else if params.send.transport == Some(crate::api::schema::MessageTransport::Mailbox) {
-            return encode_error(
+            return crate::app::messages::messages_unavailable_json(
                 id,
-                "messages_unavailable",
                 "the recipient has no live Messages connection",
             );
         }
@@ -310,7 +309,6 @@ impl App {
             );
             held.delivery = Some(crate::api::schema::MessageDelivery {
                 path: "pty_deferred".into(),
-                method: "pty_deferred".into(),
                 reason: typed_reason.clone(),
                 editable: false,
                 deferral_id: Some(deferral_id),
@@ -357,7 +355,6 @@ impl App {
         let mut admitted = receipt(HandoffTransportOutcome::RuntimeTransactionAdmitted, "Herdr runtime admitted the complete prompt transaction; Pi/gate/agent acknowledgement is unknown".into());
         admitted.delivery = Some(crate::api::schema::MessageDelivery {
             path: "pty".into(),
-            method: "typed".into(),
             reason: typed_reason,
             editable: false,
             typed_ahead_of_queued,
@@ -433,7 +430,10 @@ impl App {
                 ))
             }
             Ok(crate::app::messages::SendRoute::Pty) => None,
-            Err(crate::app::messages::SendRefusal::MailboxUnavailable(_)) => None,
+            // The recipient takes Messages: never fall back to typing into it.
+            Err(crate::app::messages::SendRefusal::MailboxUnavailable(message)) => Some(
+                crate::app::messages::messages_unavailable_json(id.to_string(), message),
+            ),
             Err(refusal) => crate::app::messages::pending_error_json(id.to_string(), &refusal)
                 .or_else(|| match refusal {
                     crate::app::messages::SendRefusal::Store(message) => Some(encode_error(

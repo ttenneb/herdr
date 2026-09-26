@@ -263,12 +263,8 @@ async fn a_non_pi_agent_pane_keeps_the_pty_bytes_unchanged() {
     };
     let delivery = delivery.expect("delivery");
     assert_eq!(
-        (
-            delivery.path.as_str(),
-            delivery.method.as_str(),
-            delivery.reason.as_str()
-        ),
-        ("pty", "typed", "not_pi"),
+        (delivery.path.as_str(), delivery.reason.as_str()),
+        ("pty", "not_pi"),
         "non-Pi agent: typed, and the sender is told why"
     );
     let typed = fixture.rx[1].recv().await.unwrap();
@@ -2841,7 +2837,7 @@ async fn typed_delivery_waits_for_the_humans_draft_then_types_in_order() {
     assert!(!fixture.app.pane_draft_pending(&terminal));
     let direct = prompt_pane(&mut fixture, "direct", None);
     assert_eq!(
-        direct["result"]["delivery"]["method"], "typed",
+        direct["result"]["delivery"]["path"], "pty",
         "typed at once: {direct}"
     );
     assert_eq!(direct["result"]["delivery"]["reason"], "no_messages");
@@ -3423,7 +3419,7 @@ async fn every_send_reports_its_method_and_typed_sends_leave_history() {
     let mut fixture = fixture();
     // Typed: the pane has no Messages yet.
     let typed = prompt_pane(&mut fixture, "typed hello", None);
-    assert_eq!(typed["result"]["delivery"]["method"], "typed", "{typed}");
+    assert_eq!(typed["result"]["delivery"]["path"], "pty", "{typed}");
     assert_eq!(typed["result"]["delivery"]["reason"], "no_messages");
     let explicit = prompt_pane(
         &mut fixture,
@@ -3434,7 +3430,7 @@ async fn every_send_reports_its_method_and_typed_sends_leave_history() {
     // Queued once the pane's Pi attached Messages.
     let session = attach_recipient(&mut fixture);
     let queued = prompt_pane(&mut fixture, "queued hello", None);
-    assert_eq!(queued["result"]["delivery"]["method"], "queued", "{queued}");
+    assert_eq!(queued["result"]["delivery"]["path"], "mailbox", "{queued}");
     assert_eq!(queued["result"]["delivery"]["reason"], "messages");
     assert_eq!(queued["result"]["delivery"]["editable"], true);
     // History shows the typed ones as closed rows; they are never claimed.
@@ -3493,4 +3489,27 @@ async fn every_send_reports_its_method_and_typed_sends_leave_history() {
         history.to_string().contains("\"closedBy\":\"typed\""),
         "{history}"
     );
+}
+
+/// A pane that takes Messages is never typed into: oversize text is refused
+/// with messages_unavailable and reason "oversized"; nothing is typed or
+/// queued.
+#[tokio::test]
+async fn oversize_text_to_a_messages_pane_is_refused_not_typed() {
+    let mut fixture = fixture();
+    attach_recipient(&mut fixture);
+    let big = "x".repeat(20 * 1024);
+    let refused = prompt_pane(&mut fixture, &big, None);
+    assert_eq!(
+        refused["error"]["code"], "messages_unavailable",
+        "{refused}"
+    );
+    assert_eq!(refused["error"]["reason"], "oversized");
+    assert!(fixture.rx[1].try_recv().is_err(), "nothing typed");
+    assert!(crate::mailbox::MailboxStore::open(&fixture.directory)
+        .unwrap()
+        .load()
+        .unwrap()
+        .heads
+        .is_empty());
 }

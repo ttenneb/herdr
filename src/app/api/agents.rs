@@ -134,7 +134,7 @@ impl App {
                     }
                     return match refusal {
                         crate::app::messages::SendRefusal::MailboxUnavailable(message) => {
-                            encode_error(id, "messages_unavailable", message)
+                            crate::app::messages::messages_unavailable_json(id, message)
                         }
                         crate::app::messages::SendRefusal::Store(message) => {
                             encode_error(id, "mailbox_store_failed", message)
@@ -179,9 +179,8 @@ impl App {
         if expected_agent != crate::detect::Agent::Pi
             && params.send.transport == Some(crate::api::schema::MessageTransport::Mailbox)
         {
-            return encode_error(
+            return crate::app::messages::messages_unavailable_json(
                 id,
-                "messages_unavailable",
                 "only Pi recipients have a Messages queue",
             );
         }
@@ -219,7 +218,6 @@ impl App {
                     agent,
                     delivery: Some(crate::api::schema::MessageDelivery {
                         path: "pty_deferred".into(),
-                        method: "pty_deferred".into(),
                         reason: typed_reason.clone(),
                         editable: false,
                         deferral_id: Some(deferral_id),
@@ -253,7 +251,6 @@ impl App {
                 agent,
                 delivery: Some(crate::api::schema::MessageDelivery {
                     path: "pty".into(),
-                    method: "typed".into(),
                     reason: typed_reason,
                     editable: false,
                     typed_ahead_of_queued,
