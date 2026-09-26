@@ -337,6 +337,48 @@ impl App {
         encode_success(id, ResponseResult::AgentExplain { explain: value })
     }
 
+    /// `agent.sleep`: record that Herdr put the agent to sleep, then send it a
+    /// guarded ctrl+d. Herdr wakes only agents it put to sleep this way.
+    pub(super) fn handle_agent_sleep(&mut self, id: String, params: AgentTarget) -> String {
+        let resolved = match self.resolve_agent_target(&params.target) {
+            Ok(resolved) => resolved,
+            Err(err) => return encode_error_body(id, self.agent_target_error_body(err)),
+        };
+        let Some(terminal_id) = self
+            .state
+            .workspaces
+            .get(resolved.ws_idx)
+            .and_then(|workspace| workspace.terminal_id(resolved.pane_id))
+            .cloned()
+        else {
+            return agent_not_found(id, &params.target);
+        };
+        let (agent_name, generation) = match self.pane_sleep_candidate(&terminal_id) {
+            Ok(candidate) => candidate,
+            Err(message) => return encode_error(id, "agent_sleep_unavailable", message),
+        };
+        self.set_pane_sleep(
+            &terminal_id,
+            Some(App::new_pane_sleep(agent_name.clone(), generation)),
+        );
+        let response = self.handle_agent_send_keys(
+            id,
+            AgentSendKeysParams {
+                target: params.target,
+                keys: vec!["ctrl+d".into()],
+                expected_terminal_id: Some(terminal_id.to_string()),
+                expected_name: Some(agent_name),
+            },
+        );
+        let sent = serde_json::from_str::<serde_json::Value>(&response)
+            .ok()
+            .is_some_and(|value| value.get("error").is_none());
+        if !sent {
+            self.set_pane_sleep(&terminal_id, None);
+        }
+        response
+    }
+
     pub(super) fn handle_agent_send_keys(
         &mut self,
         id: String,
@@ -1206,13 +1248,70 @@ mod tests {
         std::fs::remove_dir_all(directory).unwrap();
     }
 
+    /// A Pi session root (`PI_CODING_AGENT_SESSION_DIR`) with one private,
+    /// still-empty session file in Pi's per-cwd layout, as the launch scripts
+    /// create it.
+    #[cfg(unix)]
+    fn pi_session_fixture(tag: &str) -> (std::path::PathBuf, String) {
+        use std::os::unix::fs::OpenOptionsExt;
+        let root = std::env::temp_dir().join(format!(
+            "herdr-pi-sessions-{tag}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let dir = root.join("--tmp-work--");
+        std::fs::create_dir_all(&dir).unwrap();
+        let session = dir.join("2026-01-01T00-00-00-000Z_session.jsonl");
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&session)
+            .unwrap();
+        (root, session.display().to_string())
+    }
+
+    #[cfg(target_os = "linux")]
+    fn start_owner(
+        app: &mut App,
+        args: Vec<String>,
+        env: Vec<String>,
+        close_input: bool,
+    ) -> (crate::terminal::TerminalId, bool) {
+        let pane = app.state.workspaces[0].tabs[0].root_pane.unwrap();
+        let terminal = app.state.workspaces[0].terminal_id(pane).unwrap().clone();
+        let (runtime, input) = crate::terminal::TerminalRuntime::test_with_channel(80, 24);
+        app.terminal_runtimes.insert(terminal.clone(), runtime);
+        if close_input {
+            drop(input);
+        } else {
+            std::mem::forget(input);
+        }
+        let response = app.handle_agent_start(
+            "start".into(),
+            crate::api::schema::AgentStartParams {
+                name: "owner".into(),
+                kind: "pi".into(),
+                pane_id: app.public_pane_id(0, pane).unwrap(),
+                args,
+                env,
+                timeout_ms: None,
+            },
+        );
+        (
+            terminal,
+            serde_json::from_str::<SuccessResponse>(&response).is_ok(),
+        )
+    }
+
     #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn managed_start_commits_only_one_valid_selector_after_successful_input() {
-        let path = std::env::temp_dir()
-            .join("herdr-managed-commit.jsonl")
-            .display()
-            .to_string();
+        let (root, path) = pi_session_fixture("commit");
+        let env = vec![format!("PI_CODING_AGENT_SESSION_DIR={}", root.display())];
         for (args, close_input, expect_committed) in [
             (vec!["--session".into(), path.clone()], false, true),
             (
@@ -1228,37 +1327,8 @@ mod tests {
             (vec!["--session".into(), path.clone()], true, false),
         ] {
             let mut app = app_with_agent();
-            let pane = app.state.workspaces[0].tabs[0].root_pane.unwrap();
-            let terminal = app.state.workspaces[0].terminal_id(pane).unwrap().clone();
-            let authority_dir = std::env::temp_dir().join(format!(
-                "herdr-managed-commit-{}-{}",
-                std::process::id(),
-                std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap()
-                    .as_nanos()
-            ));
-            app.sender_authority_dir = authority_dir.clone();
-            let (runtime, input) = crate::terminal::TerminalRuntime::test_with_channel(80, 24);
-            app.terminal_runtimes.insert(terminal.clone(), runtime);
-            if close_input {
-                drop(input);
-            }
-            let response = app.handle_agent_start(
-                "start".into(),
-                crate::api::schema::AgentStartParams {
-                    name: "owner".into(),
-                    kind: "pi".into(),
-                    pane_id: app.public_pane_id(0, pane).unwrap(),
-                    args,
-                    env: Vec::new(),
-                    timeout_ms: None,
-                },
-            );
-            assert_eq!(
-                serde_json::from_str::<SuccessResponse>(&response).is_ok(),
-                !close_input
-            );
+            let (terminal, started) = start_owner(&mut app, args, env.clone(), close_input);
+            assert_eq!(started, !close_input);
             let committed = app.managed_pi_launches.get(&terminal);
             assert_eq!(committed.is_some(), expect_committed);
             if let Some(launch) = committed {
@@ -1269,8 +1339,113 @@ mod tests {
                     "birth must bind only after Active observation"
                 );
             }
-            std::fs::remove_dir_all(authority_dir).unwrap();
         }
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn managed_start_records_only_private_session_files_inside_pi_session_dir() {
+        use std::os::unix::fs::PermissionsExt;
+        let (root, empty) = pi_session_fixture("checks");
+        let dir = std::path::Path::new(&empty).parent().unwrap().to_path_buf();
+        let env = vec![format!("PI_CODING_AGENT_SESSION_DIR={}", root.display())];
+        let private = |name: &str, body: &[u8], mode: u32| {
+            let path = dir.join(name);
+            std::fs::write(&path, body).unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode)).unwrap();
+            path.display().to_string()
+        };
+        let header = b"{\"type\":\"session\",\"version\":3,\"id\":\"h\",\"cwd\":\"/tmp\"}\n";
+        let with_header = private("header.jsonl", header, 0o600);
+        let readable = private("readable.jsonl", b"", 0o644);
+        let garbage = private("garbage.jsonl", b"not a session\n", 0o600);
+        let linked = private("linked.jsonl", b"", 0o600);
+        std::fs::hard_link(&linked, dir.join("second-link.jsonl")).unwrap();
+        let symlink = dir.join("symlink.jsonl");
+        std::os::unix::fs::symlink(&with_header, &symlink).unwrap();
+        let outside_dir = root.with_extension("outside");
+        std::fs::create_dir_all(&outside_dir).unwrap();
+        let outside = outside_dir.join("outside.jsonl");
+        std::fs::write(&outside, b"").unwrap();
+        std::fs::set_permissions(&outside, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let missing = dir.join("missing.jsonl").display().to_string();
+        for (path, expect_managed) in [
+            (empty.clone(), true),
+            (with_header, true),
+            (readable, false),
+            (garbage, false),
+            (linked, false),
+            (symlink.display().to_string(), false),
+            (outside.display().to_string(), false),
+            (missing, false),
+        ] {
+            let mut app = app_with_agent();
+            let (terminal, started) = start_owner(
+                &mut app,
+                vec!["--session".into(), path.clone()],
+                env.clone(),
+                false,
+            );
+            assert!(started, "an untrusted --session still launches: {path}");
+            assert_eq!(
+                app.managed_pi_launches.contains_key(&terminal),
+                expect_managed,
+                "{path}"
+            );
+        }
+        // Without the session-dir override the fixture is outside Pi's
+        // default session directory, so it earns no launch record.
+        let mut app = app_with_agent();
+        let (terminal, started) = start_owner(
+            &mut app,
+            vec!["--session".into(), empty],
+            vec![format!("HOME={}", root.display())],
+            false,
+        );
+        assert!(started);
+        assert!(!app.managed_pi_launches.contains_key(&terminal));
+        std::fs::remove_dir_all(root).unwrap();
+        std::fs::remove_dir_all(outside_dir).unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn failed_managed_start_leaves_no_launch_record_or_live_generation() {
+        let (root, path) = pi_session_fixture("failed");
+        let env = vec![format!("PI_CODING_AGENT_SESSION_DIR={}", root.display())];
+        let mut app = app_with_agent();
+        let (terminal, started) = start_owner(
+            &mut app,
+            vec!["--session".into(), path.clone()],
+            env.clone(),
+            true,
+        );
+        assert!(!started);
+        assert!(!app.managed_pi_launches.contains_key(&terminal));
+        let terminal_state = &app.state.terminals[&terminal];
+        assert!(terminal_state.accepts_managed_agent_generation(0));
+        assert!(!terminal_state.accepts_managed_agent_generation(1));
+        let store = crate::sender_authority::SenderAuthorityStore::for_sender(
+            &app.sender_authority_dir,
+            &terminal.to_string(),
+        )
+        .unwrap();
+        let record = store
+            .load()
+            .unwrap()
+            .expect("allocated generation is recorded");
+        assert_eq!(record.process_generation, 1);
+        assert_eq!(
+            record.phase,
+            crate::sender_authority::SenderAuthorityPhase::Invalidated,
+            "a launch that never started must not leave a promotable generation"
+        );
+
+        let (terminal, started) = start_owner(&mut app, vec!["--session".into(), path], env, false);
+        assert!(started, "the pane can be retried");
+        assert_eq!(app.managed_pi_launches[&terminal].generation, 2);
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[tokio::test]

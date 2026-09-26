@@ -159,6 +159,12 @@ pub struct TerminalState {
     recent_agent_process_exit: Option<RecentAgentProcessExit>,
     agent_process_acquisition_pending: bool,
     pub pending_agent_resume_plan: Option<crate::agent_resume::AgentResumePlan>,
+    /// Durable recipe of the last committed managed launch in this pane.
+    pub launch_recipe: Option<crate::launch_recipe::LaunchRecipe>,
+    /// Set only by agent.sleep; see crate::app::wake.
+    pub sleep: Option<crate::launch_recipe::PaneSleep>,
+    /// Delegation route to carry across a same-session recipe relaunch.
+    pub route_carry: Option<crate::launch_recipe::RouteCarry>,
 }
 
 /// A 128-bit random hex key; falls back to a time- and PID-derived value only
@@ -217,6 +223,9 @@ impl TerminalState {
             recent_agent_process_exit: None,
             agent_process_acquisition_pending: false,
             pending_agent_resume_plan: None,
+            launch_recipe: None,
+            sleep: None,
+            route_carry: None,
         }
     }
 
@@ -1955,6 +1964,10 @@ impl TerminalState {
 
     pub(crate) fn set_managed_agent_generation(&mut self, generation: u64) {
         self.managed_agent_generation = Some(generation);
+    }
+
+    pub(crate) fn managed_agent_generation(&self) -> Option<u64> {
+        self.managed_agent_generation
     }
 
     pub(crate) fn accepts_managed_agent_generation(&self, generation: u64) -> bool {

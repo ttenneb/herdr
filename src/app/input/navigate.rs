@@ -4007,6 +4007,7 @@ navigate_pane_down = "ctrl+j"
     #[cfg(unix)]
     #[tokio::test]
     async fn edit_scrollback_key_preserves_logical_lines_in_editor_pane() {
+        let _env = crate::test_env::lock();
         let (_api_tx, api_rx) = tokio::sync::mpsc::unbounded_channel();
         let mut app = App::new(
             &Config::default(),

@@ -78,10 +78,17 @@ struct ProcessGuard(u32);
 
 impl ProcessGuard {
     fn from_pid_file(path: &std::path::Path) -> Self {
-        let deadline = Instant::now() + Duration::from_secs(1);
+        // The shell creates the file before `echo` fills it, and a detached
+        // descendant may be scheduled late on a loaded machine. Only a
+        // complete line counts; the deadline is a hang guard, not a timing
+        // assertion.
+        let deadline = Instant::now() + Duration::from_secs(20);
         loop {
-            if let Ok(pid) = std::fs::read_to_string(path) {
-                return Self(pid.trim().parse().unwrap());
+            if let Some(pid) = std::fs::read_to_string(path)
+                .ok()
+                .and_then(|text| text.strip_suffix('\n').and_then(|pid| pid.parse().ok()))
+            {
+                return Self(pid);
             }
             assert!(
                 Instant::now() < deadline,
@@ -92,7 +99,8 @@ impl ProcessGuard {
     }
 
     fn assert_gone(&self) {
-        let deadline = Instant::now() + Duration::from_secs(2);
+        // Hang guard only: the descendant is killed, but reaping may lag under load.
+        let deadline = Instant::now() + Duration::from_secs(10);
         while process_exists(self.0) && Instant::now() < deadline {
             std::thread::sleep(Duration::from_millis(5));
         }
@@ -118,7 +126,7 @@ fn process_exists(pid: u32) -> bool {
 }
 
 fn handle_provider_events_until_idle(app: &mut App) {
-    let deadline = Instant::now() + Duration::from_secs(5);
+    let deadline = Instant::now() + Duration::from_secs(20);
     while app.state.plugin_action_choices_providers_in_flight > 0 {
         match app.event_rx.try_recv() {
             Ok(event) => app.handle_internal_event(event),
@@ -135,6 +143,7 @@ fn handle_provider_events_until_idle(app: &mut App) {
 
 #[test]
 fn provider_success_malformed_nonzero_and_spawn_failure() {
+    let _env = crate::test_env::shared();
     let valid = shell(
         r#"printf '%s' '{"version":1,"choices":[{"id":"one","label":"One","payload":null}]}'"#,
     );
@@ -177,6 +186,7 @@ fn provider_success_malformed_nonzero_and_spawn_failure() {
 
 #[test]
 fn provider_timeout_terminates_process_group() {
+    let _env = crate::test_env::shared();
     let root = root("choices-timeout-tree");
     let pid_file = root.join("descendant.pid");
     let started = Instant::now();
@@ -187,7 +197,7 @@ fn provider_timeout_terminates_process_group() {
     .result
     .unwrap_err();
     let descendant = ProcessGuard::from_pid_file(&pid_file);
-    assert!(started.elapsed() < Duration::from_secs(5));
+    assert!(started.elapsed() < Duration::from_secs(20));
     assert!(result.contains("timed out after 2 seconds"));
     descendant.assert_gone();
     std::fs::remove_dir_all(root).ok();
@@ -195,6 +205,7 @@ fn provider_timeout_terminates_process_group() {
 
 #[test]
 fn provider_completion_kills_descendant_that_retains_output_pipes() {
+    let _env = crate::test_env::shared();
     let root = root("choices-completion-tree");
     let pid_file = root.join("descendant.pid");
     let started = Instant::now();
@@ -205,7 +216,7 @@ fn provider_completion_kills_descendant_that_retains_output_pipes() {
     let descendant = ProcessGuard::from_pid_file(&pid_file);
 
     assert!(
-        started.elapsed() < Duration::from_secs(3),
+        started.elapsed() < Duration::from_secs(15),
         "provider completion waited for an inherited descendant pipe"
     );
     assert_eq!(completion.exit_code, Some(0));
@@ -217,17 +228,18 @@ fn provider_completion_kills_descendant_that_retains_output_pipes() {
 #[cfg(target_os = "linux")]
 #[test]
 fn provider_completion_does_not_wait_for_escaped_descendant_pipes() {
+    let _env = crate::test_env::shared();
     let root = root("choices-escaped-completion");
     let pid_file = root.join("descendant.pid");
     let started = Instant::now();
     let completion = shell(&format!(
-        r#"setsid sh -c 'echo $$ > {}; sleep 30' & printf '%s' '{{"version":1,"choices":[]}}'"#,
+        r#"setsid sh -c 'echo $$ > {0}; sleep 30' & while [ ! -s {0} ]; do sleep 0.01; done; printf '%s' '{{"version":1,"choices":[]}}'"#,
         pid_file.display()
     ));
     let _descendant = ProcessGuard::from_pid_file(&pid_file);
 
     assert!(
-        started.elapsed() < Duration::from_secs(3),
+        started.elapsed() < Duration::from_secs(15),
         "provider completion waited for an escaped descendant pipe"
     );
     assert_eq!(completion.exit_code, Some(0));
@@ -238,11 +250,12 @@ fn provider_completion_does_not_wait_for_escaped_descendant_pipes() {
 #[cfg(target_os = "linux")]
 #[test]
 fn provider_timeout_does_not_wait_for_escaped_descendant_pipes() {
+    let _env = crate::test_env::shared();
     let root = root("choices-escaped-timeout");
     let pid_file = root.join("descendant.pid");
     let started = Instant::now();
     let result = shell(&format!(
-        r#"setsid sh -c 'echo $$ > {}; sleep 30' & wait"#,
+        r#"setsid sh -c 'echo $$ > {0}; sleep 30' & while [ ! -s {0} ]; do sleep 0.01; done; wait"#,
         pid_file.display()
     ))
     .result
@@ -250,7 +263,7 @@ fn provider_timeout_does_not_wait_for_escaped_descendant_pipes() {
     let _descendant = ProcessGuard::from_pid_file(&pid_file);
 
     assert!(
-        started.elapsed() < Duration::from_secs(4),
+        started.elapsed() < Duration::from_secs(20),
         "provider timeout waited for an escaped descendant pipe"
     );
     assert!(result.contains("timed out after 2 seconds"));
@@ -259,6 +272,7 @@ fn provider_timeout_does_not_wait_for_escaped_descendant_pipes() {
 
 #[test]
 fn provider_is_async_correlated_and_accounted() {
+    let _env = crate::test_env::shared();
     let root = root("choices-async");
     let plugin = plugin(&root);
     let mut app = test_app();
@@ -322,6 +336,7 @@ fn provider_is_async_correlated_and_accounted() {
 #[cfg(target_os = "linux")]
 #[test]
 fn escaped_descendant_pipes_do_not_hold_provider_capacity() {
+    let _env = crate::test_env::shared();
     let root = root("choices-escaped-capacity");
     let pid_file = root.join("descendant.pid");
     let plugin = plugin(&root);
@@ -335,7 +350,7 @@ fn escaped_descendant_pipes_do_not_hold_provider_capacity() {
             "sh".into(),
             "-c".into(),
             format!(
-                r#"setsid sh -c 'echo $$ > {}; sleep 30' & printf '{{"version":1,"choices":[]}}'"#,
+                r#"setsid sh -c 'echo $$ > {0}; sleep 30' & while [ ! -s {0} ]; do sleep 0.01; done; printf '{{"version":1,"choices":[]}}'"#,
                 pid_file.display()
             ),
         ],
@@ -346,7 +361,7 @@ fn escaped_descendant_pipes_do_not_hold_provider_capacity() {
     let event = app.event_rx.blocking_recv().unwrap();
     let _descendant = ProcessGuard::from_pid_file(&pid_file);
     assert!(
-        started.elapsed() < Duration::from_secs(3),
+        started.elapsed() < Duration::from_secs(15),
         "escaped output pipes held provider capacity"
     );
     app.handle_internal_event(event);
@@ -360,6 +375,7 @@ fn escaped_descendant_pipes_do_not_hold_provider_capacity() {
 
 #[test]
 fn provider_completion_accounting_survives_log_eviction_and_duplicates() {
+    let _env = crate::test_env::shared();
     let root = root("choices-accounting-eviction");
     let plugin = plugin(&root);
     let mut app = test_app();
@@ -429,6 +445,7 @@ fn provider_completion_accounting_survives_log_eviction_and_duplicates() {
 
 #[test]
 fn provider_admission_is_dedicated_and_bounded_to_four() {
+    let _env = crate::test_env::shared();
     let root = root("choices-limit");
     let plugin = plugin(&root);
     let mut app = test_app();
@@ -468,6 +485,7 @@ fn provider_admission_is_dedicated_and_bounded_to_four() {
 
 #[test]
 fn dismiss_and_reopen_releases_capacity_only_after_cancelled_workers_finish() {
+    let _env = crate::test_env::shared();
     use crate::app::state::{
         ContextMenuKind, ContextMenuPluginState, ContextMenuState, ContextMenuTarget, Mode,
     };
@@ -623,6 +641,7 @@ fn deferred_reaping_retains_admission_until_cleanup_event() {
 
 #[test]
 fn provider_cancelled_before_worker_start_never_executes_command() {
+    let _env = crate::test_env::shared();
     let root = root("choices-pre-spawn-cancel");
     let marker = root.join("executed");
     let mut command = crate::plugin_command::command_for_argv_in_dir(
@@ -646,6 +665,7 @@ fn provider_cancelled_before_worker_start_never_executes_command() {
 
 #[test]
 fn normal_command_choice_env_is_canonical_and_provider_env_removes_stale_choice() {
+    let _env = crate::test_env::shared();
     let root = root("choice-env");
     let plugin = plugin(&root);
     let context = context();

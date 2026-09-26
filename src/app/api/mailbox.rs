@@ -1620,6 +1620,157 @@ mod tests {
         std::fs::remove_dir_all(directory).expect("remove mailbox directory");
     }
 
+    fn generation_claim(
+        sender_key: &str,
+        generation: u64,
+    ) -> crate::api::schema::MailboxClaimParams {
+        crate::api::schema::MailboxClaimParams {
+            caller: sender_key.into(),
+            grant_id: format!("offline:{sender_key}:{generation}"),
+            recipient: active_recipient(sender_key),
+            claim: ClaimRequest {
+                protocol: PROTOCOL.into(),
+            },
+        }
+    }
+
+    /// Herdr sleep → queued head → wake: the woken Pi runs in the same pane and
+    /// terminal (the same mailbox recipient), a second append coalesces, and the
+    /// queued head is claimed exactly once by the woken generation.
+    #[tokio::test]
+    async fn slept_pane_wakes_once_and_the_same_terminal_claims_the_queued_head_once() {
+        let (mut app, pane_id, sender_key, directory) = app_with_active_sender();
+        let terminal_id = app.state.workspaces[0]
+            .terminal_id(pane_id)
+            .unwrap()
+            .clone();
+        let (runtime, mut input) = crate::terminal::TerminalRuntime::test_with_channel(80, 24);
+        app.terminal_runtimes.insert(terminal_id.clone(), runtime);
+        app.state
+            .terminals
+            .get_mut(&terminal_id)
+            .unwrap()
+            .launch_recipe = crate::launch_recipe::LaunchRecipe::capture("sender", "pi", &[], &[]);
+        let submitted = app.handle_api_request(Request {
+            id: "submit".into(),
+            method: Method::MailboxOfflineSubmit(active_submit(sender_key.clone(), "e".repeat(64))),
+        });
+        assert!(serde_json::from_str::<SuccessResponse>(&submitted).is_ok());
+        let public = app.public_pane_id(0, pane_id).unwrap();
+
+        let slept = app.handle_api_request(Request {
+            id: "sleep".into(),
+            method: Method::AgentSleep(crate::api::schema::AgentTarget {
+                target: public.clone(),
+            }),
+        });
+        assert!(
+            serde_json::from_str::<SuccessResponse>(&slept).is_ok(),
+            "{slept}"
+        );
+        assert!(app.state.terminals[&terminal_id].sleep.is_some());
+        assert_eq!(
+            input.try_recv().unwrap().as_ref(),
+            b"\x04",
+            "guarded ctrl+d"
+        );
+        // The Pi exits back to the shell.
+        app.handle_internal_event(AppEvent::StateChanged {
+            pane_id,
+            agent: None,
+            state: crate::detect::AgentState::Idle,
+            visible_blocker: false,
+            visible_working: false,
+            process_exited: true,
+            observed_at: std::time::Instant::now(),
+        });
+
+        let trigger = || crate::app::wake::WakeTrigger {
+            cause: crate::app::wake::WakeCause::HeadAppended,
+            recipient_id: sender_key.clone(),
+            head_id: "stable-1".into(),
+        };
+        let outcome = app.wake_pane(&public, trigger());
+        let crate::app::wake::WakeOutcome::Started {
+            wake_id,
+            generation,
+        } = outcome
+        else {
+            panic!("the slept pane wakes: {outcome:?}")
+        };
+        assert_eq!(generation, 2);
+        assert_eq!(
+            app.wake_pane(&public, trigger()),
+            crate::app::wake::WakeOutcome::Duplicate {
+                wake_id: wake_id.clone()
+            },
+            "a second head coalesces into the outstanding wake"
+        );
+        let launched = input.try_recv().expect("one launch command");
+        assert!(String::from_utf8_lossy(&launched).contains("pi"));
+        assert!(input.try_recv().is_err(), "exactly one launch");
+        assert!(app.pane_wake_record_exists(&wake_id));
+        assert_eq!(
+            app.state.workspaces[0].terminal_id(pane_id),
+            Some(&terminal_id),
+            "same pane, same terminal"
+        );
+
+        // The woken Pi attaches: the wake resolves and the sleep ends.
+        app.handle_internal_event(AppEvent::AgentProcessDetected {
+            pane_id,
+            agent: Agent::Pi,
+            process_generation: 2,
+            observed_at: std::time::Instant::now(),
+        });
+        assert!(app.pane_wakes.is_empty());
+        assert!(app.state.terminals[&terminal_id].sleep.is_none());
+
+        let claim = |app: &mut App, id: &str| {
+            let response = app.handle_api_request(Request {
+                id: id.into(),
+                method: Method::MailboxClaim(generation_claim(&sender_key, 2)),
+            });
+            let response: SuccessResponse = serde_json::from_str(&response).expect("claim");
+            let ResponseResult::MailboxClaimed { claim } = response.result else {
+                panic!("claim result")
+            };
+            claim
+        };
+        let first = claim(&mut app, "claim").expect("the woken generation claims the head");
+        assert_eq!(first.stable_id, "stable-1");
+        let resolved = app.handle_api_request(Request {
+            id: "resolve".into(),
+            method: Method::MailboxResolve(crate::api::schema::MailboxResolveParams {
+                caller: sender_key.clone(),
+                grant_id: format!("offline:{sender_key}:2"),
+                recipient: active_recipient(&sender_key),
+                resolve: Resolve {
+                    protocol: PROTOCOL.into(),
+                    claim_id: first.claim_id,
+                    outcome: ResolveOutcome::Settled,
+                },
+            }),
+        });
+        assert!(
+            serde_json::from_str::<SuccessResponse>(&resolved).is_ok(),
+            "{resolved}"
+        );
+        assert_eq!(claim(&mut app, "claim-again"), None, "claimed exactly once");
+        assert!(
+            matches!(
+                app.wake_pane(&public, trigger()),
+                crate::app::wake::WakeOutcome::Refused {
+                    reason: crate::app::wake::WakeRefusal::NotSleeping,
+                    ..
+                }
+            ),
+            "awake again: no further wake"
+        );
+        drop(app);
+        std::fs::remove_dir_all(directory).expect("remove mailbox directory");
+    }
+
     #[test]
     fn mailbox_claim_replay_returns_one_durable_claim_and_resolve_is_idempotent() {
         let (mut app, _pane_id, sender_key, directory) = app_with_active_sender();

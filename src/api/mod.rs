@@ -51,6 +51,7 @@ pub(crate) fn request_changes_ui(request: &Request) -> bool {
             | Method::CollectionHelperAbort(_)
             | Method::AgentPrompt(_)
             | Method::AgentSendKeys(_)
+            | Method::AgentSleep(_)
             | Method::MailboxOfflineSubmit(_)
             | Method::MailboxClaim(_)
             | Method::MailboxResolve(_)

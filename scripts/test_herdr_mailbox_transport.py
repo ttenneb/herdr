@@ -105,74 +105,19 @@ class MailboxTransportDecisionTests(unittest.TestCase):
         self.assertEqual(sent[0][1]["mailboxPath"], str(self.mailbox))
         self.assertEqual(starts, [])
 
-    def test_sleeping_or_stopped_recipient_uses_one_nonblocking_systemd_wake(self):
+    def test_sleeping_or_stopped_recipient_is_rejected_without_starting_anything(self):
         for state in ("sleeping", "stopped"):
             with self.subTest(state=state):
-                shutil.rmtree(self.state)
-                self.state.mkdir(mode=0o700)
                 self.secure_json(self.runtime, self.runtime_value(state))
                 calls = []
-                def runner(command, **kwargs):
-                    calls.append((command, kwargs))
-                    return __import__("subprocess").CompletedProcess(command, 0, "", "")
-                first = transport.dispatch(self.manifest, self.request, self.root, runner=runner)
-                second = transport.dispatch(self.manifest, self.request, self.root, runner=runner)
-                self.assertEqual(first["route"], "systemd_wake")
-                self.assertEqual(first["outcome"], "accepted")
-                self.assertEqual(second["outcome"], "duplicate")
-                self.assertEqual(len(calls), 1)
-                self.assertEqual(calls[0][0], [str(self.systemctl), "--user", "start", "--no-block", self.manifest["wakeUnit"]])
-
-    def test_two_deliveries_share_one_generation_scoped_wake_receipt(self):
-        self.secure_json(self.runtime, self.runtime_value("sleeping", generation=9))
-        calls = []
-        def runner(command, **kwargs):
-            calls.append(command)
-            return __import__("subprocess").CompletedProcess(command, 0, "", "")
-        first = transport.dispatch(self.manifest, self.request, self.root, runner=runner)
-        second_request = dict(self.request)
-        second_request["deliveryId"] = "1123456789abcdef0123456789abcdef"
-        second = transport.dispatch(self.manifest, second_request, self.root, runner=runner)
-        self.assertEqual(first["outcome"], "accepted")
-        self.assertEqual(second["outcome"], "duplicate")
-        self.assertEqual(first["receiptId"], second["receiptId"])
-        self.assertEqual(first["receiptId"], transport.wake_receipt_id(self.manifest, 9))
-        self.assertNotIn(self.request["deliveryId"], first["receiptId"])
-        self.assertNotIn(second_request["deliveryId"], second["receiptId"])
-        self.assertEqual(len(calls), 1)
-
-    def test_mailbox_path_is_stable_across_sleep_wake_and_live_registration(self):
-        self.secure_json(self.runtime, self.runtime_value("sleeping", generation=7))
-        calls = []
-        def runner(command, **kwargs):
-            calls.append(command)
-            return __import__("subprocess").CompletedProcess(command, 0, "", "")
-        wake = transport.dispatch(self.manifest, self.request, self.root, runner=runner)
-        self.assertEqual(wake["mailboxPath"], str(self.mailbox))
-        endpoint = self.root / "woken.sock"
-        self.secure_json(self.runtime, self.runtime_value("live", generation=8, endpoint=endpoint))
-        frames = []
-        def exchange(_path, frame, _root):
-            frames.append(frame)
-            return {"kind": "herdr.mailbox.delivery-result", "version": 1,
-                    "deliveryId": frame["deliveryId"], "outcome": "duplicate",
-                    "receiptId": "mailbox-existing"}
-        direct = transport.dispatch(self.manifest, self.request, self.root, exchange=exchange, runner=runner)
-        self.assertEqual(direct["mailboxPath"], wake["mailboxPath"])
-        self.assertEqual(frames[0]["mailboxPath"], wake["mailboxPath"])
-        self.assertEqual(len(calls), 1)
-
-    def test_held_role_manager_lock_rejects_lock_cycle_without_starting(self):
-        self.secure_json(self.runtime, self.runtime_value("sleeping"))
-        lock = self.manager_lock.open("a+")
-        self.addCleanup(lock.close)
-        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        calls = []
-        result = transport.dispatch(self.manifest, self.request, self.root,
-                                    runner=lambda *args, **kwargs: calls.append((args, kwargs)))
-        self.assertEqual(result["outcome"], "rejected")
-        self.assertEqual(result["reason"], "lifecycle_manager_lock_held")
-        self.assertEqual(calls, [])
+                result = transport.dispatch(self.manifest, self.request, self.root,
+                                            runner=lambda *args, **kwargs: calls.append((args, kwargs)))
+                self.assertEqual(result["outcome"], "rejected")
+                self.assertEqual(result["route"], "none")
+                self.assertEqual(result["reason"], transport.WAKE_DISABLED_REASON)
+                self.assertEqual(result["mailboxPath"], str(self.mailbox))
+                self.assertEqual(calls, [])
+                self.assertFalse((self.state / "wake-intent.json").exists())
 
     def test_incompatible_live_registration_does_not_fall_back_to_wake(self):
         runtime = self.runtime_value("live", endpoint=self.root / "live.sock")

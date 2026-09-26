@@ -582,11 +582,16 @@ fn restore_tab(
             .and_then(crate::detect::parse_canonical_agent_label);
         let saved_launch_argv = saved_pane.and_then(|p| p.launch_argv.clone());
         let saved_agent_session = saved_pane.and_then(|p| p.agent_session.as_ref());
+        let saved_recipe = saved_pane.and_then(|p| p.launch_recipe.clone());
+        let saved_sleep = saved_pane.and_then(|p| p.sleep.clone());
+        let saved_route_carry = saved_pane.and_then(|p| p.route_carry.clone());
         let saved_history =
             old_id.and_then(|old_id| history.and_then(|history| history.panes.get(old_id)));
         let startup = {
             let mut agent_restore = AgentRestoreState {
-                enabled: runtime_context.resume_agents_on_restore,
+                // A pane Herdr put to sleep stays asleep across a restart; a
+                // queued message wakes it through its recipe.
+                enabled: runtime_context.resume_agents_on_restore && saved_sleep.is_none(),
                 resumed_sessions: resumed_agent_sessions,
             };
             pane_restore_startup(saved_agent_session, saved_history, &mut agent_restore)
@@ -622,6 +627,9 @@ fn restore_tab(
             let terminal_id = TerminalId::alloc();
             let mut terminal = TerminalState::new(terminal_id.clone(), cwd.clone())
                 .with_pending_agent_resume_plan(plan);
+            terminal.launch_recipe = saved_recipe.clone();
+            terminal.sleep = saved_sleep.clone();
+            terminal.route_carry = saved_route_carry.clone();
             if let Some(label) = saved_label {
                 terminal.set_manual_label(label);
             }
@@ -720,6 +728,9 @@ fn restore_tab(
             Ok(runtime) => {
                 let terminal_id = TerminalId::alloc();
                 let mut terminal = TerminalState::new(terminal_id.clone(), cwd.clone());
+                terminal.launch_recipe = saved_recipe.clone();
+                terminal.sleep = saved_sleep.clone();
+                terminal.route_carry = saved_route_carry.clone();
                 if was_imported {
                     if let Some(argv) = saved_launch_argv {
                         terminal = terminal.with_launch_argv(argv).with_respawn_shell_on_exit();
@@ -1264,6 +1275,9 @@ mod tests {
             managed_agent_kind: None,
             agent_session: None,
             launch_argv: None,
+            launch_recipe: None,
+            sleep: None,
+            route_carry: None,
             queue_key: None,
             messages_capable: false,
         }
@@ -1762,6 +1776,9 @@ mod tests {
                                 value: "opencode-session".into(),
                             }),
                             launch_argv: None,
+                            launch_recipe: None,
+                            sleep: None,
+                            route_carry: None,
                             queue_key: None,
                             messages_capable: false,
                         },
@@ -1854,6 +1871,9 @@ mod tests {
                                 value: "opencode-session".into(),
                             }),
                             launch_argv: None,
+                            launch_recipe: None,
+                            sleep: None,
+                            route_carry: None,
                             queue_key: Some("0123456789abcdef0123456789abcdef".into()),
                             messages_capable: true,
                         },
@@ -1933,6 +1953,9 @@ mod tests {
                                 managed_agent_kind: None,
                                 agent_session: None,
                                 launch_argv: None,
+                                launch_recipe: None,
+                                sleep: None,
+                                route_carry: None,
                                 queue_key: None,
                                 messages_capable: false,
                             },
@@ -1947,6 +1970,9 @@ mod tests {
                                 managed_agent_kind: None,
                                 agent_session: None,
                                 launch_argv: None,
+                                launch_recipe: None,
+                                sleep: None,
+                                route_carry: None,
                                 queue_key: None,
                                 messages_capable: false,
                             },
@@ -2233,6 +2259,9 @@ mod tests {
                     managed_agent_kind: None,
                     agent_session: None,
                     launch_argv: None,
+                    launch_recipe: None,
+                    sleep: None,
+                    route_carry: None,
                     queue_key: None,
                     messages_capable: false,
                 },
@@ -2251,6 +2280,9 @@ mod tests {
                 value: "codex-session".into(),
             }),
             launch_argv: None,
+            launch_recipe: None,
+            sleep: None,
+            route_carry: None,
             queue_key: None,
             messages_capable: false,
         };
@@ -2396,6 +2428,113 @@ mod tests {
 
     #[tokio::test]
     #[cfg(unix)]
+    async fn restore_keeps_launch_recipe_and_leaves_slept_panes_asleep() {
+        let cwd = std::env::current_dir().unwrap();
+        let recipe = crate::launch_recipe::LaunchRecipe::capture("owner", "pi", &[], &[]);
+        let carry = crate::launch_recipe::RouteCarry {
+            child_delegation: "d2".into(),
+            parent_delegation: "d1".into(),
+            session_path: test_session_path("recipe-session.jsonl"),
+            generation: 1,
+            parent_terminal: "term_parent".into(),
+            parent_session: test_session_path("parent-session.jsonl"),
+        };
+        for sleep in [
+            None,
+            Some(crate::launch_recipe::PaneSleep {
+                since_ms: 1,
+                agent_name: "owner".into(),
+                generation: 1,
+            }),
+        ] {
+            let cwd = cwd.clone();
+            let snapshot = SessionSnapshot {
+                version: super::super::snapshot::SNAPSHOT_VERSION,
+                repositories: Vec::new(),
+                space_order: Vec::new(),
+                workspaces: vec![WorkspaceSnapshot {
+                    id: Some("workspace".into()),
+                    custom_name: None,
+                    identity_cwd: cwd.clone(),
+                    checkout: None,
+                    worktree_space: None,
+                    public_pane_numbers: HashMap::new(),
+                    next_public_pane_number: 0,
+                    public_tab_numbers: Vec::new(),
+                    next_public_tab_number: 0,
+                    tabs: vec![TabSnapshot {
+                        custom_name: None,
+                        layout: LayoutSnapshot::Pane(0),
+                        panes: HashMap::from([(
+                            0,
+                            super::super::snapshot::PaneSnapshot {
+                                cwd,
+                                seen: true,
+                                label: None,
+                                agent_name: None,
+                                managed_agent_kind: None,
+                                agent_session: Some(
+                                    super::super::snapshot::PaneAgentSessionSnapshot {
+                                        source: "herdr:pi".into(),
+                                        agent: "pi".into(),
+                                        kind: crate::agent_resume::AgentSessionRefKind::Path,
+                                        value: test_session_path("recipe-session.jsonl"),
+                                    },
+                                ),
+                                launch_argv: None,
+                                launch_recipe: recipe.clone(),
+                                sleep: sleep.clone(),
+                                route_carry: Some(carry.clone()),
+                                queue_key: None,
+                                messages_capable: true,
+                            },
+                        )]),
+                        zoomed: false,
+                        focused: Some(0),
+                        root_pane: Some(0),
+
+                        collections: Vec::new(),
+                        focused_leaf: None,
+                    }],
+                    active_tab: 0,
+                }],
+                active: Some(0),
+                selected: 0,
+                sidebar_width: None,
+                sidebar_section_split: None,
+                collapsed_space_keys: Default::default(),
+
+                delegations: Vec::new(),
+                collection_archive_times: Vec::new(),
+            };
+            let (events, _event_rx) = mpsc::channel(4);
+            let (_workspaces, _delegations, _archive_times, terminals, _runtimes) = restore(
+                &snapshot,
+                None,
+                24,
+                80,
+                0,
+                test_restore_shell(),
+                crate::config::ShellModeConfig::NonLogin,
+                true,
+                events,
+                Arc::new(Notify::new()),
+                Arc::new(RenderSignal::new()),
+            );
+            let terminal = terminals.values().next().expect("restored terminal");
+            assert_eq!(terminal.launch_recipe, recipe);
+            assert_eq!(terminal.sleep, sleep);
+            assert_eq!(terminal.route_carry, Some(carry.clone()));
+            assert_eq!(
+                terminal.pending_agent_resume_plan.is_some(),
+                sleep.is_none(),
+                "a slept pane stays asleep; an awake one resumes through its recipe"
+            );
+        }
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
     async fn native_agent_restore_defers_runtime_launch() {
         let cwd = std::env::current_dir().unwrap();
         let snapshot = SessionSnapshot {
@@ -2430,6 +2569,9 @@ mod tests {
                                 value: "codex-session".into(),
                             }),
                             launch_argv: None,
+                            launch_recipe: None,
+                            sleep: None,
+                            route_carry: None,
                             queue_key: None,
                             messages_capable: false,
                         },
@@ -2606,6 +2748,9 @@ mod tests {
                 managed_agent_kind: None,
                 agent_session: None,
                 launch_argv: None,
+                launch_recipe: None,
+                sleep: None,
+                route_carry: None,
                 queue_key: None,
                 messages_capable: false,
             },

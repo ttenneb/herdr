@@ -73,6 +73,7 @@ mod input;
 mod integration;
 mod ipc;
 mod kitty_graphics;
+mod launch_recipe;
 mod layout;
 mod logging;
 pub mod mailbox;
@@ -105,6 +106,8 @@ mod terminal_effects;
 mod terminal_modes;
 mod terminal_notify;
 mod terminal_theme;
+#[cfg(test)]
+mod test_env;
 mod ui;
 mod update;
 mod workspace;

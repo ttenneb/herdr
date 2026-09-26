@@ -381,6 +381,7 @@ impl Tab {
         shell_config: crate::pane::PaneShellConfig<'_>,
         launch_env: &PaneLaunchEnv,
         argv: Option<&[String]>,
+        terminal_id: TerminalId,
     ) -> Result<NewPane, CollectionCreateMemberError> {
         let pane_id = PaneId::alloc();
         self.validate_collection_insert(collection_id, pane_id)
@@ -420,7 +421,6 @@ impl Tab {
             )
         }
         .map_err(CollectionCreateMemberError::Spawn)?;
-        let terminal_id = TerminalId::alloc();
         let terminal = match argv {
             Some(argv) => {
                 TerminalState::new(terminal_id.clone(), actual_cwd).with_launch_argv(argv.to_vec())

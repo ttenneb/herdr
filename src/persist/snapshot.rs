@@ -161,6 +161,12 @@ pub struct PaneSnapshot {
     pub agent_session: Option<PaneAgentSessionSnapshot>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub launch_argv: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub launch_recipe: Option<crate::launch_recipe::LaunchRecipe>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sleep: Option<crate::launch_recipe::PaneSleep>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub route_carry: Option<crate::launch_recipe::RouteCarry>,
     /// Durable Messages queue key of this pane (see `TerminalState::queue_key`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub queue_key: Option<String>,
@@ -508,6 +514,9 @@ fn capture_tab(
             })
             .unwrap_or_default();
         let launch_argv = terminal.and_then(|terminal| terminal.launch_argv.clone());
+        let launch_recipe = terminal.and_then(|terminal| terminal.launch_recipe.clone());
+        let sleep = terminal.and_then(|terminal| terminal.sleep.clone());
+        let route_carry = terminal.and_then(|terminal| terminal.route_carry.clone());
         let queue_key = terminal.map(|terminal| terminal.queue_key.clone());
         let messages_capable = terminal.is_some_and(|terminal| terminal.messages_capable);
         let agent_session = terminal.and_then(|terminal| {
@@ -541,6 +550,9 @@ fn capture_tab(
                 managed_agent_kind,
                 agent_session,
                 launch_argv,
+                launch_recipe,
+                sleep,
+                route_carry,
                 queue_key,
                 messages_capable,
             },
@@ -988,6 +1000,9 @@ mod tests {
                 managed_agent_kind: None,
                 agent_session: None,
                 launch_argv: None,
+                launch_recipe: None,
+                sleep: None,
+                route_carry: None,
                 queue_key: None,
                 messages_capable: false,
             },
@@ -1002,6 +1017,9 @@ mod tests {
                 managed_agent_kind: None,
                 agent_session: None,
                 launch_argv: None,
+                launch_recipe: None,
+                sleep: None,
+                route_carry: None,
                 queue_key: None,
                 messages_capable: false,
             },
@@ -1690,6 +1708,9 @@ mod tests {
                 managed_agent_kind: None,
                 agent_session: None,
                 launch_argv: None,
+                launch_recipe: None,
+                sleep: None,
+                route_carry: None,
                 queue_key: None,
                 messages_capable: false,
             },
@@ -1706,6 +1727,9 @@ mod tests {
                 managed_agent_kind: None,
                 agent_session: None,
                 launch_argv: None,
+                launch_recipe: None,
+                sleep: None,
+                route_carry: None,
                 queue_key: None,
                 messages_capable: false,
             },

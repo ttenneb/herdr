@@ -8,7 +8,219 @@ use crate::delegation::{DelegationId, DelegationRecord, SiblingPosition};
 
 use super::responses::{encode_error, encode_success};
 
+/// How long a relaunched pane may take (its Pi attaching, its parent being
+/// ready) before a carried route is dropped.
+pub(crate) const ROUTE_CARRY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+const ROUTE_CARRY_RETRY: std::time::Duration = std::time::Duration::from_millis(500);
+
 impl App {
+    fn record_route_carry(
+        &self,
+        terminal_id: &crate::terminal::TerminalId,
+        carry: &crate::launch_recipe::RouteCarry,
+        generation: Option<u64>,
+        outcome: &str,
+        detail: Option<String>,
+    ) {
+        use std::io::Write;
+        use std::os::unix::fs::OpenOptionsExt;
+        let dir = self.sender_authority_dir.join("route-carries");
+        if std::fs::create_dir_all(&dir).is_err() {
+            return;
+        }
+        let name = format!(
+            "{}-g{}",
+            carry.child_delegation,
+            generation.map_or_else(|| "unknown".to_string(), |g| g.to_string())
+        );
+        let record = serde_json::json!({
+            "version": 1,
+            "childDelegation": carry.child_delegation,
+            "parentDelegation": carry.parent_delegation,
+            "terminalId": terminal_id.to_string(),
+            "sessionPath": carry.session_path,
+            "previousGeneration": carry.generation,
+            "generation": generation,
+            "outcome": outcome,
+            "detail": detail,
+            "atMs": std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|elapsed| elapsed.as_millis() as u64)
+                .unwrap_or(0),
+        });
+        let tmp = dir.join(format!(".{name}.tmp"));
+        let written = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(&tmp)
+            .and_then(|mut file| {
+                file.write_all(&serde_json::to_vec(&record).unwrap_or_default())?;
+                file.sync_all()
+            })
+            .and_then(|()| std::fs::rename(&tmp, dir.join(format!("{name}.json"))));
+        if let Err(err) = written {
+            tracing::warn!(%err, "cannot write route carry record");
+        }
+    }
+
+    pub(crate) fn next_route_carry_deadline(
+        &self,
+        now: std::time::Instant,
+    ) -> Option<std::time::Instant> {
+        (!self.pending_route_carries.is_empty()).then(|| now + ROUTE_CARRY_RETRY)
+    }
+
+    /// Re-establish carried delegation routes for panes relaunched from their
+    /// recipe (wake or restart resume): same pane and terminal, same session
+    /// file, same expected parent. Anything else drops the carry.
+    pub(crate) fn retry_route_carries(&mut self, now: std::time::Instant) -> bool {
+        let pending: Vec<_> = self
+            .pending_route_carries
+            .iter()
+            .map(|(terminal, deadline)| (terminal.clone(), *deadline))
+            .collect();
+        let mut changed = false;
+        for (terminal_id, deadline) in pending {
+            let Some(terminal) = self.state.terminals.get(&terminal_id) else {
+                self.pending_route_carries.remove(&terminal_id);
+                continue;
+            };
+            let Some(carry) = terminal.route_carry.clone() else {
+                self.pending_route_carries.remove(&terminal_id);
+                continue;
+            };
+            let generation = terminal.managed_agent_generation();
+            let drop_carry = |app: &mut App, outcome: &str, detail: String| {
+                app.record_route_carry(&terminal_id, &carry, generation, outcome, Some(detail));
+                app.pending_route_carries.remove(&terminal_id);
+                if let Some(terminal) = app.state.terminals.get_mut(&terminal_id) {
+                    terminal.route_carry = None;
+                }
+                app.state.mark_session_dirty();
+                app.schedule_session_save();
+            };
+            // Same pane: the child delegation must still be bound to this
+            // terminal's pane.
+            let child_terminal = parse_id(&carry.child_delegation)
+                .ok()
+                .and_then(|child| self.state.delegations.get(child))
+                .and_then(|record| record.pane_id)
+                .and_then(|pane| {
+                    let (ws_idx, _) = self.find_pane(pane)?;
+                    self.state.workspaces[ws_idx].terminal_id(pane).cloned()
+                });
+            if child_terminal.as_ref() != Some(&terminal_id) {
+                drop_carry(
+                    self,
+                    "refused",
+                    "the child delegation is not bound to this pane".into(),
+                );
+                changed = true;
+                continue;
+            }
+            // Same session: only known once the new Pi is bound and verified.
+            let session = self
+                .state
+                .terminals
+                .get(&terminal_id)
+                .and_then(|terminal| self.trusted_managed_pi_session(terminal));
+            match session {
+                Some(session) if session.value != carry.session_path => {
+                    if let Ok(child_id) = parse_id(&carry.child_delegation) {
+                        self.ready_delegation_routes.remove(&child_id);
+                    }
+                    drop_carry(
+                        self,
+                        "refused",
+                        format!("different session {}", session.value),
+                    );
+                    changed = true;
+                    continue;
+                }
+                Some(_) => {}
+                None => {
+                    if now >= deadline {
+                        drop_carry(
+                            self,
+                            "expired",
+                            "the relaunched Pi never became trusted".into(),
+                        );
+                        changed = true;
+                    }
+                    continue;
+                }
+            }
+            // The parent side must be the same execution the route was ready
+            // with: same terminal, same trusted session. Otherwise a woken child
+            // would be bound to a parent that holds no delegation for it.
+            let (Ok(child_id), Ok(parent_id)) = (
+                parse_id(&carry.child_delegation),
+                parse_id(&carry.parent_delegation),
+            ) else {
+                drop_carry(self, "refused", "invalid delegation id".into());
+                changed = true;
+                continue;
+            };
+            match self.ready_route_shape(child_id, parent_id) {
+                Some(shape)
+                    if shape.parent_terminal.to_string() != carry.parent_terminal
+                        || shape.parent_session.value != carry.parent_session =>
+                {
+                    // The old generation's route must not linger as ready.
+                    self.ready_delegation_routes.remove(&child_id);
+                    drop_carry(
+                        self,
+                        "refused",
+                        format!(
+                            "the parent changed: terminal {} session {}",
+                            shape.parent_terminal, shape.parent_session.value
+                        ),
+                    );
+                    changed = true;
+                    continue;
+                }
+                Some(_) => {}
+                None => {
+                    if now >= deadline {
+                        self.ready_delegation_routes.remove(&child_id);
+                        drop_carry(self, "expired", "the route never became ready".into());
+                        changed = true;
+                    }
+                    continue;
+                }
+            }
+            let response = self.handle_delegation_route_ready(
+                "route-carry".into(),
+                DelegationRouteReadyParams {
+                    child_delegation_id: carry.child_delegation.clone(),
+                    expected_parent_delegation_id: carry.parent_delegation.clone(),
+                },
+            );
+            let value: serde_json::Value =
+                serde_json::from_str(&response).unwrap_or(serde_json::Value::Null);
+            if value["result"]["type"] == "delegation_route_ready" {
+                self.pending_route_carries.remove(&terminal_id);
+                let epoch = value["result"]["route_epoch"].as_str().map(str::to_string);
+                self.record_route_carry(&terminal_id, &carry, generation, "established", epoch);
+                changed = true;
+            } else if now >= deadline {
+                let detail = value["error"]["code"]
+                    .as_str()
+                    .unwrap_or("unknown")
+                    .to_string();
+                drop_carry(
+                    self,
+                    "expired",
+                    format!("route not ready before the deadline: {detail}"),
+                );
+                changed = true;
+            }
+        }
+        changed
+    }
+
     pub(super) fn handle_delegation_create(
         &mut self,
         id: String,
@@ -121,6 +333,23 @@ impl App {
         }
         shape.epoch = epoch.clone();
         current.epoch = epoch.clone();
+        // Remember the route on the child's pane, so a same-session recipe
+        // relaunch (wake or restart resume) can re-establish it.
+        let carry = crate::launch_recipe::RouteCarry {
+            child_delegation: params.child_delegation_id.clone(),
+            parent_delegation: params.expected_parent_delegation_id.clone(),
+            session_path: current.child_session.value.clone(),
+            generation: current.child_generation,
+            parent_terminal: current.parent_terminal.to_string(),
+            parent_session: current.parent_session.value.clone(),
+        };
+        if let Some(terminal) = self.state.terminals.get_mut(&current.child_terminal) {
+            if terminal.route_carry.as_ref() != Some(&carry) {
+                terminal.route_carry = Some(carry);
+                self.state.mark_session_dirty();
+                self.schedule_session_save();
+            }
+        }
         self.ready_delegation_routes.insert(child, current);
         let delegation = self.delegation_info(
             self.state
