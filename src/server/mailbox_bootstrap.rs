@@ -757,6 +757,64 @@ mod tests {
         let _ = std::fs::remove_dir_all(directory);
     }
 
+    /// A carry pins the parent execution: if the parent pane now runs another
+    /// session, the woken child is not rebound to it and shows not ready.
+    #[tokio::test]
+    async fn carry_is_refused_when_the_parent_changed_its_session() {
+        use std::os::unix::fs::PermissionsExt;
+        let (mut app, directory, child, _parent, child_pane, child_terminal) =
+            ready_route_with_child_recipe();
+        let parent_pane = app.state.workspaces[1].tabs[0].root_pane.unwrap();
+        let parent_terminal = app.state.workspaces[1]
+            .terminal_id(parent_pane)
+            .unwrap()
+            .clone();
+        let carry = app.state.terminals[&child_terminal]
+            .route_carry
+            .clone()
+            .unwrap();
+        assert_eq!(carry.parent_terminal, parent_terminal.to_string());
+        // The parent restarts on a new session file.
+        let new_session = directory.join("parent-new.jsonl");
+        std::fs::write(
+            &new_session,
+            b"{\"type\":\"session\",\"version\":3,\"id\":\"parent-new\",\"cwd\":\"/tmp\"}\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&new_session, std::fs::Permissions::from_mode(0o600)).unwrap();
+        app.managed_pi_launches
+            .get_mut(&parent_terminal)
+            .unwrap()
+            .session_path = new_session.display().to_string();
+        assert_ne!(carry.parent_session, new_session.display().to_string());
+
+        app.state.terminals.get_mut(&child_terminal).unwrap().sleep =
+            Some(App::new_pane_sleep("sender".into(), 1));
+        let public = app.public_pane_id(0, child_pane).unwrap();
+        let outcome = app.wake_pane(
+            &public,
+            crate::app::wake::WakeTrigger {
+                cause: crate::app::wake::WakeCause::HeadAppended,
+                recipient_id: child_terminal.to_string(),
+                head_id: "h".into(),
+            },
+        );
+        assert!(matches!(
+            outcome,
+            crate::app::wake::WakeOutcome::Started { generation: 2, .. }
+        ));
+        relaunched_pi_attaches(&mut app, child_pane, &child_terminal, 2);
+        assert!(
+            !app.ready_delegation_routes.contains_key(&child),
+            "the child shows NOT ready"
+        );
+        assert!(app.state.terminals[&child_terminal].route_carry.is_none());
+        assert!(app.pending_route_carries.is_empty());
+        assert_eq!(route_carry_outcome(&directory, child, 2), "refused");
+        drop(app);
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
     #[tokio::test]
     async fn recipe_restart_resume_carries_the_delegation_route() {
         let (mut app, directory, child, parent, child_pane, child_terminal) =

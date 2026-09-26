@@ -128,6 +128,9 @@ impl App {
                 .and_then(|terminal| self.trusted_managed_pi_session(terminal));
             match session {
                 Some(session) if session.value != carry.session_path => {
+                    if let Ok(child_id) = parse_id(&carry.child_delegation) {
+                        self.ready_delegation_routes.remove(&child_id);
+                    }
                     drop_carry(
                         self,
                         "refused",
@@ -144,6 +147,45 @@ impl App {
                             "expired",
                             "the relaunched Pi never became trusted".into(),
                         );
+                        changed = true;
+                    }
+                    continue;
+                }
+            }
+            // The parent side must be the same execution the route was ready
+            // with: same terminal, same trusted session. Otherwise a woken child
+            // would be bound to a parent that holds no delegation for it.
+            let (Ok(child_id), Ok(parent_id)) = (
+                parse_id(&carry.child_delegation),
+                parse_id(&carry.parent_delegation),
+            ) else {
+                drop_carry(self, "refused", "invalid delegation id".into());
+                changed = true;
+                continue;
+            };
+            match self.ready_route_shape(child_id, parent_id) {
+                Some(shape)
+                    if shape.parent_terminal.to_string() != carry.parent_terminal
+                        || shape.parent_session.value != carry.parent_session =>
+                {
+                    // The old generation's route must not linger as ready.
+                    self.ready_delegation_routes.remove(&child_id);
+                    drop_carry(
+                        self,
+                        "refused",
+                        format!(
+                            "the parent changed: terminal {} session {}",
+                            shape.parent_terminal, shape.parent_session.value
+                        ),
+                    );
+                    changed = true;
+                    continue;
+                }
+                Some(_) => {}
+                None => {
+                    if now >= deadline {
+                        self.ready_delegation_routes.remove(&child_id);
+                        drop_carry(self, "expired", "the route never became ready".into());
                         changed = true;
                     }
                     continue;
@@ -298,6 +340,8 @@ impl App {
             parent_delegation: params.expected_parent_delegation_id.clone(),
             session_path: current.child_session.value.clone(),
             generation: current.child_generation,
+            parent_terminal: current.parent_terminal.to_string(),
+            parent_session: current.parent_session.value.clone(),
         };
         if let Some(terminal) = self.state.terminals.get_mut(&current.child_terminal) {
             if terminal.route_carry.as_ref() != Some(&carry) {

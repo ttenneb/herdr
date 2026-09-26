@@ -47,6 +47,12 @@ pub(crate) struct RouteCarry {
     pub parent_delegation: String,
     pub session_path: String,
     pub generation: u64,
+    /// The parent execution the route was ready with. A carry is refused if
+    /// the parent pane now holds another terminal or another session.
+    #[serde(default)]
+    pub parent_terminal: String,
+    #[serde(default)]
+    pub parent_session: String,
 }
 
 fn credential_like(name: &str) -> bool {

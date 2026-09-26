@@ -2331,6 +2331,8 @@ mod tests {
             parent_delegation: "d1".into(),
             session_path: test_session_path("recipe-session.jsonl"),
             generation: 1,
+            parent_terminal: "term_parent".into(),
+            parent_session: test_session_path("parent-session.jsonl"),
         };
         for sleep in [
             None,
