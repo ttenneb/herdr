@@ -160,6 +160,7 @@ fn sender(fixture: &Fixture) -> SenderAttribution {
         terminal: Some(fixture.terminals[0].clone()),
         label: "tpm".into(),
         session: Some("/sessions/s0-a.jsonl".into()),
+        external_key: None,
     }
 }
 
@@ -3107,4 +3108,92 @@ async fn a_pi_whose_messages_streams_closed_over_30s_ago_gets_typed_input() {
     // Re-attaching clears it.
     attach_recipient(&mut fixture);
     assert!(fixture.app.pane_takes_messages(&key));
+}
+
+/// QA 2b #4: senders outside every pane are keyed per process identity, so
+/// one external script cannot replace another's waiting message.
+#[tokio::test]
+async fn external_senders_cannot_replace_each_others_waiting_messages() {
+    let mut fixture = fixture();
+    attach_recipient(&mut fixture);
+    let recipient = fixture.terminals[1].clone();
+    let external = |key: &str| SenderAttribution {
+        terminal: None,
+        label: "external".into(),
+        session: None,
+        external_key: Some(key.into()),
+    };
+    let correlated = |body: &str, revision: u64| {
+        let mut message = plain(body);
+        message.correlation = Some(crate::mailbox::SendCorrelation {
+            namespace: "ci".into(),
+            key: "status".into(),
+            revision,
+        });
+        message.replace_pending = true;
+        message
+    };
+    let first = fixture
+        .app
+        .route_ordinary_send(
+            &recipient,
+            &external("external:1000:sid:100:5"),
+            correlated("script A", 1),
+            &Default::default(),
+        )
+        .unwrap();
+    let second = fixture
+        .app
+        .route_ordinary_send(
+            &recipient,
+            &external("external:1000:sid:200:9"),
+            correlated("script B", 1),
+            &MessageSendOptions {
+                send_new: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    let (
+        crate::app::messages::SendRoute::Mailbox(first),
+        crate::app::messages::SendRoute::Mailbox(second),
+    ) = (first, second)
+    else {
+        panic!("queued")
+    };
+    assert!(!second.edited, "B did not replace A's message");
+    assert_ne!(first.stable_id, second.stable_id);
+    let heads = crate::mailbox::MailboxStore::open(&fixture.directory)
+        .unwrap()
+        .load()
+        .unwrap()
+        .heads;
+    assert!(heads.values().any(|head| head.body.contains("script A")));
+    // The same script replaces its own.
+    let again = fixture
+        .app
+        .route_ordinary_send(
+            &recipient,
+            &external("external:1000:sid:100:5"),
+            correlated("script A v2", 2),
+            &Default::default(),
+        )
+        .unwrap();
+    let crate::app::messages::SendRoute::Mailbox(again) = again else {
+        panic!("queued")
+    };
+    assert!(again.edited);
+    assert_eq!(again.stable_id, first.stable_id);
+    // Different login sessions give different keys.
+    let own = crate::app::messages::external_sender_key(std::process::id());
+    let mut child = std::process::Command::new("setsid")
+        .args(["sleep", "5"])
+        .spawn()
+        .unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(100));
+    let other = crate::app::messages::external_sender_key(child.id());
+    assert!(own.starts_with("external:") && other.starts_with("external:"));
+    assert_ne!(own, other);
+    let _ = child.kill();
+    let _ = child.wait();
 }

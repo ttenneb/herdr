@@ -316,6 +316,7 @@ impl App {
             terminal: None,
             label: "herdr".into(),
             session: None,
+            external_key: None,
         };
         let options = crate::api::schema::MessageSendOptions {
             send_new: true,

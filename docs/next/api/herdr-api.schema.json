@@ -14361,6 +14361,15 @@
                 "string",
                 "null"
               ]
+            },
+            "typed_ahead_of_queued": {
+              "description": "For a typed delivery (`pty`/`pty_deferred`) to a pane whose Messages\nqueue still holds older messages: how many it was typed ahead of.",
+              "format": "uint64",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
             }
           },
           "required": [

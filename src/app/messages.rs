@@ -124,6 +124,11 @@ pub(crate) struct SenderAttribution {
     pub terminal: Option<String>,
     pub label: String,
     pub session: Option<String>,
+    /// For a sender outside every pane: its process identity (uid, and the
+    /// login session of the sending CLI, pinned by the session leader's
+    /// birth tick), so one external script cannot edit or replace another's
+    /// waiting message.
+    pub external_key: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -452,6 +457,26 @@ pub(crate) fn session_execution(session: &crate::app::MailboxBootstrapSession) -
             session.caller, session.active_execution_generation
         ),
     }
+}
+
+/// Identity of a sender outside every pane: the peer's uid plus its login
+/// session (session ID and the session leader's birth tick, so a recycled
+/// session ID is a different sender); the PID and its birth tick when the
+/// session cannot be read.
+pub(crate) fn external_sender_key(pid: u32) -> String {
+    use std::os::unix::fs::MetadataExt;
+    let uid = std::fs::metadata(format!("/proc/{pid}"))
+        .map(|meta| meta.uid().to_string())
+        .unwrap_or_else(|_| "?".into());
+    let sid = unsafe { libc::getsid(pid as libc::pid_t) };
+    if sid > 0 {
+        if let Some(leader) = crate::platform::process_birth_identity(sid as u32) {
+            return format!("external:{uid}:sid:{sid}:{}", leader.start_ticks);
+        }
+    }
+    let ticks = crate::platform::process_birth_identity(pid)
+        .map_or_else(|| "?".into(), |birth| birth.start_ticks.to_string());
+    format!("external:{uid}:pid:{pid}:{ticks}")
 }
 
 /// How long a live Pi may take to attach Messages before new sends to its
@@ -924,6 +949,7 @@ impl App {
             terminal: None,
             label: "external".into(),
             session: None,
+            external_key: caller_pid.map(external_sender_key),
         };
         let Some(mut pid) = caller_pid else {
             return external;
@@ -951,6 +977,7 @@ impl App {
                     terminal: Some(terminal.clone()),
                     label,
                     session: agent.and_then(|agent| agent.agent_session.map(|s| s.value)),
+                    external_key: None,
                 };
             }
             match parent_pid(pid) {
@@ -999,7 +1026,11 @@ impl App {
         let recovered = store
             .load()
             .map_err(|error| SendRefusal::Store(error.to_string()))?;
-        let sender_key = sender.terminal.clone().unwrap_or_else(|| "external".into());
+        let sender_key = sender
+            .terminal
+            .clone()
+            .or_else(|| sender.external_key.clone())
+            .unwrap_or_else(|| "external".into());
         let recipient_session = self.current_agent_session_value(recipient_terminal);
 
         // An identical send (same message ID from the same sender) returns its

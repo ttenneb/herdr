@@ -292,6 +292,7 @@ impl App {
                     .and_then(|agent| agent.name)
                     .unwrap_or_else(|| envelope.sender.pane_id.clone()),
                 session: Some(envelope.sender.agent_session.value.clone()),
+                external_key: None,
             };
             let deferral_id = self.defer_typed_delivery(
                 terminal_id.clone(),
@@ -379,6 +380,7 @@ impl App {
             terminal: Some(envelope.sender.terminal_id.clone()),
             label: sender_label.clone(),
             session: Some(envelope.sender.agent_session.value.clone()),
+            external_key: None,
         };
         let kind = match envelope.kind {
             crate::api::schema::HandoffKind::Assignment => "assignment",
