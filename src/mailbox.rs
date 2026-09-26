@@ -1216,6 +1216,53 @@ mod tests {
         std::fs::remove_dir_all(store.lock_path.parent().unwrap()).unwrap();
     }
 
+    // The edit CAS is per head: a live (claimed, admitted) head for the same
+    // recipient never blocks editing another held head.
+    #[test]
+    fn head_edit_is_per_head_and_independent_of_a_live_claim() {
+        let store = temporary_store();
+        let running = head();
+        let mut waiting = head();
+        waiting.stable_id = "recipient\0sender\0waiting".into();
+        waiting.delivery_digest = "e".repeat(64);
+        waiting.message_id = "waiting".into();
+        store.append_offline_head(running.clone()).unwrap();
+        store.append_offline_head(waiting.clone()).unwrap();
+        let claim = store.claim_next(&running.recipient).unwrap().unwrap();
+        assert_eq!(claim.stable_id, running.stable_id);
+        store
+            .resolve_claim(&claim.claim_id, ClaimResolutionOutcome::Admitted)
+            .unwrap();
+        let edited = store
+            .edit_unclaimed_head(MailboxHeadEdit {
+                stable_id: waiting.stable_id.clone(),
+                revision: 1,
+                digest: waiting.digest.clone(),
+                subject: "edited".into(),
+                body: "edited while another head runs".into(),
+                repin_recipient_session: None,
+            })
+            .unwrap();
+        assert_eq!(edited.revision, 2);
+        assert_eq!(
+            store.claim_next(&running.recipient).unwrap(),
+            Some(claim.clone()),
+            "the live claim is unchanged"
+        );
+        assert_eq!(
+            store.edit_unclaimed_head(MailboxHeadEdit {
+                stable_id: running.stable_id.clone(),
+                revision: running.revision,
+                digest: running.digest.clone(),
+                subject: "x".into(),
+                body: "y".into(),
+                repin_recipient_session: None,
+            }),
+            Err(MailboxError::HeadClaimed)
+        );
+        std::fs::remove_dir_all(store.lock_path.parent().unwrap()).unwrap();
+    }
+
     #[test]
     fn bound_parent_head_cannot_bypass_the_prepared_attempt_gate() {
         let store = temporary_store();
