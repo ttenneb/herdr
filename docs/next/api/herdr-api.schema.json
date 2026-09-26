@@ -3190,6 +3190,21 @@
           ],
           "type": "object"
         },
+        "DelegationRouteReadyParams": {
+          "properties": {
+            "child_delegation_id": {
+              "type": "string"
+            },
+            "expected_parent_delegation_id": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "child_delegation_id",
+            "expected_parent_delegation_id"
+          ],
+          "type": "object"
+        },
         "DelegationSiblingPosition": {
           "oneOf": [
             {
@@ -3975,6 +3990,204 @@
           "required": [
             "path",
             "ratio"
+          ],
+          "type": "object"
+        },
+        "MailboxClaimParams": {
+          "additionalProperties": false,
+          "description": "Consumer operation selectors. The server selects the durable head and mints\nthe claim only after matching its current active generation-bound capability.",
+          "properties": {
+            "caller": {
+              "type": "string"
+            },
+            "grantId": {
+              "type": "string"
+            },
+            "protocol": {
+              "type": "string"
+            },
+            "recipient": {
+              "$ref": "#/schemas/request/$defs/RecipientKey"
+            }
+          },
+          "required": [
+            "caller",
+            "grantId",
+            "recipient",
+            "protocol"
+          ],
+          "type": "object"
+        },
+        "MailboxEditParams": {
+          "additionalProperties": false,
+          "description": "Untrusted edit intent. The caller/grant/recipient selectors are constrained\nby the current server-issued mailbox scope; `edit` must CAS the exact head.",
+          "properties": {
+            "body": {
+              "type": "string"
+            },
+            "caller": {
+              "type": "string"
+            },
+            "digest": {
+              "type": "string"
+            },
+            "grantId": {
+              "type": "string"
+            },
+            "protocol": {
+              "type": "string"
+            },
+            "recipient": {
+              "$ref": "#/schemas/request/$defs/RecipientKey"
+            },
+            "revision": {
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "stableId": {
+              "type": "string"
+            },
+            "subject": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "caller",
+            "grantId",
+            "recipient",
+            "protocol",
+            "stableId",
+            "revision",
+            "digest",
+            "subject",
+            "body"
+          ],
+          "type": "object"
+        },
+        "MailboxOfflineSubmitParams": {
+          "additionalProperties": false,
+          "description": "Untrusted selectors for a server-owned offline mailbox route. The server\nresolves both values against its authenticated local route; they are not\nrecipient or grant authority by themselves.",
+          "properties": {
+            "body": {
+              "type": "string"
+            },
+            "caller": {
+              "type": "string"
+            },
+            "deliveryDigest": {
+              "type": "string"
+            },
+            "digest": {
+              "type": "string"
+            },
+            "grantId": {
+              "type": "string"
+            },
+            "kind": {
+              "type": "string"
+            },
+            "messageId": {
+              "type": "string"
+            },
+            "originalSequence": {
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "priority": {
+              "type": "string"
+            },
+            "protocol": {
+              "type": "string"
+            },
+            "recipient": {
+              "$ref": "#/schemas/request/$defs/RecipientKey"
+            },
+            "revision": {
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "stableId": {
+              "type": "string"
+            },
+            "subject": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "caller",
+            "grantId",
+            "recipient",
+            "protocol",
+            "stableId",
+            "revision",
+            "digest",
+            "deliveryDigest",
+            "subject",
+            "body",
+            "messageId",
+            "kind",
+            "priority",
+            "originalSequence"
+          ],
+          "type": "object"
+        },
+        "MailboxResolveParams": {
+          "additionalProperties": false,
+          "properties": {
+            "caller": {
+              "type": "string"
+            },
+            "claimId": {
+              "type": "string"
+            },
+            "grantId": {
+              "type": "string"
+            },
+            "outcome": {
+              "$ref": "#/schemas/request/$defs/ResolveOutcome"
+            },
+            "protocol": {
+              "type": "string"
+            },
+            "recipient": {
+              "$ref": "#/schemas/request/$defs/RecipientKey"
+            }
+          },
+          "required": [
+            "caller",
+            "grantId",
+            "recipient",
+            "protocol",
+            "claimId",
+            "outcome"
+          ],
+          "type": "object"
+        },
+        "MailboxSnapshotParams": {
+          "additionalProperties": false,
+          "description": "Read selectors for the server-owned stable-recipient mailbox projection.",
+          "properties": {
+            "caller": {
+              "type": "string"
+            },
+            "grantId": {
+              "type": "string"
+            },
+            "protocol": {
+              "type": "string"
+            },
+            "recipient": {
+              "$ref": "#/schemas/request/$defs/RecipientKey"
+            }
+          },
+          "required": [
+            "caller",
+            "grantId",
+            "recipient",
+            "protocol"
           ],
           "type": "object"
         },
@@ -5372,6 +5585,22 @@
           ],
           "type": "string"
         },
+        "RecipientKey": {
+          "description": "Durable mailbox ownership. It is intentionally independent of Pi session files.",
+          "properties": {
+            "generation": {
+              "type": "string"
+            },
+            "recipientId": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "recipientId",
+            "generation"
+          ],
+          "type": "object"
+        },
         "RepositoryMoveParams": {
           "properties": {
             "insert_index": {
@@ -5414,6 +5643,13 @@
             "repository_id"
           ],
           "type": "object"
+        },
+        "ResolveOutcome": {
+          "enum": [
+            "admitted",
+            "settled"
+          ],
+          "type": "string"
         },
         "ServerLiveHandoffParams": {
           "properties": {
@@ -7556,6 +7792,86 @@
         {
           "properties": {
             "method": {
+              "const": "mailbox.offline_submit",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/schemas/request/$defs/MailboxOfflineSubmitParams"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "method": {
+              "const": "mailbox.claim",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/schemas/request/$defs/MailboxClaimParams"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "method": {
+              "const": "mailbox.resolve",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/schemas/request/$defs/MailboxResolveParams"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "method": {
+              "const": "mailbox.snapshot",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/schemas/request/$defs/MailboxSnapshotParams"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "method": {
+              "const": "mailbox.edit",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/schemas/request/$defs/MailboxEditParams"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "method": {
               "const": "collection.list",
               "type": "string"
             },
@@ -7849,6 +8165,22 @@
             },
             "params": {
               "$ref": "#/schemas/request/$defs/DelegationTarget"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "method": {
+              "const": "delegation.route_ready",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/schemas/request/$defs/DelegationRouteReadyParams"
             }
           },
           "required": [
@@ -11025,6 +11357,35 @@
     },
     "success_response": {
       "$defs": {
+        "AdmissionReceipt": {
+          "properties": {
+            "deliveryDigest": {
+              "type": "string"
+            },
+            "digest": {
+              "type": "string"
+            },
+            "revision": {
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "stableId": {
+              "type": "string"
+            },
+            "status": {
+              "$ref": "#/schemas/success_response/$defs/ReceiptStatus"
+            }
+          },
+          "required": [
+            "deliveryDigest",
+            "stableId",
+            "revision",
+            "digest",
+            "status"
+          ],
+          "type": "object"
+        },
         "AgentInfo": {
           "properties": {
             "agent": {
@@ -11042,6 +11403,17 @@
                   "type": "null"
                 }
               ]
+            },
+            "agent_session_trust": {
+              "anyOf": [
+                {
+                  "$ref": "#/schemas/success_response/$defs/AgentSessionTrust"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "How `agent_session` was established. Additive and informational only:\nmailbox, bound-report and route authority never read `agent_info`; they\nrequire the trusted managed launch directly."
             },
             "agent_status": {
               "$ref": "#/schemas/success_response/$defs/AgentStatus"
@@ -11242,6 +11614,21 @@
           ],
           "type": "string"
         },
+        "AgentSessionTrust": {
+          "description": "Provenance of an agent's reported `agent_session`.",
+          "oneOf": [
+            {
+              "const": "managed",
+              "description": "Derived from this execution's trusted managed launch (explicit, verified\n`--session` plus process birth). The only form that carries authority.",
+              "type": "string"
+            },
+            {
+              "const": "reported",
+              "description": "Reported by the pane's agent integration (for Pi, `herdr-agent-state`).\nUsable for identity display and matching, never for authority.",
+              "type": "string"
+            }
+          ]
+        },
         "AgentStatus": {
           "enum": [
             "idle",
@@ -11329,6 +11716,57 @@
           "enum": [
             "primary",
             "linked"
+          ],
+          "type": "string"
+        },
+        "Claim": {
+          "properties": {
+            "claimId": {
+              "type": "string"
+            },
+            "digest": {
+              "type": "string"
+            },
+            "recipient": {
+              "$ref": "#/schemas/success_response/$defs/RecipientKey"
+            },
+            "revision": {
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "stableId": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "claimId",
+            "recipient",
+            "stableId",
+            "revision",
+            "digest"
+          ],
+          "type": "object"
+        },
+        "ClaimResolution": {
+          "properties": {
+            "claimId": {
+              "type": "string"
+            },
+            "outcome": {
+              "$ref": "#/schemas/success_response/$defs/ClaimResolutionOutcome"
+            }
+          },
+          "required": [
+            "claimId",
+            "outcome"
+          ],
+          "type": "object"
+        },
+        "ClaimResolutionOutcome": {
+          "enum": [
+            "admitted",
+            "settled"
           ],
           "type": "string"
         },
@@ -12876,6 +13314,46 @@
           ],
           "type": "object"
         },
+        "HeadLifecycle": {
+          "enum": [
+            "held",
+            "claimed",
+            "admitted",
+            "settled"
+          ],
+          "type": "string"
+        },
+        "HeadState": {
+          "properties": {
+            "claimId": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "digest": {
+              "type": "string"
+            },
+            "lifecycle": {
+              "$ref": "#/schemas/success_response/$defs/HeadLifecycle"
+            },
+            "revision": {
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "stableId": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "stableId",
+            "revision",
+            "digest",
+            "lifecycle"
+          ],
+          "type": "object"
+        },
         "InstalledPluginInfo": {
           "properties": {
             "actions": {
@@ -13180,6 +13658,109 @@
               "type": "object"
             }
           ]
+        },
+        "MailboxGrant": {
+          "description": "Durable server-owned recipient policy. This is deliberately distinct from\na transient sender/consumer execution binding.",
+          "properties": {
+            "grantId": {
+              "type": "string"
+            },
+            "recipient": {
+              "$ref": "#/schemas/success_response/$defs/RecipientKey"
+            },
+            "sender": {
+              "$ref": "#/schemas/success_response/$defs/RecipientKey"
+            }
+          },
+          "required": [
+            "grantId",
+            "sender",
+            "recipient"
+          ],
+          "type": "object"
+        },
+        "MailboxHead": {
+          "properties": {
+            "acceptedAt": {
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "body": {
+              "type": "string"
+            },
+            "deliveryDigest": {
+              "type": "string"
+            },
+            "digest": {
+              "type": "string"
+            },
+            "enqueueEpoch": {
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "grantId": {
+              "type": "string"
+            },
+            "kind": {
+              "type": "string"
+            },
+            "messageId": {
+              "type": "string"
+            },
+            "originalSequence": {
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "priority": {
+              "type": "string"
+            },
+            "recipient": {
+              "$ref": "#/schemas/success_response/$defs/RecipientKey"
+            },
+            "recipientGeneration": {
+              "type": "string"
+            },
+            "revision": {
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "sender": {
+              "type": "string"
+            },
+            "stableId": {
+              "type": "string"
+            },
+            "subject": {
+              "type": "string"
+            },
+            "target": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "stableId",
+            "revision",
+            "digest",
+            "deliveryDigest",
+            "recipient",
+            "subject",
+            "body",
+            "recipientGeneration",
+            "sender",
+            "target",
+            "grantId",
+            "messageId",
+            "kind",
+            "priority",
+            "originalSequence",
+            "enqueueEpoch",
+            "acceptedAt"
+          ],
+          "type": "object"
         },
         "NotificationShowReason": {
           "enum": [
@@ -14628,6 +15209,29 @@
           ],
           "type": "string"
         },
+        "ReceiptStatus": {
+          "enum": [
+            "admitted",
+            "rejected"
+          ],
+          "type": "string"
+        },
+        "RecipientKey": {
+          "description": "Durable mailbox ownership. It is intentionally independent of Pi session files.",
+          "properties": {
+            "generation": {
+              "type": "string"
+            },
+            "recipientId": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "recipientId",
+            "generation"
+          ],
+          "type": "object"
+        },
         "RepositoryInfo": {
           "properties": {
             "active_agent_count": {
@@ -15112,6 +15716,108 @@
             },
             {
               "properties": {
+                "receipt": {
+                  "$ref": "#/schemas/success_response/$defs/AdmissionReceipt"
+                },
+                "type": {
+                  "const": "mailbox_offline_submitted",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type",
+                "receipt"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "grant": {
+                  "$ref": "#/schemas/success_response/$defs/MailboxGrant"
+                },
+                "type": {
+                  "const": "mailbox_grant_provisioned",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type",
+                "grant"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "claim": {
+                  "anyOf": [
+                    {
+                      "$ref": "#/schemas/success_response/$defs/Claim"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
+                },
+                "type": {
+                  "const": "mailbox_claimed",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "resolution": {
+                  "$ref": "#/schemas/success_response/$defs/ClaimResolution"
+                },
+                "type": {
+                  "const": "mailbox_resolved",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type",
+                "resolution"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "snapshot": {
+                  "$ref": "#/schemas/success_response/$defs/Snapshot"
+                },
+                "type": {
+                  "const": "mailbox_snapshot",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type",
+                "snapshot"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "snapshot": {
+                  "$ref": "#/schemas/success_response/$defs/Snapshot"
+                },
+                "type": {
+                  "const": "mailbox_edited",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type",
+                "snapshot"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
                 "agents": {
                   "items": {
                     "$ref": "#/schemas/success_response/$defs/AgentInfo"
@@ -15237,6 +15943,26 @@
               "required": [
                 "type",
                 "delegation"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "delegation": {
+                  "$ref": "#/schemas/success_response/$defs/DelegationInfo"
+                },
+                "route_epoch": {
+                  "type": "string"
+                },
+                "type": {
+                  "const": "delegation_route_ready",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type",
+                "delegation",
+                "route_epoch"
               ],
               "type": "object"
             },
@@ -16182,6 +16908,46 @@
             "panes",
             "layouts",
             "agents"
+          ],
+          "type": "object"
+        },
+        "Snapshot": {
+          "properties": {
+            "claim": {
+              "anyOf": [
+                {
+                  "$ref": "#/schemas/success_response/$defs/Claim"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "headStates": {
+              "description": "Required authoritative state for every head, in the same order as heads.",
+              "items": {
+                "$ref": "#/schemas/success_response/$defs/HeadState"
+              },
+              "type": "array"
+            },
+            "heads": {
+              "description": "Retained heads and receipts remain available for immutable artifact\nvalidation. Use headStates, not heads alone, for active work.",
+              "items": {
+                "$ref": "#/schemas/success_response/$defs/MailboxHead"
+              },
+              "type": "array"
+            },
+            "receipts": {
+              "items": {
+                "$ref": "#/schemas/success_response/$defs/AdmissionReceipt"
+              },
+              "type": "array"
+            }
+          },
+          "required": [
+            "heads",
+            "receipts",
+            "headStates"
           ],
           "type": "object"
         },
