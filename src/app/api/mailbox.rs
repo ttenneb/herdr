@@ -1099,6 +1099,19 @@ mod tests {
             .load()
             .expect("reload durable mailbox");
         assert_eq!(durable.heads["stable-1"], *head);
+        // F3: the edited revision carries its own exact admitted receipt, so a
+        // recipient join and the settled-history view accept it.
+        assert_eq!(
+            snapshot.receipts,
+            vec![crate::mailbox::AdmissionReceipt {
+                delivery_digest: head.delivery_digest.clone(),
+                stable_id: head.stable_id.clone(),
+                revision: 2,
+                digest: head.digest.clone(),
+                status: crate::mailbox::ReceiptStatus::Admitted,
+            }]
+        );
+        assert_eq!(durable.receipts[&head.delivery_digest].revision, 2);
         drop(app);
         std::fs::remove_dir_all(directory).expect("remove mailbox directory");
     }

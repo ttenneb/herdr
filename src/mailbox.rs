@@ -73,6 +73,23 @@ pub struct MailboxHeadEditRecord {
     expected_revision: u64,
     expected_digest: String,
     head: MailboxHead,
+    /// Server-minted admission receipt for the edited revision (F3). The
+    /// delivery digest is the head's stable delivery identity and never
+    /// changes; revision and digest follow the head. Journals written before
+    /// this field existed derive the identical receipt on load.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    receipt: Option<AdmissionReceipt>,
+}
+
+/// The one admission receipt that matches an edited head exactly.
+pub(crate) fn edited_head_receipt(head: &MailboxHead) -> AdmissionReceipt {
+    AdmissionReceipt {
+        delivery_digest: head.delivery_digest.clone(),
+        stable_id: head.stable_id.clone(),
+        revision: head.revision,
+        digest: head.digest.clone(),
+        status: ReceiptStatus::Admitted,
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
@@ -552,6 +569,7 @@ impl MailboxStore {
                 expected_stable_id: current.stable_id.clone(),
                 expected_revision: current.revision,
                 expected_digest: current.digest,
+                receipt: Some(edited_head_receipt(&next)),
                 head: next.clone(),
             };
             self.append_synced(&MailboxRecord::HeadEdit { edit: record })?;
@@ -872,6 +890,27 @@ impl RecoveredMailbox {
         {
             return Err(MailboxError::CorruptRecord);
         }
+        // F3: the admitted receipt follows the edited revision. An edit is
+        // only possible for an admitted, unclaimed head, so the prior receipt
+        // must exist, be admitted and match the prior version exactly.
+        let receipt = edited_head_receipt(&edit.head);
+        if edit
+            .receipt
+            .as_ref()
+            .is_some_and(|minted| minted != &receipt)
+        {
+            return Err(MailboxError::CorruptRecord);
+        }
+        match self.receipts.get(&current.delivery_digest) {
+            Some(prior)
+                if prior.status == ReceiptStatus::Admitted
+                    && prior.stable_id == current.stable_id
+                    && prior.revision == current.revision
+                    && prior.digest == current.digest => {}
+            _ => return Err(MailboxError::CorruptRecord),
+        }
+        self.receipts
+            .insert(receipt.delivery_digest.clone(), receipt);
         self.heads.insert(edit.head.stable_id.clone(), edit.head);
         Ok(())
     }
@@ -993,6 +1032,64 @@ mod tests {
         let store = MailboxStore::existing(&path);
         assert_eq!(store.load().unwrap(), RecoveredMailbox::default());
         assert!(!path.exists());
+    }
+
+    // F3: an edit written before edit records carried a receipt recovers the
+    // identical current-revision receipt; a forged one is corrupt.
+    #[test]
+    fn edited_head_receipt_is_minted_and_derived_for_old_journals() {
+        let store = temporary_store();
+        let original = head();
+        store.append_offline_head(original.clone()).unwrap();
+        let edited = store
+            .edit_unclaimed_head(MailboxHeadEdit {
+                stable_id: original.stable_id.clone(),
+                revision: original.revision,
+                digest: original.digest.clone(),
+                subject: "edited".into(),
+                body: "edited body".into(),
+            })
+            .unwrap();
+        let recovered = store.load().unwrap();
+        let expected = edited_head_receipt(&edited);
+        assert_eq!(recovered.receipts[&edited.delivery_digest], expected);
+        assert_eq!(expected.revision, original.revision + 1);
+        let journal = std::fs::read_to_string(&store.stream_path).unwrap();
+        assert!(journal.contains("\"receipt\":{"));
+        // Old journal shape: drop the minted receipt from the edit record.
+        let old: String = journal
+            .lines()
+            .map(|line| {
+                let mut value: serde_json::Value = serde_json::from_str(line).unwrap();
+                if value["kind"] == "head_edit" {
+                    value["edit"].as_object_mut().unwrap().remove("receipt");
+                }
+                value.to_string() + "\n"
+            })
+            .collect();
+        std::fs::write(&store.stream_path, &old).unwrap();
+        assert_eq!(
+            store.load().unwrap().receipts[&edited.delivery_digest],
+            expected
+        );
+        // A receipt that does not match the edited head is corrupt.
+        let forged: String = old
+            .lines()
+            .map(|line| {
+                let mut value: serde_json::Value = serde_json::from_str(line).unwrap();
+                if value["kind"] == "head_edit" {
+                    value["edit"]["receipt"] = serde_json::to_value(AdmissionReceipt {
+                        revision: 9,
+                        ..expected.clone()
+                    })
+                    .unwrap();
+                }
+                value.to_string() + "\n"
+            })
+            .collect();
+        std::fs::write(&store.stream_path, forged).unwrap();
+        assert_eq!(store.load(), Err(MailboxError::CorruptRecord));
+        std::fs::remove_dir_all(store.lock_path.parent().unwrap()).unwrap();
     }
 
     #[test]
