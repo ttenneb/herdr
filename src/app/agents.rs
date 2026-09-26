@@ -500,8 +500,16 @@ impl App {
             &self.sender_authority_dir,
             &terminal_id.to_string(),
         ) {
-            // Only a non-authoritative (Preparing) record is invalidated here.
-            let _ = store.recover();
+            // Only this launch's own non-authoritative (Preparing) record is
+            // invalidated; a newer generation prepared since is left alone.
+            if store
+                .load()
+                .ok()
+                .flatten()
+                .is_some_and(|record| record.process_generation == generation)
+            {
+                let _ = store.recover();
+            }
         }
     }
 

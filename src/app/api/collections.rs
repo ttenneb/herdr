@@ -1342,6 +1342,22 @@ impl App {
                 "helper pane no longer matches the created collection member and terminal",
             );
         }
+        // A managed helper that never became Active leaves a Preparing
+        // generation and a launch record; abandon both before closing.
+        if let Some(terminal_id) = self.state.workspaces[collection_ws_idx]
+            .terminal_id(pane_id)
+            .cloned()
+        {
+            if let Some(generation) = self
+                .state
+                .terminals
+                .get(&terminal_id)
+                .and_then(|terminal| terminal.managed_agent_generation())
+                .filter(|generation| *generation > 0)
+            {
+                self.abandon_managed_launch(&terminal_id, generation);
+            }
+        }
         match self.close_pane(
             id.clone(),
             &PaneTarget {
@@ -2275,6 +2291,53 @@ mod tests {
         );
         abort_helper(&mut app, &collection_id, public, terminal.to_string());
         std::fs::remove_dir_all(&fixture.root).unwrap();
+    }
+
+    /// Review finding 1 on 2f3603e8: a helper rolled back after its readiness
+    /// timeout (collection.helper_abort) leaves no launch record and no
+    /// current sender authority, whether it was still Preparing or already
+    /// Active when rolled back.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn helper_abort_retires_the_managed_launch_and_its_authority() {
+        let _env = crate::test_env::shared();
+        for promoted in [false, true] {
+            let fixture = HelperFixture::new(if promoted {
+                "abort-active"
+            } else {
+                "abort-prep"
+            });
+            let (mut app, root, _, _) = app_with_panes();
+            let collection_id = create_collection(&mut app, root);
+            let response = fixture.launch(
+                &mut app,
+                &collection_id,
+                vec!["--session".into(), fixture.session.clone()],
+            );
+            let (pane, terminal, public) = launched_helper(&app, &response);
+            let generation = app.managed_pi_launches[&terminal].generation;
+            if promoted {
+                observe_helper_pi(&mut app, pane, &terminal, &fixture.session, generation);
+                assert!(app
+                    .offline_mailbox_authority_current(&terminal.to_string())
+                    .unwrap());
+            }
+            abort_helper(&mut app, &collection_id, public, terminal.to_string());
+            assert!(!app.managed_pi_launches.contains_key(&terminal));
+            assert!(!app
+                .offline_mailbox_authority_current(&terminal.to_string())
+                .unwrap_or(false));
+            let record = crate::sender_authority::SenderAuthorityStore::for_sender(
+                &app.sender_authority_dir,
+                &terminal.to_string(),
+            )
+            .unwrap()
+            .load()
+            .unwrap()
+            .expect("record");
+            assert!(!record.authoritative(), "promoted={promoted}: {record:?}");
+            std::fs::remove_dir_all(&fixture.root).unwrap();
+        }
     }
 
     #[cfg(target_os = "linux")]

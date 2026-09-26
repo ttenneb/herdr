@@ -1307,6 +1307,43 @@
               "type": "object"
             },
             {
+              "description": "A Messages head was queued for a pane with no attached Pi. Consumers\n(sleep/wake, #25) may wake the pane's agent; Herdr itself does nothing\nelse.",
+              "properties": {
+                "pane_id": {
+                  "type": "string"
+                },
+                "queue_key": {
+                  "type": "string"
+                },
+                "reason": {
+                  "type": "string"
+                },
+                "stable_id": {
+                  "type": "string"
+                },
+                "terminal_id": {
+                  "type": "string"
+                },
+                "type": {
+                  "const": "pane_wake_requested",
+                  "type": "string"
+                },
+                "workspace_id": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type",
+                "pane_id",
+                "workspace_id",
+                "terminal_id",
+                "queue_key",
+                "stable_id",
+                "reason"
+              ],
+              "type": "object"
+            },
+            {
               "properties": {
                 "agent": {
                   "type": [
@@ -1463,6 +1500,7 @@
             "pane_output_changed",
             "pane_exited",
             "pane_agent_detected",
+            "pane_wake_requested",
             "pane_agent_status_changed",
             "layout_updated"
           ],
@@ -2181,11 +2219,41 @@
       "$defs": {
         "AgentPromptParams": {
           "properties": {
+            "edit_pending": {
+              "description": "Replace the text of this sender's waiting message with this stableId\n(taken from a `pending_exists` result).",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "expect_revision": {
+              "description": "With `edit_pending`: the pending revision the sender last saw.",
+              "format": "uint64",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "send_new": {
+              "description": "Queue this message even though earlier ones are still waiting.",
+              "type": "boolean"
+            },
             "target": {
               "type": "string"
             },
             "text": {
               "type": "string"
+            },
+            "transport": {
+              "anyOf": [
+                {
+                  "$ref": "#/schemas/request/$defs/MessageTransport"
+                },
+                {
+                  "type": "null"
+                }
+              ]
             },
             "wait": {
               "anyOf": [
@@ -3681,8 +3749,38 @@
         },
         "HandoffSendParams": {
           "properties": {
+            "edit_pending": {
+              "description": "Replace the text of this sender's waiting message with this stableId\n(taken from a `pending_exists` result).",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
             "envelope": {
               "$ref": "#/schemas/request/$defs/HerdrHandoff"
+            },
+            "expect_revision": {
+              "description": "With `edit_pending`: the pending revision the sender last saw.",
+              "format": "uint64",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "send_new": {
+              "description": "Queue this message even though earlier ones are still waiting.",
+              "type": "boolean"
+            },
+            "transport": {
+              "anyOf": [
+                {
+                  "$ref": "#/schemas/request/$defs/MessageTransport"
+                },
+                {
+                  "type": "null"
+                }
+              ]
             }
           },
           "required": [
@@ -4190,6 +4288,26 @@
             "protocol"
           ],
           "type": "object"
+        },
+        "MessageTransport": {
+          "description": "How an ordinary send reaches the recipient.",
+          "oneOf": [
+            {
+              "const": "auto",
+              "description": "The recipient's Messages queue when it has a live Messages stream,\notherwise typed into the pane exactly as before.",
+              "type": "string"
+            },
+            {
+              "const": "mailbox",
+              "description": "The recipient's Messages queue only; refuse if it has none.",
+              "type": "string"
+            },
+            {
+              "const": "pty",
+              "description": "Typed into the pane (the pre-Messages behaviour).",
+              "type": "string"
+            }
+          ]
         },
         "NotificationShowParams": {
           "properties": {
@@ -6265,6 +6383,18 @@
               "properties": {
                 "type": {
                   "const": "pane.agent_detected",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "type": {
+                  "const": "pane.wake_requested",
                   "type": "string"
                 }
               },
@@ -10303,6 +10433,43 @@
               "type": "object"
             },
             {
+              "description": "A Messages head was queued for a pane with no attached Pi. Consumers\n(sleep/wake, #25) may wake the pane's agent; Herdr itself does nothing\nelse.",
+              "properties": {
+                "pane_id": {
+                  "type": "string"
+                },
+                "queue_key": {
+                  "type": "string"
+                },
+                "reason": {
+                  "type": "string"
+                },
+                "stable_id": {
+                  "type": "string"
+                },
+                "terminal_id": {
+                  "type": "string"
+                },
+                "type": {
+                  "const": "pane_wake_requested",
+                  "type": "string"
+                },
+                "workspace_id": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type",
+                "pane_id",
+                "workspace_id",
+                "terminal_id",
+                "queue_key",
+                "stable_id",
+                "reason"
+              ],
+              "type": "object"
+            },
+            {
               "properties": {
                 "agent": {
                   "type": [
@@ -10459,6 +10626,7 @@
             "pane_output_changed",
             "pane_exited",
             "pane_agent_detected",
+            "pane_wake_requested",
             "pane_agent_status_changed",
             "layout_updated"
           ],
@@ -11743,6 +11911,13 @@
             "digest": {
               "type": "string"
             },
+            "execution": {
+              "description": "The recipient execution that took this claim (per-pane queues). Only\nthat execution sees and resolves it; absent on older claims.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
             "recipient": {
               "$ref": "#/schemas/success_response/$defs/RecipientKey"
             },
@@ -11768,6 +11943,13 @@
           "properties": {
             "claimId": {
               "type": "string"
+            },
+            "closedBy": {
+              "description": "Set when the recipient's explicit Drop or Retry closed the claim\n(`dropped` or `retried`) rather than the head running to completion.",
+              "type": [
+                "string",
+                "null"
+              ]
             },
             "outcome": {
               "$ref": "#/schemas/success_response/$defs/ClaimResolutionOutcome"
@@ -13088,6 +13270,43 @@
               "type": "object"
             },
             {
+              "description": "A Messages head was queued for a pane with no attached Pi. Consumers\n(sleep/wake, #25) may wake the pane's agent; Herdr itself does nothing\nelse.",
+              "properties": {
+                "pane_id": {
+                  "type": "string"
+                },
+                "queue_key": {
+                  "type": "string"
+                },
+                "reason": {
+                  "type": "string"
+                },
+                "stable_id": {
+                  "type": "string"
+                },
+                "terminal_id": {
+                  "type": "string"
+                },
+                "type": {
+                  "const": "pane_wake_requested",
+                  "type": "string"
+                },
+                "workspace_id": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type",
+                "pane_id",
+                "workspace_id",
+                "terminal_id",
+                "queue_key",
+                "stable_id",
+                "reason"
+              ],
+              "type": "object"
+            },
+            {
               "properties": {
                 "agent": {
                   "type": [
@@ -13259,29 +13478,49 @@
             "pane_output_changed",
             "pane_exited",
             "pane_agent_detected",
+            "pane_wake_requested",
             "pane_agent_status_changed",
             "layout_updated"
           ],
           "type": "string"
         },
         "HandoffTransportOutcome": {
-          "enum": [
-            "runtime_transaction_admitted",
-            "sender_identity_mismatch",
-            "recipient_identity_mismatch",
-            "recipient_not_ready",
-            "recipient_blocked",
-            "recipient_not_foreground",
-            "queue_full",
-            "payload_too_large",
-            "transport_closed"
-          ],
-          "type": "string"
+          "oneOf": [
+            {
+              "enum": [
+                "runtime_transaction_admitted",
+                "sender_identity_mismatch",
+                "recipient_identity_mismatch",
+                "recipient_not_ready",
+                "recipient_blocked",
+                "recipient_not_foreground",
+                "queue_full",
+                "payload_too_large",
+                "transport_closed"
+              ],
+              "type": "string"
+            },
+            {
+              "const": "mailbox_admitted",
+              "description": "Durably queued in the recipient's Messages; the recipient runs it when\nit next picks up work.",
+              "type": "string"
+            }
+          ]
         },
         "HandoffTransportReceipt": {
           "properties": {
             "attemptedPath": {
               "type": "string"
+            },
+            "delivery": {
+              "anyOf": [
+                {
+                  "$ref": "#/schemas/success_response/$defs/MessageDelivery"
+                },
+                {
+                  "type": "null"
+                }
+              ]
             },
             "detail": {
               "type": "string"
@@ -13341,7 +13580,21 @@
         },
         "HeadState": {
           "properties": {
+            "claimExecution": {
+              "description": "For a claimed head: `current` when this execution holds the claim,\n`other` when another (for example an exited) Pi does.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
             "claimId": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "closedBy": {
+              "description": "For a settled head closed by the recipient instead of by a completed\nrun: `dropped` or `retried`. Kept in history.",
               "type": [
                 "string",
                 "null"
@@ -13352,6 +13605,21 @@
             },
             "lifecycle": {
               "$ref": "#/schemas/success_response/$defs/HeadLifecycle"
+            },
+            "previousSession": {
+              "description": "True for a held head pinned to a different session than the viewing\nrecipient's current one: shown, never claimed, until Retry or Drop.",
+              "type": "boolean"
+            },
+            "recipientSession": {
+              "description": "The recipient Pi session a server-sent head is pinned to.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "recoveryNeeded": {
+              "description": "A claim left claimed or admitted (uncertain) by another, ended Pi\nexecution: never auto-rerun, resolved only by explicit Retry or Drop.",
+              "type": "boolean"
             },
             "revision": {
               "format": "uint64",
@@ -13705,6 +13973,17 @@
             "body": {
               "type": "string"
             },
+            "delivery": {
+              "anyOf": [
+                {
+                  "$ref": "#/schemas/success_response/$defs/ServerDelivery"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Present only on heads the server minted from an ordinary send\n(`agent prompt`, structured prompt, `handoff send`). Additive: older\njournals and Pi peers ignore it."
+            },
             "deliveryDigest": {
               "type": "string"
             },
@@ -13775,6 +14054,40 @@
             "originalSequence",
             "enqueueEpoch",
             "acceptedAt"
+          ],
+          "type": "object"
+        },
+        "MessageDelivery": {
+          "description": "Where an ordinary send went.",
+          "properties": {
+            "duplicate": {
+              "description": "True when an identical correlated send found its existing message.",
+              "type": "boolean"
+            },
+            "edited": {
+              "type": "boolean"
+            },
+            "path": {
+              "description": "`mailbox` or `pty`.",
+              "type": "string"
+            },
+            "revision": {
+              "format": "uint64",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "stable_id": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          "required": [
+            "path"
           ],
           "type": "object"
         },
@@ -15674,6 +15987,16 @@
                 "agent": {
                   "$ref": "#/schemas/success_response/$defs/AgentInfo"
                 },
+                "delivery": {
+                  "anyOf": [
+                    {
+                      "$ref": "#/schemas/success_response/$defs/MessageDelivery"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
+                },
                 "type": {
                   "const": "agent_prompted",
                   "type": "string"
@@ -16828,6 +17151,27 @@
             }
           ]
         },
+        "SendCorrelation": {
+          "properties": {
+            "key": {
+              "type": "string"
+            },
+            "namespace": {
+              "type": "string"
+            },
+            "revision": {
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            }
+          },
+          "required": [
+            "namespace",
+            "key",
+            "revision"
+          ],
+          "type": "object"
+        },
         "ServerCapabilities": {
           "properties": {
             "detached_server_daemon": {
@@ -16840,6 +17184,54 @@
           },
           "required": [
             "live_handoff"
+          ],
+          "type": "object"
+        },
+        "ServerDelivery": {
+          "description": "Server-owned send metadata for a head minted from an ordinary agent send.\nAttribution only: none of these values grant mailbox authority.",
+          "properties": {
+            "correlation": {
+              "anyOf": [
+                {
+                  "$ref": "#/schemas/success_response/$defs/SendCorrelation"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "origin": {
+              "description": "`agent_prompt`, `structured_prompt` or `handoff`.",
+              "type": "string"
+            },
+            "recipientSession": {
+              "description": "The recipient's `agent_session` value when the head was sent. A head\npinned to a session is only claimable by that session; another\nsession sees it as stranded and must explicitly adopt or drop it.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "retryOf": {
+              "description": "Set on a head created by the recipient's explicit Retry of a head an\nended Pi execution left in recovery: the original stable ID.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "senderLabel": {
+              "description": "Display label for the sending pane or agent, or `external`.",
+              "type": "string"
+            },
+            "senderSession": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          "required": [
+            "origin",
+            "senderLabel"
           ],
           "type": "object"
         },
