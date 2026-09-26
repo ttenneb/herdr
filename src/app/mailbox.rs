@@ -1339,6 +1339,9 @@ impl App {
         }
         self.resolve_pane_wake_on_active(&terminal_id, process_generation);
         let _ = self.install_offline_mailbox_authority(record);
+        if !self.pending_route_carries.is_empty() {
+            self.retry_route_carries(std::time::Instant::now());
+        }
     }
 }
 

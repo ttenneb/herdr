@@ -580,6 +580,7 @@ fn restore_tab(
         let saved_agent_session = saved_pane.and_then(|p| p.agent_session.as_ref());
         let saved_recipe = saved_pane.and_then(|p| p.launch_recipe.clone());
         let saved_sleep = saved_pane.and_then(|p| p.sleep.clone());
+        let saved_route_carry = saved_pane.and_then(|p| p.route_carry.clone());
         let saved_history =
             old_id.and_then(|old_id| history.and_then(|history| history.panes.get(old_id)));
         let startup = {
@@ -624,6 +625,7 @@ fn restore_tab(
                 .with_pending_agent_resume_plan(plan);
             terminal.launch_recipe = saved_recipe.clone();
             terminal.sleep = saved_sleep.clone();
+            terminal.route_carry = saved_route_carry.clone();
             if let Some(label) = saved_label {
                 terminal.set_manual_label(label);
             }
@@ -720,6 +722,7 @@ fn restore_tab(
                 let mut terminal = TerminalState::new(terminal_id.clone(), cwd.clone());
                 terminal.launch_recipe = saved_recipe.clone();
                 terminal.sleep = saved_sleep.clone();
+                terminal.route_carry = saved_route_carry.clone();
                 if was_imported {
                     if let Some(argv) = saved_launch_argv {
                         terminal = terminal.with_launch_argv(argv).with_respawn_shell_on_exit();
@@ -1262,6 +1265,7 @@ mod tests {
             launch_argv: None,
             launch_recipe: None,
             sleep: None,
+            route_carry: None,
         }
     }
 
@@ -1760,6 +1764,7 @@ mod tests {
                             launch_argv: None,
                             launch_recipe: None,
                             sleep: None,
+                            route_carry: None,
                         },
                     )]),
                     zoomed: false,
@@ -1853,6 +1858,7 @@ mod tests {
                                 launch_argv: None,
                                 launch_recipe: None,
                                 sleep: None,
+                                route_carry: None,
                             },
                         ),
                         (
@@ -1867,6 +1873,7 @@ mod tests {
                                 launch_argv: None,
                                 launch_recipe: None,
                                 sleep: None,
+                                route_carry: None,
                             },
                         ),
                     ]),
@@ -2153,6 +2160,7 @@ mod tests {
                     launch_argv: None,
                     launch_recipe: None,
                     sleep: None,
+                    route_carry: None,
                 },
             )
         };
@@ -2171,6 +2179,7 @@ mod tests {
             launch_argv: None,
             launch_recipe: None,
             sleep: None,
+            route_carry: None,
         };
         let snapshot = SessionSnapshot {
             version: super::super::snapshot::SNAPSHOT_VERSION,
@@ -2317,6 +2326,12 @@ mod tests {
     async fn restore_keeps_launch_recipe_and_leaves_slept_panes_asleep() {
         let cwd = std::env::current_dir().unwrap();
         let recipe = crate::launch_recipe::LaunchRecipe::capture("owner", "pi", &[], &[]);
+        let carry = crate::launch_recipe::RouteCarry {
+            child_delegation: "d2".into(),
+            parent_delegation: "d1".into(),
+            session_path: test_session_path("recipe-session.jsonl"),
+            generation: 1,
+        };
         for sleep in [
             None,
             Some(crate::launch_recipe::PaneSleep {
@@ -2362,6 +2377,7 @@ mod tests {
                                 launch_argv: None,
                                 launch_recipe: recipe.clone(),
                                 sleep: sleep.clone(),
+                                route_carry: Some(carry.clone()),
                             },
                         )]),
                         zoomed: false,
@@ -2399,6 +2415,7 @@ mod tests {
             let terminal = terminals.values().next().expect("restored terminal");
             assert_eq!(terminal.launch_recipe, recipe);
             assert_eq!(terminal.sleep, sleep);
+            assert_eq!(terminal.route_carry, Some(carry.clone()));
             assert_eq!(
                 terminal.pending_agent_resume_plan.is_some(),
                 sleep.is_none(),
@@ -2445,6 +2462,7 @@ mod tests {
                             launch_argv: None,
                             launch_recipe: None,
                             sleep: None,
+                            route_carry: None,
                         },
                     )]),
                     zoomed: false,
@@ -2621,6 +2639,7 @@ mod tests {
                 launch_argv: None,
                 launch_recipe: None,
                 sleep: None,
+                route_carry: None,
             },
         );
         let history = SessionHistorySnapshot {

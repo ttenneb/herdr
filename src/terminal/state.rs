@@ -154,6 +154,8 @@ pub struct TerminalState {
     pub launch_recipe: Option<crate::launch_recipe::LaunchRecipe>,
     /// Set only by agent.sleep; see crate::app::wake.
     pub sleep: Option<crate::launch_recipe::PaneSleep>,
+    /// Delegation route to carry across a same-session recipe relaunch.
+    pub route_carry: Option<crate::launch_recipe::RouteCarry>,
 }
 
 impl TerminalState {
@@ -191,6 +193,7 @@ impl TerminalState {
             pending_agent_resume_plan: None,
             launch_recipe: None,
             sleep: None,
+            route_carry: None,
         }
     }
 

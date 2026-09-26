@@ -30,6 +30,8 @@ pub(crate) const WAKE_FAILURE_COOLDOWN: Duration = Duration::from_secs(30);
 /// whenever a slept pane has unsettled heads; wake_pane refuses or coalesces.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 #[serde(rename_all = "snake_case")]
+// Constructed by the mailbox wake hook (herdr_identity_owner, rc3).
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) enum WakeCause {
     /// A head was appended for the pane's recipient.
     HeadAppended,
@@ -317,6 +319,7 @@ impl App {
         if let Some(terminal) = self.state.terminals.get_mut(&terminal_id) {
             terminal.clear_agent_name();
         }
+        self.recipe_relaunches.insert(terminal_id.clone());
         let started = self.start_agent(crate::api::schema::AgentStartParams {
             name: recipe.name.clone(),
             kind: recipe.kind.clone(),
@@ -325,6 +328,7 @@ impl App {
             env: recipe.env_assignments(),
             timeout_ms: None,
         });
+        self.recipe_relaunches.remove(&terminal_id);
         match started {
             Ok(_) => {
                 let generation = self

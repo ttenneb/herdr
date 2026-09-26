@@ -37,6 +37,18 @@ pub(crate) struct PaneSleep {
     pub generation: u64,
 }
 
+/// A delegation report route that was ready for the pane's previous managed
+/// generation. Only a recipe relaunch (wake or restart resume) of the same pane
+/// on the same session file re-establishes it for the new generation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct RouteCarry {
+    pub child_delegation: String,
+    pub parent_delegation: String,
+    pub session_path: String,
+    pub generation: u64,
+}
+
 fn credential_like(name: &str) -> bool {
     let upper = name.to_ascii_uppercase();
     [

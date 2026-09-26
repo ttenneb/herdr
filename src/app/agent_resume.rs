@@ -328,10 +328,10 @@ const MANAGED_RESUME_POLL: std::time::Duration = std::time::Duration::from_milli
 
 #[derive(Debug, Clone)]
 pub(crate) struct PendingManagedResume {
-    recipe: crate::launch_recipe::LaunchRecipe,
-    public_pane_id: String,
-    fallback_command: String,
-    deadline: Instant,
+    pub(crate) recipe: crate::launch_recipe::LaunchRecipe,
+    pub(crate) public_pane_id: String,
+    pub(crate) fallback_command: String,
+    pub(crate) deadline: Instant,
 }
 
 impl App {
@@ -361,14 +361,17 @@ impl App {
                 }
                 let recipe = pending.recipe.clone();
                 let env = recipe.env_assignments();
-                match self.start_agent(crate::api::schema::AgentStartParams {
+                self.recipe_relaunches.insert(terminal_id.clone());
+                let started = self.start_agent(crate::api::schema::AgentStartParams {
                     name: recipe.name,
                     kind: recipe.kind,
                     pane_id: pending.public_pane_id.clone(),
                     args: recipe.args,
                     env,
                     timeout_ms: None,
-                }) {
+                });
+                self.recipe_relaunches.remove(&terminal_id);
+                match started {
                     Ok(_) => {
                         self.pending_managed_resumes.remove(&terminal_id);
                         changed = true;

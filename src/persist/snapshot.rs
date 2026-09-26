@@ -165,6 +165,8 @@ pub struct PaneSnapshot {
     pub launch_recipe: Option<crate::launch_recipe::LaunchRecipe>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sleep: Option<crate::launch_recipe::PaneSleep>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub route_carry: Option<crate::launch_recipe::RouteCarry>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -509,6 +511,7 @@ fn capture_tab(
         let launch_argv = terminal.and_then(|terminal| terminal.launch_argv.clone());
         let launch_recipe = terminal.and_then(|terminal| terminal.launch_recipe.clone());
         let sleep = terminal.and_then(|terminal| terminal.sleep.clone());
+        let route_carry = terminal.and_then(|terminal| terminal.route_carry.clone());
         let agent_session = terminal.and_then(|terminal| {
             if let Some(authority) = terminal.hook_authority.as_ref() {
                 if let Some(session_ref) = authority.session_ref.as_ref() {
@@ -542,6 +545,7 @@ fn capture_tab(
                 launch_argv,
                 launch_recipe,
                 sleep,
+                route_carry,
             },
         );
     }
@@ -989,6 +993,7 @@ mod tests {
                 launch_argv: None,
                 launch_recipe: None,
                 sleep: None,
+                route_carry: None,
             },
         );
         panes.insert(
@@ -1003,6 +1008,7 @@ mod tests {
                 launch_argv: None,
                 launch_recipe: None,
                 sleep: None,
+                route_carry: None,
             },
         );
 
@@ -1691,6 +1697,7 @@ mod tests {
                 launch_argv: None,
                 launch_recipe: None,
                 sleep: None,
+                route_carry: None,
             },
         );
         panes.insert(
@@ -1707,6 +1714,7 @@ mod tests {
                 launch_argv: None,
                 launch_recipe: None,
                 sleep: None,
+                route_carry: None,
             },
         );
 

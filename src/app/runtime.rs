@@ -658,6 +658,7 @@ impl App {
             self.pending_agent_resume_deadline,
             self.next_pane_wake_deadline(),
             self.next_managed_resume_deadline(now),
+            self.next_route_carry_deadline(now),
             self.session_save_deadline,
             self.selection_autoscroll_deadline,
             self.selection_highlight_clear_deadline,

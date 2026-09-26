@@ -5,7 +5,7 @@
 //! - `input.rs` — key/mouse → action translation
 
 pub(crate) mod actions;
-mod agent_resume;
+pub(crate) mod agent_resume;
 pub(crate) mod agent_view;
 mod agents;
 #[cfg(test)]
@@ -151,6 +151,9 @@ pub struct App {
     pub(crate) managed_pi_launches: HashMap<crate::terminal::TerminalId, agents::ManagedPiLaunch>,
     pub(crate) pane_wakes: HashMap<crate::terminal::TerminalId, wake::OutstandingWake>,
     pub(crate) pane_wake_cooldowns: HashMap<crate::terminal::TerminalId, Instant>,
+    /// Terminals whose current start is a recipe relaunch (wake or resume).
+    pub(crate) recipe_relaunches: HashSet<crate::terminal::TerminalId>,
+    pub(crate) pending_route_carries: HashMap<crate::terminal::TerminalId, Instant>,
     pub(crate) pending_managed_resumes:
         HashMap<crate::terminal::TerminalId, agent_resume::PendingManagedResume>,
     /// Opaque per-process mailbox namespace; absent entropy disables bootstrap.
@@ -917,6 +920,8 @@ impl App {
             managed_pi_launches: HashMap::new(),
             pane_wakes: HashMap::new(),
             pane_wake_cooldowns: HashMap::new(),
+            recipe_relaunches: HashSet::new(),
+            pending_route_carries: HashMap::new(),
             pending_managed_resumes: HashMap::new(),
             mailbox_bootstrap_boot_nonce: crate::platform::random_route_epoch(),
             used_mailbox_bootstrap_nonces: HashSet::new(),

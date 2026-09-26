@@ -418,16 +418,30 @@ impl App {
         if let Some(runtime) = self.terminal_runtimes.get(terminal_id) {
             runtime.set_managed_agent_generation(prepared.generation);
         }
-        let waking = self.pane_wakes.contains_key(terminal_id);
+        let relaunch = self.recipe_relaunches.contains(terminal_id)
+            || self.pane_wakes.contains_key(terminal_id);
+        let mut carry_route = false;
         if let Some(terminal) = self.state.terminals.get_mut(terminal_id) {
             terminal.set_managed_agent_generation(prepared.generation);
             // The durable recipe is what a later wake or restart relaunches.
             terminal.launch_recipe = prepared.recipe;
-            // Any start other than a wake ends a Herdr sleep; a wake keeps it
-            // until its Pi attaches.
-            if !waking {
+            if relaunch {
+                // A wake keeps the sleep until its Pi attaches; a recipe
+                // relaunch may carry the pane's delegation route over.
+                carry_route = terminal.route_carry.is_some();
+            } else {
+                // A hand start ends a Herdr sleep and never inherits a route.
                 terminal.sleep = None;
+                terminal.route_carry = None;
             }
+        }
+        if carry_route {
+            self.pending_route_carries.insert(
+                terminal_id.clone(),
+                Instant::now() + super::api::ROUTE_CARRY_TIMEOUT,
+            );
+        } else {
+            self.pending_route_carries.remove(terminal_id);
         }
         if let Some((session_path, earliest_birth_ticks)) = prepared.pi_session {
             self.managed_pi_launches.insert(

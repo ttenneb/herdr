@@ -48,3 +48,11 @@ Never woken:
 ## Restart resume
 
 With `resume_agents_on_restore`, a pane that has a recipe and is not asleep resumes through the same managed path, so the agent comes back `managed`, with a sender generation and Messages. Panes without a recipe keep the previous plain `pi --session` resume.
+
+## Delegation routes across a relaunch
+
+A delegation report route is tied to the child Pi's process generation. When `herdr delegation route-ready <child> --expected-parent <parent>` succeeds, Herdr also remembers the route on the child's pane: child and parent delegation, the child's session file and its generation. This record is persisted with the pane.
+
+When a recipe relaunch starts a new generation, Herdr re-establishes `route_ready` for it with the same expected parent, once the new Pi is Active with a trusted session. A recipe relaunch here means `wake_pane` or the restart resume. The relaunch must be in the same pane, whose terminal is still bound to the child delegation, and on the same session file. Each outcome gets a durable record under `<data dir>/route-carries/<child>-g<generation>.json`: `established`, `refused` (different session or pane) or `expired` (not ready within 60 s).
+
+A hand start (`agent start`, helper launch) never inherits a route; it drops the remembered route. A different session file or a different pane drops it too.
