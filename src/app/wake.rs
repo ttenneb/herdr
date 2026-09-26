@@ -669,6 +669,16 @@ mod tests {
                 dedupe_key: "pi:/tmp/s.jsonl".into(),
             });
             state.restore_managed_agent("owner".into(), crate::detect::Agent::Pi);
+            // As restore does: the old agent shows as a detected, idle Pi.
+            let _ = state.set_detected_state_with_screen_signals_at(
+                Some(crate::detect::Agent::Pi),
+                crate::detect::AgentState::Idle,
+                false,
+                false,
+                false,
+                false,
+                Instant::now(),
+            );
         }
         assert!(app.start_pending_agent_resume_for_terminal(&terminal, 24, 80, true));
         // The new shell reaches its prompt on a later scheduled tick.

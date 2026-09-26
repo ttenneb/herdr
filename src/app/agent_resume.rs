@@ -353,8 +353,11 @@ impl App {
                 .get(&terminal_id)
                 .is_some_and(super::agents::runtime_at_idle_shell);
             if shell_ready {
+                // Restore marked the pane with its old agent (name, detected
+                // Pi, session metadata) for display; the managed start below
+                // re-establishes all of it for the new process.
                 if let Some(terminal) = self.state.terminals.get_mut(&terminal_id) {
-                    terminal.clear_agent_name();
+                    terminal.clear_agent_runtime_identity_after_respawn();
                 }
                 let recipe = pending.recipe.clone();
                 let env = recipe.env_assignments();
