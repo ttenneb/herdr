@@ -6,7 +6,7 @@
 //! authority stay with the trusted managed launch; a server-minted head never
 //! grants any of them.
 
-use crate::api::schema::{MessageDelivery, MessageSendOptions, MessageTransport, PendingChoice};
+use crate::api::schema::{MessageDelivery, MessageSendOptions, MessageTransport};
 use crate::app::App;
 use crate::mailbox::{
     is_withdrawn_claim, MailboxHead, MailboxStore, RecipientKey, RecoveredMailbox, SendCorrelation,
@@ -60,9 +60,11 @@ pub(crate) enum SendRoute {
 
 #[derive(Debug)]
 pub(crate) enum SendRefusal {
-    PendingExists(PendingView),
-    /// `--edit-pending` found the pending message already picked up or changed.
-    PendingChanged(Option<PendingView>),
+    /// This sender's waiting messages to the recipient, newest first.
+    PendingExists(Vec<PendingView>),
+    /// `--edit-pending` named a message that is no longer waiting, or its
+    /// revision changed; carries the sender's current waiting list.
+    PendingChanged(Vec<PendingView>),
     MailboxUnavailable(&'static str),
     Store(String),
 }
@@ -348,7 +350,16 @@ impl App {
             .clone()
             .or_else(crate::platform::random_route_epoch)
             .unwrap_or_else(|| format!("send-{}", now_secs()));
-        let stable_id = format!("{recipient_terminal}\0{sender_key}\0{message_id}");
+        // Printable and deterministic, so a sender can name it on a command
+        // line and a repeat of the same send finds it.
+        let stable_id = format!(
+            "send.{}",
+            &sha256_fields(&[
+                recipient_terminal.as_bytes(),
+                sender_key.as_bytes(),
+                message_id.as_bytes()
+            ])[..32]
+        );
         if let Some(existing) = recovered.heads.get(&stable_id) {
             return Ok(SendRoute::Mailbox(MessageDelivery {
                 path: "mailbox".into(),
@@ -374,9 +385,12 @@ impl App {
         } else {
             Vec::new()
         };
-        pending.sort_by_key(|head| head.enqueue_epoch);
+        // Newest first.
+        pending.sort_by_key(|head| std::cmp::Reverse(head.enqueue_epoch));
+        let listed =
+            |pending: &[&MailboxHead]| pending.iter().map(|head| pending_view(head)).collect();
         let correlated = message.correlation.as_ref().and_then(|correlation| {
-            pending.iter().rev().copied().find(|head| {
+            pending.iter().copied().find(|head| {
                 head.delivery
                     .as_ref()
                     .and_then(|delivery| delivery.correlation.as_ref())
@@ -388,20 +402,18 @@ impl App {
         });
         let edit_target = if message.replace_pending && correlated.is_some() {
             correlated
-        } else if !pending.is_empty() {
-            match options.on_pending {
-                None => {
-                    return Err(SendRefusal::PendingExists(pending_view(
-                        pending.last().expect("nonempty"),
-                    )))
-                }
-                Some(PendingChoice::SendNew) => None,
-                Some(PendingChoice::EditPending) => pending.last().copied(),
+        } else if let Some(wanted) = options.edit_pending.as_deref() {
+            match pending
+                .iter()
+                .copied()
+                .find(|head| head.stable_id == wanted)
+            {
+                Some(head) => Some(head),
+                None => return Err(SendRefusal::PendingChanged(listed(&pending))),
             }
+        } else if !pending.is_empty() && !options.send_new {
+            return Err(SendRefusal::PendingExists(listed(&pending)));
         } else {
-            if options.on_pending == Some(PendingChoice::EditPending) {
-                return Err(SendRefusal::PendingChanged(None));
-            }
             None
         };
         if let Some(target) = edit_target {
@@ -409,7 +421,7 @@ impl App {
                 .expect_revision
                 .is_some_and(|expected| expected != target.revision)
             {
-                return Err(SendRefusal::PendingChanged(Some(pending_view(target))));
+                return Err(SendRefusal::PendingChanged(listed(&pending)));
             }
             let edited = store
                 .edit_unclaimed_head(crate::mailbox::MailboxHeadEdit {
@@ -423,7 +435,7 @@ impl App {
                 .map_err(|error| match error {
                     crate::mailbox::MailboxError::EditConflict
                     | crate::mailbox::MailboxError::HeadClaimed => {
-                        SendRefusal::PendingChanged(Some(pending_view(target)))
+                        SendRefusal::PendingChanged(listed(&pending))
                     }
                     error => SendRefusal::Store(error.to_string()),
                 })?;
@@ -486,20 +498,18 @@ pub(crate) fn pending_error_json(id: String, refusal: &SendRefusal) -> Option<St
     let (code, message, pending) = match refusal {
         SendRefusal::PendingExists(pending) => (
             "pending_exists",
-            "this sender already has an unclaimed message waiting for the recipient; resend with --edit-pending or --send-new",
-            Some(pending),
+            "you already have messages waiting for this recipient; resend with --edit-pending <stableId> or --send-new",
+            pending,
         ),
         SendRefusal::PendingChanged(pending) => (
             "pending_claimed",
-            "the pending message was already picked up or changed; resend with --send-new",
-            pending.as_ref(),
+            "that message is no longer waiting at the expected revision; see pending for what is still waiting",
+            pending,
         ),
         _ => return None,
     };
-    let mut error = serde_json::json!({"code": code, "message": message});
-    if let Some(pending) = pending {
-        error["pending"] = serde_json::to_value(pending).ok()?;
-    }
+    let error = serde_json::json!({"code": code, "message": message,
+                                   "pending": serde_json::to_value(pending).ok()?});
     Some(serde_json::json!({"id": id, "error": error}).to_string())
 }
 

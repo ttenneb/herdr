@@ -5,8 +5,8 @@
 A queued message stays editable while it waits. It runs when the recipient picks it up, which is immediately for an idle agent and at the end of the current turn for a busy one.
 
 ## One waiting message per sender
-If you already have an unclaimed message waiting for the same recipient, the send is refused with exit code 4 and `pending_exists`. The JSON on stdout names the waiting message. Rerun with one of:
-- `--edit-pending`: replace its text. Add `--expect-revision N` to guard against a concurrent change. If the recipient picked it up meanwhile, the result is `pending_claimed` (also exit 4).
+If you already have unclaimed messages waiting for the same recipient, the send is refused with exit code 4 and `pending_exists`. The JSON on stdout carries `error.pending`: an array of your waiting messages, newest first, each with `stableId`, `revision`, `digest`, `subject`, `priority`, `enqueuedAt` and `ageSeconds`. Rerun with one of:
+- `--edit-pending <stableId>`: replace that message's text. Add `--expect-revision N` to guard against a concurrent change. If the message is no longer waiting at that revision, the result is `pending_claimed` (also exit 4), with the current waiting list.
 - `--send-new`: queue another message.
 
 A structured prompt with `supersession.mode = replace_pending` edits its own waiting message automatically. Resending the same messageId or correlation returns the existing message instead of a duplicate. Sends from outside Herdr panes are not checked.

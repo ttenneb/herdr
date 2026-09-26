@@ -793,7 +793,7 @@ fn agent_rename(args: &[String]) -> std::io::Result<i32> {
 fn agent_prompt(args: &[String]) -> std::io::Result<i32> {
     let Some(target) = args.first() else {
         eprintln!(
-            "usage: herdr agent prompt <target> <text> [--wait] [--until STATUS]... [--timeout MS] [--transport auto|mailbox|pty] [--edit-pending|--send-new] [--expect-revision N]"
+            "usage: herdr agent prompt <target> <text> [--wait] [--until STATUS]... [--timeout MS] [--transport auto|mailbox|pty] [--edit-pending STABLE_ID|--send-new] [--expect-revision N]"
         );
         return Ok(2);
     };

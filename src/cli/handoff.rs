@@ -101,7 +101,7 @@ fn send(source: &str, rest: &[String]) -> std::io::Result<i32> {
 fn print_help() {
     eprintln!("herdr handoff commands:");
     eprintln!("  herdr handoff validate <JSON|PATH|->");
-    eprintln!("  herdr handoff send <JSON|PATH|-> [--transport auto|mailbox|pty] [--edit-pending|--send-new] [--expect-revision N]");
+    eprintln!("  herdr handoff send <JSON|PATH|-> [--transport auto|mailbox|pty] [--edit-pending STABLE_ID|--send-new] [--expect-revision N]");
     eprintln!("  exit 4: a message from you to this recipient is still pending (JSON on stdout)");
 }
 

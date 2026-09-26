@@ -10,7 +10,7 @@ use serde_json::json;
 use crate::{
     api::schema::{
         AgentPromptParams, CanonicalHerdrIdentity, HandoffKind, HandoffSendParams,
-        HandoffTransportOutcome, HerdrHandoff, MessageSendOptions, MessageTransport, PendingChoice,
+        HandoffTransportOutcome, HerdrHandoff, MessageSendOptions, MessageTransport,
         ResponseResult, SuccessResponse,
     },
     app::{
@@ -286,6 +286,7 @@ async fn second_send_asks_the_sender_to_edit_or_send_new() {
     let SendRoute::Mailbox(first) = first else {
         panic!("mailbox")
     };
+    let first_id = first.stable_id.clone().unwrap();
     let refusal = fixture
         .app
         .route_ordinary_send(&recipient, &sender, plain("second"), &Default::default())
@@ -293,33 +294,83 @@ async fn second_send_asks_the_sender_to_edit_or_send_new() {
     let SendRefusal::PendingExists(pending) = &refusal else {
         panic!("pending_exists")
     };
-    assert_eq!(Some(pending.stable_id.clone()), first.stable_id);
+    assert_eq!(pending.len(), 1);
+    assert_eq!(pending[0].stable_id, first_id);
+    assert!(
+        !first_id.contains('\0'),
+        "stableId must be usable on a command line"
+    );
+    // --send-new queues a second waiting message; the list is newest first.
+    let second = fixture
+        .app
+        .route_ordinary_send(
+            &recipient,
+            &sender,
+            plain("second"),
+            &MessageSendOptions {
+                send_new: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    let SendRoute::Mailbox(second) = second else {
+        panic!("mailbox")
+    };
+    let refusal = fixture
+        .app
+        .route_ordinary_send(&recipient, &sender, plain("third"), &Default::default())
+        .unwrap_err();
     let json: serde_json::Value = serde_json::from_str(
         &crate::app::messages::pending_error_json("id".into(), &refusal).unwrap(),
     )
     .unwrap();
     assert_eq!(json["error"]["code"], "pending_exists");
-    assert_eq!(json["error"]["pending"]["revision"], 1);
-    // A stale expected revision is refused as changed, not applied.
-    let stale = fixture.app.route_ordinary_send(
-        &recipient,
-        &sender,
-        plain("second"),
-        &MessageSendOptions {
-            on_pending: Some(PendingChoice::EditPending),
+    let listed = json["error"]["pending"].as_array().unwrap();
+    assert_eq!(listed.len(), 2);
+    assert_eq!(
+        listed[0]["stableId"],
+        json!(second.stable_id.clone().unwrap())
+    );
+    assert_eq!(listed[1]["stableId"], json!(first_id));
+    for key in [
+        "stableId",
+        "revision",
+        "digest",
+        "subject",
+        "priority",
+        "enqueuedAt",
+        "ageSeconds",
+    ] {
+        assert!(listed[0].get(key).is_some(), "{key}");
+    }
+    // A stale expected revision or an unknown stableId is refused with the
+    // current waiting list, and nothing is applied.
+    for options in [
+        MessageSendOptions {
+            edit_pending: Some(first_id.clone()),
             expect_revision: Some(7),
             ..Default::default()
         },
-    );
-    assert!(matches!(stale, Err(SendRefusal::PendingChanged(Some(_)))));
+        MessageSendOptions {
+            edit_pending: Some("send.unknown".into()),
+            ..Default::default()
+        },
+    ] {
+        let refused = fixture
+            .app
+            .route_ordinary_send(&recipient, &sender, plain("nope"), &options)
+            .unwrap_err();
+        assert!(matches!(refused, SendRefusal::PendingChanged(ref list) if list.len() == 2));
+    }
+    // --edit-pending <stableId> edits exactly that (older) message.
     let edited = fixture
         .app
         .route_ordinary_send(
             &recipient,
             &sender,
-            plain("second, edited in place"),
+            plain("first, edited in place"),
             &MessageSendOptions {
-                on_pending: Some(PendingChoice::EditPending),
+                edit_pending: Some(first_id.clone()),
                 expect_revision: Some(1),
                 ..Default::default()
             },
@@ -329,25 +380,13 @@ async fn second_send_asks_the_sender_to_edit_or_send_new() {
         panic!("mailbox")
     };
     assert!(edited.edited);
+    assert_eq!(edited.stable_id, Some(first_id));
     assert_eq!(edited.revision, Some(2));
-    let added = fixture
-        .app
-        .route_ordinary_send(
-            &recipient,
-            &sender,
-            plain("third"),
-            &MessageSendOptions {
-                on_pending: Some(PendingChoice::SendNew),
-                ..Default::default()
-            },
-        )
-        .unwrap();
-    assert!(matches!(added, SendRoute::Mailbox(ref d) if !d.edited));
     let heads = snapshot_heads(&mut fixture.app, &session);
     let bodies: Vec<_> = heads.iter().map(|head| head["body"].clone()).collect();
     assert_eq!(bodies.len(), 2);
-    assert!(bodies.contains(&json!("second, edited in place")));
-    assert!(bodies.contains(&json!("third")));
+    assert!(bodies.contains(&json!("first, edited in place")));
+    assert!(bodies.contains(&json!("second")));
     // F3 through the recipient view: the edited head has its exact receipt.
     let value = dispatch(
         &mut fixture.app,
@@ -492,7 +531,7 @@ async fn previous_session_heads_never_run_and_can_be_adopted_or_dropped() {
                 &sender,
                 plain(body),
                 &MessageSendOptions {
-                    on_pending: (index > 0).then_some(PendingChoice::SendNew),
+                    send_new: index > 0,
                     ..Default::default()
                 },
             )

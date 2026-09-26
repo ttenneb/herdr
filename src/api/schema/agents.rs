@@ -204,23 +204,17 @@ pub enum MessageTransport {
     Pty,
 }
 
-/// What to do when this sender already has an unclaimed message waiting for
-/// the same recipient.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
-#[serde(rename_all = "snake_case")]
-pub enum PendingChoice {
-    /// Replace the waiting message's subject and body.
-    EditPending,
-    /// Queue a second message.
-    SendNew,
-}
-
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct MessageSendOptions {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub transport: Option<MessageTransport>,
+    /// Replace the text of this sender's waiting message with this stableId
+    /// (taken from a `pending_exists` result).
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub on_pending: Option<PendingChoice>,
+    pub edit_pending: Option<String>,
+    /// Queue this message even though earlier ones are still waiting.
+    #[serde(default, skip_serializing_if = "super::is_false")]
+    pub send_new: bool,
     /// With `edit_pending`: the pending revision the sender last saw.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub expect_revision: Option<u64>,

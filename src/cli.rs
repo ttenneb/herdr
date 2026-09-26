@@ -755,18 +755,26 @@ pub(super) fn parse_message_send_option(
     index: usize,
     options: &mut crate::api::schema::MessageSendOptions,
 ) -> Option<usize> {
-    use crate::api::schema::{MessageTransport, PendingChoice};
+    use crate::api::schema::MessageTransport;
     match args[index].as_str() {
-        "--edit-pending" | "--send-new" => {
-            if options.on_pending.is_some() {
+        "--edit-pending" => {
+            let Some(stable_id) = args.get(index + 1).filter(|value| !value.is_empty()) else {
+                eprintln!("--edit-pending requires the stableId of your waiting message");
+                return None;
+            };
+            if options.send_new {
                 eprintln!("--edit-pending and --send-new are mutually exclusive");
                 return None;
             }
-            options.on_pending = Some(if args[index] == "--edit-pending" {
-                PendingChoice::EditPending
-            } else {
-                PendingChoice::SendNew
-            });
+            options.edit_pending = Some(stable_id.clone());
+            Some(2)
+        }
+        "--send-new" => {
+            if options.edit_pending.is_some() {
+                eprintln!("--edit-pending and --send-new are mutually exclusive");
+                return None;
+            }
+            options.send_new = true;
             Some(1)
         }
         "--expect-revision" => {
@@ -803,16 +811,27 @@ pub(super) fn print_send_response(response: &serde_json::Value) -> std::io::Resu
     match response["error"]["code"].as_str() {
         Some(code @ ("pending_exists" | "pending_claimed")) => {
             println!("{}", serde_json::to_string(response).unwrap());
-            let subject = response["error"]["pending"]["subject"]
-                .as_str()
-                .unwrap_or("(unknown)");
+            let pending = response["error"]["pending"]
+                .as_array()
+                .cloned()
+                .unwrap_or_default();
             if code == "pending_exists" {
                 eprintln!(
-                    "a message to this recipient is still pending (subject: {subject}); rerun with --edit-pending or --send-new"
+                    "{} message(s) from you to this recipient are still waiting; rerun with --edit-pending <stableId> or --send-new",
+                    pending.len()
                 );
             } else {
                 eprintln!(
-                    "the pending message was already picked up or changed; rerun with --send-new"
+                    "that message is no longer waiting at the expected revision; {} still waiting",
+                    pending.len()
+                );
+            }
+            for head in pending {
+                eprintln!(
+                    "  {} r{} {}",
+                    head["stableId"].as_str().unwrap_or_default(),
+                    head["revision"],
+                    head["subject"].as_str().unwrap_or_default()
                 );
             }
             Ok(PENDING_EXIT_CODE)
