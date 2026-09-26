@@ -1431,10 +1431,18 @@ impl App {
         };
         if let Some(editor_has_text) = params.editor_has_text {
             if let Some(terminal_id) = self.state.terminal_id_for_pane(ws_idx, pane_id) {
-                if let Some(terminal) = self.state.terminals.get_mut(&terminal_id) {
-                    terminal.editor_has_text = Some(editor_has_text);
-                }
+                let previous = self
+                    .state
+                    .terminals
+                    .get_mut(&terminal_id)
+                    .and_then(|terminal| terminal.editor_has_text.replace(editor_has_text));
                 if !editor_has_text {
+                    if previous == Some(true) {
+                        // A true→false edge from Pi: its editor was emptied
+                        // (submitted or erased), so Herdr's own key-based
+                        // flag is stale too.
+                        self.clear_human_draft(&terminal_id);
+                    }
                     // The editor is clear: held typed deliveries may go now.
                     self.flush_typed_deferrals(std::time::Instant::now());
                 }
