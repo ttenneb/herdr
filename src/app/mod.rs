@@ -33,6 +33,7 @@ mod tab_bar_status;
 mod terminal_targets;
 mod terminal_titles;
 mod theme_sync;
+pub(crate) mod typed_deferral;
 pub(crate) mod wake;
 mod window_title;
 mod worktrees;
@@ -151,6 +152,10 @@ pub struct App {
     /// Ephemeral server-owned managed start evidence; never restored from a pane snapshot.
     pub(crate) managed_pi_launches: HashMap<crate::terminal::TerminalId, agents::ManagedPiLaunch>,
     pub(crate) pane_wakes: HashMap<crate::terminal::TerminalId, wake::OutstandingWake>,
+    /// Per-pane estimate of the human's unsent input (typed-delivery guard).
+    pub(crate) human_drafts: HashMap<crate::terminal::TerminalId, typed_deferral::HumanDraft>,
+    /// Typed deliveries held while a draft is pending, in arrival order.
+    pub(crate) typed_deferrals: Vec<typed_deferral::TypedDeferral>,
     pub(crate) pane_wake_cooldowns: HashMap<crate::terminal::TerminalId, Instant>,
     /// Next level-triggered sweep of sleeping panes with a queued backlog;
     /// `None` until the first (post-start, `restore_backlog`) sweep ran.
@@ -186,9 +191,13 @@ pub struct App {
     /// Test override for a process's age (the typed fallback's 30 s rule).
     #[cfg(test)]
     pub(crate) messages_test_process_ages: HashMap<u32, std::time::Duration>,
-    /// Pi processes (PID, birth tick) that attached a Messages stream during
-    /// their life. Runtime only.
-    pub(crate) messages_attached_pis: std::collections::HashSet<(u32, u64)>,
+    /// Test override: executions treated as alive elsewhere (e.g. a managed
+    /// generation) without building that state.
+    #[cfg(test)]
+    pub(crate) messages_test_live_executions: std::collections::HashSet<String>,
+    /// Pi processes (PID, birth tick) that attached a Messages stream, with
+    /// when their last stream closed (None while one is open). Runtime only.
+    pub(crate) messages_attached_pis: HashMap<(u32, u64), Option<Instant>>,
     pub event_tx: mpsc::Sender<AppEvent>,
     pub(crate) event_rx: mpsc::Receiver<AppEvent>,
     pub(crate) api_rx: tokio::sync::mpsc::UnboundedReceiver<crate::api::ApiRequestMessage>,
@@ -936,6 +945,8 @@ impl App {
             mailbox_bootstrap_bindings: BTreeMap::new(),
             managed_pi_launches: HashMap::new(),
             pane_wakes: HashMap::new(),
+            human_drafts: HashMap::new(),
+            typed_deferrals: Vec::new(),
             pane_wake_cooldowns: HashMap::new(),
             next_backlog_sweep: None,
             server_started_at: Instant::now(),
@@ -954,7 +965,9 @@ impl App {
             mailbox_bootstrap_test_process_births: HashMap::new(),
             #[cfg(test)]
             messages_test_process_ages: HashMap::new(),
-            messages_attached_pis: std::collections::HashSet::new(),
+            #[cfg(test)]
+            messages_test_live_executions: std::collections::HashSet::new(),
+            messages_attached_pis: HashMap::new(),
             event_tx,
             event_rx,
             last_git_remote_status_refresh: Instant::now() - GIT_REMOTE_STATUS_REFRESH_INTERVAL,
@@ -1913,9 +1926,14 @@ impl App {
     ) {
         match plan {
             input::RepeatPlan::Forwarded(target) => {
+                let repeat = key.kind == crossterm::event::KeyEventKind::Repeat;
+                let counted = key.clone();
                 let result = self.forward_terminal_key_to_target_headless(&target, key);
                 if result.delivered() {
                     self.acknowledge_terminal_input(&target.terminal_id);
+                    if repeat {
+                        self.note_human_key(&target.terminal_id, &counted);
+                    }
                 } else if !result.succeeded() {
                     self.input_leases.remove(&lease_key);
                 }
@@ -1935,6 +1953,8 @@ impl App {
                             self.forward_terminal_key_to_target_headless(target, key.clone());
                         if result.delivered() {
                             self.acknowledge_terminal_input(&target.terminal_id);
+                            let target_terminal = target.terminal_id.clone();
+                            self.note_human_key(&target_terminal, &key);
                         } else if !result.succeeded() {
                             self.input_leases.remove(&lease_key);
                             break;
@@ -2038,6 +2058,7 @@ impl App {
                             };
                             if let Some(target) = &target {
                                 self.acknowledge_terminal_input(&target.terminal_id);
+                                self.note_human_key(&target.terminal_id, &key);
                             }
                             let resulting_context = self.terminal_input_context();
                             let plan = self.input_leases.complete_press(
@@ -2104,9 +2125,11 @@ impl App {
                                         ws_idx,
                                         focused,
                                     ) {
+                                        let pasted = text.clone();
                                         if runtime.try_send_paste(text).is_ok() {
                                             if let Some(terminal_id) = terminal_id {
                                                 self.acknowledge_terminal_input(&terminal_id);
+                                                self.note_human_text(&terminal_id, &pasted);
                                             }
                                         }
                                     }

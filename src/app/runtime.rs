@@ -657,6 +657,7 @@ impl App {
             self.agent_metadata_deadline,
             self.pending_agent_resume_deadline,
             self.next_pane_wake_deadline(),
+            self.next_typed_deferral_deadline(),
             self.next_managed_resume_deadline(now),
             self.next_route_carry_deadline(now),
             self.next_wake_sweep_deadline(now),

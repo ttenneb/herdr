@@ -1423,12 +1423,23 @@ impl App {
         id: String,
         params: PaneReportAgentParams,
     ) -> String {
-        let Some((_ws_idx, pane_id)) = self.parse_pane_id(&params.pane_id) else {
+        let Some((ws_idx, pane_id)) = self.parse_pane_id(&params.pane_id) else {
             return pane_not_found(id, &params.pane_id);
         };
         let Some(agent_label) = normalize_reported_agent_label(&params.agent) else {
             return invalid_agent(id);
         };
+        if let Some(editor_has_text) = params.editor_has_text {
+            if let Some(terminal_id) = self.state.terminal_id_for_pane(ws_idx, pane_id) {
+                if let Some(terminal) = self.state.terminals.get_mut(&terminal_id) {
+                    terminal.editor_has_text = Some(editor_has_text);
+                }
+                if !editor_has_text {
+                    // The editor is clear: held typed deliveries may go now.
+                    self.flush_typed_deferrals(std::time::Instant::now());
+                }
+            }
+        }
         self.handle_internal_event(crate::events::AppEvent::HookStateReported {
             pane_id,
             session_ref: crate::agent_resume::session_ref_from_report(

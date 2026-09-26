@@ -1344,6 +1344,82 @@
               "type": "object"
             },
             {
+              "description": "A typed delivery held for the human's unsent input was typed.",
+              "properties": {
+                "deferral_id": {
+                  "type": "string"
+                },
+                "pane_id": {
+                  "type": "string"
+                },
+                "terminal_id": {
+                  "type": "string"
+                },
+                "type": {
+                  "const": "delivery_deferred_delivered",
+                  "type": "string"
+                },
+                "workspace_id": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type",
+                "deferral_id",
+                "pane_id",
+                "workspace_id",
+                "terminal_id"
+              ],
+              "type": "object"
+            },
+            {
+              "description": "A held typed delivery failed (`agent_input_busy` after 10 minutes, a\nserver stop, or the recipient agent went away).",
+              "properties": {
+                "code": {
+                  "type": "string"
+                },
+                "deferral_id": {
+                  "type": "string"
+                },
+                "message": {
+                  "type": "string"
+                },
+                "pane_id": {
+                  "type": "string"
+                },
+                "sender": {
+                  "type": "string"
+                },
+                "sender_terminal_id": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "terminal_id": {
+                  "type": "string"
+                },
+                "type": {
+                  "const": "delivery_deferred_failed",
+                  "type": "string"
+                },
+                "workspace_id": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type",
+                "deferral_id",
+                "pane_id",
+                "workspace_id",
+                "terminal_id",
+                "sender",
+                "code",
+                "message"
+              ],
+              "type": "object"
+            },
+            {
               "properties": {
                 "agent": {
                   "type": [
@@ -1501,6 +1577,8 @@
             "pane_exited",
             "pane_agent_detected",
             "pane_wake_requested",
+            "delivery_deferred_delivered",
+            "delivery_deferred_failed",
             "pane_agent_status_changed",
             "layout_updated"
           ],
@@ -1578,6 +1656,13 @@
             "display_agent": {
               "type": [
                 "string",
+                "null"
+              ]
+            },
+            "editor_has_text": {
+              "description": "The agent's last reported \"editor has unsent text\" (Pi only).",
+              "type": [
+                "boolean",
                 "null"
               ]
             },
@@ -4846,6 +4931,13 @@
                 "null"
               ]
             },
+            "editor_has_text": {
+              "description": "Pi only, edge-triggered: whether the agent's editor holds unsent text.\nWhile true, Herdr holds typed deliveries to the pane.",
+              "type": [
+                "boolean",
+                "null"
+              ]
+            },
             "message": {
               "type": [
                 "string",
@@ -6395,6 +6487,30 @@
               "properties": {
                 "type": {
                   "const": "pane.wake_requested",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "type": {
+                  "const": "delivery.deferred_delivered",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "type": {
+                  "const": "delivery.deferred_failed",
                   "type": "string"
                 }
               },
@@ -10470,6 +10586,82 @@
               "type": "object"
             },
             {
+              "description": "A typed delivery held for the human's unsent input was typed.",
+              "properties": {
+                "deferral_id": {
+                  "type": "string"
+                },
+                "pane_id": {
+                  "type": "string"
+                },
+                "terminal_id": {
+                  "type": "string"
+                },
+                "type": {
+                  "const": "delivery_deferred_delivered",
+                  "type": "string"
+                },
+                "workspace_id": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type",
+                "deferral_id",
+                "pane_id",
+                "workspace_id",
+                "terminal_id"
+              ],
+              "type": "object"
+            },
+            {
+              "description": "A held typed delivery failed (`agent_input_busy` after 10 minutes, a\nserver stop, or the recipient agent went away).",
+              "properties": {
+                "code": {
+                  "type": "string"
+                },
+                "deferral_id": {
+                  "type": "string"
+                },
+                "message": {
+                  "type": "string"
+                },
+                "pane_id": {
+                  "type": "string"
+                },
+                "sender": {
+                  "type": "string"
+                },
+                "sender_terminal_id": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "terminal_id": {
+                  "type": "string"
+                },
+                "type": {
+                  "const": "delivery_deferred_failed",
+                  "type": "string"
+                },
+                "workspace_id": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type",
+                "deferral_id",
+                "pane_id",
+                "workspace_id",
+                "terminal_id",
+                "sender",
+                "code",
+                "message"
+              ],
+              "type": "object"
+            },
+            {
               "properties": {
                 "agent": {
                   "type": [
@@ -10627,6 +10819,8 @@
             "pane_exited",
             "pane_agent_detected",
             "pane_wake_requested",
+            "delivery_deferred_delivered",
+            "delivery_deferred_failed",
             "pane_agent_status_changed",
             "layout_updated"
           ],
@@ -10747,6 +10941,13 @@
             "display_agent": {
               "type": [
                 "string",
+                "null"
+              ]
+            },
+            "editor_has_text": {
+              "description": "The agent's last reported \"editor has unsent text\" (Pi only).",
+              "type": [
+                "boolean",
                 "null"
               ]
             },
@@ -11611,6 +11812,13 @@
             "display_agent": {
               "type": [
                 "string",
+                "null"
+              ]
+            },
+            "editor_has_text": {
+              "description": "The agent's last reported \"editor has unsent text\" (Pi only).",
+              "type": [
+                "boolean",
                 "null"
               ]
             },
@@ -13307,6 +13515,82 @@
               "type": "object"
             },
             {
+              "description": "A typed delivery held for the human's unsent input was typed.",
+              "properties": {
+                "deferral_id": {
+                  "type": "string"
+                },
+                "pane_id": {
+                  "type": "string"
+                },
+                "terminal_id": {
+                  "type": "string"
+                },
+                "type": {
+                  "const": "delivery_deferred_delivered",
+                  "type": "string"
+                },
+                "workspace_id": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type",
+                "deferral_id",
+                "pane_id",
+                "workspace_id",
+                "terminal_id"
+              ],
+              "type": "object"
+            },
+            {
+              "description": "A held typed delivery failed (`agent_input_busy` after 10 minutes, a\nserver stop, or the recipient agent went away).",
+              "properties": {
+                "code": {
+                  "type": "string"
+                },
+                "deferral_id": {
+                  "type": "string"
+                },
+                "message": {
+                  "type": "string"
+                },
+                "pane_id": {
+                  "type": "string"
+                },
+                "sender": {
+                  "type": "string"
+                },
+                "sender_terminal_id": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "terminal_id": {
+                  "type": "string"
+                },
+                "type": {
+                  "const": "delivery_deferred_failed",
+                  "type": "string"
+                },
+                "workspace_id": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type",
+                "deferral_id",
+                "pane_id",
+                "workspace_id",
+                "terminal_id",
+                "sender",
+                "code",
+                "message"
+              ],
+              "type": "object"
+            },
+            {
               "properties": {
                 "agent": {
                   "type": [
@@ -13479,6 +13763,8 @@
             "pane_exited",
             "pane_agent_detected",
             "pane_wake_requested",
+            "delivery_deferred_delivered",
+            "delivery_deferred_failed",
             "pane_agent_status_changed",
             "layout_updated"
           ],
@@ -13503,6 +13789,11 @@
             {
               "const": "mailbox_admitted",
               "description": "Durably queued in the recipient's Messages; the recipient runs it when\nit next picks up work.",
+              "type": "string"
+            },
+            {
+              "const": "deferred_human_draft",
+              "description": "Held because the recipient pane has unsent human input; typed when it\nclears (see `delivery.deferral_id`).",
               "type": "string"
             }
           ]
@@ -14067,6 +14358,13 @@
         "MessageDelivery": {
           "description": "Where an ordinary send went.",
           "properties": {
+            "deferral_id": {
+              "description": "For `pty_deferred`: the ID in the later `delivery.deferred_delivered`\nor `delivery.deferred_failed` event.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
             "duplicate": {
               "description": "True when an identical correlated send found its existing message.",
               "type": "boolean"
@@ -14075,7 +14373,7 @@
               "type": "boolean"
             },
             "path": {
-              "description": "`mailbox` or `pty`.",
+              "description": "`mailbox`, `pty`, or `pty_deferred` (held while the recipient pane has\nunsent human input; see `deferral_id`).",
               "type": "string"
             },
             "revision": {
@@ -14089,6 +14387,15 @@
             "stable_id": {
               "type": [
                 "string",
+                "null"
+              ]
+            },
+            "typed_ahead_of_queued": {
+              "description": "For a typed delivery (`pty`/`pty_deferred`) to a pane whose Messages\nqueue still holds older messages: how many it was typed ahead of.",
+              "format": "uint64",
+              "minimum": 0,
+              "type": [
+                "integer",
                 "null"
               ]
             }
@@ -14219,6 +14526,13 @@
             "display_agent": {
               "type": [
                 "string",
+                "null"
+              ]
+            },
+            "editor_has_text": {
+              "description": "The agent's last reported \"editor has unsent text\" (Pi only).",
+              "type": [
+                "boolean",
                 "null"
               ]
             },

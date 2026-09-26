@@ -116,6 +116,10 @@ pub enum Subscription {
     PaneAgentDetected {},
     #[serde(rename = "pane.wake_requested")]
     PaneWakeRequested {},
+    #[serde(rename = "delivery.deferred_delivered")]
+    DeliveryDeferredDelivered {},
+    #[serde(rename = "delivery.deferred_failed")]
+    DeliveryDeferredFailed {},
     #[serde(rename = "pane.output_matched")]
     PaneOutputMatched {
         pane_id: String,
@@ -297,6 +301,8 @@ pub enum EventKind {
     PaneExited,
     PaneAgentDetected,
     PaneWakeRequested,
+    DeliveryDeferredDelivered,
+    DeliveryDeferredFailed,
     PaneAgentStatusChanged,
     LayoutUpdated,
 }
@@ -355,6 +361,8 @@ impl EventKind {
             EventKind::PaneExited => "pane.exited",
             EventKind::PaneAgentDetected => "pane.agent_detected",
             EventKind::PaneWakeRequested => "pane.wake_requested",
+            EventKind::DeliveryDeferredDelivered => "delivery.deferred_delivered",
+            EventKind::DeliveryDeferredFailed => "delivery.deferred_failed",
             EventKind::PaneAgentStatusChanged => "pane.agent_status_changed",
             EventKind::LayoutUpdated => "layout.updated",
         }
@@ -414,6 +422,8 @@ pub const KNOWN_EVENT_KINDS: &[EventKind] = &[
     EventKind::PaneExited,
     EventKind::PaneAgentDetected,
     EventKind::PaneWakeRequested,
+    EventKind::DeliveryDeferredDelivered,
+    EventKind::DeliveryDeferredFailed,
     EventKind::PaneAgentStatusChanged,
     EventKind::LayoutUpdated,
 ];
@@ -823,6 +833,26 @@ pub enum EventData {
         queue_key: String,
         stable_id: String,
         reason: String,
+    },
+    /// A typed delivery held for the human's unsent input was typed.
+    DeliveryDeferredDelivered {
+        deferral_id: String,
+        pane_id: String,
+        workspace_id: String,
+        terminal_id: String,
+    },
+    /// A held typed delivery failed (`agent_input_busy` after 10 minutes, a
+    /// server stop, or the recipient agent went away).
+    DeliveryDeferredFailed {
+        deferral_id: String,
+        pane_id: String,
+        workspace_id: String,
+        terminal_id: String,
+        sender: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        sender_terminal_id: Option<String>,
+        code: String,
+        message: String,
     },
     PaneAgentDetected {
         pane_id: String,

@@ -438,7 +438,7 @@ impl App {
                 .values()
                 .filter(|claim| recipients.contains(&claim.recipient))
                 .filter_map(|claim| claim.execution.clone())
-                .filter(|owner| *owner != execution && self.execution_alive(owner))
+                .filter(|owner| *owner != execution && self.execution_alive(owner, &session.caller))
                 .collect();
             let held_by_live_other = |claim: &crate::mailbox::Claim| {
                 claim
@@ -736,6 +736,20 @@ impl App {
                     // Any other caller is outside this pane's inbox and refused.
                     if !own && outcome != crate::mailbox::ClaimResolutionOutcome::Settled {
                         return Err(MailboxBootstrapError::InvalidRequest);
+                    }
+                    // A recovered settle closes only a claim the gone Pi had
+                    // ADMITTED (its turn ran or may have). One that was only
+                    // claimed never ran: it needs an explicit Drop or Retry.
+                    if !own
+                        && !matches!(
+                            recovered.resolutions.get(&claim.claim_id),
+                            Some(crate::mailbox::ClaimResolution {
+                                outcome: crate::mailbox::ClaimResolutionOutcome::Admitted,
+                                ..
+                            })
+                        )
+                    {
+                        return Err(MailboxBootstrapError::RecoveryNeedsDropOrRetry);
                     }
                     let resolution = store
                         .resolve_claim_closed_by(

@@ -229,6 +229,10 @@ fn failure(request_id: Option<String>, error: MailboxBootstrapError) -> String {
             code,
             "the server refused or failed the mailbox request; see the code",
         ),
+        MailboxBootstrapError::RecoveryNeedsDropOrRetry => (
+            "mailbox_recovery_needs_drop_or_retry",
+            "that message was claimed by a Pi that is gone but never admitted; use Drop or Retry",
+        ),
         MailboxBootstrapError::RecipientNotAllowed => (
             "mailbox_recipient_not_allowed",
             "a send grant can be provisioned only for your delegation parent or a direct child; reach other agents with herdr agent prompt or handoff",

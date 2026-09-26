@@ -944,6 +944,8 @@ impl HeadlessServer {
             }
         }
 
+        // Held typed deliveries are in memory only: report each as failed.
+        self.app.drop_typed_deferrals_on_stop();
         // Save session on exit.
         if !self.app.no_session {
             self.app.save_session_now();
@@ -5149,6 +5151,7 @@ impl HeadlessServer {
 
         changed |= self.app.handle_tab_bar_status_tasks(now);
         changed |= self.app.handle_pane_wake_deadlines(now);
+        changed |= self.app.flush_typed_deferrals(now);
         changed |= self.app.maybe_sweep_sleeping_backlog(now);
         changed |= self.app.retry_pending_managed_resumes(now);
         changed |= self.app.retry_route_carries(now);
@@ -12597,6 +12600,7 @@ next_tab = ""
                     seq: Some(19),
                     agent_session_id: None,
                     agent_session_path: None,
+                    editor_has_text: None,
                 }),
             },
             respond_to,

@@ -4718,6 +4718,7 @@ action = "missing"
                 seq: None,
                 agent_session_id: None,
                 agent_session_path: None,
+                editor_has_text: None,
             },
         );
 

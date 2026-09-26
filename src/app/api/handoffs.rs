@@ -307,6 +307,49 @@ impl App {
             }
         }
         let prompt = envelope.prompt_text();
+        let queued_ahead = self.unsettled_queue_len(&terminal_id.to_string());
+        if queued_ahead > 0 {
+            tracing::warn!(
+                terminal = %terminal_id,
+                queued_ahead,
+                "messages: typing a handoff ahead of messages still queued in this pane"
+            );
+        }
+        let typed_ahead_of_queued = (queued_ahead > 0).then_some(queued_ahead);
+        // Never type into the human's unsent draft: hold it (in order).
+        if self.typed_delivery_must_wait(&terminal_id) {
+            let sender = crate::app::messages::SenderAttribution {
+                terminal: Some(envelope.sender.terminal_id.clone()),
+                label: self
+                    .current_identity_info(&envelope.sender)
+                    .and_then(|agent| agent.name)
+                    .unwrap_or_else(|| envelope.sender.pane_id.clone()),
+                session: Some(envelope.sender.agent_session.value.clone()),
+                external_key: None,
+            };
+            let deferral_id = self.defer_typed_delivery(
+                terminal_id.clone(),
+                prompt,
+                expected_agent,
+                envelope.recipient.pane_id.clone(),
+                sender,
+                "handoff",
+            );
+            let mut held = receipt(
+                HandoffTransportOutcome::DeferredHumanDraft,
+                "the recipient pane has unsent human input; Herdr types the handoff when it clears (up to 10 minutes)".into(),
+            );
+            held.delivery = Some(crate::api::schema::MessageDelivery {
+                path: "pty_deferred".into(),
+                deferral_id: Some(deferral_id),
+                typed_ahead_of_queued,
+                stable_id: None,
+                revision: None,
+                edited: false,
+                duplicate: false,
+            });
+            return encode_success(id, ResponseResult::HandoffTransport { receipt: held });
+        }
         let (text, enter) = crate::app::api_helpers::encode_api_submission_parts(runtime, &prompt);
         let result = runtime.try_send_prompt_transaction(
             Bytes::from(text),
@@ -338,9 +381,18 @@ impl App {
             self.commit_archived_member_input(restore);
         }
         self.acknowledge_terminal_input(&terminal_id);
-        encode_success(id, ResponseResult::HandoffTransport {
-            receipt: receipt(HandoffTransportOutcome::RuntimeTransactionAdmitted, "Herdr runtime admitted the complete prompt transaction; Pi/gate/agent acknowledgement is unknown".into()),
-        })
+        let mut admitted = receipt(HandoffTransportOutcome::RuntimeTransactionAdmitted, "Herdr runtime admitted the complete prompt transaction; Pi/gate/agent acknowledgement is unknown".into());
+        admitted.delivery =
+            typed_ahead_of_queued.map(|queued| crate::api::schema::MessageDelivery {
+                path: "pty".into(),
+                typed_ahead_of_queued: Some(queued),
+                deferral_id: None,
+                stable_id: None,
+                revision: None,
+                edited: false,
+                duplicate: false,
+            });
+        encode_success(id, ResponseResult::HandoffTransport { receipt: admitted })
     }
 
     /// Queues a validated handoff in the recipient's Messages. Returns `None`
@@ -361,6 +413,7 @@ impl App {
             terminal: Some(envelope.sender.terminal_id.clone()),
             label: sender_label.clone(),
             session: Some(envelope.sender.agent_session.value.clone()),
+            external_key: None,
         };
         let kind = match envelope.kind {
             crate::api::schema::HandoffKind::Assignment => "assignment",

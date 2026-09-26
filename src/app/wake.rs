@@ -1521,6 +1521,7 @@ mod tests {
                 terminal: None,
                 label: "external".into(),
                 session: None,
+                external_key: None,
             },
             crate::app::messages::OutgoingMessage {
                 origin: "agent_prompt",
@@ -1592,6 +1593,7 @@ mod tests {
             terminal: None,
             label: "external".into(),
             session: None,
+            external_key: None,
         };
         let routed = app.route_ordinary_send(
             &terminal.to_string(),

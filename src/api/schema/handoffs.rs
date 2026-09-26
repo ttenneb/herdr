@@ -98,6 +98,9 @@ pub enum HandoffTransportOutcome {
     /// Durably queued in the recipient's Messages; the recipient runs it when
     /// it next picks up work.
     MailboxAdmitted,
+    /// Held because the recipient pane has unsent human input; typed when it
+    /// clears (see `delivery.deferral_id`).
+    DeferredHumanDraft,
     SenderIdentityMismatch,
     RecipientIdentityMismatch,
     RecipientNotReady,

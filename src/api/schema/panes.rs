@@ -385,6 +385,10 @@ pub struct PaneReportAgentParams {
     pub agent_session_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent_session_path: Option<String>,
+    /// Pi only, edge-triggered: whether the agent's editor holds unsent text.
+    /// While true, Herdr holds typed deliveries to the pane.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub editor_has_text: Option<bool>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
@@ -452,6 +456,9 @@ pub struct PaneReleaseAgentParams {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct PaneInfo {
+    /// The agent's last reported "editor has unsent text" (Pi only).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub editor_has_text: Option<bool>,
     pub pane_id: String,
     pub terminal_id: String,
     pub workspace_id: String,

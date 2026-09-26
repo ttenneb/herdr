@@ -171,6 +171,7 @@ impl App {
             self.invalidate_offline_mailbox_authority_for_pane(*pane_id, *process_generation);
         }
 
+        self.note_agent_process_event(&ev);
         if let AppEvent::AgentProcessDetected {
             pane_id,
             agent,

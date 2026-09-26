@@ -124,6 +124,11 @@ pub(crate) struct SenderAttribution {
     pub terminal: Option<String>,
     pub label: String,
     pub session: Option<String>,
+    /// For a sender outside every pane: its process identity (uid, and the
+    /// login session of the sending CLI, pinned by the session leader's
+    /// birth tick), so one external script cannot edit or replace another's
+    /// waiting message.
+    pub external_key: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -454,15 +459,41 @@ pub(crate) fn session_execution(session: &crate::app::MailboxBootstrapSession) -
     }
 }
 
+/// Identity of a sender outside every pane: the peer's uid plus its login
+/// session (session ID and the session leader's birth tick, so a recycled
+/// session ID is a different sender); the PID and its birth tick when the
+/// session cannot be read.
+pub(crate) fn external_sender_key(pid: u32) -> String {
+    use std::os::unix::fs::MetadataExt;
+    let uid = std::fs::metadata(format!("/proc/{pid}"))
+        .map(|meta| meta.uid().to_string())
+        .unwrap_or_else(|_| "?".into());
+    let sid = unsafe { libc::getsid(pid as libc::pid_t) };
+    if sid > 0 {
+        if let Some(leader) = crate::platform::process_birth_identity(sid as u32) {
+            return format!("external:{uid}:sid:{sid}:{}", leader.start_ticks);
+        }
+    }
+    let ticks = crate::platform::process_birth_identity(pid)
+        .map_or_else(|| "?".into(), |birth| birth.start_ticks.to_string());
+    format!("external:{uid}:pid:{pid}:{ticks}")
+}
+
 /// How long a live Pi may take to attach Messages before new sends to its
 /// pane are typed instead of queued.
 pub(crate) const MESSAGES_ATTACH_GRACE: std::time::Duration = std::time::Duration::from_secs(30);
 
 impl App {
-    /// Whether a claiming execution still runs: `pid:<pid>:<ticks>` while
-    /// that exact process lives; `managed:<terminal>:<generation>` while that
-    /// generation holds the pane's Active sender authority.
-    pub(crate) fn execution_alive(&self, execution: &str) -> bool {
+    /// Whether a claiming execution still runs in the pane `terminal_key`:
+    /// `pid:<pid>:<ticks>` while that exact process lives, is still the
+    /// pane's foreground Pi and is not stopped (a stopped or backgrounded old
+    /// Pi must not block Drop/Retry forever); `managed:<terminal>:<generation>`
+    /// while that generation holds the pane's Active sender authority.
+    pub(crate) fn execution_alive(&self, execution: &str, terminal_key: &str) -> bool {
+        #[cfg(test)]
+        if self.messages_test_live_executions.contains(execution) {
+            return true;
+        }
         if let Some(rest) = execution.strip_prefix("pid:") {
             let Some((pid, ticks)) = rest.split_once(':') else {
                 return false;
@@ -470,9 +501,8 @@ impl App {
             let (Ok(pid), Ok(ticks)) = (pid.parse::<u32>(), ticks.parse::<u64>()) else {
                 return false;
             };
-            return self
-                .managed_pi_process_birth(pid)
-                .is_some_and(|birth| birth.start_ticks == ticks);
+            return self.foreground_pi_identity(terminal_key) == Some((pid, ticks))
+                && !crate::platform::process_stopped(pid);
         }
         if let Some(rest) = execution.strip_prefix("managed:") {
             let Some((terminal, generation)) = rest.rsplit_once(':') else {
@@ -570,7 +600,13 @@ impl App {
         // messages typed again; queued heads wait for the next Messages Pi.
         // A pane with no Pi (plain shell, restarting) keeps queueing.
         if let Some((pid, start_ticks)) = self.foreground_pi_identity(terminal_key) {
-            if !self.messages_attached_pis.contains(&(pid, start_ticks))
+            let attached = self
+                .messages_attached_pis
+                .get(&(pid, start_ticks))
+                .is_some_and(|closed| {
+                    closed.is_none_or(|since| since.elapsed() < MESSAGES_ATTACH_GRACE)
+                });
+            if !attached
                 && self
                     .pi_process_age(pid, start_ticks)
                     .is_some_and(|age| age >= MESSAGES_ATTACH_GRACE)
@@ -587,6 +623,8 @@ impl App {
     }
 
     fn pi_process_age(&self, pid: u32, start_ticks: u64) -> Option<std::time::Duration> {
+        #[cfg(not(test))]
+        let _ = pid;
         #[cfg(test)]
         if let Some(age) = self.messages_test_process_ages.get(&pid) {
             return Some(*age);
@@ -613,6 +651,34 @@ impl App {
             self.next_backlog_sweep = Some(sooner);
         }
         false
+    }
+
+    /// Messages still waiting in this pane's queue (held, or claimed and not
+    /// settled; dropped ones excluded).
+    pub(crate) fn unsettled_queue_len(&self, terminal_key: &str) -> u64 {
+        let Ok(recovered) = MailboxStore::open(&self.sender_authority_dir).and_then(|s| s.load())
+        else {
+            return 0;
+        };
+        let recipients = self.inbox_recipients(terminal_key);
+        recovered
+            .heads
+            .values()
+            .filter(|head| recipients.contains(&head.recipient))
+            .filter(|head| match recovered.claims.get(&head.stable_id) {
+                None => true,
+                Some(claim) => {
+                    !is_withdrawn_claim(claim)
+                        && !matches!(
+                            recovered.resolutions.get(&claim.claim_id),
+                            Some(crate::mailbox::ClaimResolution {
+                                outcome: crate::mailbox::ClaimResolutionOutcome::Settled,
+                                ..
+                            })
+                        )
+                }
+            })
+            .count() as u64
     }
 
     /// Level-triggered backlog sweep: every sleeping Pi pane that still has
@@ -761,6 +827,7 @@ impl App {
             cwd: pane.cwd,
             foreground_cwd: pane.foreground_cwd,
             revision: pane.revision,
+            editor_has_text: pane.editor_has_text,
         })
     }
 
@@ -887,6 +954,7 @@ impl App {
             terminal: None,
             label: "external".into(),
             session: None,
+            external_key: caller_pid.map(external_sender_key),
         };
         let Some(mut pid) = caller_pid else {
             return external;
@@ -914,6 +982,7 @@ impl App {
                     terminal: Some(terminal.clone()),
                     label,
                     session: agent.and_then(|agent| agent.agent_session.map(|s| s.value)),
+                    external_key: None,
                 };
             }
             match parent_pid(pid) {
@@ -963,7 +1032,11 @@ impl App {
         let recovered = store
             .load()
             .map_err(|error| SendRefusal::Store(error.to_string()))?;
-        let sender_key = sender.terminal.clone().unwrap_or_else(|| "external".into());
+        let sender_key = sender
+            .terminal
+            .clone()
+            .or_else(|| sender.external_key.clone())
+            .unwrap_or_else(|| "external".into());
         let recipient_session = self.current_agent_session_value(recipient_terminal);
 
         // An identical send (same message ID from the same sender) returns its
@@ -985,6 +1058,8 @@ impl App {
         );
         if let Some(existing) = recovered.heads.get(&stable_id) {
             return Ok(SendRoute::Mailbox(MessageDelivery {
+                deferral_id: None,
+                typed_ahead_of_queued: None,
                 path: "mailbox".into(),
                 stable_id: Some(existing.stable_id.clone()),
                 revision: Some(existing.revision),
@@ -1084,6 +1159,8 @@ impl App {
                     error => SendRefusal::Store(error.to_string()),
                 })?;
             return Ok(SendRoute::Mailbox(MessageDelivery {
+                deferral_id: None,
+                typed_ahead_of_queued: None,
                 path: "mailbox".into(),
                 stable_id: Some(edited.stable_id),
                 revision: Some(edited.revision),
@@ -1130,6 +1207,8 @@ impl App {
             .append_offline_head(head)
             .map_err(|error| SendRefusal::Store(error.to_string()))?;
         Ok(SendRoute::Mailbox(MessageDelivery {
+            deferral_id: None,
+            typed_ahead_of_queued: None,
             path: "mailbox".into(),
             stable_id: Some(receipt.stable_id),
             revision: Some(receipt.revision),

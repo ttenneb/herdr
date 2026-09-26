@@ -124,6 +124,9 @@ pub(crate) enum MailboxBootstrapError {
     /// provision_recipient for an agent outside the caller's own delegation
     /// edges (its parent or a direct child).
     RecipientNotAllowed,
+    /// A gone execution's claim that was never admitted cannot be settled
+    /// as recovered; it needs an explicit Drop or Retry.
+    RecoveryNeedsDropOrRetry,
 }
 
 /// Error codes a mailbox handler may return that are passed through to the
@@ -143,6 +146,7 @@ const PASSTHROUGH_CODES: &[&str] = &[
     "mailbox_claim_execution_alive",
     "mailbox_recipient_not_allowed",
     "mailbox_caller_unauthenticated",
+    "mailbox_recovery_needs_drop_or_retry",
     "mailbox_resolve_failed",
     "mailbox_snapshot_failed",
     "report_route_required",
@@ -1301,7 +1305,7 @@ impl App {
         // Remember that this exact Pi process attached (the typed fallback
         // never applies to it, even while its stream reconnects).
         if let Some(pi) = self.foreground_pi_identity(terminal_key) {
-            self.messages_attached_pis.insert(pi);
+            self.messages_attached_pis.insert(pi, None);
         }
         let mut flipped = false;
         if let Some(terminal) = self
@@ -1348,7 +1352,24 @@ impl App {
     /// Releases the binding of a closed bootstrap stream so "has Messages"
     /// reflects live connections only.
     pub(crate) fn release_mailbox_bootstrap_binding(&mut self, binding_generation: &str) {
-        self.mailbox_bootstrap_bindings.remove(binding_generation);
+        let Some(session) = self.mailbox_bootstrap_bindings.remove(binding_generation) else {
+            return;
+        };
+        // The pane's Pi closed its last stream: remember when, so a Pi whose
+        // Messages extension died falls back to typed input after 30 s.
+        let still_open = self
+            .mailbox_bootstrap_bindings
+            .values()
+            .any(|other| other.caller == session.caller);
+        if !still_open {
+            let pi = session
+                .recipient_only
+                .map(|binding| (binding.foreground_pid, binding.start_ticks))
+                .or_else(|| self.foreground_pi_identity(&session.caller));
+            if let Some(closed) = pi.and_then(|pi| self.messages_attached_pis.get_mut(&pi)) {
+                closed.get_or_insert_with(std::time::Instant::now);
+            }
+        }
     }
 
     fn accept_trusted_mailbox_bootstrap_stream(
@@ -1596,7 +1617,7 @@ impl App {
             &self.inbox_recipients(&session.caller),
             &crate::app::messages::session_execution(session),
             current.as_deref(),
-            &|execution| self.execution_alive(execution),
+            &|execution| self.execution_alive(execution, &session.caller),
         )
         .map_err(|_| MailboxBootstrapError::GrantMissing)?;
         let settled: std::collections::HashSet<_> = snapshot

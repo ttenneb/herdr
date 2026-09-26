@@ -229,6 +229,12 @@ impl ActiveSubscription {
             Subscription::PaneWakeRequested {} => {
                 Ok(event_subscription(EventKind::PaneWakeRequested))
             }
+            Subscription::DeliveryDeferredDelivered {} => {
+                Ok(event_subscription(EventKind::DeliveryDeferredDelivered))
+            }
+            Subscription::DeliveryDeferredFailed {} => {
+                Ok(event_subscription(EventKind::DeliveryDeferredFailed))
+            }
             Subscription::PaneAgentDetected {} => {
                 Ok(event_subscription(EventKind::PaneAgentDetected))
             }
@@ -946,6 +952,7 @@ mod tests {
             agent_session: None,
             scroll,
             revision: 0,
+            editor_has_text: None,
         }
     }
 

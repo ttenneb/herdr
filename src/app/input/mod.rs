@@ -186,6 +186,7 @@ impl App {
                     {
                         if let Some(terminal_id) = terminal_id {
                             self.acknowledge_terminal_input(&terminal_id);
+                            self.note_human_text(&terminal_id, text);
                         }
                     }
                 }
@@ -274,7 +275,12 @@ impl App {
                     ws_idx,
                     pane_id,
                 ) {
-                    return rt.send_paste(text).await.is_ok().then_some(terminal_id);
+                    let pasted = text.clone();
+                    let sent = rt.send_paste(text).await.is_ok();
+                    if sent {
+                        self.note_human_text(&terminal_id, &pasted);
+                    }
+                    return sent.then_some(terminal_id);
                 }
             }
         }
