@@ -214,6 +214,10 @@ fn failure(request_id: Option<String>, error: MailboxBootstrapError) -> String {
             "invalid_request",
             "the bootstrap mailbox request is invalid",
         ),
+        MailboxBootstrapError::Refused(code) => (
+            code,
+            "the server refused or failed the mailbox request; see the code",
+        ),
     };
     serde_json::to_string(&BootstrapFailure {
         ok: false,
@@ -1221,6 +1225,58 @@ mod tests {
         drop(client);
         listener.poll(&mut app).unwrap();
         assert!(app.attached_messages_recipient(&sender).is_none());
+        std::fs::remove_dir_all(directory).ok();
+    }
+
+    /// A handler refusal keeps its specific code on the wire, so a client can
+    /// tell a pre-append refusal from a malformed request.
+    #[test]
+    fn bootstrap_wire_passes_specific_handler_error_codes_through() {
+        let (mut app, directory, _sender) = active_app();
+        let mut listener = listener(&directory);
+        let mut client = UnixStream::connect(listener.path()).expect("connect bootstrap socket");
+        client
+            .set_read_timeout(Some(Duration::from_secs(1)))
+            .expect("set read timeout");
+        let descriptor = bootstrap(&mut listener, &mut app, &mut client);
+        let binding = descriptor["result"]["bindingGeneration"]
+            .as_str()
+            .expect("binding generation")
+            .to_owned();
+        let submit = |request_id: &str| {
+            json!({
+                "method": "mailbox.offline_submit", "requestId": request_id,
+                "bindingGeneration": binding,
+                "params": {
+                    "protocol": crate::mailbox_v1::PROTOCOL,
+                    "stableId": "stable-1", "revision": 1,
+                    "digest": "a".repeat(64), "deliveryDigest": "b".repeat(64),
+                    "subject": "subject", "body": "body", "messageId": "message-1",
+                    "kind": "advisory", "priority": "normal", "originalSequence": 1
+                }
+            })
+        };
+        let first = exchange(&mut listener, &mut app, &mut client, submit("first"));
+        assert_eq!(first["ok"], true, "{first}");
+        let replay = exchange(&mut listener, &mut app, &mut client, submit("replay"));
+        assert_eq!(replay["ok"], false);
+        assert_eq!(
+            replay["error"]["code"], "mailbox_replay_rejected",
+            "{replay}"
+        );
+        let malformed = exchange(
+            &mut listener,
+            &mut app,
+            &mut client,
+            json!({"method": "mailbox.offline_submit", "requestId": "bad",
+                   "bindingGeneration": binding, "params": {"protocol": "nope"}}),
+        );
+        assert_eq!(malformed["error"]["code"], "invalid_request", "{malformed}");
+        assert_eq!(
+            crate::app::MailboxBootstrapError::from_handler_error("something_new"),
+            crate::app::MailboxBootstrapError::Refused("mailbox_request_refused")
+        );
+        drop(listener);
         std::fs::remove_dir_all(directory).ok();
     }
 

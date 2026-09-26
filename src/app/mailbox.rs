@@ -110,6 +110,53 @@ pub(crate) enum MailboxBootstrapError {
     GrantRevoked,
     PeerRejected,
     InvalidRequest,
+    /// A well-formed request the server handler refused (or failed after
+    /// admission), with its specific error code.
+    Refused(&'static str),
+}
+
+/// Error codes a mailbox handler may return that are passed through to the
+/// bootstrap wire unchanged; anything else becomes `mailbox_request_refused`.
+const PASSTHROUGH_CODES: &[&str] = &[
+    "mailbox_authority_unavailable",
+    "mailbox_caller_mismatch",
+    "mailbox_capability_mismatch",
+    "mailbox_replay_rejected",
+    "mailbox_store_failed",
+    "mailbox_receipt_missing",
+    "mailbox_claim_failed",
+    "mailbox_edit_failed",
+    "mailbox_edit_claimed",
+    "mailbox_edit_conflict",
+    "mailbox_resolve_failed",
+    "mailbox_snapshot_failed",
+    "report_route_required",
+    "authority_unconfirmed",
+    "channel_generation_mismatch",
+    "channel_peer_mismatch",
+    "correlation_conflict",
+    "grant_expired",
+    "grant_missing",
+    "grant_revoked",
+    "grant_scope_mismatch",
+    "message_id_collision",
+    "operation_not_allowed",
+    "protocol_incompatible",
+    "rate_limited",
+    "recipient_session_replaced",
+];
+
+impl MailboxBootstrapError {
+    /// The typed wire error for a handler's JSON error response.
+    pub(crate) fn from_handler_error(code: &str) -> Self {
+        Self::Refused(
+            PASSTHROUGH_CODES
+                .iter()
+                .find(|known| **known == code)
+                .copied()
+                .unwrap_or("mailbox_request_refused"),
+        )
+    }
 }
 
 #[derive(Debug)]

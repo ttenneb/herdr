@@ -367,6 +367,13 @@ impl App {
             }
             _ => return Err(MailboxBootstrapError::InvalidRequest),
         };
+        // A handler's refusal or post-admission failure keeps its specific
+        // code on the wire; invalid_request is only for malformed requests.
+        if let Ok(refused) = serde_json::from_str::<crate::api::schema::ErrorResponse>(&response) {
+            return Err(MailboxBootstrapError::from_handler_error(
+                &refused.error.code,
+            ));
+        }
         let success: SuccessResponse =
             serde_json::from_str(&response).map_err(|_| MailboxBootstrapError::InvalidRequest)?;
         serde_json::to_value(success.result).map_err(|_| MailboxBootstrapError::InvalidRequest)
