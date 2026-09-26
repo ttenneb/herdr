@@ -5503,7 +5503,7 @@ mod tests {
 
     #[test]
     fn kitty_graphics_write_requests_render_with_settle_backstop() {
-        crate::kitty_graphics::set_enabled(true);
+        crate::kitty_graphics::set_enabled_for_test(Some(true));
         let (tx, _rx) = mpsc::channel(4);
         let terminal = crate::ghostty::Terminal::new(80, 24, 0).unwrap();
         let pane_terminal = GhosttyPaneTerminal::new(terminal, tx.clone()).unwrap();
@@ -5565,7 +5565,7 @@ mod tests {
 
     #[test]
     fn render_blanks_kitty_unicode_placeholders_when_graphics_enabled() {
-        crate::kitty_graphics::set_enabled(true);
+        crate::kitty_graphics::set_enabled_for_test(Some(true));
         let (tx, _rx) = mpsc::channel(4);
         let terminal = crate::ghostty::Terminal::new(20, 5, 0).unwrap();
         let pane = GhosttyPaneTerminal::new(terminal, tx).unwrap();
@@ -5580,7 +5580,7 @@ mod tests {
         terminal
             .draw(|frame| pane.render(frame, Rect::new(0, 0, 20, 5), false))
             .unwrap();
-        crate::kitty_graphics::set_enabled(false);
+        crate::kitty_graphics::set_enabled_for_test(None);
 
         let buffer = terminal.backend().buffer();
         assert_eq!(buffer[(0, 0)].symbol(), "b");
