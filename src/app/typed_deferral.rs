@@ -242,8 +242,10 @@ impl App {
         id
     }
 
-    /// The pane's current agent execution: its managed generation (if any)
-    /// and its foreground agent process as PID plus kernel birth tick.
+    /// The pane's current agent identity: its managed generation (if any),
+    /// its foreground agent process as PID plus kernel birth tick, its agent
+    /// name, and its agent session (for a handoff, the envelope's recipient
+    /// session, which was verified current at send time).
     pub(crate) fn current_agent_execution(&self, terminal_id: &TerminalId) -> Option<String> {
         let generation = self
             .state
@@ -260,13 +262,23 @@ impl App {
                 self.managed_pi_process_birth(pid)
                     .map(|birth| (pid, birth.start_ticks))
             });
-        if generation.is_none() && process.is_none() {
+        let name = self
+            .state
+            .terminals
+            .get(terminal_id)
+            .and_then(|terminal| terminal.agent_name.clone());
+        let session = self.current_agent_session_value(&terminal_id.to_string());
+        if generation.is_none() && process.is_none() && name.is_none() && session.is_none() {
             return None;
         }
+        // Execution, addressed name and agent session: a held message goes
+        // only to exactly the agent it was sent to.
         Some(format!(
-            "g{}/p{}",
+            "g{}/p{}/n{}/s{}",
             generation.map_or_else(|| "-".into(), |g| g.to_string()),
-            process.map_or_else(|| "-".into(), |(pid, ticks)| format!("{pid}:{ticks}"))
+            process.map_or_else(|| "-".into(), |(pid, ticks)| format!("{pid}:{ticks}")),
+            name.as_deref().unwrap_or("-"),
+            session.as_deref().unwrap_or("-"),
         ))
     }
 
