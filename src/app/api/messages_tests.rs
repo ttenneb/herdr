@@ -2934,3 +2934,79 @@ async fn client_keys_and_pastes_count_as_the_humans_draft() {
     fixture.app.route_client_events(vec![ctrl_u], false);
     assert!(!fixture.app.pane_draft_pending(&focused));
 }
+
+/// QA 2b #1: a gone Pi's claim that was only claimed (never admitted) can't
+/// be settled as recovered; it needs Drop or Retry. An admitted one can.
+#[tokio::test]
+async fn recovered_settle_needs_an_admitted_claim() {
+    let mut fixture = fixture();
+    let session = attach_recipient(&mut fixture);
+    let recipient = fixture.terminals[1].clone();
+    let sender = sender(&fixture);
+    for (index, body) in ["claimed only", "admitted"].iter().enumerate() {
+        fixture
+            .app
+            .route_ordinary_send(
+                &recipient,
+                &sender,
+                plain(body),
+                &MessageSendOptions {
+                    send_new: index > 0,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+    }
+    let store = crate::mailbox::MailboxStore::open(&fixture.app.sender_authority_dir).unwrap();
+    let recovered = store.load().unwrap();
+    for (body, claim_id) in [
+        ("claimed only", "gone-claimed"),
+        ("admitted", "gone-admitted"),
+    ] {
+        let head = recovered
+            .heads
+            .values()
+            .find(|head| head.body.contains(body))
+            .cloned()
+            .unwrap();
+        store
+            .claim(crate::mailbox::Claim {
+                claim_id: claim_id.into(),
+                recipient: head.recipient.clone(),
+                stable_id: head.stable_id.clone(),
+                revision: head.revision,
+                digest: head.digest.clone(),
+                execution: Some("pid:4000000050:1".into()),
+            })
+            .unwrap();
+    }
+    store
+        .resolve_claim(
+            "gone-admitted",
+            crate::mailbox::ClaimResolutionOutcome::Admitted,
+        )
+        .unwrap();
+    let protocol = crate::mailbox_v1::PROTOCOL;
+    assert!(matches!(
+        dispatch(
+            &mut fixture.app,
+            &session,
+            "mailbox.resolve",
+            json!({"protocol": protocol, "claimId": "gone-claimed", "outcome": "settled"}),
+        ),
+        Err(crate::app::MailboxBootstrapError::RecoveryNeedsDropOrRetry)
+    ));
+    assert!(!store
+        .load()
+        .unwrap()
+        .resolutions
+        .contains_key("gone-claimed"));
+    let settled = dispatch(
+        &mut fixture.app,
+        &session,
+        "mailbox.resolve",
+        json!({"protocol": protocol, "claimId": "gone-admitted", "outcome": "settled"}),
+    )
+    .unwrap();
+    assert_eq!(settled["resolution"]["closedBy"], "recovered", "{settled}");
+}

@@ -121,6 +121,9 @@ pub(crate) enum MailboxBootstrapError {
     /// provision_recipient for an agent outside the caller's own delegation
     /// edges (its parent or a direct child).
     RecipientNotAllowed,
+    /// A gone execution's claim that was never admitted cannot be settled
+    /// as recovered; it needs an explicit Drop or Retry.
+    RecoveryNeedsDropOrRetry,
 }
 
 #[derive(Debug)]

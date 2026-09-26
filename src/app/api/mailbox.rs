@@ -723,6 +723,20 @@ impl App {
                     if !own && outcome != crate::mailbox::ClaimResolutionOutcome::Settled {
                         return Err(MailboxBootstrapError::InvalidRequest);
                     }
+                    // A recovered settle closes only a claim the gone Pi had
+                    // ADMITTED (its turn ran or may have). One that was only
+                    // claimed never ran: it needs an explicit Drop or Retry.
+                    if !own
+                        && !matches!(
+                            recovered.resolutions.get(&claim.claim_id),
+                            Some(crate::mailbox::ClaimResolution {
+                                outcome: crate::mailbox::ClaimResolutionOutcome::Admitted,
+                                ..
+                            })
+                        )
+                    {
+                        return Err(MailboxBootstrapError::RecoveryNeedsDropOrRetry);
+                    }
                     let resolution = store
                         .resolve_claim_closed_by(
                             &claim.claim_id,
