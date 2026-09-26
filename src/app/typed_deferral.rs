@@ -47,6 +47,8 @@ pub(crate) struct TypedDeferral {
     /// generation and foreground process PID plus birth tick). A held
     /// message is only ever typed into that same execution.
     pub execution: Option<String>,
+    /// Why it is typed rather than queued (for the history record).
+    pub reason: String,
 }
 
 /// How a human keystroke changes the draft estimate.
@@ -215,6 +217,7 @@ impl App {
         target: String,
         sender: crate::app::messages::SenderAttribution,
         origin: &'static str,
+        reason: String,
     ) -> String {
         let id = new_deferral_id();
         let execution = self.current_agent_execution(&terminal_id);
@@ -234,6 +237,7 @@ impl App {
             origin,
             deadline: Instant::now() + TYPED_DEFERRAL_LIMIT,
             execution,
+            reason,
         });
         id
     }
@@ -264,6 +268,66 @@ impl App {
             generation.map_or_else(|| "-".into(), |g| g.to_string()),
             process.map_or_else(|| "-".into(), |(pid, ticks)| format!("{pid}:{ticks}"))
         ))
+    }
+
+    /// Why a message to this terminal is typed rather than queued.
+    pub(crate) fn typed_reason(
+        &self,
+        terminal_id: &TerminalId,
+        transport: Option<crate::api::schema::MessageTransport>,
+    ) -> String {
+        if transport == Some(crate::api::schema::MessageTransport::Pty) {
+            return "explicit_pty".into();
+        }
+        let key = terminal_id.to_string();
+        let Some(terminal) = self.state.terminals.get(terminal_id) else {
+            return "no_messages".into();
+        };
+        if matches!(terminal.effective_known_agent(), Some(agent) if agent != crate::detect::Agent::Pi)
+        {
+            return "not_pi".into();
+        }
+        if self.pane_takes_messages(&key) {
+            // It has a queue, so only the size or content kept it out.
+            return "oversized".into();
+        }
+        if terminal.messages_capable {
+            return "fallback_30s".into();
+        }
+        "no_messages".into()
+    }
+
+    /// Durable history for a message typed into a pane: a head in the
+    /// pane's queue, never claimable, settled at once with closedBy "typed"
+    /// and `delivery.typedReason`, so Messages history shows typed
+    /// deliveries next to queued ones. Best effort: a failure is logged.
+    pub(crate) fn record_typed_delivery(
+        &mut self,
+        terminal_id: &TerminalId,
+        sender: &crate::app::messages::SenderAttribution,
+        text: &str,
+        reason: &str,
+        origin: &'static str,
+    ) {
+        // History is for Pi panes (Messages); other agents keep none.
+        if reason == "not_pi" {
+            return;
+        }
+        let key = terminal_id.to_string();
+        let Some(queue_key) = self.pane_queue_key(&key) else {
+            return;
+        };
+        if let Err(err) = crate::app::messages::append_typed_history(
+            &self.sender_authority_dir,
+            &queue_key,
+            &key,
+            sender,
+            text,
+            reason,
+            origin,
+        ) {
+            tracing::warn!(terminal = %terminal_id, %err, "could not record the typed delivery in history");
+        }
     }
 
     pub(crate) fn next_typed_deferral_deadline(&self) -> Option<Instant> {
@@ -315,6 +379,13 @@ impl App {
             ) {
                 Ok(()) => {
                     tracing::info!(deferral = %deferral.id, "held typed delivery typed");
+                    self.record_typed_delivery(
+                        &deferral.terminal_id,
+                        &deferral.sender,
+                        &deferral.text,
+                        &deferral.reason,
+                        deferral.origin,
+                    );
                     self.emit_deferral_event(&deferral, "delivered", None, None);
                 }
                 Err((code, message)) => self.fail_typed_deferral(&deferral, code, &message),

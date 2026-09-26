@@ -261,7 +261,16 @@ async fn a_non_pi_agent_pane_keeps_the_pty_bytes_unchanged() {
     let ResponseResult::AgentPrompted { delivery, .. } = success.result else {
         panic!("prompted")
     };
-    assert_eq!(delivery, None, "non-Pi agent: PTY path, no delivery field");
+    let delivery = delivery.expect("delivery");
+    assert_eq!(
+        (
+            delivery.path.as_str(),
+            delivery.method.as_str(),
+            delivery.reason.as_str()
+        ),
+        ("pty", "typed", "not_pi"),
+        "non-Pi agent: typed, and the sender is told why"
+    );
     let typed = fixture.rx[1].recv().await.unwrap();
     assert!(String::from_utf8_lossy(&typed).contains(text));
     assert!(crate::mailbox::MailboxStore::open(&fixture.directory)
@@ -2658,7 +2667,24 @@ async fn a_live_pi_without_messages_after_30s_gets_new_messages_typed() {
         .load()
         .unwrap()
         .heads;
-    assert_eq!(heads.len(), 1);
+    assert_eq!(
+        heads
+            .values()
+            .filter(|head| !head.stable_id.starts_with("typed."))
+            .count(),
+        1
+    );
+    assert!(
+        heads
+            .values()
+            .any(|head| head.stable_id.starts_with("typed.")
+                && head
+                    .delivery
+                    .as_ref()
+                    .and_then(|d| d.typed_reason.as_deref())
+                    == Some("fallback_30s")),
+        "the typed fallback is in history"
+    );
     // A Pi that attached once keeps queueing even with its stream down.
     fixture.app.messages_attached_pis.insert((old_pi, 11), None);
     assert!(fixture.app.pane_takes_messages(&key));
@@ -2814,10 +2840,12 @@ async fn typed_delivery_waits_for_the_humans_draft_then_types_in_order() {
     // The typed delivery itself did not create a draft.
     assert!(!fixture.app.pane_draft_pending(&terminal));
     let direct = prompt_pane(&mut fixture, "direct", None);
-    assert!(
-        direct["result"]["delivery"].is_null(),
+    assert_eq!(
+        direct["result"]["delivery"]["method"], "typed",
         "typed at once: {direct}"
     );
+    assert_eq!(direct["result"]["delivery"]["reason"], "no_messages");
+    assert_eq!(direct["result"]["delivery"]["editable"], false);
 }
 
 /// After 10 minutes a held delivery fails with agent_input_busy; a sender
@@ -2851,6 +2879,7 @@ async fn a_held_delivery_fails_after_the_limit_and_the_sender_is_told() {
         "recipient".into(),
         sender(&fixture),
         "agent_prompt",
+        "no_messages".into(),
     );
     fixture.app.typed_deferrals[0].deadline =
         std::time::Instant::now() - std::time::Duration::from_secs(1);
@@ -3384,4 +3413,84 @@ async fn a_held_message_is_never_typed_into_a_replacement_agent() {
         .unwrap()
         .unwrap();
     assert!(String::from_utf8_lossy(&typed).contains("for the same Pi"));
+}
+
+/// VQRO 2: every send result says how it was delivered and why, and typed
+/// deliveries leave a settled, never-claimable history row
+/// (closedBy "typed", delivery.typedReason) in the pane's queue.
+#[tokio::test]
+async fn every_send_reports_its_method_and_typed_sends_leave_history() {
+    let mut fixture = fixture();
+    // Typed: the pane has no Messages yet.
+    let typed = prompt_pane(&mut fixture, "typed hello", None);
+    assert_eq!(typed["result"]["delivery"]["method"], "typed", "{typed}");
+    assert_eq!(typed["result"]["delivery"]["reason"], "no_messages");
+    let explicit = prompt_pane(
+        &mut fixture,
+        "typed on purpose",
+        Some(MessageTransport::Pty),
+    );
+    assert_eq!(explicit["result"]["delivery"]["reason"], "explicit_pty");
+    // Queued once the pane's Pi attached Messages.
+    let session = attach_recipient(&mut fixture);
+    let queued = prompt_pane(&mut fixture, "queued hello", None);
+    assert_eq!(queued["result"]["delivery"]["method"], "queued", "{queued}");
+    assert_eq!(queued["result"]["delivery"]["reason"], "messages");
+    assert_eq!(queued["result"]["delivery"]["editable"], true);
+    // History shows the typed ones as closed rows; they are never claimed.
+    let snapshot = dispatch(
+        &mut fixture.app,
+        &session,
+        "mailbox.snapshot",
+        json!({"protocol": crate::mailbox_v1::PROTOCOL}),
+    )
+    .unwrap();
+    let heads = snapshot["snapshot"]["heads"].as_array().unwrap();
+    let typed_rows: Vec<_> = heads
+        .iter()
+        .filter(|head| head["stableId"].as_str().unwrap().starts_with("typed."))
+        .collect();
+    assert_eq!(typed_rows.len(), 2, "{snapshot}");
+    let reasons: Vec<_> = typed_rows
+        .iter()
+        .map(|head| head["delivery"]["typedReason"].as_str().unwrap())
+        .collect();
+    assert!(reasons.contains(&"no_messages") && reasons.contains(&"explicit_pty"));
+    for row in &typed_rows {
+        let state = snapshot["snapshot"]["headStates"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|state| state["stableId"] == row["stableId"])
+            .unwrap();
+        assert_eq!(state["lifecycle"], "settled");
+        assert_eq!(state["closedBy"], "typed");
+        assert!(state.get("recoveryNeeded").is_none());
+    }
+    let claim = dispatch(
+        &mut fixture.app,
+        &session,
+        "mailbox.claim",
+        json!({"protocol": crate::mailbox_v1::PROTOCOL}),
+    )
+    .unwrap();
+    assert!(
+        claim["claim"]["stableId"]
+            .as_str()
+            .unwrap()
+            .starts_with("send."),
+        "only the queued message is claimable: {claim}"
+    );
+    let history = fixture
+        .app
+        .dispatch_mailbox_bootstrap(
+            &session,
+            "mailbox.history_snapshot",
+            json!({"protocol": crate::mailbox_v1::PROTOCOL}),
+        )
+        .expect("history");
+    assert!(
+        history.to_string().contains("\"closedBy\":\"typed\""),
+        "{history}"
+    );
 }
