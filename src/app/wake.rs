@@ -25,6 +25,10 @@ use crate::terminal::TerminalId;
 pub(crate) const WAKE_ATTACH_TIMEOUT: Duration = Duration::from_secs(60);
 /// After a failed or timed-out wake, further wakes for the pane wait this long.
 pub(crate) const WAKE_FAILURE_COOLDOWN: Duration = Duration::from_secs(30);
+/// A sleeping pane whose shell is not at its prompt yet is re-swept this
+/// often, for up to [`WAKE_SHELL_RETRY_FOR`].
+pub(crate) const WAKE_SHELL_RETRY_EVERY: Duration = Duration::from_millis(1500);
+pub(crate) const WAKE_SHELL_RETRY_FOR: Duration = Duration::from_secs(30);
 /// A slept parent has no live generation or trusted session, so its children's
 /// bound report routes would stop working; such a pane never sleeps.
 pub(crate) const PARENT_OF_ACTIVE_ROUTES: &str = "parent of active delegation routes; not sleeping";
@@ -678,7 +682,6 @@ impl App {
 
     /// The first unsettled head in the pane's inbox (its queue key and the
     /// legacy terminal key).
-    #[cfg(test)]
     fn first_unsettled_head(&self, terminal_id: &TerminalId) -> Option<String> {
         let store = crate::mailbox::MailboxStore::open(&self.sender_authority_dir).ok()?;
         let recovered = store.load().ok()?;
@@ -688,6 +691,46 @@ impl App {
             .flat_map(|snapshot| snapshot.head_states)
             .find(|state| state.lifecycle != crate::mailbox_v1::HeadLifecycle::Settled)
             .map(|state| state.stable_id)
+    }
+
+    /// After a backlog sweep: when to sweep again sooner than the regular
+    /// 30 s, because a sleeping pane with unsettled heads was skipped only
+    /// because its shell is not at its prompt yet (a restored shell still
+    /// starting). Each such pane is retried every 1.5 s for up to 30 s from
+    /// when it was first seen waiting; wake_pane stays single-flight.
+    pub(crate) fn backlog_shell_retry_at(&mut self, now: Instant) -> Option<Instant> {
+        let waiting: Vec<TerminalId> = self
+            .state
+            .terminals
+            .values()
+            .filter(|terminal| terminal.sleep.is_some())
+            .map(|terminal| terminal.id.clone())
+            .filter(|terminal_id| {
+                self.attached_messages_recipient(&terminal_id.to_string())
+                    .is_none()
+                    && !self.pane_wakes.contains_key(terminal_id)
+                    && !self
+                        .pane_wake_cooldowns
+                        .get(terminal_id)
+                        .is_some_and(|until| now < *until)
+                    && self
+                        .terminal_runtimes
+                        .get(terminal_id)
+                        .is_some_and(|runtime| {
+                            !super::agents::runtime_has_live_agent(runtime)
+                                && !super::agents::runtime_at_idle_shell(runtime)
+                        })
+                    && self.first_unsettled_head(terminal_id).is_some()
+            })
+            .collect();
+        self.backlog_shell_waits
+            .retain(|terminal_id, _| waiting.contains(terminal_id));
+        let mut retry = false;
+        for terminal_id in waiting {
+            let since = *self.backlog_shell_waits.entry(terminal_id).or_insert(now);
+            retry |= now.duration_since(since) < WAKE_SHELL_RETRY_FOR;
+        }
+        retry.then(|| now + WAKE_SHELL_RETRY_EVERY)
     }
 
     /// When the server loop must next run the sleeping-pane backlog sweep
@@ -1454,6 +1497,73 @@ mod tests {
         assert!(app.pane_wakes.is_empty());
         assert!(input.try_recv().is_err(), "nothing launched or typed");
         assert_eq!(app.first_unsettled_head(&terminal), None, "nothing queued");
+    }
+
+    /// A sleeping pane with a backlog whose shell is not at its prompt yet is
+    /// re-swept every 1.5 s (not only every 30 s), for up to 30 s.
+    #[tokio::test]
+    async fn backlog_sweep_retries_a_not_ready_shell_sooner() {
+        let (mut app, pane, terminal, public) = app_with_shell_pane();
+        let mut input = start(&mut app, &public, Vec::new());
+        pi_attaches(&mut app, pane, 1);
+        request(
+            &mut app,
+            crate::api::schema::Method::AgentSleep(AgentTarget {
+                target: "owner".into(),
+            }),
+        );
+        pi_exits(&mut app, pane);
+        let routed = app.route_ordinary_send(
+            &terminal.to_string(),
+            &crate::app::messages::SenderAttribution {
+                terminal: None,
+                label: "external".into(),
+                session: None,
+            },
+            crate::app::messages::OutgoingMessage {
+                origin: "agent_prompt",
+                subject: "backlog".into(),
+                body: "queued before restart".into(),
+                priority: "normal".into(),
+                kind: "advisory".into(),
+                message_id: None,
+                correlation: None,
+                replace_pending: false,
+            },
+            &Default::default(),
+        );
+        assert!(matches!(
+            routed,
+            Ok(crate::app::messages::SendRoute::Mailbox(_))
+        ));
+        while input.try_recv().is_ok() {}
+        let busy = |value: bool| {
+            crate::app::agents::TEST_SHELLS_BUSY.with(|cell| cell.set(value));
+        };
+
+        busy(true);
+        let t0 = app.server_started_at + Duration::from_secs(4);
+        app.maybe_sweep_sleeping_backlog(t0);
+        assert!(app.pane_wakes.is_empty(), "the shell is not ready yet");
+        assert_eq!(app.next_backlog_sweep, Some(t0 + WAKE_SHELL_RETRY_EVERY));
+        // Still not ready past the 30 s window: back to the regular sweep.
+        let late = t0 + WAKE_SHELL_RETRY_FOR + Duration::from_secs(1);
+        app.maybe_sweep_sleeping_backlog(late);
+        assert_eq!(app.next_backlog_sweep, Some(late + Duration::from_secs(30)));
+        // A fresh wait (the window restarts once the pane stops waiting).
+        app.backlog_shell_waits.clear();
+        let t1 = late + Duration::from_secs(30);
+        app.maybe_sweep_sleeping_backlog(t1);
+        assert_eq!(app.next_backlog_sweep, Some(t1 + WAKE_SHELL_RETRY_EVERY));
+
+        busy(false);
+        app.maybe_sweep_sleeping_backlog(t1 + WAKE_SHELL_RETRY_EVERY);
+        assert!(
+            app.pane_wakes.contains_key(&terminal),
+            "the retry wakes the pane once its shell is ready"
+        );
+        assert!(input.try_recv().is_ok(), "one launch");
+        assert!(app.backlog_shell_waits.is_empty());
     }
 
     #[tokio::test]

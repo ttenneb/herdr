@@ -572,6 +572,10 @@ impl App {
         }
         self.next_backlog_sweep = Some(now + SWEEP_EVERY);
         self.sweep_sleeping_backlog(first);
+        // A restored shell not at its prompt yet is retried sooner (wake.rs).
+        if let Some(sooner) = self.backlog_shell_retry_at(now) {
+            self.next_backlog_sweep = Some(sooner);
+        }
         false
     }
 

@@ -1020,10 +1020,16 @@ impl App {
     }
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Test-only: process-less test runtimes report a busy (not idle) shell.
+    pub(crate) static TEST_SHELLS_BUSY: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
 fn available_shell_name(runtime: &crate::terminal::TerminalRuntime) -> Option<String> {
     #[cfg(test)]
     if runtime.child_pid().is_none() {
-        return Some("sh".into());
+        return (!TEST_SHELLS_BUSY.with(std::cell::Cell::get)).then(|| "sh".into());
     }
     crate::platform::available_pane_shell(runtime.child_pid()?)
 }

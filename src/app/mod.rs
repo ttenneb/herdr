@@ -156,6 +156,9 @@ pub struct App {
     /// `None` until the first (post-start, `restore_backlog`) sweep ran.
     pub(crate) next_backlog_sweep: Option<Instant>,
     pub(crate) server_started_at: Instant,
+    /// Sleeping panes with a backlog whose shell is not at its prompt yet,
+    /// and since when; they are re-swept sooner (wake.rs).
+    pub(crate) backlog_shell_waits: HashMap<crate::terminal::TerminalId, Instant>,
     /// Terminals whose current start is a recipe relaunch (wake or resume).
     pub(crate) recipe_relaunches: HashSet<crate::terminal::TerminalId>,
     pub(crate) pending_route_carries: HashMap<crate::terminal::TerminalId, Instant>,
@@ -930,6 +933,7 @@ impl App {
             pane_wake_cooldowns: HashMap::new(),
             next_backlog_sweep: None,
             server_started_at: Instant::now(),
+            backlog_shell_waits: HashMap::new(),
             recipe_relaunches: HashSet::new(),
             pending_route_carries: HashMap::new(),
             pending_managed_resumes: HashMap::new(),
