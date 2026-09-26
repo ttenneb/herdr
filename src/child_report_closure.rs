@@ -46,14 +46,12 @@ pub const MAX_WAIT_MS: u64 = 30_000;
 /// The only HERDR_* variables a covered (sandboxed) child launch may inherit.
 /// Pi reads only the bootstrap address; HERDR_AGENT is Herdr's own process
 /// classification hint. The CLI/API socket variables are deliberately absent.
-#[cfg_attr(not(test), allow(dead_code))] // Wired by the #145 covered-launch seam.
 pub const COVERED_CHILD_HERDR_ENV_ALLOWLIST: &[&str] =
     &["HERDR_MAILBOX_BOOTSTRAP_ADDRESS", "HERDR_AGENT"];
 
 /// Keep exactly the allowlisted HERDR_* names from a Herdr-provided child
 /// environment. A name given twice is ambiguous and is dropped. Non-HERDR
 /// variables are the sandbox policy's concern and are not passed through.
-#[cfg_attr(not(test), allow(dead_code))] // Wired by the #145 covered-launch seam.
 pub fn covered_child_herdr_environment(
     environment: impl IntoIterator<Item = (String, String)>,
 ) -> Vec<(String, String)> {
@@ -138,6 +136,7 @@ pub trait EnforcementVerifier: Send + Sync {
 }
 
 /// Production verifier until the #145 seam lands: nothing is attested.
+#[cfg_attr(target_os = "linux", allow(dead_code))] // Linux uses the kernel verifier.
 pub struct UnprovenEnforcementVerifier;
 
 impl EnforcementVerifier for UnprovenEnforcementVerifier {

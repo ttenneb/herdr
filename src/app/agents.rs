@@ -286,7 +286,7 @@ impl App {
         &mut self,
         params: AgentStartParams,
     ) -> Result<(crate::api::schema::AgentInfo, Vec<String>), AgentStartError> {
-        let (kind, argv) = self.prepare_agent_launch(&params)?;
+        let (kind, mut argv) = self.prepare_agent_launch(&params)?;
         let name = params.name.clone();
         let Some((ws_idx, pane_id)) = self.parse_current_public_pane_id(&params.pane_id) else {
             return Err(AgentStartError::TargetNotFound(params.pane_id));
@@ -321,9 +321,22 @@ impl App {
         } else {
             params.env.clone()
         };
-        let command =
-            crate::platform::interactive_shell_command(&argv, &launch_environment, &shell_name)
-                .ok_or(AgentStartError::InvalidArgument)?;
+        // #145: a covered child runs the pinned bwrap argv; the sandbox's
+        // --clearenv discards the shell environment, so none is passed.
+        let covered = params
+            .covered
+            .as_ref()
+            .map(|covered| self.covered_launch_argv(kind, &argv, covered, &params.env))
+            .transpose()?;
+        let command = match &covered {
+            Some((sandboxed, _)) => {
+                crate::platform::interactive_shell_command(sandboxed, &[], &shell_name)
+            }
+            None => {
+                crate::platform::interactive_shell_command(&argv, &launch_environment, &shell_name)
+            }
+        }
+        .ok_or(AgentStartError::InvalidArgument)?;
         let bytes = crate::app::api_helpers::encode_api_submission(runtime, &command);
         let timeout = self.agent_start_timeout(&params)?;
         // Persist the new generation before mutating launch state or sending
@@ -340,6 +353,13 @@ impl App {
             })
             .flatten();
         self.managed_pi_launches.remove(&terminal_id);
+        self.pending_covered_launches.remove(&terminal_id);
+        self.covered_child_launches.remove(&terminal_id);
+        if covered.is_some() && managed_pi_launch.is_none() {
+            return Err(AgentStartError::CoveredLaunch(
+                "an explicit --session and a process birth floor are required",
+            ));
+        }
         if let Some((_, cutoff)) = managed_pi_launch.as_ref() {
             if !crate::platform::wait_until_birth_tick(*cutoff) {
                 return Err(AgentStartError::AuthorityPersistence(
@@ -365,6 +385,16 @@ impl App {
             terminal.clear_agent_name();
             runtime.set_managed_agent_generation(0);
             return Err(AgentStartError::InputFailed(err.to_string()));
+        }
+        if let Some((sandboxed, pending)) = covered {
+            self.pending_covered_launches.insert(
+                terminal_id.clone(),
+                crate::covered_launch::PendingCoveredLaunch {
+                    generation: process_generation,
+                    ..pending
+                },
+            );
+            argv = sandboxed;
         }
         if let Some((session_path, earliest_birth_ticks)) = managed_pi_launch {
             self.managed_pi_launches.insert(
@@ -395,6 +425,10 @@ impl App {
             AgentStartError::InvalidName => crate::api::schema::ErrorBody {
                 code: "invalid_agent_name".into(),
                 message: INVALID_AGENT_NAME_MESSAGE.into(),
+            },
+            AgentStartError::CoveredLaunch(reason) => crate::api::schema::ErrorBody {
+                code: "covered_launch_unavailable".into(),
+                message: format!("covered child launch refused: {reason}"),
             },
             AgentStartError::UnsupportedKind(kind) => crate::api::schema::ErrorBody {
                 code: "unsupported_agent_kind".into(),
@@ -573,6 +607,88 @@ impl App {
                 launch.process = Some(birth);
             }
         }
+        // #145 seam: the receipt names this exact managed-launch birth and is
+        // registered before any route for the child can become ready.
+        if let Some(pending) = self
+            .pending_covered_launches
+            .remove(terminal_id)
+            .filter(|pending| pending.generation == generation)
+        {
+            let receipt = crate::covered_launch::CoveredLaunchReceipt {
+                kind: "herdr.covered-launch-receipt",
+                version: 1,
+                policy_id: crate::covered_launch::POLICY_ID,
+                argv_sha256: pending.argv_sha256,
+                env_keys: pending.env_keys,
+                launch_birth: birth.into(),
+                launch_floor_ticks: floor,
+            };
+            if !self.register_covered_child_launch(terminal_id.clone(), receipt.policy()) {
+                tracing::warn!("covered child launch could not be registered; it stays uncovered");
+            }
+        }
+    }
+
+    /// Build the pinned sandbox argv for a covered Pi launch.
+    fn covered_launch_argv(
+        &self,
+        kind: crate::detect::Agent,
+        argv: &[String],
+        covered: &crate::covered_launch::CoveredLaunchParams,
+        requested_env: &[String],
+    ) -> Result<(Vec<String>, crate::covered_launch::PendingCoveredLaunch), AgentStartError> {
+        if kind != crate::detect::Agent::Pi {
+            return Err(AgentStartError::CoveredLaunch(
+                "only a managed Pi can be covered",
+            ));
+        }
+        if !self.child_report_signals_enabled || !cfg!(target_os = "linux") {
+            return Err(AgentStartError::CoveredLaunch(
+                "child report signals are disabled or unsupported on this platform",
+            ));
+        }
+        if !requested_env.is_empty() {
+            return Err(AgentStartError::CoveredLaunch(
+                "caller environment cannot enter the sandbox",
+            ));
+        }
+        let address = self
+            .mailbox_bootstrap_discovery_address
+            .clone()
+            .filter(|address| !address.is_empty())
+            .ok_or(AgentStartError::CoveredLaunch(
+                "mailbox bootstrap is not listening",
+            ))?;
+        let env = crate::covered_launch::child_env(
+            &covered.root,
+            [
+                (
+                    crate::app::mailbox::PI_MAILBOX_BOOTSTRAP_ADDRESS_ENV.to_string(),
+                    address.clone(),
+                ),
+                ("HERDR_AGENT".to_string(), "pi".to_string()),
+            ],
+        )
+        .map_err(|error| AgentStartError::CoveredLaunch(error.0))?;
+        #[cfg(unix)]
+        let (uid, gid) = unsafe { (libc::geteuid(), libc::getegid()) };
+        #[cfg(not(unix))]
+        let (uid, gid) = (0, 0);
+        let sandboxed = crate::covered_launch::bwrap_argv(
+            covered,
+            &[address],
+            &env,
+            argv.get(1..).unwrap_or_default(),
+            uid,
+            gid,
+        )
+        .map_err(|error| AgentStartError::CoveredLaunch(error.0))?;
+        let pending = crate::covered_launch::PendingCoveredLaunch {
+            generation: 0,
+            argv_sha256: crate::covered_launch::policy_hash(&sandboxed),
+            env_keys: env.keys().cloned().collect(),
+        };
+        Ok((sandboxed, pending))
     }
 
     /// Derive Pi's identity on demand so no stopped or replaced process can
@@ -736,6 +852,8 @@ pub(super) enum AgentStartError {
     TargetUnavailable(String),
     InputFailed(String),
     AuthorityPersistence(String),
+    /// #145: a covered launch was requested but cannot be established.
+    CoveredLaunch(&'static str),
     DuplicateName {
         name: String,
         candidates: Vec<crate::api::schema::AgentInfo>,

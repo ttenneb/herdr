@@ -79,7 +79,6 @@ impl App {
     /// The covered-launch seam (#145). Registration must happen before the
     /// child's route becomes ready; a later registration cannot cover the
     /// interval already elapsed and is refused once a route is ready.
-    #[cfg_attr(not(test), allow(dead_code))] // Called by the #145 launch seam.
     pub(crate) fn register_covered_child_launch(
         &mut self,
         terminal: crate::terminal::TerminalId,

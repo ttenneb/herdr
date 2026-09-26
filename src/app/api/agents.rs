@@ -1144,6 +1144,7 @@ mod tests {
                     args,
                     env: Vec::new(),
                     timeout_ms: None,
+                    covered: None,
                 },
             );
             assert_eq!(
@@ -1162,6 +1163,155 @@ mod tests {
             }
             std::fs::remove_dir_all(authority_dir).unwrap();
         }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn covered_start_runs_the_pinned_sandbox_and_registers_the_launch_birth_receipt() {
+        let mut app = app_with_agent();
+        let pane = app.state.workspaces[0].tabs[0].root_pane.unwrap();
+        let terminal = app.state.workspaces[0].terminal_id(pane).unwrap().clone();
+        let root = std::env::temp_dir().join(format!(
+            "herdr-covered-start-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        for dir in ["cwd", "home", "agent", "lock", "run", "authority"] {
+            std::fs::create_dir_all(root.join(dir)).unwrap();
+        }
+        let root = std::fs::canonicalize(root).unwrap();
+        app.sender_authority_dir = root.join("authority");
+        let socket = root.join("run/bootstrap.sock");
+        std::fs::write(&socket, b"").unwrap();
+        let at = |dir: &str| root.join(dir).display().to_string();
+        let session = at("cwd/session.jsonl");
+        let covered = crate::covered_launch::CoveredLaunchParams {
+            root: root.display().to_string(),
+            cwd: at("cwd"),
+            command: vec!["/usr/bin/node-22".into(), at("lock/cli.js")],
+            lock_dirs: vec![at("lock")],
+            writable: vec![at("cwd"), at("home"), at("agent")],
+            readonly: vec![],
+        };
+        let (runtime, _input) = crate::terminal::TerminalRuntime::test_with_channel(80, 24);
+        app.terminal_runtimes.insert(terminal.clone(), runtime);
+        let target = app.public_pane_id(0, pane).unwrap();
+        let start = |app: &mut App, env: Vec<String>| {
+            let response = app.handle_agent_start(
+                "start".into(),
+                crate::api::schema::AgentStartParams {
+                    name: "covered".into(),
+                    kind: "pi".into(),
+                    pane_id: target.clone(),
+                    args: vec!["--session".into(), session.clone()],
+                    env,
+                    timeout_ms: None,
+                    covered: Some(covered.clone()),
+                },
+            );
+            serde_json::from_str::<serde_json::Value>(&response).unwrap()
+        };
+        // Default-off gate, missing discovery and caller env all refuse.
+        assert_eq!(
+            start(&mut app, vec![])["error"]["code"],
+            "covered_launch_unavailable"
+        );
+        app.child_report_signals_enabled = true;
+        assert_eq!(
+            start(&mut app, vec![])["error"]["code"],
+            "covered_launch_unavailable",
+            "no bootstrap listener"
+        );
+        app.mailbox_bootstrap_discovery_address = Some(socket.display().to_string());
+        assert_eq!(
+            start(&mut app, vec!["EXTRA=1".into()])["error"]["code"],
+            "covered_launch_unavailable",
+            "caller environment cannot enter the sandbox"
+        );
+        assert!(app.pending_covered_launches.is_empty());
+        let started = start(&mut app, vec![]);
+        let argv: Vec<String> =
+            serde_json::from_value(started["result"]["argv"].clone()).expect("started");
+        assert_eq!(argv[0], crate::covered_launch::BWRAP);
+        let tail = argv.iter().position(|arg| arg == "--").unwrap();
+        assert_eq!(
+            argv[tail + 1..],
+            [
+                "/usr/bin/node-22".to_string(),
+                at("lock/cli.js"),
+                "--session".into(),
+                session.clone()
+            ]
+        );
+        let herdr: Vec<_> = argv
+            .windows(3)
+            .filter(|window| window[0] == "--setenv" && window[1].starts_with("HERDR_"))
+            .map(|window| (window[1].clone(), window[2].clone()))
+            .collect();
+        assert_eq!(
+            herdr,
+            [
+                ("HERDR_AGENT".to_string(), "pi".to_string()),
+                (
+                    "HERDR_MAILBOX_BOOTSTRAP_ADDRESS".to_string(),
+                    socket.display().to_string()
+                ),
+            ]
+        );
+        assert!(argv.windows(3).any(|window| window
+            == [
+                "--bind",
+                &socket.display().to_string(),
+                &socket.display().to_string()
+            ]));
+        let pending = app.pending_covered_launches[&terminal].clone();
+        assert_eq!(pending.generation, 1);
+        assert_eq!(
+            pending.argv_sha256,
+            crate::covered_launch::policy_hash(&argv)
+        );
+        let launch = app.managed_pi_launches[&terminal].clone();
+        assert_eq!(launch.session_path, session);
+        // Active observation binds the managed-launch birth and registers the
+        // receipt naming it, before any route can be ready.
+        let birth = crate::platform::ProcessBirthIdentity {
+            pid: 424_242,
+            start_ticks: launch.earliest_birth_ticks + 5,
+        };
+        app.mailbox_bootstrap_test_process_births
+            .insert(birth.pid, birth);
+        app.install_mailbox_bootstrap_test_foreground_job(
+            terminal.clone(),
+            crate::platform::ForegroundJob {
+                process_group_id: 424_240,
+                processes: vec![crate::platform::ForegroundProcess {
+                    pid: birth.pid,
+                    name: "pi".into(),
+                    argv0: None,
+                    argv: Some(vec!["pi".into()]),
+                    cmdline: None,
+                }],
+            },
+        );
+        app.bind_active_managed_pi_process(&terminal, 1);
+        assert!(app.pending_covered_launches.is_empty());
+        let policy = app.covered_child_launches[&terminal].clone();
+        assert_eq!(policy.policy_id, crate::covered_launch::POLICY_ID);
+        assert_eq!(policy.policy_hash, pending.argv_sha256);
+        assert_eq!(policy.sandboxed_birth, birth.into());
+        assert!(policy.valid());
+        // The production kernel verifier refuses a process that is not the
+        // sandboxed child.
+        let query = crate::child_report_closure::EnforcementQuery {
+            policy: &policy,
+            managed_launch_birth: birth.into(),
+            launch_floor_ticks: launch.earliest_birth_ticks,
+        };
+        assert!(app.enforcement_verifier.verify(&query).is_err());
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[cfg(unix)]
@@ -1216,6 +1366,7 @@ mod tests {
                 // A client cannot replace host discovery with an attacker path.
                 env: vec!["HERDR_MAILBOX_BOOTSTRAP_ADDRESS=/tmp/attacker.sock".into()],
                 timeout_ms: None,
+                covered: None,
             },
         );
         assert!(serde_json::from_str::<SuccessResponse>(&response).is_ok());
@@ -1266,6 +1417,7 @@ mod tests {
                 args: Vec::new(),
                 env: Vec::new(),
                 timeout_ms: None,
+                covered: None,
             },
         );
         assert!(serde_json::from_str::<SuccessResponse>(&response).is_ok());
@@ -1343,6 +1495,7 @@ mod tests {
                 args: Vec::new(),
                 env: Vec::new(),
                 timeout_ms: None,
+                covered: None,
             },
         );
         let error: crate::api::schema::ErrorResponse = serde_json::from_str(&response).unwrap();

@@ -212,6 +212,7 @@ fn agent_start_and_prompt_requests_round_trip() {
             args: vec!["--no-session".into()],
             env: vec!["PI_TASKING_HERDR_ADAPTER_CONFIG=/home/user/adapter.json".into()],
             timeout_ms: Some(30_000),
+            covered: None,
         }),
     };
     let start_json = serde_json::to_value(&start).unwrap();

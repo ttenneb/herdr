@@ -64,6 +64,7 @@ mod child_report_closure;
 mod cli;
 mod client;
 mod config;
+mod covered_launch;
 pub mod delegation;
 mod detect;
 pub mod direct_transport;

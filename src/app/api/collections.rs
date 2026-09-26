@@ -1053,6 +1053,7 @@ impl App {
             args: params.args,
             env: Vec::new(),
             timeout_ms: params.timeout_ms,
+            covered: None,
         };
         // Validate every managed-agent field before allocating a pane or emitting lifecycle
         // events. The agent process itself becomes the pane's initial process, avoiding the

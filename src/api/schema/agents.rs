@@ -179,6 +179,11 @@ pub struct AgentStartParams {
     /// Startup timeout in milliseconds. Values must be greater than 3000 and at most 300000.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub timeout_ms: Option<u64>,
+    /// Experimental (#145/#159, `[experimental] child_report_signals`, Linux,
+    /// Pi only): launch this managed Pi inside the pinned bubblewrap sandbox
+    /// as a covered child. Absent means an ordinary launch.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub covered: Option<crate::covered_launch::CoveredLaunchParams>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]

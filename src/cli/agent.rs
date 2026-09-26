@@ -387,6 +387,7 @@ fn agent_start(args: &[String]) -> std::io::Result<i32> {
                 args: agent_args.clone(),
                 env: env.clone(),
                 timeout_ms,
+                covered: None,
             }),
         })?;
         if response.get("error").is_none() {
