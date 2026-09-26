@@ -11944,6 +11944,13 @@
             "claimId": {
               "type": "string"
             },
+            "closedBy": {
+              "description": "Set when the recipient's explicit Drop or Retry closed the claim\n(`dropped` or `retried`) rather than the head running to completion.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
             "outcome": {
               "$ref": "#/schemas/success_response/$defs/ClaimResolutionOutcome"
             }
@@ -13586,6 +13593,13 @@
                 "null"
               ]
             },
+            "closedBy": {
+              "description": "For a settled head closed by the recipient instead of by a completed\nrun: `dropped` or `retried`. Kept in history.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
             "digest": {
               "type": "string"
             },
@@ -13602,6 +13616,10 @@
                 "string",
                 "null"
               ]
+            },
+            "recoveryNeeded": {
+              "description": "A claim left claimed or admitted (uncertain) by another, ended Pi\nexecution: never auto-rerun, resolved only by explicit Retry or Drop.",
+              "type": "boolean"
             },
             "revision": {
               "format": "uint64",
@@ -17188,6 +17206,13 @@
             },
             "recipientSession": {
               "description": "The recipient's `agent_session` value when the head was sent. A head\npinned to a session is only claimable by that session; another\nsession sees it as stranded and must explicitly adopt or drop it.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "retryOf": {
+              "description": "Set on a head created by the recipient's explicit Retry of a head an\nended Pi execution left in recovery: the original stable ID.",
               "type": [
                 "string",
                 "null"
