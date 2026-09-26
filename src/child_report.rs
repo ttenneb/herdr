@@ -588,7 +588,7 @@ pub(crate) fn matches_prepared_head(
         && head.grant_id == prepared.route.bound_grant_id()
 }
 
-fn exact_admitted(prepared: &PreparedReport, mailbox: &RecoveredMailbox) -> bool {
+pub(crate) fn exact_admitted(prepared: &PreparedReport, mailbox: &RecoveredMailbox) -> bool {
     let heads: Vec<_> = mailbox
         .heads
         .values()

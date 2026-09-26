@@ -1042,6 +1042,10 @@ pub struct ExperimentalConfig {
     /// elsewhere and a best-effort no-op if the switch fails.
     /// Default: false.
     pub switch_ascii_input_source_in_prefix: bool,
+    /// Server-owned covered-child closure barrier and typed parent
+    /// `child_report_signal` delivery (#159). Only children launched through
+    /// the covered-launch seam are affected. Default: false.
+    pub child_report_signals: bool,
 }
 
 impl Default for KeysConfig {

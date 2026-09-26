@@ -122,6 +122,12 @@ impl App {
         shape.epoch = epoch.clone();
         current.epoch = epoch.clone();
         self.ready_delegation_routes.insert(child, current);
+        // #159: a covered child's domain must be durable before its accepted
+        // stream can offer any parent-report path on this epoch.
+        if let Err(err) = self.create_covered_domain_on_route_ready(child) {
+            self.ready_delegation_routes.remove(&child);
+            return encode_error(id, "coverage_persistence_failed", err);
+        }
         let delegation = self.delegation_info(
             self.state
                 .delegations

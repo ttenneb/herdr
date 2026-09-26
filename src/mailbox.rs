@@ -162,6 +162,8 @@ pub struct RecoveredMailbox {
     pub grants: BTreeMap<String, MailboxGrant>,
     /// Full identity and provider coverage are required before a missing status.
     pub child_report_events: Vec<crate::child_report::ChildReportEvent>,
+    /// Mailbox-journal cursor of each entry in `child_report_events`.
+    pub child_report_event_cursors: Vec<u64>,
     /// Count of durably replayed records, including other mailbox events.
     pub record_cursor: u64,
 }
@@ -708,7 +710,13 @@ impl MailboxStore {
         Ok(())
     }
 
-    fn with_exclusive_lock<T>(
+    /// Sibling closure journal (#159). It shares this store's exclusive lock.
+    pub(crate) fn closure_path(&self) -> PathBuf {
+        self.stream_path
+            .with_file_name(crate::child_report_closure::CLOSURE_STREAM_FILE)
+    }
+
+    pub(crate) fn with_exclusive_lock<T>(
         &self,
         operation: impl FnOnce() -> Result<T, MailboxError>,
     ) -> Result<T, MailboxError> {
@@ -818,6 +826,11 @@ impl RecoveredMailbox {
                 match crate::child_report::validate_next(&self.child_report_events, &event) {
                     Ok(true) => {
                         self.child_report_events.push(event);
+                        self.child_report_event_cursors.push(
+                            self.record_cursor
+                                .checked_add(1)
+                                .ok_or(MailboxError::CorruptRecord)?,
+                        );
                         Ok(())
                     }
                     Ok(false) | Err(()) => Err(MailboxError::CorruptRecord),

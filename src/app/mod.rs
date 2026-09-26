@@ -16,6 +16,7 @@ pub(crate) mod api_helpers;
 pub(crate) use api_helpers::limit_snapshot_lines;
 pub(crate) mod collection_view;
 mod config_io;
+pub(crate) mod covered_child;
 mod creation;
 mod git_refresh;
 mod ids;
@@ -150,6 +151,14 @@ pub struct App {
     pub(crate) managed_pi_launches: HashMap<crate::terminal::TerminalId, agents::ManagedPiLaunch>,
     /// Opaque per-process mailbox namespace; absent entropy disables bootstrap.
     pub(crate) mailbox_bootstrap_boot_nonce: Option<String>,
+    /// #159 `[experimental] child_report_signals`. Off: no domain, closure,
+    /// signal or recovery method exists and gen1 behavior is unchanged.
+    pub(crate) child_report_signals_enabled: bool,
+    /// #159 covered-launch seam registrations (ephemeral, never restored).
+    pub(crate) covered_child_launches:
+        HashMap<crate::terminal::TerminalId, crate::child_report_closure::CoveredLaunchPolicy>,
+    /// #159 enforcement verifier. Production: unproven until #145 lands.
+    pub(crate) enforcement_verifier: Arc<dyn crate::child_report_closure::EnforcementVerifier>,
     /// Per-stream entropy is never reused, even with a different local ordinal.
     pub(crate) used_mailbox_bootstrap_nonces: HashSet<String>,
     pub(crate) next_mailbox_bootstrap_binding: u64,
@@ -894,6 +903,11 @@ impl App {
             mailbox_bootstrap_bindings: BTreeMap::new(),
             managed_pi_launches: HashMap::new(),
             mailbox_bootstrap_boot_nonce: crate::platform::random_route_epoch(),
+            child_report_signals_enabled: config.experimental.child_report_signals,
+            covered_child_launches: HashMap::new(),
+            enforcement_verifier: Arc::new(
+                crate::child_report_closure::UnprovenEnforcementVerifier,
+            ),
             used_mailbox_bootstrap_nonces: HashSet::new(),
             next_mailbox_bootstrap_binding: 1,
             mailbox_bootstrap_discovery_address: None,

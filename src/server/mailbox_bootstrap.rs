@@ -47,6 +47,10 @@ pub(crate) struct MailboxBootstrapDescriptor {
     /// admission or the parent's acceptance of the report.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub parent_report: Option<ParentReportAdvertisement>,
+    /// #159, feature-gated: typed child-report signals for this parent and
+    /// its recovery request. Never mailbox heads or prompt text.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub parent_signals: Option<ParentSignalsAdvertisement>,
     pub endpoint: String,
     pub caller: String,
     pub recipient: crate::mailbox::RecipientKey,
@@ -78,6 +82,29 @@ pub(crate) struct ParentReportAdvertisement {
     pub protocol: &'static str,
     pub recipient: crate::mailbox::RecipientKey,
     pub grant_id: String,
+    /// #159: offered only to a covered child with a durable done ACK and a
+    /// closure barrier on this route.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub recovery: Option<ChildRecoveryAdvertisement>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct ParentSignalsAdvertisement {
+    pub method: &'static str,
+    pub bind_method: &'static str,
+    pub recovery_request_method: &'static str,
+    pub protocol: &'static str,
+    pub max_wait_ms: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct ChildRecoveryAdvertisement {
+    pub wait_method: &'static str,
+    pub decline_method: &'static str,
+    pub protocol: &'static str,
+    pub max_wait_ms: u64,
 }
 
 impl MailboxBootstrapDescriptor {
@@ -106,6 +133,23 @@ impl MailboxBootstrapDescriptor {
                     protocol: crate::mailbox_v1::PROTOCOL,
                     recipient: route.recipient.clone(),
                     grant_id: route.grant_id.clone(),
+                    recovery: session
+                        .child_recovery
+                        .then_some(ChildRecoveryAdvertisement {
+                            wait_method: "report_recovery_wait",
+                            decline_method: "report_recovery_decline",
+                            protocol: crate::mailbox_v1::PROTOCOL,
+                            max_wait_ms: crate::child_report_closure::MAX_WAIT_MS,
+                        }),
+                }),
+            parent_signals: session
+                .parent_signals
+                .then_some(ParentSignalsAdvertisement {
+                    method: "child_report_signals",
+                    bind_method: "child_delegation_bind_todo",
+                    recovery_request_method: "report_recovery_request",
+                    protocol: crate::mailbox_v1::PROTOCOL,
+                    max_wait_ms: crate::child_report_closure::MAX_WAIT_MS,
                 }),
             endpoint: endpoint.display().to_string(),
             caller: session.caller.clone(),
@@ -170,6 +214,10 @@ fn failure(request_id: Option<String>, error: MailboxBootstrapError) -> String {
             "invalid_request",
             "the bootstrap mailbox request is invalid",
         ),
+        MailboxBootstrapError::EgressFrozen => (
+            "egress_frozen",
+            "the covered child's report egress is closed by its closure barrier",
+        ),
     };
     serde_json::to_string(&BootstrapFailure {
         ok: false,
@@ -185,6 +233,30 @@ struct AcceptedMailboxConnection {
     stream: UnixStream,
     input: Vec<u8>,
     session: Option<MailboxBootstrapSession>,
+    /// #159 long-poll parked until a result exists or its deadline passes.
+    /// While parked, later frames stay buffered in order.
+    parked: Option<ParkedPoll>,
+}
+
+struct ParkedPoll {
+    request_id: Option<String>,
+    method: String,
+    params: Value,
+    deadline: std::time::Instant,
+}
+
+enum Handled {
+    Respond(String),
+    Park(ParkedPoll),
+}
+
+/// Methods that may park, and the result array that must be nonempty.
+fn long_poll_items(method: &str) -> Option<&'static str> {
+    match method {
+        "child_report_signals" => Some("signals"),
+        "report_recovery_wait" => Some("requests"),
+        _ => None,
+    }
 }
 
 /// A HeadlessServer-owned listener.  It is nonblocking; accepted streams are
@@ -237,6 +309,7 @@ impl MailboxBootstrapListener {
                             stream,
                             input: Vec::new(),
                             session: None,
+                            parked: None,
                         },
                     );
                 }
@@ -272,13 +345,33 @@ impl MailboxBootstrapListener {
                     }
                 }
             }
+            if let Some(parked) = connection.parked.take() {
+                match Self::resume_parked(app, connection, parked) {
+                    Handled::Respond(response) => {
+                        if write_response(&mut connection.stream, &response).is_err() {
+                            closed.push(*id);
+                            continue;
+                        }
+                    }
+                    Handled::Park(parked) => {
+                        connection.parked = Some(parked);
+                        continue;
+                    }
+                }
+            }
             while let Some(end) = connection.input.iter().position(|byte| *byte == b'\n') {
                 let frame: Vec<u8> = connection.input.drain(..=end).collect();
                 let request = std::str::from_utf8(&frame[..frame.len().saturating_sub(1)])
                     .ok()
                     .and_then(|frame| serde_json::from_str::<BootstrapRequest>(frame).ok());
                 let response = match request {
-                    Some(request) => Self::handle_request(app, connection, request),
+                    Some(request) => match Self::handle_request(app, connection, request) {
+                        Handled::Respond(response) => response,
+                        Handled::Park(parked) => {
+                            connection.parked = Some(parked);
+                            break;
+                        }
+                    },
                     None => failure(None, MailboxBootstrapError::InvalidRequest),
                 };
                 if write_response(&mut connection.stream, &response).is_err() {
@@ -293,48 +386,107 @@ impl MailboxBootstrapListener {
         Ok(())
     }
 
+    /// Re-run a parked poll through full authentication. A revoked stream
+    /// gets its error immediately; an expired deadline gets the empty page.
+    fn resume_parked(
+        app: &mut App,
+        connection: &mut AcceptedMailboxConnection,
+        parked: ParkedPoll,
+    ) -> Handled {
+        let Some(session) = connection.session.as_ref() else {
+            return Handled::Respond(failure(
+                parked.request_id,
+                MailboxBootstrapError::GrantMissing,
+            ));
+        };
+        let items = long_poll_items(&parked.method).unwrap_or("signals");
+        match app.dispatch_mailbox_bootstrap(session, &parked.method, parked.params.clone()) {
+            Ok(result)
+                if result[items].as_array().is_some_and(|list| list.is_empty())
+                    && std::time::Instant::now() < parked.deadline =>
+            {
+                Handled::Park(parked)
+            }
+            Ok(result) => Handled::Respond(
+                serde_json::to_string(&BootstrapSuccess {
+                    ok: true,
+                    request_id: parked.request_id,
+                    result,
+                })
+                .unwrap_or_else(|_| failure(None, MailboxBootstrapError::GrantMissing)),
+            ),
+            Err(error) => Handled::Respond(failure(parked.request_id, error)),
+        }
+    }
+
     fn handle_request(
         app: &mut App,
         connection: &mut AcceptedMailboxConnection,
         request: BootstrapRequest,
-    ) -> String {
+    ) -> Handled {
         let request_id = request.request_id;
         if request.method == "bootstrap" {
             if connection.session.is_some() {
-                return failure(request_id, MailboxBootstrapError::InvalidRequest);
+                return Handled::Respond(failure(
+                    request_id,
+                    MailboxBootstrapError::InvalidRequest,
+                ));
             }
             let session = match app.accept_mailbox_bootstrap_stream(connection.stream.as_raw_fd()) {
                 Ok(session) => session,
-                Err(error) => return failure(request_id, error),
+                Err(error) => return Handled::Respond(failure(request_id, error)),
             };
             let descriptor = MailboxBootstrapDescriptor::from_session(
                 &session,
                 &mailbox_bootstrap_socket_path(),
             );
             connection.session = Some(session);
-            return serde_json::to_string(&BootstrapSuccess {
-                ok: true,
-                request_id,
-                result: descriptor,
-            })
-            .unwrap_or_else(|_| failure(None, MailboxBootstrapError::GrantMissing));
+            return Handled::Respond(
+                serde_json::to_string(&BootstrapSuccess {
+                    ok: true,
+                    request_id,
+                    result: descriptor,
+                })
+                .unwrap_or_else(|_| failure(None, MailboxBootstrapError::GrantMissing)),
+            );
         }
 
         let Some(session) = connection.session.as_ref() else {
-            return failure(request_id, MailboxBootstrapError::GrantMissing);
+            return Handled::Respond(failure(request_id, MailboxBootstrapError::GrantMissing));
         };
         if request.binding_generation.as_deref() != Some(&session.binding_generation) {
-            return failure(request_id, MailboxBootstrapError::GrantRevoked);
+            return Handled::Respond(failure(request_id, MailboxBootstrapError::GrantRevoked));
         }
+        let wait_ms = long_poll_items(&request.method)
+            .and_then(|_| request.params.get("waitMs"))
+            .and_then(Value::as_u64)
+            .unwrap_or(0)
+            .min(crate::child_report_closure::MAX_WAIT_MS);
+        let params = request.params.clone();
         let result = app.dispatch_mailbox_bootstrap(session, &request.method, request.params);
         match result {
-            Ok(result) => serde_json::to_string(&BootstrapSuccess {
-                ok: true,
-                request_id,
-                result,
-            })
-            .unwrap_or_else(|_| failure(None, MailboxBootstrapError::GrantMissing)),
-            Err(error) => failure(request_id, error),
+            Ok(result)
+                if wait_ms > 0
+                    && long_poll_items(&request.method).is_some_and(|items| {
+                        result[items].as_array().is_some_and(Vec::is_empty)
+                    }) =>
+            {
+                Handled::Park(ParkedPoll {
+                    request_id,
+                    method: request.method,
+                    params,
+                    deadline: std::time::Instant::now() + std::time::Duration::from_millis(wait_ms),
+                })
+            }
+            Ok(result) => Handled::Respond(
+                serde_json::to_string(&BootstrapSuccess {
+                    ok: true,
+                    request_id,
+                    result,
+                })
+                .unwrap_or_else(|_| failure(None, MailboxBootstrapError::GrantMissing)),
+            ),
+            Err(error) => Handled::Respond(failure(request_id, error)),
         }
     }
 }
@@ -3382,5 +3534,888 @@ mod tests {
         assert_eq!(client_scope["error"]["code"], "invalid_request");
         drop(listener);
         std::fs::remove_dir_all(directory).expect("remove test directory");
+    }
+
+    // ---- #159 covered-child closure, signals and recovery ----
+
+    struct TestVerifier(Option<u64>);
+
+    impl crate::child_report_closure::EnforcementVerifier for TestVerifier {
+        fn verify(
+            &self,
+            query: &crate::child_report_closure::EnforcementQuery<'_>,
+        ) -> Result<crate::child_report_closure::EnforcementAttestation, String> {
+            let late_by = self.0.ok_or_else(|| "test_refused".to_string())?;
+            Ok(crate::child_report_closure::EnforcementAttestation {
+                policy_hash: query.policy.policy_hash.clone(),
+                covered_from_birth: crate::child_report_closure::BirthRecord {
+                    pid: query.managed_launch_birth.pid,
+                    start_ticks: query.managed_launch_birth.start_ticks + late_by,
+                },
+            })
+        }
+    }
+
+    struct Covered {
+        app: App,
+        directory: PathBuf,
+        listener: MailboxBootstrapListener,
+        child: UnixStream,
+        child_binding: String,
+        parent: UnixStream,
+        parent_binding: String,
+        parent_descriptor: Value,
+        child_id: crate::delegation::DelegationId,
+        child_terminal: crate::terminal::TerminalId,
+        parent_key: String,
+    }
+
+    fn terminal_for(app: &App, key: &str) -> crate::terminal::TerminalId {
+        app.state
+            .terminals
+            .keys()
+            .find(|id| id.to_string() == key)
+            .unwrap()
+            .clone()
+    }
+
+    fn connect(listener: &MailboxBootstrapListener) -> UnixStream {
+        let stream = UnixStream::connect(listener.path()).unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        stream
+    }
+
+    /// Both Pis share this test process as peer; hide one terminal's
+    /// foreground job so the other is the only bootstrap candidate.
+    fn bootstrap_hiding(
+        app: &mut App,
+        listener: &mut MailboxBootstrapListener,
+        hide: &crate::terminal::TerminalId,
+    ) -> (UnixStream, Value) {
+        let hidden = app
+            .mailbox_bootstrap_test_foreground_jobs
+            .remove(hide)
+            .unwrap();
+        let mut stream = connect(listener);
+        let descriptor = bootstrap(listener, app, &mut stream);
+        app.install_mailbox_bootstrap_test_foreground_job(hide.clone(), hidden);
+        (stream, descriptor)
+    }
+
+    fn covered_policy(
+        birth: crate::platform::ProcessBirthIdentity,
+    ) -> crate::child_report_closure::CoveredLaunchPolicy {
+        crate::child_report_closure::CoveredLaunchPolicy {
+            policy_id: "sandbox-145".into(),
+            policy_hash: "e".repeat(64),
+            receipt_digest: "d".repeat(64),
+            sandboxed_birth: birth.into(),
+        }
+    }
+
+    fn covered_fixture(enabled: bool, register: bool, verifier: Option<u64>) -> Covered {
+        let (mut app, directory, child_key) = active_app();
+        app.child_report_signals_enabled = enabled;
+        app.enforcement_verifier = std::sync::Arc::new(TestVerifier(verifier));
+        let (parent_key, _) = active_managed_recipient(&mut app, &directory);
+        let child_pane = app.state.workspaces[0].tabs[0].root_pane.unwrap();
+        let parent_pane = app.state.workspaces[1].tabs[0].root_pane.unwrap();
+        let parent_id = app
+            .state
+            .delegations
+            .create(Some(parent_pane), None, None)
+            .unwrap();
+        let child_id = app
+            .state
+            .delegations
+            .create(Some(child_pane), Some(parent_id), None)
+            .unwrap();
+        let child_terminal = terminal_for(&app, &child_key);
+        if register {
+            let birth = app.managed_pi_launches[&child_terminal].process.unwrap();
+            assert_eq!(
+                app.register_covered_child_launch(child_terminal.clone(), covered_policy(birth)),
+                enabled
+            );
+        }
+        ready_test_route(&mut app, &directory, child_id, parent_id);
+        let mut listener = listener(&directory);
+        let mut child = connect(&listener);
+        let descriptor = bootstrap(&mut listener, &mut app, &mut child);
+        assert_eq!(descriptor["result"]["caller"], child_key, "{descriptor}");
+        assert!(descriptor["result"]["parentReport"]["recovery"].is_null());
+        let child_binding = descriptor["result"]["bindingGeneration"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        // The parent Pi becomes this test process for its own stream.
+        install_trusted_test_pi(&mut app, &directory, &parent_key, std::process::id());
+        let (parent, parent_descriptor) =
+            bootstrap_hiding(&mut app, &mut listener, &child_terminal);
+        assert_eq!(parent_descriptor["result"]["caller"], parent_key);
+        let parent_binding = parent_descriptor["result"]["bindingGeneration"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        Covered {
+            app,
+            directory,
+            listener,
+            child,
+            child_binding,
+            parent,
+            parent_binding,
+            parent_descriptor,
+            child_id,
+            child_terminal,
+            parent_key,
+        }
+    }
+
+    fn call(fx: &mut Covered, as_parent: bool, method: &str, params: Value) -> Value {
+        let Covered {
+            app,
+            listener,
+            child,
+            parent,
+            child_binding,
+            parent_binding,
+            ..
+        } = fx;
+        let (stream, binding) = if as_parent {
+            (parent, parent_binding.clone())
+        } else {
+            (child, child_binding.clone())
+        };
+        exchange(
+            listener,
+            app,
+            stream,
+            json!({"method":method,"bindingGeneration":binding,"params":params}),
+        )
+    }
+
+    fn state_digest(revision: u64) -> String {
+        format!("{revision:064x}")
+    }
+
+    fn todo(revision: u64, done: bool) -> Value {
+        json!({"protocol":crate::mailbox_v1::PROTOCOL,"localRoot":"child-root",
+               "localRevision":revision,"stateDigest":state_digest(revision),
+               "state": if done { "done" } else { "not_done" }})
+    }
+
+    fn path_attempt(revision: u64, id: &str) -> Value {
+        json!({"protocol":crate::mailbox_v1::PROTOCOL,"path":"legacy_bound_submit",
+               "localRoot":"child-root","localRevision":revision,
+               "stateDigest":state_digest(revision),"reportDigest":"c".repeat(64),
+               "reportId":format!("report-{id}"),"messageId":format!("message-{id}")})
+    }
+
+    fn preparation(revision: u64, id: &str) -> Value {
+        json!({"protocol":crate::mailbox_v1::PROTOCOL,"localRoot":"child-root",
+               "localRevision":revision,"reportId":format!("report-{id}"),
+               "reportDigest":"a".repeat(64),"stableId":format!("stable-{id}"),
+               "submitRevision":1,"submitDigest":"a".repeat(64),
+               "deliveryDigest":format!("{:064x}", id.len() as u64 + 0xb00),
+               "messageId":format!("message-{id}")})
+    }
+
+    fn submission(id: &str) -> Value {
+        json!({"protocol":crate::mailbox_v1::PROTOCOL,"stableId":format!("stable-{id}"),
+               "revision":1,"digest":"a".repeat(64),
+               "deliveryDigest":format!("{:064x}", id.len() as u64 + 0xb00),
+               "subject":"report","body":"body","messageId":format!("message-{id}"),
+               "kind":"report","priority":"normal","originalSequence":1})
+    }
+
+    fn signals(fx: &mut Covered, after: u64) -> Vec<Value> {
+        let page = call(
+            fx,
+            true,
+            "child_report_signals",
+            json!({"protocol":crate::mailbox_v1::PROTOCOL,"afterCursor":after}),
+        );
+        page["result"]["signals"]
+            .as_array()
+            .unwrap_or_else(|| panic!("{page}"))
+            .clone()
+    }
+
+    fn recovery_request(signal: &Value) -> Value {
+        json!({"protocol":crate::mailbox_v1::PROTOCOL,
+               "signalCursor":signal["signalCursor"],
+               "routeEpoch":signal["route"]["routeEpoch"],
+               "childTerminalId":signal["route"]["childTerminalId"],
+               "localRoot":signal["todo"]["localRoot"],
+               "localRevision":signal["todo"]["localRevision"],
+               "stateDigest":signal["todo"]["stateDigest"]})
+    }
+
+    fn closure_journal(fx: &Covered) -> crate::child_report_closure::ClosureJournal {
+        crate::child_report_closure::load_closure(&crate::mailbox::MailboxStore::existing(
+            &fx.directory,
+        ))
+        .unwrap()
+    }
+
+    fn current_route(fx: &Covered) -> crate::child_report::RouteIdentity {
+        crate::mailbox::MailboxStore::existing(&fx.directory)
+            .load()
+            .unwrap()
+            .child_report_events
+            .iter()
+            .rev()
+            .find_map(|event| match event {
+                crate::child_report::ChildReportEvent::TodoState { route, .. } => {
+                    Some(route.clone())
+                }
+                _ => None,
+            })
+            .unwrap()
+    }
+
+    fn finish(fx: Covered) {
+        let directory = fx.directory.clone();
+        drop(fx);
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn covered_quiet_done_signals_missing_then_recovers_exactly_once() {
+        let mut fx = covered_fixture(true, true, Some(0));
+        assert_eq!(
+            fx.parent_descriptor["result"]["parentSignals"]["method"],
+            "child_report_signals"
+        );
+        assert_eq!(
+            fx.parent_descriptor["result"]["parentSignals"]["recoveryRequestMethod"],
+            "report_recovery_request"
+        );
+        assert_eq!(
+            call(&mut fx, false, "todo_state", todo(1, false))["result"]["type"],
+            "todo_state"
+        );
+        assert!(signals(&mut fx, 0).is_empty(), "not_done closes nothing");
+        let done = call(&mut fx, false, "todo_state", todo(2, true));
+        let done_cursor = done["result"]["cursor"].as_u64().unwrap();
+        let page = signals(&mut fx, 0);
+        assert_eq!(page.len(), 1, "{page:?}");
+        let signal = page[0].clone();
+        assert_eq!(signal["type"], "missing_after_done", "{signal}");
+        assert!(signal["reason"].is_null());
+        assert_eq!(
+            signal["route"]["childDelegationId"],
+            fx.child_id.to_string()
+        );
+        assert_eq!(signal["route"]["parentTerminalId"], fx.parent_key);
+        assert_eq!(signal["route"]["routeEpoch"], done["result"]["routeEpoch"]);
+        assert_eq!(signal["todo"]["todoStateCursor"], done_cursor);
+        assert_eq!(signal["todo"]["localRevision"], 2);
+        assert_eq!(signal["todo"]["state"], "done");
+        for count in ["pathAttemptCount", "preparedCount", "admittedReportCount"] {
+            assert_eq!(signal["closure"][count], 0, "{count}");
+        }
+        assert!(
+            signal["closure"]["closureCursor"].as_u64().unwrap()
+                < signal["signalCursor"].as_u64().unwrap()
+        );
+        assert!(signal["parentTodo"].is_null());
+        assert_eq!(signal["recovery"]["available"], true);
+        let signal_cursor = signal["signalCursor"].as_u64().unwrap();
+        assert!(signals(&mut fx, signal_cursor).is_empty());
+        // The barrier carries the only AllPathsTrusted mint.
+        assert!(closure_journal(&fx).committed().any(|record| matches!(
+            record,
+            crate::child_report_closure::ClosureRecord::ClosureBarrier {
+                qualification: crate::child_report::CoverageQualification::AllPathsTrusted,
+                ..
+            }
+        )));
+        // Repeating the done ACK is idempotent: no second closure or signal.
+        call(&mut fx, false, "todo_state", todo(2, true));
+        assert_eq!(signals(&mut fx, 0).len(), 1);
+        // Egress is frozen until the parent requests recovery.
+        let frozen = call(&mut fx, false, "report_path_attempt", path_attempt(2, "a"));
+        assert_eq!(frozen["error"]["code"], "egress_frozen", "{frozen}");
+        let mut mismatched = recovery_request(&signal);
+        mismatched["stateDigest"] = json!(state_digest(1));
+        assert_eq!(
+            call(&mut fx, true, "report_recovery_request", mismatched)["error"]["code"],
+            "invalid_request"
+        );
+        assert_eq!(
+            call(
+                &mut fx,
+                false,
+                "report_recovery_request",
+                recovery_request(&signal)
+            )["error"]["code"],
+            "grant_revoked",
+            "only the signal's exact parent may request recovery"
+        );
+        let requested = call(
+            &mut fx,
+            true,
+            "report_recovery_request",
+            recovery_request(&signal),
+        );
+        assert_eq!(requested["result"]["created"], true, "{requested}");
+        let recovery_cursor = requested["result"]["recoveryCursor"].as_u64().unwrap();
+        let repeat = call(
+            &mut fx,
+            true,
+            "report_recovery_request",
+            recovery_request(&signal),
+        );
+        assert_eq!(repeat["result"]["recoveryCursor"], recovery_cursor);
+        assert_eq!(repeat["result"]["created"], false);
+        let waited = call(
+            &mut fx,
+            false,
+            "report_recovery_wait",
+            json!({"protocol":crate::mailbox_v1::PROTOCOL,"afterCursor":0}),
+        );
+        assert_eq!(
+            waited["result"]["requests"][0]["signalCursor"],
+            signal_cursor
+        );
+        assert_eq!(
+            waited["result"]["requests"][0]["recoveryCursor"],
+            recovery_cursor
+        );
+        // Exactly one delivery through the existing bound path.
+        assert_eq!(
+            call(&mut fx, false, "report_path_attempt", path_attempt(2, "a"))["result"]["type"],
+            "report_path_attempt"
+        );
+        assert_eq!(
+            call(&mut fx, false, "report_path_attempt", path_attempt(2, "bb"))["error"]["code"],
+            "egress_frozen"
+        );
+        assert_eq!(
+            call(&mut fx, false, "report_prepared", preparation(2, "a"))["result"]["type"],
+            "report_prepared"
+        );
+        assert_eq!(
+            call(&mut fx, false, "report_prepared", preparation(2, "bb"))["error"]["code"],
+            "egress_frozen"
+        );
+        let delivered = call(&mut fx, false, "report_submit_parent", submission("a"));
+        assert!(delivered["ok"].as_bool().unwrap(), "{delivered}");
+        assert_eq!(signals(&mut fx, 0).len(), 1, "recovery adds no signal");
+        // A fresh child stream now advertises recovery. Move the parent Pi
+        // off this test process so the child is the only candidate.
+        let parent_key = fx.parent_key.clone();
+        install_trusted_test_pi(
+            &mut fx.app,
+            &fx.directory,
+            &parent_key,
+            std::process::id() + 1,
+        );
+        let mut renewed = connect(&fx.listener);
+        let descriptor = bootstrap(&mut fx.listener, &mut fx.app, &mut renewed);
+        assert_eq!(
+            descriptor["result"]["parentReport"]["recovery"]["waitMethod"], "report_recovery_wait",
+            "{descriptor}"
+        );
+        finish(fx);
+    }
+
+    #[test]
+    fn covered_closure_never_reports_missing_on_any_uncertain_path() {
+        struct Case {
+            label: &'static str,
+            verifier: Option<u64>,
+            expected: Option<(&'static str, &'static str)>,
+        }
+        let cases = [
+            Case {
+                label: "unverified",
+                verifier: None,
+                expected: Some(("report_unknown", "coverage_unqualified")),
+            },
+            Case {
+                label: "late_enforcement",
+                verifier: Some(1),
+                expected: Some(("report_unknown", "coverage_unqualified")),
+            },
+            Case {
+                label: "path_attempt",
+                verifier: Some(0),
+                expected: Some(("report_unknown", "path_attempt_uncertain")),
+            },
+            Case {
+                label: "prepared",
+                verifier: Some(0),
+                expected: Some(("report_unknown", "prepared_not_admitted")),
+            },
+            Case {
+                label: "in_flight",
+                verifier: Some(0),
+                expected: Some(("report_unknown", "in_flight")),
+            },
+            Case {
+                label: "bypass",
+                verifier: Some(0),
+                expected: Some(("report_unknown", "coverage_unqualified")),
+            },
+            Case {
+                label: "restart",
+                verifier: Some(0),
+                expected: Some(("report_unknown", "coverage_unqualified")),
+            },
+            Case {
+                label: "process_gone",
+                verifier: Some(0),
+                expected: Some(("report_unknown", "child_process_gone")),
+            },
+            Case {
+                label: "admitted",
+                verifier: Some(0),
+                expected: None,
+            },
+            Case {
+                label: "readback_failure",
+                verifier: Some(0),
+                expected: None,
+            },
+        ];
+        for case in cases {
+            let mut fx = covered_fixture(true, true, case.verifier);
+            assert_eq!(
+                call(&mut fx, false, "todo_state", todo(1, false))["result"]["type"],
+                "todo_state",
+                "{}",
+                case.label
+            );
+            let store = crate::mailbox::MailboxStore::existing(&fx.directory);
+            match case.label {
+                "path_attempt" => {
+                    let marked = call(&mut fx, false, "report_path_attempt", path_attempt(1, "a"));
+                    assert_eq!(marked["result"]["type"], "report_path_attempt", "{marked}");
+                }
+                "prepared" => {
+                    call(&mut fx, false, "report_prepared", preparation(1, "a"));
+                }
+                "in_flight" => {
+                    call(&mut fx, false, "report_prepared", preparation(1, "a"));
+                    let prepared = store
+                        .load()
+                        .unwrap()
+                        .child_report_events
+                        .into_iter()
+                        .find_map(|event| match event {
+                            crate::child_report::ChildReportEvent::Prepared { preparation } => {
+                                Some(preparation)
+                            }
+                            _ => None,
+                        })
+                        .unwrap();
+                    store
+                        .append_child_report_event(
+                            crate::child_report::ChildReportEvent::PreparedAttempt {
+                                preparation: prepared,
+                            },
+                        )
+                        .unwrap();
+                }
+                "bypass" => {
+                    store
+                        .append_child_report_event(crate::child_report::ChildReportEvent::Bypass {
+                            route: current_route(&fx),
+                            path: crate::child_report::ReportBypassPath::HandoffPty,
+                            message_id: "pty".into(),
+                        })
+                        .unwrap();
+                }
+                "restart" => {
+                    fx.app.mailbox_bootstrap_boot_nonce = Some("f".repeat(64));
+                }
+                "process_gone" => {
+                    let real = crate::platform::process_birth_identity(std::process::id()).unwrap();
+                    let replacement = crate::platform::ProcessBirthIdentity {
+                        pid: std::process::id() + 7,
+                        start_ticks: real.start_ticks,
+                    };
+                    fx.app
+                        .mailbox_bootstrap_test_process_births
+                        .insert(replacement.pid, replacement);
+                    fx.app
+                        .managed_pi_launches
+                        .get_mut(&fx.child_terminal)
+                        .unwrap()
+                        .process = Some(replacement);
+                    let mut job =
+                        fx.app.mailbox_bootstrap_test_foreground_jobs[&fx.child_terminal].clone();
+                    job.process_group_id = replacement.pid;
+                    job.processes[0].pid = replacement.pid;
+                    fx.app.install_mailbox_bootstrap_test_foreground_job(
+                        fx.child_terminal.clone(),
+                        job,
+                    );
+                }
+                "admitted" => {
+                    call(&mut fx, false, "report_prepared", preparation(1, "a"));
+                    let sent = call(&mut fx, false, "report_submit_parent", submission("a"));
+                    assert!(sent["ok"].as_bool().unwrap(), "{sent}");
+                }
+                "readback_failure" => crate::child_report_closure::test_fail_closure_readback(true),
+                _ => {}
+            }
+            let done = call(&mut fx, false, "todo_state", todo(2, true));
+            crate::child_report_closure::test_fail_closure_readback(false);
+            assert_eq!(
+                done["result"]["type"], "todo_state",
+                "{}: {done}",
+                case.label
+            );
+            let page = signals(&mut fx, 0);
+            match case.expected {
+                Some((signal_type, reason)) => {
+                    assert_eq!(page.len(), 1, "{}: {page:?}", case.label);
+                    assert_eq!(page[0]["type"], signal_type, "{}", case.label);
+                    assert_eq!(page[0]["reason"], reason, "{}", case.label);
+                    assert_eq!(page[0]["recovery"]["available"], false, "{}", case.label);
+                    let denied = call(
+                        &mut fx,
+                        true,
+                        "report_recovery_request",
+                        recovery_request(&page[0]),
+                    );
+                    assert!(denied["error"].is_object(), "{}: {denied}", case.label);
+                }
+                None => assert!(page.is_empty(), "{}: {page:?}", case.label),
+            }
+            match case.label {
+                "path_attempt" => assert_eq!(page[0]["closure"]["pathAttemptCount"], 1),
+                "prepared" | "in_flight" => {
+                    assert_eq!(page[0]["closure"]["preparedCount"], 1)
+                }
+                "restart" | "process_gone" => {
+                    assert!(closure_journal(&fx).records.iter().any(|record| matches!(
+                        record,
+                        crate::child_report_closure::ClosureRecord::DomainSuspended { .. }
+                    )))
+                }
+                "admitted" => assert!(closure_journal(&fx).committed().any(|record| matches!(
+                    record,
+                    crate::child_report_closure::ClosureRecord::ClosureBarrier {
+                        outcome: crate::child_report_closure::ClosureOutcome::Admitted,
+                        ..
+                    }
+                ))),
+                "readback_failure" => {
+                    // The uncommitted freeze still restricts egress, and a
+                    // repeated ACK cannot mint a late signal.
+                    assert_eq!(
+                        call(&mut fx, false, "report_path_attempt", path_attempt(2, "a"))["error"]
+                            ["code"],
+                        "egress_frozen"
+                    );
+                    call(&mut fx, false, "todo_state", todo(2, true));
+                    assert!(signals(&mut fx, 0).is_empty());
+                }
+                _ => {}
+            }
+            if case.label != "readback_failure" && case.label != "admitted" {
+                assert!(
+                    !closure_journal(&fx).committed().any(|record| matches!(
+                        record,
+                        crate::child_report_closure::ClosureRecord::ClosureBarrier {
+                            qualification:
+                                crate::child_report::CoverageQualification::AllPathsTrusted,
+                            ..
+                        }
+                    )),
+                    "{}",
+                    case.label
+                );
+            }
+            finish(fx);
+        }
+    }
+
+    #[test]
+    fn parent_todo_binding_decline_and_reopen_stay_exact() {
+        let mut fx = covered_fixture(true, true, Some(0));
+        let bind = |todo_id: &str, task: &str, child: String| {
+            json!({"protocol":crate::mailbox_v1::PROTOCOL,"childDelegationId":child,
+                   "todoDelegationId":todo_id,"parentTaskId":task})
+        };
+        let child = fx.child_id.to_string();
+        assert_eq!(
+            call(
+                &mut fx,
+                false,
+                "child_delegation_bind_todo",
+                bind("pi-d1", "7", child.clone())
+            )["error"]["code"],
+            "grant_revoked",
+            "a child cannot bind its parent's Todo"
+        );
+        let bound = call(
+            &mut fx,
+            true,
+            "child_delegation_bind_todo",
+            bind("pi-d1", "7", child.clone()),
+        );
+        let binding_cursor = bound["result"]["bindingCursor"].as_u64().unwrap();
+        let again = call(
+            &mut fx,
+            true,
+            "child_delegation_bind_todo",
+            bind("pi-d1", "7", child.clone()),
+        );
+        assert_eq!(again["result"]["bindingCursor"], binding_cursor);
+        assert_eq!(
+            call(
+                &mut fx,
+                true,
+                "child_delegation_bind_todo",
+                bind("pi-d1", "8", child.clone())
+            )["error"]["code"],
+            "invalid_request"
+        );
+        call(&mut fx, false, "todo_state", todo(1, true));
+        let signal = signals(&mut fx, 0)[0].clone();
+        assert_eq!(signal["type"], "missing_after_done", "{signal}");
+        assert_eq!(signal["parentTodo"]["delegationId"], "pi-d1");
+        assert_eq!(signal["parentTodo"]["parentTaskId"], "7");
+        let decline = |reason: &str| {
+            json!({"protocol":crate::mailbox_v1::PROTOCOL,
+                   "signalCursor":signal["signalCursor"],"reason":reason})
+        };
+        assert_eq!(
+            call(
+                &mut fx,
+                false,
+                "report_recovery_decline",
+                decline("no_exported_report")
+            )["error"]["code"],
+            "invalid_request",
+            "no request, nothing to decline"
+        );
+        call(
+            &mut fx,
+            true,
+            "report_recovery_request",
+            recovery_request(&signal),
+        );
+        assert_eq!(
+            call(
+                &mut fx,
+                true,
+                "report_recovery_decline",
+                decline("no_exported_report")
+            )["error"]["code"],
+            "grant_missing",
+            "the parent is not the covered child"
+        );
+        let declined = call(
+            &mut fx,
+            false,
+            "report_recovery_decline",
+            decline("no_exported_report"),
+        );
+        let decline_cursor = declined["result"]["declineCursor"].as_u64().unwrap();
+        assert_eq!(
+            call(
+                &mut fx,
+                false,
+                "report_recovery_decline",
+                decline("no_exported_report")
+            )["result"]["declineCursor"],
+            decline_cursor
+        );
+        assert_eq!(
+            call(
+                &mut fx,
+                false,
+                "report_recovery_decline",
+                decline("already_admitted")
+            )["error"]["code"],
+            "invalid_request"
+        );
+        assert_eq!(
+            call(&mut fx, false, "report_path_attempt", path_attempt(1, "a"))["error"]["code"],
+            "egress_frozen",
+            "a declined recovery keeps egress frozen"
+        );
+        assert_eq!(signals(&mut fx, 0)[0]["recovery"]["available"], false);
+        // Reopened work makes the old signal non-current and unfreezes the
+        // bound path for the new revision.
+        call(&mut fx, false, "todo_state", todo(2, false));
+        assert_eq!(
+            call(&mut fx, false, "report_path_attempt", path_attempt(2, "b"))["result"]["type"],
+            "report_path_attempt"
+        );
+        finish(fx);
+    }
+
+    #[test]
+    fn recovery_is_refused_and_domain_suspended_after_the_child_process_changes() {
+        let mut fx = covered_fixture(true, true, Some(0));
+        call(&mut fx, false, "todo_state", todo(1, true));
+        let signal = signals(&mut fx, 0)[0].clone();
+        assert_eq!(signal["type"], "missing_after_done");
+        let real = crate::platform::process_birth_identity(std::process::id()).unwrap();
+        let replacement = crate::platform::ProcessBirthIdentity {
+            pid: std::process::id() + 9,
+            start_ticks: real.start_ticks,
+        };
+        fx.app
+            .mailbox_bootstrap_test_process_births
+            .insert(replacement.pid, replacement);
+        fx.app
+            .managed_pi_launches
+            .get_mut(&fx.child_terminal)
+            .unwrap()
+            .process = Some(replacement);
+        let mut job = fx.app.mailbox_bootstrap_test_foreground_jobs[&fx.child_terminal].clone();
+        job.process_group_id = replacement.pid;
+        job.processes[0].pid = replacement.pid;
+        fx.app
+            .install_mailbox_bootstrap_test_foreground_job(fx.child_terminal.clone(), job);
+        assert_eq!(signals(&mut fx, 0)[0]["recovery"]["available"], false);
+        assert_eq!(
+            call(
+                &mut fx,
+                true,
+                "report_recovery_request",
+                recovery_request(&signal)
+            )["error"]["code"],
+            "grant_revoked"
+        );
+        assert!(closure_journal(&fx).records.iter().any(|record| matches!(
+            record,
+            crate::child_report_closure::ClosureRecord::DomainSuspended {
+                reason: crate::child_report_closure::UnknownReason::ChildProcessGone,
+                ..
+            }
+        )));
+        finish(fx);
+    }
+
+    #[test]
+    fn covered_child_generic_paths_are_denied_but_uncovered_beta_is_unchanged() {
+        for covered in [true, false] {
+            let mut fx = covered_fixture(true, covered, Some(0));
+            let mut submit = submission("self");
+            submit["stableId"] = json!("self-report");
+            let result = call(&mut fx, false, "report_submit", submit);
+            assert_eq!(result["ok"], !covered, "covered={covered}: {result}");
+            let target = json!({"target": fx.parent_key.clone()});
+            let provision = call(&mut fx, false, "mailbox.provision_recipient", target);
+            if covered {
+                assert_eq!(provision["error"]["code"], "grant_revoked", "{provision}");
+            }
+            finish(fx);
+        }
+    }
+
+    #[test]
+    fn feature_off_keeps_gen1_descriptor_and_methods() {
+        let mut fx = covered_fixture(false, true, Some(0));
+        assert!(fx.parent_descriptor["result"]["parentSignals"].is_null());
+        call(&mut fx, false, "todo_state", todo(1, true));
+        assert!(!fx
+            .directory
+            .join(crate::child_report_closure::CLOSURE_STREAM_FILE)
+            .exists());
+        for method in [
+            "child_report_signals",
+            "report_recovery_wait",
+            "report_recovery_request",
+            "report_recovery_decline",
+            "child_delegation_bind_todo",
+        ] {
+            assert_eq!(
+                call(
+                    &mut fx,
+                    true,
+                    method,
+                    json!({"protocol":crate::mailbox_v1::PROTOCOL})
+                )["error"]["code"],
+                "invalid_request",
+                "{method}"
+            );
+        }
+        assert_eq!(
+            call(&mut fx, false, "report_path_attempt", path_attempt(1, "a"))["result"]["type"],
+            "report_path_attempt"
+        );
+        finish(fx);
+    }
+
+    fn read_frame(stream: &mut UnixStream) -> Value {
+        let mut response = Vec::new();
+        let mut byte = [0_u8; 1];
+        loop {
+            stream.read_exact(&mut byte).expect("read response");
+            if byte[0] == b'\n' {
+                break;
+            }
+            response.push(byte[0]);
+        }
+        serde_json::from_slice(&response).unwrap()
+    }
+
+    #[test]
+    fn signal_long_poll_parks_without_blocking_and_is_bounded() {
+        let mut fx = covered_fixture(true, true, Some(0));
+        let after = closure_journal(&fx).next_cursor() - 1;
+        assert_eq!(
+            call(
+                &mut fx,
+                true,
+                "child_report_signals",
+                json!({"protocol":crate::mailbox_v1::PROTOCOL,"afterCursor":after,
+                        "waitMs":crate::child_report_closure::MAX_WAIT_MS + 1})
+            )["error"]["code"],
+            "invalid_request"
+        );
+        let frame = json!({"method":"child_report_signals","requestId":"poll",
+            "bindingGeneration":fx.parent_binding,
+            "params":{"protocol":crate::mailbox_v1::PROTOCOL,"afterCursor":after,"waitMs":20_000}});
+        fx.parent
+            .write_all(&serde_json::to_vec(&frame).unwrap())
+            .unwrap();
+        fx.parent.write_all(b"\n").unwrap();
+        fx.listener.poll(&mut fx.app).unwrap();
+        fx.parent.set_nonblocking(true).unwrap();
+        let mut probe = [0_u8; 1];
+        assert_eq!(
+            fx.parent.read(&mut probe).unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock,
+            "an empty long-poll is parked, not answered"
+        );
+        fx.parent.set_nonblocking(false).unwrap();
+        // The event loop keeps serving other streams while the parent waits.
+        call(&mut fx, false, "todo_state", todo(1, true));
+        fx.listener.poll(&mut fx.app).unwrap();
+        let woken = read_frame(&mut fx.parent);
+        assert_eq!(woken["requestId"], "poll");
+        assert_eq!(
+            woken["result"]["signals"][0]["type"], "missing_after_done",
+            "{woken}"
+        );
+        let next = woken["result"]["nextCursor"].as_u64().unwrap();
+        let frame = json!({"method":"child_report_signals","requestId":"expire",
+            "bindingGeneration":fx.parent_binding,
+            "params":{"protocol":crate::mailbox_v1::PROTOCOL,"afterCursor":next,"waitMs":1}});
+        fx.parent
+            .write_all(&serde_json::to_vec(&frame).unwrap())
+            .unwrap();
+        fx.parent.write_all(b"\n").unwrap();
+        fx.listener.poll(&mut fx.app).unwrap();
+        std::thread::sleep(Duration::from_millis(10));
+        fx.listener.poll(&mut fx.app).unwrap();
+        let expired = read_frame(&mut fx.parent);
+        assert_eq!(expired["requestId"], "expire");
+        assert_eq!(expired["result"]["signals"], json!([]));
+        finish(fx);
     }
 }

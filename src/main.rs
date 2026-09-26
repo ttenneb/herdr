@@ -60,6 +60,7 @@ mod app;
 mod build_info;
 mod checksum;
 mod child_report;
+mod child_report_closure;
 mod cli;
 mod client;
 mod config;

@@ -98,6 +98,17 @@ impl SessionWriter {
         Ok(())
     }
 
+    /// Identity of the held writer lock file, bound by covered-child domains.
+    #[cfg(unix)]
+    pub(crate) fn lock_identity(&self) -> Option<(u64, u64)> {
+        Some(self.lock_identity)
+    }
+
+    #[cfg(not(unix))]
+    pub(crate) fn lock_identity(&self) -> Option<(u64, u64)> {
+        None
+    }
+
     #[cfg(not(unix))]
     pub(crate) fn validate(&self, _path: &Path) -> std::io::Result<()> {
         Err(std::io::Error::other("session writer unsupported"))

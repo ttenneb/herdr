@@ -44,6 +44,11 @@ pub(crate) struct MailboxBootstrapSession {
     pub(crate) active_execution_generation: u64,
     pub(crate) binding_generation: String,
     pub(crate) parent_report: Option<BoundParentReportRoute>,
+    /// #159: advertise the parent signal long-poll (feature on only).
+    pub(crate) parent_signals: bool,
+    /// #159: advertise recovery wait/decline to a covered child that already
+    /// has a durable done ACK and closure barrier on this route.
+    pub(crate) child_recovery: bool,
     pub(crate) history_only: bool,
     history_edge: Option<(
         crate::delegation::DelegationId,
@@ -77,7 +82,7 @@ pub(crate) struct BoundParentReportRoute {
     pub(crate) recipient: crate::mailbox::RecipientKey,
     pub(crate) grant_id: String,
     parent_generation: u64,
-    child_delegation: crate::delegation::DelegationId,
+    pub(crate) child_delegation: crate::delegation::DelegationId,
     parent_delegation: crate::delegation::DelegationId,
     parent_pane: crate::layout::PaneId,
     route_epoch: String,
@@ -101,6 +106,9 @@ pub(crate) enum MailboxBootstrapError {
     GrantRevoked,
     PeerRejected,
     InvalidRequest,
+    /// #159: a covered child's bound report egress is frozen by its closure
+    /// barrier and no open recovery request permits it.
+    EgressFrozen,
 }
 
 #[derive(Debug)]
@@ -635,7 +643,7 @@ impl App {
         self.ready_report_identity(ready)
     }
 
-    fn ready_report_identity(
+    pub(crate) fn ready_report_identity(
         &self,
         ready: &ReadyDelegationRoute,
     ) -> Option<crate::child_report::RouteIdentity> {
@@ -665,6 +673,21 @@ impl App {
         session: &MailboxBootstrapSession,
         child: crate::delegation::DelegationId,
     ) -> Result<crate::child_report::ReportDisposition, MailboxBootstrapError> {
+        let identity = self.parent_current_route_identity(session, child)?;
+        let recovered = crate::mailbox::MailboxStore::existing(&self.sender_authority_dir)
+            .load()
+            .map_err(|_| MailboxBootstrapError::GrantMissing)?;
+        Ok(crate::child_report::project(&identity, &recovered))
+    }
+
+    /// The exact current child route, authenticated as seen from its current
+    /// parent's accepted stream. No wire selector other than the child
+    /// delegation is consulted.
+    pub(crate) fn parent_current_route_identity(
+        &self,
+        session: &MailboxBootstrapSession,
+        child: crate::delegation::DelegationId,
+    ) -> Result<crate::child_report::RouteIdentity, MailboxBootstrapError> {
         self.mailbox_bootstrap_session_current(session)?;
         if !self
             .session_writer_healthy
@@ -692,13 +715,8 @@ impl App {
         if &current != ready {
             return Err(MailboxBootstrapError::GrantRevoked);
         }
-        let identity = self
-            .ready_report_identity(ready)
-            .ok_or(MailboxBootstrapError::GrantRevoked)?;
-        let recovered = crate::mailbox::MailboxStore::existing(&self.sender_authority_dir)
-            .load()
-            .map_err(|_| MailboxBootstrapError::GrantMissing)?;
-        Ok(crate::child_report::project(&identity, &recovered))
+        self.ready_report_identity(ready)
+            .ok_or(MailboxBootstrapError::GrantRevoked)
     }
 
     /// Detect only a verified current child→parent edge for legacy generic
@@ -1037,8 +1055,13 @@ impl App {
                 )
                 .map_err(|_| MailboxBootstrapError::GrantMissing)?;
             }
+            let child_recovery = parent_report
+                .as_ref()
+                .is_some_and(|route| self.covered_child_done_acked(route));
             let session = MailboxBootstrapSession {
                 caller: candidate.sender_key.clone(),
+                parent_signals: self.child_report_signals_enabled && !candidate.history_only,
+                child_recovery,
                 parent_report,
                 history_only: candidate.history_only,
                 history_edge: self.history_delegation_edge(&candidate.sender_key),

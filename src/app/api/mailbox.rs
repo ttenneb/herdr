@@ -108,6 +108,20 @@ impl App {
                     return Err(MailboxBootstrapError::GrantMissing);
                 }
                 self.bound_parent_report_current(session)?;
+                // #159: a covered child's done ACK closes its interval. A
+                // failed closure leaves no barrier and no signal (UNKNOWN);
+                // the durable ACK above is unaffected.
+                if matches!(
+                    &event,
+                    crate::child_report::ChildReportEvent::TodoState {
+                        state: crate::child_report::LocalTodoState::Done,
+                        ..
+                    }
+                ) {
+                    if let Err(error) = self.run_covered_closure(event.route()) {
+                        tracing::warn!(?error, "covered child closure barrier failed");
+                    }
+                }
                 return Ok(serde_json::json!({"type":"todo_state", "cursor":cursor,
                                             "routeEpoch":route.route_epoch()}));
             }
@@ -119,6 +133,10 @@ impl App {
                 let identity = self
                     .child_report_route_identity(session, &route)
                     .ok_or(MailboxBootstrapError::GrantRevoked)?;
+                self.covered_egress_check(
+                    &identity,
+                    crate::app::covered_child::CoveredEgress::PathAttempt,
+                )?;
                 let event = params
                     .bind(identity)
                     .ok_or(MailboxBootstrapError::InvalidRequest)?;
@@ -147,6 +165,10 @@ impl App {
                 let identity = self
                     .child_report_route_identity(session, &route)
                     .ok_or(MailboxBootstrapError::GrantRevoked)?;
+                self.covered_egress_check(
+                    &identity,
+                    crate::app::covered_child::CoveredEgress::Prepared,
+                )?;
                 let preparation = params
                     .bind(identity)
                     .ok_or(MailboxBootstrapError::InvalidRequest)?;
@@ -263,6 +285,14 @@ impl App {
                 if prepared.len() != 1 {
                     return Err(MailboxBootstrapError::GrantMissing);
                 }
+                self.covered_egress_check(
+                    &identity,
+                    crate::app::covered_child::CoveredEgress::Submit,
+                )?;
+                let authority = self
+                    .offline_mailbox_authorities
+                    .get(&session.caller)
+                    .ok_or(MailboxBootstrapError::GrantRevoked)?;
                 authority
                     .store
                     .append_child_report_event(
@@ -282,6 +312,109 @@ impl App {
                     },
                 )
             }
+            "child_delegation_bind_todo" => {
+                #[derive(serde::Deserialize)]
+                #[serde(rename_all = "camelCase", deny_unknown_fields)]
+                struct BindTodoParams {
+                    protocol: String,
+                    child_delegation_id: String,
+                    todo_delegation_id: String,
+                    parent_task_id: String,
+                }
+                self.require_child_report_signals()?;
+                let params: BindTodoParams = serde_json::from_value(params)
+                    .map_err(|_| MailboxBootstrapError::InvalidRequest)?;
+                if params.protocol != crate::mailbox_v1::PROTOCOL {
+                    return Err(MailboxBootstrapError::InvalidRequest);
+                }
+                let child: crate::delegation::DelegationId = params
+                    .child_delegation_id
+                    .parse()
+                    .map_err(|_| MailboxBootstrapError::InvalidRequest)?;
+                let cursor = self.bind_parent_todo(
+                    session,
+                    child,
+                    crate::child_report_closure::ParentTodo {
+                        delegation_id: params.todo_delegation_id,
+                        parent_task_id: params.parent_task_id,
+                    },
+                )?;
+                return Ok(serde_json::json!({"type":"child_delegation_bind_todo",
+                                             "bindingCursor":cursor}));
+            }
+            "child_report_signals" | "report_recovery_wait" => {
+                #[derive(serde::Deserialize)]
+                #[serde(rename_all = "camelCase", deny_unknown_fields)]
+                struct PollParams {
+                    protocol: String,
+                    after_cursor: u64,
+                    #[serde(default)]
+                    wait_ms: u64,
+                }
+                self.require_child_report_signals()?;
+                let params: PollParams = serde_json::from_value(params)
+                    .map_err(|_| MailboxBootstrapError::InvalidRequest)?;
+                if params.protocol != crate::mailbox_v1::PROTOCOL
+                    || params.wait_ms > crate::child_report_closure::MAX_WAIT_MS
+                {
+                    return Err(MailboxBootstrapError::InvalidRequest);
+                }
+                return if method == "child_report_signals" {
+                    self.child_report_signals_page(session, params.after_cursor)
+                } else {
+                    self.recovery_requests_page(session, params.after_cursor)
+                };
+            }
+            "report_recovery_request" => {
+                #[derive(serde::Deserialize)]
+                #[serde(rename_all = "camelCase", deny_unknown_fields)]
+                struct RecoveryParams {
+                    protocol: String,
+                    signal_cursor: u64,
+                    route_epoch: String,
+                    child_terminal_id: String,
+                    local_root: String,
+                    local_revision: u64,
+                    state_digest: String,
+                }
+                self.require_child_report_signals()?;
+                let params: RecoveryParams = serde_json::from_value(params)
+                    .map_err(|_| MailboxBootstrapError::InvalidRequest)?;
+                if params.protocol != crate::mailbox_v1::PROTOCOL {
+                    return Err(MailboxBootstrapError::InvalidRequest);
+                }
+                let (cursor, created) = self.request_report_recovery(
+                    session,
+                    params.signal_cursor,
+                    &params.route_epoch,
+                    &params.child_terminal_id,
+                    &params.local_root,
+                    params.local_revision,
+                    &params.state_digest,
+                )?;
+                return Ok(serde_json::json!({"type":"report_recovery_request",
+                    "recoveryCursor":cursor, "signalCursor":params.signal_cursor,
+                    "created":created}));
+            }
+            "report_recovery_decline" => {
+                #[derive(serde::Deserialize)]
+                #[serde(rename_all = "camelCase", deny_unknown_fields)]
+                struct DeclineParams {
+                    protocol: String,
+                    signal_cursor: u64,
+                    reason: crate::child_report_closure::DeclineReason,
+                }
+                self.require_child_report_signals()?;
+                let params: DeclineParams = serde_json::from_value(params)
+                    .map_err(|_| MailboxBootstrapError::InvalidRequest)?;
+                if params.protocol != crate::mailbox_v1::PROTOCOL {
+                    return Err(MailboxBootstrapError::InvalidRequest);
+                }
+                let cursor =
+                    self.decline_report_recovery(session, params.signal_cursor, params.reason)?;
+                return Ok(serde_json::json!({"type":"report_recovery_decline",
+                    "declineCursor":cursor, "signalCursor":params.signal_cursor}));
+            }
             "mailbox.provision_recipient" => {
                 #[derive(serde::Deserialize)]
                 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -290,6 +423,9 @@ impl App {
                 }
                 let params: ProvisionRecipientParams = serde_json::from_value(params)
                     .map_err(|_| MailboxBootstrapError::InvalidRequest)?;
+                if self.covered_child_generic_denied(&session.caller) {
+                    return Err(MailboxBootstrapError::GrantRevoked);
+                }
                 let grant = self.provision_mailbox_bootstrap_recipient(session, &params.target)?;
                 encode_success(id, ResponseResult::MailboxGrantProvisioned { grant })
             }
@@ -367,6 +503,14 @@ impl App {
         // delegation reparent, parent replacement, or server restart. Older
         // `mailbox:` grants cannot be classified: typed and explicitly
         // provisioned grants previously used the identical durable ID.
+        // #159: a covered child may send only on its bound report path.
+        if self.covered_child_generic_denied(&params.caller) {
+            return encode_error(
+                id,
+                "mailbox_capability_mismatch",
+                "a covered child may report only on its bound accepted stream",
+            );
+        }
         if params.grant_id.starts_with("bound-parent-report:") {
             return encode_error(
                 id,
