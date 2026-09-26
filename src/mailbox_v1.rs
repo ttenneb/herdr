@@ -215,14 +215,22 @@ pub fn snapshot(
         .map(|head: &MailboxHead| {
             // A typed-delivery history row is settled with closedBy "typed"
             // whatever part of its write survived (head only, or head and
-            // claim): it was typed, never queued, and exposes no claim.
+            // claim): it was typed, never queued. When its own `typed:` claim
+            // record exists, its claimId is kept (with its admitted receipt
+            // in `receipts`), so a client can verify the row like any other
+            // settled head; it is never claimable.
             if crate::mailbox::is_typed_history(head) {
+                let typed_claim = format!("typed:{}", head.stable_id);
                 return HeadState {
                     stable_id: head.stable_id.clone(),
                     revision: head.revision,
                     digest: head.digest.clone(),
                     lifecycle: HeadLifecycle::Settled,
-                    claim_id: None,
+                    claim_id: recovered
+                        .claims
+                        .get(&head.stable_id)
+                        .filter(|claim| claim.claim_id == typed_claim)
+                        .map(|claim| claim.claim_id.clone()),
                     recipient_session: None,
                     previous_session: false,
                     claim_execution: None,

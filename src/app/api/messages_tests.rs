@@ -3229,6 +3229,16 @@ async fn external_senders_cannot_replace_each_others_waiting_messages() {
 }
 
 fn report_editor(fixture: &mut Fixture, has_text: bool) {
+    // Sampled strictly after any key the test sent before this report.
+    std::thread::sleep(std::time::Duration::from_millis(2));
+    report_editor_sampled(
+        fixture,
+        has_text,
+        Some(crate::app::typed_deferral::unix_ms()),
+    );
+}
+
+fn report_editor_sampled(fixture: &mut Fixture, has_text: bool, sampled_at_ms: Option<u64>) {
     let pane_id = fixture.app.public_pane_id(1, fixture.panes[1]).unwrap();
     let response = fixture.app.handle_pane_report_agent(
         "editor".into(),
@@ -3242,9 +3252,53 @@ fn report_editor(fixture: &mut Fixture, has_text: bool) {
             agent_session_id: None,
             agent_session_path: None,
             editor_has_text: Some(has_text),
+            editor_sampled_at_ms: sampled_at_ms,
         },
     );
     assert!(response.contains("\"result\""), "{response}");
+}
+
+/// QA4 draft race: a stale, in-flight Pi "false" (sampled before a newer
+/// human key) must not clear Herdr's key-based draft flag; a report without
+/// a sample never clears it; a false sampled after the key does.
+#[tokio::test]
+async fn a_stale_pi_editor_false_never_clears_a_newer_key_draft() {
+    use crossterm::event::KeyCode;
+    let mut fixture = fixture();
+    let terminal = fixture.app.state.workspaces[1]
+        .terminal_id(fixture.panes[1])
+        .unwrap()
+        .clone();
+    // Pi's editor had text; Pi samples it empty at `stale` ...
+    report_editor(&mut fixture, true);
+    let stale = crate::app::typed_deferral::unix_ms();
+    std::thread::sleep(std::time::Duration::from_millis(5));
+    // ... the human types a new character before that report arrives ...
+    human_key(&mut fixture.app, &terminal, KeyCode::Char('n'));
+    assert!(fixture.app.pane_draft_pending(&terminal));
+    // ... and the stale true→false edge arrives afterwards.
+    report_editor_sampled(&mut fixture, false, Some(stale));
+    assert!(
+        fixture.app.pane_draft_pending(&terminal),
+        "a stale false must not clear the newer key draft"
+    );
+    let held = prompt_pane(&mut fixture, "never over the new draft", None);
+    assert_eq!(held["result"]["delivery"]["path"], "pty_deferred", "{held}");
+    assert!(fixture.rx[1].try_recv().is_err(), "nothing typed");
+    // A report without a sample (an older Pi asset) never clears it either.
+    report_editor_sampled(&mut fixture, true, None);
+    report_editor_sampled(&mut fixture, false, None);
+    assert!(fixture.app.pane_draft_pending(&terminal));
+    // A true→false edge sampled after the key clears it; the held message
+    // is typed.
+    report_editor(&mut fixture, true);
+    report_editor(&mut fixture, false);
+    assert!(!fixture.app.pane_draft_pending(&terminal));
+    let typed = tokio::time::timeout(std::time::Duration::from_secs(2), fixture.rx[1].recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(String::from_utf8_lossy(&typed).contains("never over the new draft"));
 }
 
 /// Pi's own `editor_has_text` report wins over Herdr's input count for a
@@ -3534,6 +3588,12 @@ async fn every_send_reports_its_method_and_typed_sends_leave_history() {
         assert_eq!(receipt["revision"], row["revision"]);
         assert_eq!(receipt["digest"], row["digest"]);
         assert_eq!(receipt["deliveryDigest"], row["deliveryDigest"]);
+        // QA4: the row keeps its own typed: claimId, so Pi verifies it.
+        assert_eq!(
+            state["claimId"],
+            format!("typed:{}", row["stableId"].as_str().unwrap()),
+            "{state}"
+        );
         assert!(state.get("recoveryNeeded").is_none());
     }
     let claim = dispatch(
@@ -3749,9 +3809,14 @@ async fn a_partly_written_typed_history_row_is_never_delivered_or_recovered() {
         !snapshot.to_string().contains("\"recoveryNeeded\":true"),
         "never offered for recovery: {snapshot}"
     );
-    // Projection: both torn rows read as settled, closedBy "typed", with no
-    // claim exposed and no held row, in snapshot and history.
-    for stable_id in ["typed.headonly", "typed.withclaim"] {
+    // Projection: both torn rows read as settled, closedBy "typed", never
+    // claimable and no held row, in snapshot and history. A row whose
+    // `typed:` claim record survived keeps that claimId (QA4), so clients
+    // can verify it; a head-only row has none.
+    for (stable_id, claim_id) in [
+        ("typed.headonly", None),
+        ("typed.withclaim", Some("typed:typed.withclaim")),
+    ] {
         let state = snapshot["snapshot"]["headStates"]
             .as_array()
             .unwrap()
@@ -3760,7 +3825,11 @@ async fn a_partly_written_typed_history_row_is_never_delivered_or_recovered() {
             .unwrap_or_else(|| panic!("{stable_id} listed: {snapshot}"));
         assert_eq!(state["lifecycle"], "settled", "{state}");
         assert_eq!(state["closedBy"], "typed");
-        assert!(state.get("claimId").is_none(), "{state}");
+        assert_eq!(
+            state.get("claimId").and_then(|v| v.as_str()),
+            claim_id,
+            "{state}"
+        );
         assert!(state.get("claimExecution").is_none(), "{state}");
     }
     assert!(snapshot["snapshot"]

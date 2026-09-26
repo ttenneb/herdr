@@ -2,7 +2,7 @@
 // managed by herdr; reinstalling or updating the integration overwrites this file.
 // add custom hooks/plugins beside this file instead of editing it.
 // HERDR_INTEGRATION_ID=pi
-// HERDR_INTEGRATION_VERSION=11
+// HERDR_INTEGRATION_VERSION=12
 // @ts-nocheck
 
 import net from "node:net";
@@ -60,6 +60,7 @@ type QueuedState = {
   state: AgentState;
   message?: string;
   editorHasText?: boolean;
+  editorSampledAtMs?: number;
   seq: number;
 };
 
@@ -134,7 +135,9 @@ function reportSession(sessionStartSource?: string): Promise<void> {
 
 // editor_has_text: the human has unsent text in Pi's editor (a boolean, never the content). Herdr can defer
 // typed delivery while it is true. Older Herdr ignores the unknown field.
-function sendState(state: AgentState, message?: string, seq = nextReportSeq(), editorHasText?: boolean): Promise<void> {
+// editor_sampled_at_ms: when that editor state was read (wall clock, ms). Herdr only lets a stale
+// "false" clear its own key-based draft flag if no human key reached the pane after this sample.
+function sendState(state: AgentState, message?: string, seq = nextReportSeq(), editorHasText?: boolean, editorSampledAtMs?: number): Promise<void> {
   return sendRequest({
     id: `${source}:${Date.now()}:${Math.random().toString(36).slice(2)}`,
     method: "pane.report_agent",
@@ -146,6 +149,7 @@ function sendState(state: AgentState, message?: string, seq = nextReportSeq(), e
       message,
       seq,
       ...(editorHasText === undefined ? {} : { editor_has_text: editorHasText }),
+      ...(editorHasText === undefined || editorSampledAtMs === undefined ? {} : { editor_sampled_at_ms: editorSampledAtMs }),
     }),
   });
 }
@@ -153,8 +157,8 @@ function sendState(state: AgentState, message?: string, seq = nextReportSeq(), e
 let sendInFlight = false;
 let queuedState: QueuedState | undefined;
 
-function queueState(state: AgentState, message?: string, editorHasText?: boolean): void {
-  queuedState = { state, message, editorHasText, seq: nextReportSeq() };
+function queueState(state: AgentState, message?: string, editorHasText?: boolean, editorSampledAtMs?: number): void {
+  queuedState = { state, message, editorHasText, editorSampledAtMs, seq: nextReportSeq() };
   if (!sendInFlight) {
     void drainStateQueue();
   }
@@ -170,7 +174,7 @@ async function drainStateQueue(): Promise<void> {
     while (queuedState) {
       const next = queuedState;
       queuedState = undefined;
-      await sendState(next.state, next.message, next.seq, next.editorHasText);
+      await sendState(next.state, next.message, next.seq, next.editorHasText, next.editorSampledAtMs);
     }
   } finally {
     sendInFlight = false;
@@ -194,6 +198,7 @@ export default function (pi) {
   // Edge-triggered: re-checked after each terminal input (the editor applies the key first) and once a second
   // (programmatic changes: an extension restoring a draft, a submit); a report is sent only when it flips.
   let editorHasText: boolean | undefined;
+  let editorSampledAtMs: number | undefined;
   let lastEditorHasText: boolean | undefined;
   let editorUi: any;
   let stopTerminalInput: (() => void) | undefined;
@@ -212,11 +217,13 @@ export default function (pi) {
     if (!rootSession) {
       return;
     }
+    const sampledAt = Date.now();
     const next = readEditorHasText();
     if (next === undefined || next === editorHasText) {
       return;
     }
     editorHasText = next;
+    editorSampledAtMs = sampledAt;
     publishState();
   }
 
@@ -235,6 +242,7 @@ export default function (pi) {
     }
     editorPoll = setInterval(checkEditor, 1000);
     editorPoll.unref?.();
+    editorSampledAtMs = Date.now();
     editorHasText = readEditorHasText();
   }
 
@@ -256,7 +264,7 @@ export default function (pi) {
     lastState = next.state;
     lastMessage = next.message;
     lastEditorHasText = editorHasText;
-    queueState(next.state, next.message, editorHasText);
+    queueState(next.state, next.message, editorHasText, editorSampledAtMs);
   }
 
   const blockingToolCalls = new Set<string>();

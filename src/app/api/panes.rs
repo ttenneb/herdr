@@ -1440,8 +1440,13 @@ impl App {
                     if previous == Some(true) {
                         // A true→false edge from Pi: its editor was emptied
                         // (submitted or erased), so Herdr's own key-based
-                        // flag is stale too.
-                        self.clear_human_draft(&terminal_id);
+                        // flag is stale too, unless a human key reached the
+                        // pane after Pi sampled its editor (the report was
+                        // still in flight).
+                        self.clear_human_draft_if_older_than(
+                            &terminal_id,
+                            params.editor_sampled_at_ms,
+                        );
                     }
                     // The editor is clear: held typed deliveries may go now.
                     self.flush_typed_deferrals(std::time::Instant::now());

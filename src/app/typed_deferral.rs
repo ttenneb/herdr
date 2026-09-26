@@ -27,6 +27,9 @@ const TYPED_SUBMIT_DELAY: Duration = Duration::from_millis(300);
 #[derive(Debug, Clone, Copy, Default)]
 pub(crate) struct HumanDraft {
     pub count: usize,
+    /// Wall-clock Unix ms of the last human key or text counted into this
+    /// draft; a Pi editor sample older than this cannot clear it.
+    pub last_key_at_ms: u64,
     /// The agent process generation the count belongs to; a new agent
     /// process starts with an empty editor.
     pub process_generation: Option<u64>,
@@ -90,7 +93,34 @@ fn new_deferral_id() -> String {
         })
 }
 
+pub(crate) fn unix_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_millis() as u64)
+        .unwrap_or(0)
+}
+
 impl App {
+    /// Pi reported a true→false editor edge sampled at `sampled_at_ms`: clear
+    /// Herdr's key-based draft flag only if no human key was counted after
+    /// that sample (a stale, in-flight "false" must not erase a newer draft).
+    pub(crate) fn clear_human_draft_if_older_than(
+        &mut self,
+        terminal_id: &TerminalId,
+        sampled_at_ms: Option<u64>,
+    ) {
+        let Some(sampled_at_ms) = sampled_at_ms else {
+            return;
+        };
+        if self
+            .human_drafts
+            .get(terminal_id)
+            .is_none_or(|draft| draft.last_key_at_ms < sampled_at_ms)
+        {
+            self.clear_human_draft(terminal_id);
+        }
+    }
+
     fn terminal_of_pane(&self, pane_id: crate::layout::PaneId) -> Option<TerminalId> {
         let (ws_idx, _) = self.find_pane(pane_id)?;
         self.state.terminal_id_for_pane(ws_idx, pane_id)
@@ -108,6 +138,7 @@ impl App {
             Some(delta) => {
                 let draft = self.human_drafts.entry(terminal_id.clone()).or_default();
                 draft.count = draft.count.saturating_add_signed(delta);
+                draft.last_key_at_ms = unix_ms();
                 if draft.process_generation.is_none() {
                     draft.process_generation = self
                         .state
@@ -131,6 +162,7 @@ impl App {
         if added > 0 {
             let draft = self.human_drafts.entry(terminal_id.clone()).or_default();
             draft.count = draft.count.saturating_add(added);
+            draft.last_key_at_ms = unix_ms();
         }
     }
 

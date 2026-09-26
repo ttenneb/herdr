@@ -4938,6 +4938,15 @@
                 "null"
               ]
             },
+            "editor_sampled_at_ms": {
+              "description": "When `editor_has_text` was sampled (wall clock, Unix ms). A `false`\nclears Herdr's key-based draft flag only if no human key reached the\npane after this sample; without it a `false` never clears that flag.",
+              "format": "uint64",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
             "message": {
               "type": [
                 "string",

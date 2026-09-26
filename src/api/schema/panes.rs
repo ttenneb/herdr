@@ -389,6 +389,11 @@ pub struct PaneReportAgentParams {
     /// While true, Herdr holds typed deliveries to the pane.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub editor_has_text: Option<bool>,
+    /// When `editor_has_text` was sampled (wall clock, Unix ms). A `false`
+    /// clears Herdr's key-based draft flag only if no human key reached the
+    /// pane after this sample; without it a `false` never clears that flag.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub editor_sampled_at_ms: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]

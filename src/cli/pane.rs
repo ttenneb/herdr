@@ -1304,6 +1304,7 @@ fn pane_report_agent(args: &[String]) -> std::io::Result<i32> {
         agent_session_id,
         agent_session_path,
         editor_has_text,
+        editor_sampled_at_ms: None,
     }))
 }
 
