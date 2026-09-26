@@ -94,14 +94,39 @@ fn pi_session_root(launch_env: &impl Fn(&str) -> Option<String>) -> Option<std::
         Some(dir) => expand(&dir)?,
         None => home.as_ref()?.join(".pi/agent"),
     };
-    let configured = std::fs::read(agent_dir.join("settings.json"))
-        .ok()
+    let configured = read_capped(&agent_dir.join("settings.json"), PI_SETTINGS_MAX_BYTES)
         .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
         .and_then(|settings| settings.get("sessionDir")?.as_str().map(str::to_string));
     match configured {
         Some(dir) => expand(&dir),
         None => Some(agent_dir.join("sessions")),
     }
+}
+
+/// The agent dir can be chosen by the caller (`PI_CODING_AGENT_DIR`), so its
+/// settings.json is read only up to this size; a larger file counts as absent.
+const PI_SETTINGS_MAX_BYTES: u64 = 64 * 1024;
+
+/// The whole file if it is at most `max` bytes, else `None`.
+fn read_capped(path: &std::path::Path, max: u64) -> Option<Vec<u8>> {
+    use std::io::Read;
+    let mut bytes = Vec::new();
+    std::fs::File::open(path)
+        .ok()?
+        .take(max + 1)
+        .read_to_end(&mut bytes)
+        .ok()?;
+    (bytes.len() as u64 <= max).then_some(bytes)
+}
+
+/// Whether a Pi argv names exactly one `--session` file that passes the
+/// launch checks of [`trusted_launch_session_path`].
+pub(super) fn trusted_explicit_pi_session(
+    argv: &[String],
+    launch_env: &impl Fn(&str) -> Option<String>,
+) -> bool {
+    explicit_pi_session_path(argv)
+        .is_some_and(|path| trusted_launch_session_path(&path, launch_env))
 }
 
 /// A `--session` path earns a managed launch record only if it is an existing,
@@ -630,9 +655,13 @@ impl App {
         self.state.mark_session_dirty();
         self.schedule_session_save();
 
+        // The launch is committed and its input sent: an error return here would
+        // leave its generation and launch record behind for a start the caller
+        // was told failed. The pane and its managed terminal were resolved
+        // above in this same dispatch, so they are still present.
         let agent = self
             .agent_info(ws_idx, pane_id)
-            .ok_or(AgentStartError::TargetUnavailable(params.pane_id))?;
+            .expect("a committed managed start's pane still hosts its agent");
         Ok((agent, argv))
     }
 
@@ -1063,6 +1092,42 @@ pub(super) enum AgentRenameError {
 
 #[cfg(test)]
 mod tests {
+    /// Review finding 5 on 2f3603e8: a caller-chosen agent dir's settings.json
+    /// is read only up to 64 KiB; a larger one counts as absent.
+    #[test]
+    fn pi_session_root_ignores_an_oversized_settings_file() {
+        let dir = std::env::temp_dir().join(format!(
+            "herdr-settings-cap-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let agent_dir = dir.display().to_string();
+        let env = |name: &str| match name {
+            "PI_CODING_AGENT_DIR" => Some(agent_dir.clone()),
+            "PI_CODING_AGENT_SESSION_DIR" => Some(String::new()),
+            "HOME" => Some("/nonexistent-home".into()),
+            _ => None,
+        };
+        let small = r#"{"sessionDir":"/tmp/configured-sessions"}"#;
+        std::fs::write(dir.join("settings.json"), small).unwrap();
+        assert_eq!(
+            super::pi_session_root(&env),
+            Some(std::path::PathBuf::from("/tmp/configured-sessions"))
+        );
+        let padding = " ".repeat(64 * 1024);
+        std::fs::write(
+            dir.join("settings.json"),
+            format!(r#"{{"sessionDir":"/tmp/configured-sessions"}}{padding}"#),
+        )
+        .unwrap();
+        assert_eq!(super::pi_session_root(&env), Some(dir.join("sessions")));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
     use super::{valid_agent_environment, valid_agent_name};
 
     #[test]

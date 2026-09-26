@@ -1139,12 +1139,19 @@ impl App {
             .map(std::path::PathBuf::from)
             .or_else(|| Some(self.resolve_new_terminal_cwd(follow_cwd)));
         let helper_terminal_id = crate::terminal::TerminalId::alloc();
-        // A helper that names its own --session file gets exactly the managed
-        // launch that agent.start gives (generation, birth-tick cutoff, launch
-        // record, session-file checks). Without --session the helper keeps the
-        // unmanaged path below unchanged.
+        // A helper that names its own --session file that passes the launch
+        // checks gets exactly the managed launch that agent.start gives
+        // (generation, birth-tick cutoff, launch record). Without --session, or
+        // with one that fails the checks, the helper keeps the unmanaged path
+        // below unchanged: no sender generation is allocated for it.
+        let helper_env_value = |name: &str| {
+            extra_env
+                .iter()
+                .find(|(key, _)| key == name)
+                .map(|(_, value)| value.clone())
+        };
         let managed = if kind == crate::detect::Agent::Pi
-            && crate::app::agents::explicit_pi_session_path(&argv).is_some()
+            && crate::app::agents::trusted_explicit_pi_session(&argv, &helper_env_value)
         {
             let launch_env = extra_env.clone();
             match self.prepare_managed_launch(
@@ -2288,6 +2295,48 @@ mod tests {
         assert_eq!(
             app.live_mailbox_bootstrap_candidate_for_test(&terminal.to_string()),
             None
+        );
+        abort_helper(&mut app, &collection_id, public, terminal.to_string());
+        std::fs::remove_dir_all(&fixture.root).unwrap();
+    }
+
+    /// Review finding 3 on 2f3603e8: a helper whose --session fails the launch
+    /// checks is exactly an unmanaged helper: no sender generation, no launch
+    /// record, reported trust.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn helper_with_an_untrusted_session_gets_no_sender_generation() {
+        use std::os::unix::fs::OpenOptionsExt;
+        let _env = crate::test_env::shared();
+        let fixture = HelperFixture::new("untrusted");
+        // Outside Pi's session directory, so it fails the launch checks.
+        let outside = fixture.root.join("outside.jsonl");
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&outside)
+            .unwrap();
+        let (mut app, root, _, _) = app_with_panes();
+        let collection_id = create_collection(&mut app, root);
+        let response = fixture.launch(
+            &mut app,
+            &collection_id,
+            vec!["--session".into(), outside.display().to_string()],
+        );
+        let (_pane, terminal, public) = launched_helper(&app, &response);
+        assert!(!app.managed_pi_launches.contains_key(&terminal));
+        assert!(app.state.terminals[&terminal].accepts_managed_agent_generation(0));
+        assert!(
+            crate::sender_authority::SenderAuthorityStore::for_sender(
+                &app.sender_authority_dir,
+                &terminal.to_string()
+            )
+            .unwrap()
+            .load()
+            .unwrap()
+            .is_none(),
+            "no sender generation is allocated for an untrusted --session"
         );
         abort_helper(&mut app, &collection_id, public, terminal.to_string());
         std::fs::remove_dir_all(&fixture.root).unwrap();
