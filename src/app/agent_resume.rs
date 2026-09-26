@@ -263,6 +263,41 @@ impl App {
             }
         };
 
+        // A pane with a durable launch recipe resumes through the managed
+        // launch path, so the agent comes back managed (generation, sender
+        // authority, Messages). Without a recipe the plain resume below runs.
+        let recipe = self
+            .state
+            .terminals
+            .get(&terminal_id)
+            .and_then(|terminal| terminal.launch_recipe.clone())
+            .filter(|recipe| recipe.lifecycle_role.is_none());
+        let public_pane_id = self
+            .find_pane(pane_id)
+            .and_then(|(ws_idx, _)| self.public_pane_id(ws_idx, pane_id));
+        if let (Some(recipe), Some(public_pane_id)) = (recipe, public_pane_id) {
+            self.terminal_runtimes.insert(terminal_id.clone(), runtime);
+            if let Some(terminal) = self.state.terminals.get_mut(&terminal_id) {
+                terminal.pending_agent_resume_plan = None;
+                terminal.respawn_shell_on_exit = false;
+                terminal.clear_agent_name();
+            }
+            // The new shell may not be at its prompt yet; the managed start is
+            // retried on scheduled ticks until it is, or until the deadline,
+            // when the plain resume command is used instead.
+            self.pending_managed_resumes.insert(
+                terminal_id.clone(),
+                PendingManagedResume {
+                    recipe,
+                    public_pane_id,
+                    fallback_command: resume_command,
+                    deadline: Instant::now() + MANAGED_RESUME_SHELL_WAIT,
+                },
+            );
+            self.retry_pending_managed_resumes(Instant::now());
+            return true;
+        }
+
         let mut input = resume_command;
         input.push('\r');
         if let Err(err) = runtime.try_send_bytes(Bytes::from(input)) {
@@ -283,6 +318,81 @@ impl App {
             terminal.respawn_shell_on_exit = false;
         }
         true
+    }
+}
+
+/// How long a restored pane's new shell may take to reach its prompt before a
+/// recipe resume falls back to the plain resume command.
+pub(crate) const MANAGED_RESUME_SHELL_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
+const MANAGED_RESUME_POLL: std::time::Duration = std::time::Duration::from_millis(100);
+
+#[derive(Debug, Clone)]
+pub(crate) struct PendingManagedResume {
+    recipe: crate::launch_recipe::LaunchRecipe,
+    public_pane_id: String,
+    fallback_command: String,
+    deadline: Instant,
+}
+
+impl App {
+    pub(crate) fn next_managed_resume_deadline(&self, now: Instant) -> Option<Instant> {
+        (!self.pending_managed_resumes.is_empty()).then(|| now + MANAGED_RESUME_POLL)
+    }
+
+    /// Start pending recipe resumes whose shell is now at its prompt; past the
+    /// deadline, type the plain resume command instead.
+    pub(crate) fn retry_pending_managed_resumes(&mut self, now: Instant) -> bool {
+        let terminals: Vec<_> = self.pending_managed_resumes.keys().cloned().collect();
+        let mut changed = false;
+        for terminal_id in terminals {
+            let Some(pending) = self.pending_managed_resumes.get(&terminal_id).cloned() else {
+                continue;
+            };
+            let shell_ready = self
+                .terminal_runtimes
+                .get(&terminal_id)
+                .is_some_and(super::agents::runtime_at_idle_shell);
+            if shell_ready {
+                if let Some(terminal) = self.state.terminals.get_mut(&terminal_id) {
+                    terminal.clear_agent_name();
+                }
+                let recipe = pending.recipe.clone();
+                let env = recipe.env_assignments();
+                match self.start_agent(crate::api::schema::AgentStartParams {
+                    name: recipe.name,
+                    kind: recipe.kind,
+                    pane_id: pending.public_pane_id.clone(),
+                    args: recipe.args,
+                    env,
+                    timeout_ms: None,
+                }) {
+                    Ok(_) => {
+                        self.pending_managed_resumes.remove(&terminal_id);
+                        changed = true;
+                        continue;
+                    }
+                    Err(err) => {
+                        let body = self.agent_start_error_body(err);
+                        tracing::warn!(
+                            terminal = %terminal_id,
+                            code = %body.code,
+                            message = %body.message,
+                            "managed resume failed; falling back to a plain resume"
+                        );
+                    }
+                }
+            } else if now < pending.deadline {
+                continue;
+            }
+            self.pending_managed_resumes.remove(&terminal_id);
+            let mut input = pending.fallback_command;
+            input.push('\r');
+            if let Some(runtime) = self.terminal_runtimes.get(&terminal_id) {
+                let _ = runtime.try_send_bytes(Bytes::from(input));
+            }
+            changed = true;
+        }
+        changed
     }
 }
 

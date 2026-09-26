@@ -3,6 +3,9 @@
 ## Unreleased
 
 ### Added
+- Added `herdr agent sleep <agent>` and in-process pane wake: Herdr records a durable launch recipe (name, kind, args, explicit non-credential `--env` keys) for every managed launch, can put an idle managed agent to sleep with a guarded ctrl+d, and relaunches only such slept panes in the same pane and terminal through the managed launch path when a message is queued for them (`App::wake_pane`, single-flight with durable per-wake records). Restart resume uses the same recipe, so resumed agents come back managed. See `docs/next/pane-sleep-wake.md`.
+- `herdr collection helper-launch ... -- --session <file>` now gets the same managed Pi launch as `agent start` (generation, launch record, session-file checks), so such helpers show `managed` trust and attach to Messages.
+- Custom build channels (`HERDR_BUILD_CHANNEL` other than stable/preview, e.g. `stabilized`) show the channel in `herdr --version`, refuse `herdr update`, and never show an upstream update notice.
 - Added an owner-only exact-parent report acknowledgement Unix-socket transport with live issuer/child-session authority checks, durable content intent, accepted child-durability results, conflict-safe dedupe, and query-only lost-ack recovery.
 - Added a pinned role-specific user-systemd instance boundary for queued-input activations, with exact activation-ID start validation, durable duplicate/uncertain start handling, generated result schema, and no generic wake path.
 - Added an external queued-input lifecycle scheduler with exact v1 request/issuer validation, digest-bound secure activation materialization, durable conflict-safe idempotency, bounded role guards, and explicit same-ID uncertain recovery.

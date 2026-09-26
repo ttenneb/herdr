@@ -1147,12 +1147,19 @@ impl App {
             && crate::app::agents::explicit_pi_session_path(&argv).is_some()
         {
             let launch_env = extra_env.clone();
-            match self.prepare_managed_launch(&helper_terminal_id, kind, &argv, |name| {
-                launch_env
-                    .iter()
-                    .find(|(key, _)| key == name)
-                    .map(|(_, value)| value.clone())
-            }) {
+            match self.prepare_managed_launch(
+                &helper_terminal_id,
+                &agent_params.name,
+                kind,
+                &argv,
+                &launch_env,
+                |name| {
+                    launch_env
+                        .iter()
+                        .find(|(key, _)| key == name)
+                        .map(|(_, value)| value.clone())
+                },
+            ) {
                 Ok(prepared) => Some(prepared),
                 Err(err) => return encode_error_body(id, self.agent_start_error_body(err)),
             }

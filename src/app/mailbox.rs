@@ -1337,6 +1337,7 @@ impl App {
         if agent == crate::detect::Agent::Pi {
             self.bind_active_managed_pi_process(&terminal_id, process_generation);
         }
+        self.resolve_pane_wake_on_active(&terminal_id, process_generation);
         let _ = self.install_offline_mailbox_authority(record);
     }
 }

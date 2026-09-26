@@ -426,6 +426,7 @@ fn api_method_name(method: &Method) -> &'static str {
         Method::TabClose(_) => "tab.close",
         Method::AgentList(_) => "agent.list",
         Method::AgentGet(_) => "agent.get",
+        Method::AgentSleep(_) => "agent.sleep",
         Method::AgentRead(_) => "agent.read",
         Method::AgentExplain(_) => "agent.explain",
         Method::AgentSendKeys(_) => "agent.send_keys",

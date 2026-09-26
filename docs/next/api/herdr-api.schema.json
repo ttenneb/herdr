@@ -7648,6 +7648,22 @@
         {
           "properties": {
             "method": {
+              "const": "agent.sleep",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/schemas/request/$defs/AgentTarget"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "method": {
               "const": "agent.rename",
               "type": "string"
             },

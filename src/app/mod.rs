@@ -32,6 +32,7 @@ mod tab_bar_status;
 mod terminal_targets;
 mod terminal_titles;
 mod theme_sync;
+pub(crate) mod wake;
 mod window_title;
 mod worktrees;
 
@@ -148,6 +149,10 @@ pub struct App {
     pub(crate) mailbox_bootstrap_bindings: BTreeMap<String, mailbox::MailboxBootstrapSession>,
     /// Ephemeral server-owned managed start evidence; never restored from a pane snapshot.
     pub(crate) managed_pi_launches: HashMap<crate::terminal::TerminalId, agents::ManagedPiLaunch>,
+    pub(crate) pane_wakes: HashMap<crate::terminal::TerminalId, wake::OutstandingWake>,
+    pub(crate) pane_wake_cooldowns: HashMap<crate::terminal::TerminalId, Instant>,
+    pub(crate) pending_managed_resumes:
+        HashMap<crate::terminal::TerminalId, agent_resume::PendingManagedResume>,
     /// Opaque per-process mailbox namespace; absent entropy disables bootstrap.
     pub(crate) mailbox_bootstrap_boot_nonce: Option<String>,
     /// Per-stream entropy is never reused, even with a different local ordinal.
@@ -910,6 +915,9 @@ impl App {
             offline_mailbox_authorities: BTreeMap::new(),
             mailbox_bootstrap_bindings: BTreeMap::new(),
             managed_pi_launches: HashMap::new(),
+            pane_wakes: HashMap::new(),
+            pane_wake_cooldowns: HashMap::new(),
+            pending_managed_resumes: HashMap::new(),
             mailbox_bootstrap_boot_nonce: crate::platform::random_route_epoch(),
             used_mailbox_bootstrap_nonces: HashSet::new(),
             next_mailbox_bootstrap_binding: 1,

@@ -648,6 +648,11 @@ fn agent_command() -> Command {
                 .arg(flag("ansi")),
         )
         .subcommand(
+            Command::new("sleep")
+                .about("Put a managed agent to sleep; Herdr wakes it when a message is queued for its pane")
+                .arg(required("target", "TARGET")),
+        )
+        .subcommand(
             Command::new("send-keys")
                 .about("Send key presses to an agent")
                 .arg(required("target", "TARGET"))

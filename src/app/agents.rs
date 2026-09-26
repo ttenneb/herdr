@@ -52,6 +52,7 @@ pub(super) fn explicit_pi_session_path(argv: &[String]) -> Option<String> {
 pub(crate) struct PreparedManagedLaunch {
     pub(crate) generation: u64,
     pi_session: Option<(String, u64)>,
+    recipe: Option<crate::launch_recipe::LaunchRecipe>,
 }
 
 /// `NAME=value` from an `agent.start` environment list.
@@ -363,11 +364,14 @@ impl App {
     ///
     /// Nothing in memory is bound until [`Self::commit_managed_launch`]; any
     /// failure after this returns must call [`Self::abandon_managed_launch`].
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn prepare_managed_launch(
         &mut self,
         terminal_id: &crate::terminal::TerminalId,
+        name: &str,
         kind: crate::detect::Agent,
         argv: &[String],
+        explicit_env: &[(String, String)],
         launch_env: impl Fn(&str) -> Option<String>,
     ) -> Result<PreparedManagedLaunch, AgentStartError> {
         let generation = self.allocate_sender_authority_generation(terminal_id.to_string())?;
@@ -390,9 +394,16 @@ impl App {
                 ));
             }
         }
+        let recipe = crate::launch_recipe::LaunchRecipe::capture(
+            name,
+            crate::detect::agent_label(kind),
+            argv.get(1..).unwrap_or_default(),
+            explicit_env,
+        );
         Ok(PreparedManagedLaunch {
             generation,
             pi_session,
+            recipe,
         })
     }
 
@@ -407,8 +418,16 @@ impl App {
         if let Some(runtime) = self.terminal_runtimes.get(terminal_id) {
             runtime.set_managed_agent_generation(prepared.generation);
         }
+        let waking = self.pane_wakes.contains_key(terminal_id);
         if let Some(terminal) = self.state.terminals.get_mut(terminal_id) {
             terminal.set_managed_agent_generation(prepared.generation);
+            // The durable recipe is what a later wake or restart relaunches.
+            terminal.launch_recipe = prepared.recipe;
+            // Any start other than a wake ends a Herdr sleep; a wake keeps it
+            // until its Pi attaches.
+            if !waking {
+                terminal.sleep = None;
+            }
         }
         if let Some((session_path, earliest_birth_ticks)) = prepared.pi_session {
             self.managed_pi_launches.insert(
@@ -502,9 +521,16 @@ impl App {
         let timeout = self.agent_start_timeout(&params)?;
         // Persist the new generation, and for a Pi --session launch wait out the
         // birth-tick cutoff, before mutating launch state or sending bytes.
-        let managed = self.prepare_managed_launch(&terminal_id, kind, &argv, |name| {
-            launch_env_value(&params.env, name)
-        })?;
+        let explicit_env: Vec<(String, String)> = params
+            .env
+            .iter()
+            .filter_map(|entry| entry.split_once('='))
+            .map(|(key, value)| (key.to_string(), value.to_string()))
+            .collect();
+        let managed =
+            self.prepare_managed_launch(&terminal_id, &name, kind, &argv, &explicit_env, |name| {
+                launch_env_value(&params.env, name)
+            })?;
         let generation = managed.generation;
         // The wait must not turn a previously shell-only pane into a launch
         // against a newly foregrounded Pi.
@@ -889,6 +915,20 @@ fn available_shell_name(runtime: &crate::terminal::TerminalRuntime) -> Option<St
         return Some("sh".into());
     }
     crate::platform::available_pane_shell(runtime.child_pid()?)
+}
+
+/// A live agent (e.g. Pi) is the pane's foreground job.
+pub(super) fn runtime_has_live_agent(runtime: &crate::terminal::TerminalRuntime) -> bool {
+    #[cfg(test)]
+    if runtime.child_pid().is_none() {
+        return false;
+    }
+    live_runtime_agent(runtime).is_some()
+}
+
+/// The pane's shell is at an idle prompt, as agent.start requires.
+pub(super) fn runtime_at_idle_shell(runtime: &crate::terminal::TerminalRuntime) -> bool {
+    available_shell_name(runtime).is_some()
 }
 
 pub(super) fn runtime_hosts_agent(

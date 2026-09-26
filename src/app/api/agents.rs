@@ -263,6 +263,48 @@ impl App {
         encode_success(id, ResponseResult::AgentExplain { explain: value })
     }
 
+    /// `agent.sleep`: record that Herdr put the agent to sleep, then send it a
+    /// guarded ctrl+d. Herdr wakes only agents it put to sleep this way.
+    pub(super) fn handle_agent_sleep(&mut self, id: String, params: AgentTarget) -> String {
+        let resolved = match self.resolve_agent_target(&params.target) {
+            Ok(resolved) => resolved,
+            Err(err) => return encode_error_body(id, self.agent_target_error_body(err)),
+        };
+        let Some(terminal_id) = self
+            .state
+            .workspaces
+            .get(resolved.ws_idx)
+            .and_then(|workspace| workspace.terminal_id(resolved.pane_id))
+            .cloned()
+        else {
+            return agent_not_found(id, &params.target);
+        };
+        let (agent_name, generation) = match self.pane_sleep_candidate(&terminal_id) {
+            Ok(candidate) => candidate,
+            Err(message) => return encode_error(id, "agent_sleep_unavailable", message),
+        };
+        self.set_pane_sleep(
+            &terminal_id,
+            Some(App::new_pane_sleep(agent_name.clone(), generation)),
+        );
+        let response = self.handle_agent_send_keys(
+            id,
+            AgentSendKeysParams {
+                target: params.target,
+                keys: vec!["ctrl+d".into()],
+                expected_terminal_id: Some(terminal_id.to_string()),
+                expected_name: Some(agent_name),
+            },
+        );
+        let sent = serde_json::from_str::<serde_json::Value>(&response)
+            .ok()
+            .is_some_and(|value| value.get("error").is_none());
+        if !sent {
+            self.set_pane_sleep(&terminal_id, None);
+        }
+        response
+    }
+
     pub(super) fn handle_agent_send_keys(
         &mut self,
         id: String,

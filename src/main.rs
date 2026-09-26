@@ -73,6 +73,7 @@ mod input;
 mod integration;
 mod ipc;
 mod kitty_graphics;
+mod launch_recipe;
 mod layout;
 mod logging;
 pub mod mailbox;

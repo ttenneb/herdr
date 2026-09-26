@@ -5148,6 +5148,8 @@ impl HeadlessServer {
         }
 
         changed |= self.app.handle_tab_bar_status_tasks(now);
+        changed |= self.app.handle_pane_wake_deadlines(now);
+        changed |= self.app.retry_pending_managed_resumes(now);
 
         if geometry_dirty {
             self.app.pending_agent_resume_deadline = None;
