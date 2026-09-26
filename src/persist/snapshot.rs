@@ -161,6 +161,11 @@ pub struct PaneSnapshot {
     pub agent_session: Option<PaneAgentSessionSnapshot>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub launch_argv: Option<Vec<String>>,
+    /// Durable Messages queue key of this pane (see `TerminalState::queue_key`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub queue_key: Option<String>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub messages_capable: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -503,6 +508,8 @@ fn capture_tab(
             })
             .unwrap_or_default();
         let launch_argv = terminal.and_then(|terminal| terminal.launch_argv.clone());
+        let queue_key = terminal.map(|terminal| terminal.queue_key.clone());
+        let messages_capable = terminal.is_some_and(|terminal| terminal.messages_capable);
         let agent_session = terminal.and_then(|terminal| {
             if let Some(authority) = terminal.hook_authority.as_ref() {
                 if let Some(session_ref) = authority.session_ref.as_ref() {
@@ -534,6 +541,8 @@ fn capture_tab(
                 managed_agent_kind,
                 agent_session,
                 launch_argv,
+                queue_key,
+                messages_capable,
             },
         );
     }
@@ -979,6 +988,8 @@ mod tests {
                 managed_agent_kind: None,
                 agent_session: None,
                 launch_argv: None,
+                queue_key: None,
+                messages_capable: false,
             },
         );
         panes.insert(
@@ -991,6 +1002,8 @@ mod tests {
                 managed_agent_kind: None,
                 agent_session: None,
                 launch_argv: None,
+                queue_key: None,
+                messages_capable: false,
             },
         );
 
@@ -1677,6 +1690,8 @@ mod tests {
                 managed_agent_kind: None,
                 agent_session: None,
                 launch_argv: None,
+                queue_key: None,
+                messages_capable: false,
             },
         );
         panes.insert(
@@ -1691,6 +1706,8 @@ mod tests {
                 managed_agent_kind: None,
                 agent_session: None,
                 launch_argv: None,
+                queue_key: None,
+                messages_capable: false,
             },
         );
 

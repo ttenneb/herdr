@@ -365,9 +365,10 @@ impl App {
         serde_json::to_value(success.result).map_err(|_| MailboxBootstrapError::InvalidRequest)
     }
 
-    /// Own-inbox operations that need no sender authority: previous-session
-    /// Retry/Drop for every Messages session, and the whole inbox surface for
-    /// a recipient-only session. Returns `None` for any other method.
+    /// The pane inbox surface for every current Messages session (managed or
+    /// recipient-only): snapshot, claim, edit, resolve and drop over all of
+    /// the pane's recipient keys, with claims bound to this execution.
+    /// Returns `None` for any other method.
     fn dispatch_recipient_inbox(
         &mut self,
         session: &MailboxBootstrapSession,
@@ -386,20 +387,21 @@ impl App {
             stable_id: String,
             expected_revision: u64,
         }
-        let recipient_only = session.recipient_only.is_some();
-        let known = matches!(method, "mailbox.repin" | "mailbox.drop")
-            || (recipient_only
-                && matches!(
-                    method,
-                    "mailbox.snapshot" | "mailbox.claim" | "mailbox.edit" | "mailbox.resolve"
-                ));
-        if !known {
+        if !matches!(
+            method,
+            "mailbox.snapshot"
+                | "mailbox.claim"
+                | "mailbox.edit"
+                | "mailbox.resolve"
+                | "mailbox.drop"
+        ) {
             return None;
         }
         Some((|| {
             let store = crate::mailbox::MailboxStore::open(&self.sender_authority_dir)
                 .map_err(|_| MailboxBootstrapError::GrantMissing)?;
-            let recipient = session.recipient.clone();
+            let recipients = self.inbox_recipients(&session.caller);
+            let execution = crate::app::messages::session_execution(session);
             let current = self.current_agent_session_value(&session.caller);
             let load = || {
                 store
@@ -407,32 +409,13 @@ impl App {
                     .map_err(|_| MailboxBootstrapError::GrantMissing)
             };
             let view = |recovered: &crate::mailbox::RecoveredMailbox| {
-                crate::mailbox_v1::snapshot(recovered, &recipient)
-                    .map(|snapshot| {
-                        crate::app::messages::filter_recipient_snapshot(
-                            snapshot,
-                            recovered,
-                            current.as_deref(),
-                        )
-                    })
-                    .map_err(|_| MailboxBootstrapError::GrantMissing)
-            };
-            let stranded_head = |recovered: &crate::mailbox::RecoveredMailbox,
-                                 params: &HeadVersionParams| {
-                recovered
-                    .heads
-                    .get(&params.stable_id)
-                    .filter(|head| {
-                        head.recipient == recipient
-                            && head.revision == params.expected_revision
-                            && crate::app::messages::head_standing(
-                                head,
-                                recovered,
-                                current.as_deref(),
-                            ) == crate::app::messages::HeadStanding::Stranded
-                    })
-                    .cloned()
-                    .ok_or(MailboxBootstrapError::InvalidRequest)
+                crate::app::messages::inbox_snapshot(
+                    recovered,
+                    &recipients,
+                    &execution,
+                    current.as_deref(),
+                )
+                .map_err(|_| MailboxBootstrapError::GrantMissing)
             };
             let protocol_ok = |protocol: &str| {
                 (protocol == crate::mailbox_v1::PROTOCOL)
@@ -443,70 +426,6 @@ impl App {
                 serde_json::to_value(result).map_err(|_| MailboxBootstrapError::InvalidRequest)
             };
             match method {
-                "mailbox.repin" => {
-                    let params: HeadVersionParams = serde_json::from_value(params.clone())
-                        .map_err(|_| MailboxBootstrapError::InvalidRequest)?;
-                    protocol_ok(&params.protocol)?;
-                    let session_value =
-                        current.clone().ok_or(MailboxBootstrapError::GrantMissing)?;
-                    let head = stranded_head(&load()?, &params)?;
-                    let repinned = store
-                        .edit_unclaimed_head(crate::mailbox::MailboxHeadEdit {
-                            stable_id: head.stable_id,
-                            revision: head.revision,
-                            digest: head.digest,
-                            subject: head.subject,
-                            body: head.body,
-                            repin_recipient_session: Some(session_value.clone()),
-                        })
-                        .map_err(|_| MailboxBootstrapError::InvalidRequest)?;
-                    let recovered = load()?;
-                    let receipt = recovered
-                        .receipts
-                        .get(&repinned.delivery_digest)
-                        .filter(|receipt| {
-                            receipt.revision == repinned.revision
-                                && receipt.digest == repinned.digest
-                        })
-                        .cloned()
-                        .ok_or(MailboxBootstrapError::GrantMissing)?;
-                    Ok(serde_json::json!({
-                        "type": "mailbox_repinned",
-                        "stableId": repinned.stable_id,
-                        "revision": repinned.revision,
-                        "recipientSession": session_value,
-                        "receipt": receipt,
-                        "snapshot": view(&recovered)?,
-                    }))
-                }
-                "mailbox.drop" => {
-                    let params: HeadVersionParams = serde_json::from_value(params.clone())
-                        .map_err(|_| MailboxBootstrapError::InvalidRequest)?;
-                    protocol_ok(&params.protocol)?;
-                    let head = stranded_head(&load()?, &params)?;
-                    store
-                        .withdraw_unclaimed_head(&head.stable_id, head.revision, &head.digest)
-                        .map_err(|_| MailboxBootstrapError::InvalidRequest)?;
-                    let recovered = load()?;
-                    let claim = recovered
-                        .claims
-                        .get(&head.stable_id)
-                        .filter(|claim| crate::mailbox::is_withdrawn_claim(claim))
-                        .cloned()
-                        .ok_or(MailboxBootstrapError::GrantMissing)?;
-                    let resolution = recovered
-                        .resolutions
-                        .get(&claim.claim_id)
-                        .cloned()
-                        .ok_or(MailboxBootstrapError::GrantMissing)?;
-                    Ok(serde_json::json!({
-                        "type": "mailbox_dropped",
-                        "stableId": head.stable_id,
-                        "revision": head.revision,
-                        "receipt": {"claim": claim, "resolution": resolution},
-                        "snapshot": view(&recovered)?,
-                    }))
-                }
                 "mailbox.snapshot" => {
                     let params: ProtocolParams = serde_json::from_value(params.clone())
                         .map_err(|_| MailboxBootstrapError::InvalidRequest)?;
@@ -519,20 +438,18 @@ impl App {
                     let _: crate::mailbox_v1::ClaimRequest = serde_json::from_value(params.clone())
                         .map_err(|_| MailboxBootstrapError::InvalidRequest)?;
                     let claim = store
-                        .claim_next_eligible(&recipient, |head| {
-                            crate::app::messages::head_claimable_by(head, current.as_deref())
-                        })
+                        .claim_next_for_execution(&recipients, &execution)
                         .map_err(|_| MailboxBootstrapError::GrantMissing)?;
                     to_value(ResponseResult::MailboxClaimed { claim })
                 }
                 "mailbox.edit" => {
                     let edit: crate::mailbox_v1::Edit = serde_json::from_value(params.clone())
                         .map_err(|_| MailboxBootstrapError::InvalidRequest)?;
-                    // Own inbox only: the edited head must be addressed here.
+                    // Own pane inbox only.
                     if !load()?
                         .heads
                         .get(&edit.stable_id)
-                        .is_some_and(|head| head.recipient == recipient)
+                        .is_some_and(|head| recipients.contains(&head.recipient))
                     {
                         return Err(MailboxBootstrapError::InvalidRequest);
                     }
@@ -552,8 +469,9 @@ impl App {
                         .values()
                         .find(|claim| claim.claim_id == resolve.claim_id)
                         .filter(|claim| {
-                            claim.recipient == recipient
+                            recipients.contains(&claim.recipient)
                                 && !crate::mailbox::is_withdrawn_claim(claim)
+                                && crate::app::messages::claim_is_current(claim, &execution)
                         })
                         .ok_or(MailboxBootstrapError::InvalidRequest)?;
                     let outcome = match resolve.outcome {
@@ -568,6 +486,65 @@ impl App {
                         .resolve_claim(&claim.claim_id, outcome)
                         .map_err(|_| MailboxBootstrapError::InvalidRequest)?;
                     to_value(ResponseResult::MailboxResolved { resolution })
+                }
+                "mailbox.drop" => {
+                    // The human's Drop: any held head in this pane's inbox, or
+                    // one left claimed by another (exited) Pi execution.
+                    let params: HeadVersionParams = serde_json::from_value(params.clone())
+                        .map_err(|_| MailboxBootstrapError::InvalidRequest)?;
+                    protocol_ok(&params.protocol)?;
+                    let recovered = load()?;
+                    let head = recovered
+                        .heads
+                        .get(&params.stable_id)
+                        .filter(|head| {
+                            recipients.contains(&head.recipient)
+                                && head.revision == params.expected_revision
+                        })
+                        .cloned()
+                        .ok_or(MailboxBootstrapError::InvalidRequest)?;
+                    match recovered.claims.get(&head.stable_id).cloned() {
+                        None => store
+                            .withdraw_unclaimed_head(&head.stable_id, head.revision, &head.digest)
+                            .map_err(|_| MailboxBootstrapError::InvalidRequest)?,
+                        Some(claim)
+                            if !crate::mailbox::is_withdrawn_claim(&claim)
+                                && !crate::app::messages::claim_is_current(&claim, &execution)
+                                && !matches!(
+                                    recovered.resolutions.get(&claim.claim_id),
+                                    Some(crate::mailbox::ClaimResolution {
+                                        outcome: crate::mailbox::ClaimResolutionOutcome::Settled,
+                                        ..
+                                    })
+                                ) =>
+                        {
+                            store
+                                .resolve_claim(
+                                    &claim.claim_id,
+                                    crate::mailbox::ClaimResolutionOutcome::Settled,
+                                )
+                                .map_err(|_| MailboxBootstrapError::InvalidRequest)?;
+                        }
+                        Some(_) => return Err(MailboxBootstrapError::InvalidRequest),
+                    }
+                    let recovered = load()?;
+                    let claim = recovered
+                        .claims
+                        .get(&head.stable_id)
+                        .cloned()
+                        .ok_or(MailboxBootstrapError::GrantMissing)?;
+                    let resolution = recovered
+                        .resolutions
+                        .get(&claim.claim_id)
+                        .cloned()
+                        .ok_or(MailboxBootstrapError::GrantMissing)?;
+                    Ok(serde_json::json!({
+                        "type": "mailbox_dropped",
+                        "stableId": head.stable_id,
+                        "revision": head.revision,
+                        "receipt": {"claim": claim, "resolution": resolution},
+                        "snapshot": view(&recovered)?,
+                    }))
                 }
                 _ => Err(MailboxBootstrapError::InvalidRequest),
             }

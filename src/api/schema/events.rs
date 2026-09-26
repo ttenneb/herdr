@@ -114,6 +114,8 @@ pub enum Subscription {
     PaneExited {},
     #[serde(rename = "pane.agent_detected")]
     PaneAgentDetected {},
+    #[serde(rename = "pane.wake_requested")]
+    PaneWakeRequested {},
     #[serde(rename = "pane.output_matched")]
     PaneOutputMatched {
         pane_id: String,
@@ -294,6 +296,7 @@ pub enum EventKind {
     PaneOutputChanged,
     PaneExited,
     PaneAgentDetected,
+    PaneWakeRequested,
     PaneAgentStatusChanged,
     LayoutUpdated,
 }
@@ -351,6 +354,7 @@ impl EventKind {
             EventKind::PaneOutputChanged => "pane.output_changed",
             EventKind::PaneExited => "pane.exited",
             EventKind::PaneAgentDetected => "pane.agent_detected",
+            EventKind::PaneWakeRequested => "pane.wake_requested",
             EventKind::PaneAgentStatusChanged => "pane.agent_status_changed",
             EventKind::LayoutUpdated => "layout.updated",
         }
@@ -409,6 +413,7 @@ pub const KNOWN_EVENT_KINDS: &[EventKind] = &[
     EventKind::PaneOutputChanged,
     EventKind::PaneExited,
     EventKind::PaneAgentDetected,
+    EventKind::PaneWakeRequested,
     EventKind::PaneAgentStatusChanged,
     EventKind::LayoutUpdated,
 ];
@@ -807,6 +812,17 @@ pub enum EventData {
     PaneExited {
         pane_id: String,
         workspace_id: String,
+    },
+    /// A Messages head was queued for a pane with no attached Pi. Consumers
+    /// (sleep/wake, #25) may wake the pane's agent; Herdr itself does nothing
+    /// else.
+    PaneWakeRequested {
+        pane_id: String,
+        workspace_id: String,
+        terminal_id: String,
+        queue_key: String,
+        stable_id: String,
+        reason: String,
     },
     PaneAgentDetected {
         pane_id: String,

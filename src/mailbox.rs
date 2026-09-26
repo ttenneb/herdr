@@ -161,6 +161,10 @@ pub struct Claim {
     pub stable_id: String,
     pub revision: u64,
     pub digest: String,
+    /// The recipient execution that took this claim (per-pane queues). Only
+    /// that execution sees and resolves it; absent on older claims.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub execution: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
@@ -723,6 +727,7 @@ impl MailboxStore {
                 stable_id: head.stable_id.clone(),
                 revision: head.revision,
                 digest: head.digest.clone(),
+                execution: None,
             };
             self.append_synced(&MailboxRecord::Claim {
                 claim: claim.clone(),
@@ -736,6 +741,76 @@ impl MailboxStore {
         std::fs::metadata(&self.stream_path)
             .map(|metadata| metadata.len())
             .unwrap_or(0)
+    }
+
+    /// Per-pane queue claim across the recipient keys of one inbox. Returns
+    /// this execution's outstanding claim, if any; otherwise claims the next
+    /// unclaimed head by priority then server enqueue order. Claims held by
+    /// another execution are skipped and never returned here.
+    pub fn claim_next_for_execution(
+        &self,
+        recipients: &[RecipientKey],
+        execution: &str,
+    ) -> Result<Option<Claim>, MailboxError> {
+        self.with_exclusive_lock(|| {
+            let recovered = self.load()?;
+            if let Some(existing) = recovered
+                .claims
+                .values()
+                .find(|claim| {
+                    recipients.contains(&claim.recipient)
+                        && !is_withdrawn_claim(claim)
+                        && claim
+                            .execution
+                            .as_deref()
+                            .is_none_or(|owner| owner == execution)
+                        && !matches!(
+                            recovered.resolutions.get(&claim.claim_id),
+                            Some(ClaimResolution {
+                                outcome: ClaimResolutionOutcome::Settled,
+                                ..
+                            })
+                        )
+                })
+                .cloned()
+            {
+                return Ok(Some(existing));
+            }
+            let Some(head) = recovered
+                .heads
+                .values()
+                .filter(|head| {
+                    recipients.contains(&head.recipient)
+                        && !recovered.claims.contains_key(&head.stable_id)
+                })
+                .min_by_key(|head| {
+                    let priority = match head.priority.as_str() {
+                        "high" => 0,
+                        "normal" => 1,
+                        "low" => 2,
+                        _ => 3,
+                    };
+                    (priority, head.enqueue_epoch, &head.stable_id)
+                })
+            else {
+                return Ok(None);
+            };
+            let claim = Claim {
+                claim_id: format!(
+                    "claim:{}:{}:{}",
+                    head.recipient.recipient_id, head.recipient.generation, head.stable_id
+                ),
+                recipient: head.recipient.clone(),
+                stable_id: head.stable_id.clone(),
+                revision: head.revision,
+                digest: head.digest.clone(),
+                execution: Some(execution.to_string()),
+            };
+            self.append_synced(&MailboxRecord::Claim {
+                claim: claim.clone(),
+            })?;
+            Ok(Some(claim))
+        })
     }
 
     /// Records the recipient's explicit Drop of an unclaimed head as one
@@ -765,6 +840,7 @@ impl MailboxStore {
                 stable_id: head.stable_id.clone(),
                 revision: head.revision,
                 digest: head.digest.clone(),
+                execution: None,
             };
             let claim_id = claim.claim_id.clone();
             self.append_synced(&MailboxRecord::Claim { claim })?;
@@ -1611,6 +1687,7 @@ mod tests {
             stable_id: head.stable_id.clone(),
             revision: 1,
             digest: head.digest.clone(),
+            execution: None,
         };
         store.claim(claim.clone()).unwrap();
         let reopened = MailboxStore::open(store.stream_path.parent().unwrap()).unwrap();

@@ -118,6 +118,15 @@ struct RecentAgentProcessExit {
 /// pane/view state no longer owns terminal identity, cwd, labels, or agent
 /// metadata.
 pub struct TerminalState {
+    /// Durable logical recipient for this pane's Messages queue. Minted with
+    /// the pane's terminal, persisted in session.json and restored unchanged,
+    /// so queued messages survive Pi restarts and Herdr server restarts.
+    pub queue_key: String,
+    /// True once a Pi in this pane attached a Messages stream. Only such panes
+    /// keep queueing while no Pi is attached (restart, sleep); a Pi that never
+    /// attached (no Messages support, or receive-only switched off) keeps
+    /// typed input. Persisted with the queue key.
+    pub messages_capable: bool,
     pub id: TerminalId,
     pub cwd: PathBuf,
     pub detected_agent: Option<Agent>,
@@ -152,9 +161,32 @@ pub struct TerminalState {
     pub pending_agent_resume_plan: Option<crate::agent_resume::AgentResumePlan>,
 }
 
+/// A 128-bit random hex key; falls back to a time- and PID-derived value only
+/// where the platform has no randomness source.
+pub(crate) fn mint_queue_key() -> String {
+    crate::platform::random_route_epoch().unwrap_or_else(|| {
+        use sha2::{Digest as _, Sha256};
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let seed = format!(
+            "{}:{}:{:?}",
+            std::process::id(),
+            NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+            std::time::SystemTime::now()
+        );
+        format!("{:x}", Sha256::digest(seed.as_bytes()))[..32].to_string()
+    })
+}
+
+/// Accepts only a persisted key in the minted shape.
+pub(crate) fn valid_queue_key(key: &str) -> bool {
+    key.len() == 32 && key.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
 impl TerminalState {
     pub fn new(id: TerminalId, cwd: PathBuf) -> Self {
         Self {
+            queue_key: mint_queue_key(),
+            messages_capable: false,
             id,
             cwd,
             detected_agent: None,
