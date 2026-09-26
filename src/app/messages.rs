@@ -463,6 +463,33 @@ pub(crate) fn append_typed_history(
     Ok(())
 }
 
+/// The `reason` for a `messages_unavailable` refusal.
+pub(crate) fn unavailable_reason(message: &str) -> &'static str {
+    if message.starts_with("the message exceeds Messages limits") {
+        "oversized"
+    } else if message.starts_with("only Pi recipients") {
+        "not_pi"
+    } else {
+        "no_messages"
+    }
+}
+
+/// `messages_unavailable` with its `reason` (`oversized`: the recipient
+/// takes Messages but the text is outside its limits and is never typed;
+/// `not_pi` / `no_messages`: `--transport mailbox` to a pane without
+/// Messages).
+pub(crate) fn messages_unavailable_json(id: String, message: &str) -> String {
+    serde_json::json!({
+        "id": id,
+        "error": {
+            "code": "messages_unavailable",
+            "message": message,
+            "reason": unavailable_reason(message),
+        }
+    })
+    .to_string()
+}
+
 pub(crate) fn mailbox_safe_text(subject: &str, body: &str) -> bool {
     let clean = |text: &str| {
         !text.chars().any(|ch| {
@@ -1169,7 +1196,6 @@ impl App {
                 deferral_id: None,
                 typed_ahead_of_queued: None,
                 path: "mailbox".into(),
-                method: "queued".into(),
                 reason: "messages".into(),
                 editable: !recovered.claims.contains_key(&existing.stable_id),
                 stable_id: Some(existing.stable_id.clone()),
@@ -1273,7 +1299,6 @@ impl App {
                 deferral_id: None,
                 typed_ahead_of_queued: None,
                 path: "mailbox".into(),
-                method: "queued".into(),
                 reason: "messages".into(),
                 editable: true,
                 stable_id: Some(edited.stable_id),
@@ -1325,7 +1350,6 @@ impl App {
             deferral_id: None,
             typed_ahead_of_queued: None,
             path: "mailbox".into(),
-            method: "queued".into(),
             reason: "messages".into(),
             editable: true,
             stable_id: Some(receipt.stable_id),

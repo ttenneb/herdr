@@ -287,11 +287,7 @@ impl App {
         {
             return "not_pi".into();
         }
-        if self.pane_takes_messages(&key) {
-            // It has a queue, so only the size or content kept it out.
-            return "oversized".into();
-        }
-        if terminal.messages_capable {
+        if terminal.messages_capable && !self.pane_takes_messages(&key) {
             return "fallback_30s".into();
         }
         "no_messages".into()
