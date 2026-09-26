@@ -1027,7 +1027,13 @@ async fn enqueue_self_queues_only_into_the_own_pane_inbox() {
         format!("human@{}", fixture.terminals[1])
     );
     assert_eq!(heads[0]["delivery"]["origin"], "human_typed");
-    assert_eq!(heads[0]["delivery"]["senderLabel"], "human at pane");
+    assert_eq!(
+        heads[0]["delivery"]["senderLabel"],
+        format!(
+            "human at {}",
+            fixture.app.public_pane_id(1, fixture.panes[1]).unwrap()
+        )
+    );
     // No selector can point it anywhere else, and bad input is refused.
     for params in [
         json!({"protocol": crate::mailbox_v1::PROTOCOL, "subject": "s", "body": "b",
@@ -1658,6 +1664,160 @@ async fn the_backlog_sweep_wakes_a_sleeping_pane_with_queued_messages() {
     assert!(wake_records(&fixture)
         .iter()
         .any(|record| record["outcome"] == "duplicate"));
+}
+
+/// Accepted sender contract: after --send-new there are several waiting
+/// messages; --edit-pending without a stableId edits the NEWEST, and the
+/// refusal carries `newest` and `pendingCount` (plus the full `pending` list).
+#[tokio::test]
+async fn edit_pending_without_an_id_edits_the_newest_and_reports_the_count() {
+    let mut fixture = fixture();
+    let session = attach_recipient(&mut fixture);
+    let recipient = fixture.terminals[1].clone();
+    let sender = sender(&fixture);
+    let mut ids = Vec::new();
+    for (index, body) in ["oldest", "middle", "newest"].iter().enumerate() {
+        let SendRoute::Mailbox(delivery) = fixture
+            .app
+            .route_ordinary_send(
+                &recipient,
+                &sender,
+                plain(body),
+                &MessageSendOptions {
+                    send_new: index > 0,
+                    ..Default::default()
+                },
+            )
+            .unwrap()
+        else {
+            panic!("mailbox")
+        };
+        ids.push(delivery.stable_id.unwrap());
+    }
+    let refusal = fixture
+        .app
+        .route_ordinary_send(&recipient, &sender, plain("another"), &Default::default())
+        .unwrap_err();
+    let json: serde_json::Value = serde_json::from_str(
+        &crate::app::messages::pending_error_json("id".into(), &refusal).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(json["error"]["code"], "pending_exists");
+    assert_eq!(json["error"]["pendingCount"], 3);
+    assert_eq!(json["error"]["newest"]["stableId"], json!(ids[2]));
+    assert_eq!(json["error"]["pending"][0], json["error"]["newest"]);
+    let edited = fixture
+        .app
+        .route_ordinary_send(
+            &recipient,
+            &sender,
+            plain("newest, edited"),
+            &MessageSendOptions {
+                edit_pending: Some(String::new()),
+                expect_revision: Some(1),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    assert!(
+        matches!(edited, SendRoute::Mailbox(ref d) if d.edited && d.stable_id.as_deref() == Some(ids[2].as_str()))
+    );
+    let bodies: Vec<_> = snapshot_heads(&mut fixture.app, &session)
+        .iter()
+        .map(|head| head["body"].as_str().unwrap().to_string())
+        .collect();
+    assert!(bodies.contains(&"oldest".to_string()));
+    assert!(bodies.contains(&"middle".to_string()));
+    assert!(bodies.contains(&"newest, edited".to_string()));
+}
+
+/// The recipient's reprioritize: a held head changes priority as a new
+/// revision with its receipt, claim order follows it, and stale or claimed
+/// heads are refused. Arrival order (enqueueEpoch, acceptedAt) and the sender
+/// label are in every snapshot head.
+#[tokio::test]
+async fn reprioritize_changes_claim_order_with_a_durable_receipt() {
+    let mut fixture = fixture();
+    let session = attach_recipient(&mut fixture);
+    let recipient = fixture.terminals[1].clone();
+    let sender = sender(&fixture);
+    for (index, body) in ["first normal", "second normal"].iter().enumerate() {
+        fixture
+            .app
+            .route_ordinary_send(
+                &recipient,
+                &sender,
+                plain(body),
+                &MessageSendOptions {
+                    send_new: index > 0,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+    }
+    let heads = snapshot_heads(&mut fixture.app, &session);
+    let pick = |body: &str| {
+        heads
+            .iter()
+            .find(|head| head["body"] == body)
+            .unwrap()
+            .clone()
+    };
+    let first = pick("first normal");
+    let second = pick("second normal");
+    assert!(first["enqueueEpoch"].as_u64() < second["enqueueEpoch"].as_u64());
+    assert!(first["acceptedAt"].as_u64().is_some());
+    assert_eq!(first["delivery"]["senderLabel"], "tpm");
+    let request = |stable: &serde_json::Value, revision: u64, priority: &str| {
+        json!({"protocol": crate::mailbox_v1::PROTOCOL, "stableId": stable,
+               "expectedRevision": revision, "priority": priority})
+    };
+    assert!(dispatch(
+        &mut fixture.app,
+        &session,
+        "mailbox.reprioritize",
+        request(&second["stableId"], 9, "high")
+    )
+    .is_err());
+    assert!(dispatch(
+        &mut fixture.app,
+        &session,
+        "mailbox.reprioritize",
+        request(&second["stableId"], 1, "urgent")
+    )
+    .is_err());
+    let done = dispatch(
+        &mut fixture.app,
+        &session,
+        "mailbox.reprioritize",
+        request(&second["stableId"], 1, "high"),
+    )
+    .unwrap();
+    assert_eq!(done["type"], "mailbox_reprioritized");
+    assert_eq!(done["revision"], 2);
+    assert_eq!(done["priority"], "high");
+    assert_eq!(done["receipt"]["revision"], 2);
+    assert_eq!(done["receipt"]["status"], "admitted");
+    let claim = dispatch(
+        &mut fixture.app,
+        &session,
+        "mailbox.claim",
+        json!({"protocol": crate::mailbox_v1::PROTOCOL}),
+    )
+    .unwrap();
+    assert_eq!(
+        claim["claim"]["stableId"], second["stableId"],
+        "high runs first"
+    );
+    assert_eq!(claim["claim"]["revision"], 2);
+    // A claimed head can no longer be reprioritized.
+    assert!(dispatch(
+        &mut fixture.app,
+        &session,
+        "mailbox.reprioritize",
+        request(&second["stableId"], 2, "low")
+    )
+    .is_err());
 }
 
 #[tokio::test]

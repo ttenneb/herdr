@@ -53,6 +53,7 @@ pub(crate) fn retry_head(head: &MailboxHead, claim: &crate::mailbox::Claim) -> M
 pub(crate) fn human_self_head(
     inbox: &RecipientKey,
     terminal_key: &str,
+    pane_label: &str,
     subject: String,
     body: String,
     priority: String,
@@ -104,7 +105,7 @@ pub(crate) fn human_self_head(
         accepted_at: now_secs(),
         delivery: Some(ServerDelivery {
             origin: "human_typed".into(),
-            sender_label: "human at pane".into(),
+            sender_label: format!("human at {pane_label}"),
             sender_session: None,
             recipient_session,
             correlation: None,
@@ -460,6 +461,23 @@ impl App {
             generation: "1".into(),
         });
         keys
+    }
+
+    /// The current public pane ID of the pane showing this terminal.
+    pub(crate) fn public_pane_for_terminal(&self, terminal_key: &str) -> Option<String> {
+        self.state
+            .workspaces
+            .iter()
+            .enumerate()
+            .find_map(|(ws_idx, workspace)| {
+                workspace.tabs.iter().find_map(|tab| {
+                    tab.panes
+                        .iter()
+                        .find(|(_, pane)| pane.attached_terminal_id.to_string() == terminal_key)
+                        .map(|(pane_id, _)| (ws_idx, *pane_id))
+                })
+            })
+            .and_then(|(ws_idx, pane_id)| self.public_pane_id(ws_idx, pane_id))
     }
 
     pub(crate) fn pane_queue_key(&self, terminal_key: &str) -> Option<String> {
@@ -902,10 +920,12 @@ impl App {
             }
             Some(head)
         } else if let Some(wanted) = options.edit_pending.as_deref() {
+            // `--edit-pending` without a stableId edits the newest waiting
+            // message (pending is newest first).
             match pending
                 .iter()
                 .copied()
-                .find(|head| head.stable_id == wanted)
+                .find(|head| wanted.is_empty() || head.stable_id == wanted)
             {
                 Some(head) => Some(head),
                 None => return Err(SendRefusal::PendingChanged(listed(&pending))),
@@ -930,6 +950,7 @@ impl App {
                     subject: message.subject,
                     body: message.body,
                     repin_recipient_session: None,
+                    priority: None,
                 })
                 .map_err(|error| match error {
                     crate::mailbox::MailboxError::EditConflict
@@ -998,7 +1019,7 @@ pub(crate) fn pending_error_json(id: String, refusal: &SendRefusal) -> Option<St
     let (code, message, pending) = match refusal {
         SendRefusal::PendingExists(pending) => (
             "pending_exists",
-            "you already have messages waiting for this recipient; resend with --edit-pending <stableId> or --send-new",
+            "you already have messages waiting for this recipient; resend with --edit-pending (newest, or a stableId) or --send-new",
             pending,
         ),
         SendRefusal::PendingChanged(pending) => (
@@ -1009,7 +1030,9 @@ pub(crate) fn pending_error_json(id: String, refusal: &SendRefusal) -> Option<St
         _ => return None,
     };
     let error = serde_json::json!({"code": code, "message": message,
-                                   "pending": serde_json::to_value(pending).ok()?});
+                                   "pending": serde_json::to_value(pending).ok()?,
+                                   "pendingCount": pending.len(),
+                                   "newest": pending.first().map(serde_json::to_value).transpose().ok()?});
     Some(serde_json::json!({"id": id, "error": error}).to_string())
 }
 

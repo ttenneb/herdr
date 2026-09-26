@@ -758,16 +758,21 @@ pub(super) fn parse_message_send_option(
     use crate::api::schema::MessageTransport;
     match args[index].as_str() {
         "--edit-pending" => {
-            let Some(stable_id) = args.get(index + 1).filter(|value| !value.is_empty()) else {
-                eprintln!("--edit-pending requires the stableId of your waiting message");
-                return None;
-            };
             if options.send_new {
                 eprintln!("--edit-pending and --send-new are mutually exclusive");
                 return None;
             }
-            options.edit_pending = Some(stable_id.clone());
-            Some(2)
+            // An optional stableId (send./self./retry. plus 32 hex) picks one
+            // waiting message; without it the newest is edited.
+            let named = args.get(index + 1).filter(|value| {
+                value.split_once('.').is_some_and(|(prefix, hex)| {
+                    matches!(prefix, "send" | "self" | "retry")
+                        && hex.len() == 32
+                        && hex.bytes().all(|byte| byte.is_ascii_hexdigit())
+                })
+            });
+            options.edit_pending = Some(named.cloned().unwrap_or_default());
+            Some(if named.is_some() { 2 } else { 1 })
         }
         "--send-new" => {
             if options.edit_pending.is_some() {

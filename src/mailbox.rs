@@ -109,9 +109,12 @@ pub struct MailboxHeadEdit {
     pub digest: String,
     pub subject: String,
     pub body: String,
-    /// Re-pin a server-sent head to this recipient session (Retry/adopt of a
-    /// stranded head). The caller must have verified the recipient.
+    /// Re-pin a server-sent head to this recipient session. The caller must
+    /// have verified the recipient.
     pub repin_recipient_session: Option<String>,
+    /// Change the head's priority (`low`, `normal`, `high`): the recipient's
+    /// explicit reprioritize. The new revision carries its own receipt.
+    pub priority: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -620,6 +623,12 @@ impl MailboxStore {
                 body: edit.body,
                 ..current.clone()
             };
+            if let Some(priority) = edit.priority {
+                if !matches!(priority.as_str(), "low" | "normal" | "high") {
+                    return Err(MailboxError::InvalidRecord);
+                }
+                next.priority = priority;
+            }
             if let Some(session) = edit.repin_recipient_session {
                 let Some(delivery) = next.delivery.as_mut() else {
                     return Err(MailboxError::InvalidRecord);
@@ -1079,7 +1088,8 @@ impl RecoveredMailbox {
             || edit.head.grant_id != current.grant_id
             || edit.head.message_id != current.message_id
             || edit.head.kind != current.kind
-            || edit.head.priority != current.priority
+            || (edit.head.priority != current.priority
+                && !matches!(edit.head.priority.as_str(), "low" | "normal" | "high"))
             || edit.head.original_sequence != current.original_sequence
             || edit.head.enqueue_epoch != current.enqueue_epoch
             || edit.head.accepted_at != current.accepted_at
@@ -1270,6 +1280,7 @@ mod tests {
                 subject: "edited".into(),
                 body: "edited body".into(),
                 repin_recipient_session: None,
+                priority: None,
             })
             .unwrap();
         let recovered = store.load().unwrap();
@@ -1339,6 +1350,7 @@ mod tests {
                 subject: "edited".into(),
                 body: "edited while another head runs".into(),
                 repin_recipient_session: None,
+                priority: None,
             })
             .unwrap();
         assert_eq!(edited.revision, 2);
@@ -1355,6 +1367,7 @@ mod tests {
                 subject: "x".into(),
                 body: "y".into(),
                 repin_recipient_session: None,
+                priority: None,
             }),
             Err(MailboxError::HeadClaimed)
         );
