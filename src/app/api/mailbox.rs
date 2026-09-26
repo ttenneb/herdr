@@ -634,7 +634,14 @@ impl App {
                 }
             }
         }
-        self.handle_mailbox_server_scoped_submit(id, params)
+        let recipient = params.recipient.recipient_id.clone();
+        let stable_id = params.submit.stable_id.clone();
+        let response = self.handle_mailbox_server_scoped_submit(id, params);
+        // Wake hook: a head queued for a pane Herdr put to sleep wakes it.
+        if !response.contains("\"error\"") {
+            self.wake_for_appended_recipient(&recipient, stable_id);
+        }
+        response
     }
 
     fn handle_mailbox_server_scoped_submit(

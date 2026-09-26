@@ -498,6 +498,169 @@ impl App {
     }
 }
 
+/// How long after startup the backlog sweep keeps retrying slept panes whose
+/// shell is not at its prompt yet.
+pub(crate) const WAKE_SWEEP_WINDOW: Duration = Duration::from_secs(30);
+const WAKE_SWEEP_POLL: Duration = Duration::from_millis(500);
+
+impl App {
+    /// The Messages recipient of a pane Herdr put to sleep, so a send can be
+    /// queued for it while no Pi is attached.
+    pub(crate) fn sleeping_messages_recipient(
+        &self,
+        terminal_id: &str,
+    ) -> Option<crate::mailbox::RecipientKey> {
+        self.state
+            .terminals
+            .values()
+            .find(|terminal| terminal.id.to_string() == terminal_id)
+            .filter(|terminal| terminal.sleep.is_some())
+            .map(|_| crate::mailbox::RecipientKey {
+                recipient_id: terminal_id.to_string(),
+                generation: "1".into(),
+            })
+    }
+
+    fn wake_pane_key_for_terminal(&self, terminal_id: &TerminalId) -> Option<String> {
+        self.state
+            .workspaces
+            .iter()
+            .enumerate()
+            .find_map(|(ws_idx, workspace)| {
+                workspace.tabs.iter().find_map(|tab| {
+                    tab.panes
+                        .iter()
+                        .find(|(_, pane)| &pane.attached_terminal_id == terminal_id)
+                        .and_then(|(pane_id, _)| self.public_pane_id(ws_idx, *pane_id))
+                })
+            })
+    }
+
+    /// The mailbox hook: a head was appended for a recipient whose terminal
+    /// may be asleep. Only a slept pane with no attached Messages stream is
+    /// woken; Duplicate and Refused outcomes are expected and ignored.
+    pub(crate) fn wake_for_appended_head(&mut self, terminal_id: &TerminalId, head_id: String) {
+        let asleep = self
+            .state
+            .terminals
+            .get(terminal_id)
+            .is_some_and(|terminal| terminal.sleep.is_some());
+        if !asleep
+            || self
+                .attached_messages_recipient(&terminal_id.to_string())
+                .is_some()
+        {
+            return;
+        }
+        let Some(pane_key) = self.wake_pane_key_for_terminal(terminal_id) else {
+            return;
+        };
+        let _ = self.wake_pane(
+            &pane_key,
+            WakeTrigger {
+                cause: WakeCause::HeadAppended,
+                recipient_id: terminal_id.to_string(),
+                head_id,
+            },
+        );
+    }
+
+    /// [`Self::wake_for_appended_head`] for a mailbox recipient ID, which is
+    /// the recipient terminal's ID.
+    pub(crate) fn wake_for_appended_recipient(&mut self, recipient_id: &str, head_id: String) {
+        let terminal_id = self
+            .state
+            .terminals
+            .keys()
+            .find(|terminal| terminal.to_string() == recipient_id)
+            .cloned();
+        if let Some(terminal_id) = terminal_id {
+            self.wake_for_appended_head(&terminal_id, head_id);
+        }
+    }
+
+    fn first_unsettled_head(&self, terminal_id: &TerminalId) -> Option<String> {
+        let recipient = crate::mailbox::RecipientKey {
+            recipient_id: terminal_id.to_string(),
+            generation: "1".into(),
+        };
+        let store = crate::mailbox::MailboxStore::open(&self.sender_authority_dir).ok()?;
+        let snapshot = crate::mailbox_v1::snapshot(&store.load().ok()?, &recipient).ok()?;
+        snapshot
+            .head_states
+            .into_iter()
+            .find(|state| state.lifecycle != crate::mailbox_v1::HeadLifecycle::Settled)
+            .map(|state| state.stable_id)
+    }
+
+    pub(crate) fn next_wake_sweep_deadline(&self, now: Instant) -> Option<Instant> {
+        (!self.wake_sweep_done
+            && self
+                .state
+                .terminals
+                .values()
+                .any(|terminal| terminal.sleep.is_some()))
+        .then(|| now + WAKE_SWEEP_POLL)
+    }
+
+    /// Startup backlog sweep (level-triggered): every slept pane that still
+    /// has unsettled heads is woken with `RestoreBacklog`. Panes whose shell
+    /// is not at its prompt yet are retried until the sweep window closes.
+    pub(crate) fn run_wake_backlog_sweep(&mut self, now: Instant) -> bool {
+        if self.wake_sweep_done {
+            return false;
+        }
+        let deadline = *self
+            .wake_sweep_deadline
+            .get_or_insert(now + WAKE_SWEEP_WINDOW);
+        let candidates: Vec<TerminalId> = self
+            .state
+            .terminals
+            .values()
+            .filter(|terminal| terminal.sleep.is_some())
+            .map(|terminal| terminal.id.clone())
+            .filter(|terminal| {
+                !self.pane_wakes.contains_key(terminal)
+                    && !self.wake_sweep_settled.contains(terminal)
+            })
+            .collect();
+        let mut changed = false;
+        let mut waiting = false;
+        for terminal_id in candidates {
+            let Some(head_id) = self.first_unsettled_head(&terminal_id) else {
+                self.wake_sweep_settled.insert(terminal_id);
+                continue;
+            };
+            let Some(pane_key) = self.wake_pane_key_for_terminal(&terminal_id) else {
+                self.wake_sweep_settled.insert(terminal_id);
+                continue;
+            };
+            let outcome = self.wake_pane(
+                &pane_key,
+                WakeTrigger {
+                    cause: WakeCause::RestoreBacklog,
+                    recipient_id: terminal_id.to_string(),
+                    head_id,
+                },
+            );
+            match outcome {
+                WakeOutcome::Refused {
+                    reason: WakeRefusal::PaneNotAtIdleShell | WakeRefusal::CoolingDown { .. },
+                    ..
+                } => waiting = true,
+                _ => {
+                    self.wake_sweep_settled.insert(terminal_id);
+                    changed = true;
+                }
+            }
+        }
+        if !waiting || now >= deadline {
+            self.wake_sweep_done = true;
+        }
+        changed
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -708,6 +871,217 @@ mod tests {
             WakeOutcome::Duplicate { .. }
         ));
         assert!(input.try_recv().is_err());
+    }
+
+    fn request(app: &mut App, method: crate::api::schema::Method) -> serde_json::Value {
+        serde_json::from_str(&app.handle_api_request(crate::api::schema::Request {
+            id: "t".into(),
+            method,
+        }))
+        .unwrap()
+    }
+
+    fn prompt(app: &mut App, target: &str, text: &str) -> serde_json::Value {
+        request(
+            app,
+            crate::api::schema::Method::AgentPrompt(crate::api::schema::AgentPromptParams {
+                target: target.into(),
+                text: text.into(),
+                wait: None,
+                send: Default::default(),
+            }),
+        )
+    }
+
+    fn pi_attaches(app: &mut App, pane: crate::layout::PaneId, generation: u64) {
+        app.handle_internal_event(crate::events::AppEvent::AgentProcessDetected {
+            pane_id: pane,
+            agent: crate::detect::Agent::Pi,
+            process_generation: generation,
+            observed_at: Instant::now(),
+        });
+    }
+
+    fn claim(app: &mut App, terminal: &TerminalId, generation: u64) -> Option<String> {
+        let response = request(
+            app,
+            crate::api::schema::Method::MailboxClaim(crate::api::schema::MailboxClaimParams {
+                caller: terminal.to_string(),
+                grant_id: format!("offline:{terminal}:{generation}"),
+                recipient: crate::mailbox::RecipientKey {
+                    recipient_id: terminal.to_string(),
+                    generation: "1".into(),
+                },
+                claim: crate::mailbox_v1::ClaimRequest {
+                    protocol: crate::mailbox_v1::PROTOCOL.into(),
+                },
+            }),
+        );
+        let claim = &response["result"]["claim"];
+        if claim.is_null() {
+            return None;
+        }
+        let stable_id = claim["stable_id"]
+            .as_str()
+            .or_else(|| claim["stableId"].as_str())
+            .expect("claimed head id")
+            .to_string();
+        let claim_id = claim["claim_id"]
+            .as_str()
+            .or_else(|| claim["claimId"].as_str())
+            .expect("claim id")
+            .to_string();
+        let resolved = request(
+            app,
+            crate::api::schema::Method::MailboxResolve(crate::api::schema::MailboxResolveParams {
+                caller: terminal.to_string(),
+                grant_id: format!("offline:{terminal}:{generation}"),
+                recipient: crate::mailbox::RecipientKey {
+                    recipient_id: terminal.to_string(),
+                    generation: "1".into(),
+                },
+                resolve: crate::mailbox_v1::Resolve {
+                    protocol: crate::mailbox_v1::PROTOCOL.into(),
+                    claim_id,
+                    outcome: crate::mailbox_v1::ResolveOutcome::Settled,
+                },
+            }),
+        );
+        assert!(resolved.get("error").is_none(), "{resolved}");
+        Some(stable_id)
+    }
+
+    /// The wake hook end to end: sleep, then `agent prompt` to the sleeping
+    /// agent queues a Messages head and wakes the pane once; a second prompt
+    /// coalesces; the woken generation runs each head exactly once.
+    #[tokio::test]
+    async fn prompt_to_a_sleeping_agent_queues_wakes_once_and_each_head_runs_once() {
+        let (mut app, pane, terminal, public) = app_with_shell_pane();
+        let mut input = start(&mut app, &public, Vec::new());
+        pi_attaches(&mut app, pane, 1);
+        let slept = request(
+            &mut app,
+            crate::api::schema::Method::AgentSleep(AgentTarget {
+                target: "owner".into(),
+            }),
+        );
+        assert!(slept.get("error").is_none(), "{slept}");
+        pi_exits(&mut app, pane);
+        while input.try_recv().is_ok() {}
+
+        let first = prompt(&mut app, "owner", "first task");
+        assert_eq!(first["result"]["delivery"]["path"], "mailbox", "{first}");
+        assert_eq!(first["result"]["agent"]["name"], "owner");
+        let outstanding = app
+            .pane_wakes
+            .get(&terminal)
+            .expect("the head woke the pane")
+            .clone();
+        assert_eq!(outstanding.trigger.cause, WakeCause::HeadAppended);
+        let second = prompt(&mut app, "owner", "second task");
+        assert_eq!(second["result"]["delivery"]["path"], "mailbox", "{second}");
+        assert_eq!(
+            app.pane_wakes[&terminal].wake_id, outstanding.wake_id,
+            "coalesced"
+        );
+        let launch = input.try_recv().expect("one launch");
+        assert!(String::from_utf8_lossy(&launch).contains("pi"));
+        assert!(
+            input.try_recv().is_err(),
+            "exactly one launch, and no prompt typed"
+        );
+
+        pi_attaches(&mut app, pane, outstanding.generation);
+        assert!(app.state.terminals[&terminal].sleep.is_none());
+        let mut ran = Vec::new();
+        while let Some(head) = claim(&mut app, &terminal, outstanding.generation) {
+            ran.push(head);
+            assert!(ran.len() <= 2, "a head ran twice: {ran:?}");
+        }
+        assert_eq!(ran.len(), 2, "each queued head runs exactly once");
+        let delivered = |response: &serde_json::Value| {
+            let delivery = &response["result"]["delivery"];
+            delivery["stable_id"]
+                .as_str()
+                .or_else(|| delivery["stableId"].as_str())
+                .expect("delivery stable id")
+                .to_string()
+        };
+        let mut expected = vec![delivered(&first), delivered(&second)];
+        expected.sort();
+        ran.sort();
+        assert_eq!(ran, expected);
+    }
+
+    #[tokio::test]
+    async fn prompt_after_a_manual_quit_neither_queues_nor_wakes() {
+        let (mut app, pane, terminal, public) = app_with_shell_pane();
+        let mut input = start(&mut app, &public, Vec::new());
+        pi_attaches(&mut app, pane, 1);
+        pi_exits(&mut app, pane);
+        while input.try_recv().is_ok() {}
+        let response = prompt(&mut app, "owner", "hello?");
+        assert!(response.get("error").is_some(), "{response}");
+        assert!(app.pane_wakes.is_empty());
+        assert!(input.try_recv().is_err(), "nothing launched or typed");
+        assert_eq!(app.first_unsettled_head(&terminal), None, "nothing queued");
+    }
+
+    #[tokio::test]
+    async fn startup_backlog_sweep_wakes_slept_panes_with_unsettled_heads_only() {
+        let (mut app, pane, terminal, public) = app_with_shell_pane();
+        let mut input = start(&mut app, &public, Vec::new());
+        pi_attaches(&mut app, pane, 1);
+        request(
+            &mut app,
+            crate::api::schema::Method::AgentSleep(AgentTarget {
+                target: "owner".into(),
+            }),
+        );
+        pi_exits(&mut app, pane);
+        // Nothing queued yet: the sweep leaves the pane asleep.
+        assert!(!app.run_wake_backlog_sweep(Instant::now()));
+        assert!(app.pane_wakes.is_empty());
+        // A head queued before the "restart", with the hook not yet run.
+        app.wake_sweep_done = false;
+        app.wake_sweep_settled.clear();
+        app.pane_wake_cooldowns.clear();
+        let recipient = app
+            .sleeping_messages_recipient(&terminal.to_string())
+            .unwrap();
+        let sender = crate::app::messages::SenderAttribution {
+            terminal: None,
+            label: "external".into(),
+            session: None,
+        };
+        let routed = app.route_ordinary_send(
+            &terminal.to_string(),
+            &sender,
+            crate::app::messages::OutgoingMessage {
+                origin: "agent_prompt",
+                subject: "backlog".into(),
+                body: "queued before restart".into(),
+                priority: "normal".into(),
+                kind: "advisory".into(),
+                message_id: None,
+                correlation: None,
+                replace_pending: false,
+            },
+            &Default::default(),
+        );
+        assert!(matches!(
+            routed,
+            Ok(crate::app::messages::SendRoute::Mailbox(_))
+        ));
+        assert_eq!(recipient.recipient_id, terminal.to_string());
+        while input.try_recv().is_ok() {}
+        assert!(app.run_wake_backlog_sweep(Instant::now()));
+        let outstanding = app
+            .pane_wakes
+            .get(&terminal)
+            .expect("backlog woke the pane");
+        assert_eq!(outstanding.trigger.cause, WakeCause::RestoreBacklog);
+        assert!(input.try_recv().is_ok(), "one launch");
     }
 
     #[cfg(unix)]

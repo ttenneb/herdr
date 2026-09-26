@@ -332,7 +332,10 @@ impl App {
         if transport == MessageTransport::Pty {
             return Ok(SendRoute::Pty);
         }
-        let Some(recipient) = self.attached_messages_recipient(recipient_terminal) else {
+        let Some(recipient) = self
+            .attached_messages_recipient(recipient_terminal)
+            .or_else(|| self.sleeping_messages_recipient(recipient_terminal))
+        else {
             return match transport {
                 MessageTransport::Mailbox => Err(SendRefusal::MailboxUnavailable(
                     "the recipient has no live Messages connection",

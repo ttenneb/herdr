@@ -59,6 +59,81 @@ impl App {
         encode_success(id, ResponseResult::AgentStarted { agent, argv })
     }
 
+    /// A message for an agent Herdr put to sleep is queued to its Messages
+    /// mailbox, and the queued head wakes the pane.
+    fn prompt_sleeping_agent(
+        &mut self,
+        id: String,
+        ws_idx: usize,
+        pane_id: crate::layout::PaneId,
+        params: AgentPromptParams,
+    ) -> String {
+        let Some(terminal_id) = self
+            .state
+            .workspaces
+            .get(ws_idx)
+            .and_then(|workspace| workspace.terminal_id(pane_id))
+            .cloned()
+        else {
+            return agent_not_found(id, &params.target);
+        };
+        if params.send.transport == Some(crate::api::schema::MessageTransport::Pty) {
+            return encode_error(
+                id,
+                "agent_sleeping",
+                "the agent is asleep; only a Messages send can reach it",
+            );
+        }
+        let sender = self.attribute_sender(params.send.caller_pid);
+        let message =
+            crate::app::messages::parse_structured_prompt(&params.text).unwrap_or_else(|| {
+                crate::app::messages::OutgoingMessage {
+                    origin: "agent_prompt",
+                    subject: crate::app::messages::subject_for("Message from", &sender.label),
+                    body: params.text.clone(),
+                    priority: "normal".into(),
+                    kind: "advisory".into(),
+                    message_id: None,
+                    correlation: None,
+                    replace_pending: false,
+                }
+            });
+        let mut options = params.send.clone();
+        options.transport = Some(crate::api::schema::MessageTransport::Mailbox);
+        match self.route_ordinary_send(&terminal_id.to_string(), &sender, message, &options) {
+            Ok(crate::app::messages::SendRoute::Mailbox(delivery)) => {
+                if let Some(head_id) = delivery.stable_id.clone() {
+                    self.wake_for_appended_head(&terminal_id, head_id);
+                }
+                let Some(agent) = self.agent_info_with_sleeping(ws_idx, pane_id, true) else {
+                    return agent_not_found(id, &params.target);
+                };
+                encode_success(
+                    id,
+                    ResponseResult::AgentPrompted {
+                        agent,
+                        delivery: Some(delivery),
+                    },
+                )
+            }
+            Ok(crate::app::messages::SendRoute::Pty) => encode_error(
+                id,
+                "agent_sleeping",
+                "the agent is asleep; only a Messages send can reach it",
+            ),
+            Err(refusal) => crate::app::messages::pending_error_json(id.clone(), &refusal)
+                .unwrap_or_else(|| match refusal {
+                    crate::app::messages::SendRefusal::Store(message) => {
+                        encode_error(id, "mailbox_store_failed", message)
+                    }
+                    crate::app::messages::SendRefusal::MailboxUnavailable(message) => {
+                        encode_error(id, "messages_unavailable", message)
+                    }
+                    _ => encode_error(id, "agent_prompt_failed", "send refused"),
+                }),
+        }
+    }
+
     pub(super) fn handle_agent_prompt(&mut self, id: String, params: AgentPromptParams) -> String {
         if params.text.is_empty() {
             return encode_error(id, "empty_agent_prompt", "agent prompt must not be empty");
@@ -79,6 +154,9 @@ impl App {
         let Some(terminal) = self.state.terminals.get(&terminal_id) else {
             return agent_not_found(id, &params.target);
         };
+        if terminal.sleep.is_some() {
+            return self.prompt_sleeping_agent(id, resolved.ws_idx, resolved.pane_id, params);
+        }
         if terminal.state == crate::detect::AgentState::Blocked {
             return encode_error(
                 id,

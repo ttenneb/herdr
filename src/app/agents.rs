@@ -872,10 +872,22 @@ impl App {
         ws_idx: usize,
         pane_id: crate::layout::PaneId,
     ) -> Option<crate::api::schema::AgentInfo> {
+        self.agent_info_with_sleeping(ws_idx, pane_id, false)
+    }
+
+    /// As [`Self::agent_info`]; with `sleeping`, a pane Herdr put to sleep is
+    /// described too, under its sleeping agent's name.
+    pub(crate) fn agent_info_with_sleeping(
+        &self,
+        ws_idx: usize,
+        pane_id: crate::layout::PaneId,
+        sleeping: bool,
+    ) -> Option<crate::api::schema::AgentInfo> {
         let ws = self.state.workspaces.get(ws_idx)?;
         let pane_state = ws.pane_state(pane_id)?;
         let terminal = self.state.terminals.get(&pane_state.attached_terminal_id)?;
-        if !terminal.is_agent_terminal() {
+        let asleep = sleeping && terminal.sleep.is_some();
+        if !terminal.is_agent_terminal() && !asleep {
             return None;
         }
         let pane = self.pane_info(ws_idx, pane_id)?;
@@ -884,7 +896,16 @@ impl App {
             self.agent_session_for_info(terminal, pi_label, pane.agent_session.clone());
         Some(crate::api::schema::AgentInfo {
             terminal_id: pane.terminal_id,
-            name: terminal.agent_name.clone(),
+            name: terminal.agent_name.clone().or_else(|| {
+                asleep
+                    .then(|| {
+                        terminal
+                            .sleep
+                            .as_ref()
+                            .map(|sleep| sleep.agent_name.clone())
+                    })
+                    .flatten()
+            }),
             agent: pane.agent,
             title: pane.title,
             terminal_title: pane.terminal_title,

@@ -93,7 +93,16 @@ impl App {
                     .terminals
                     .values()
                     .find(|terminal| terminal.id.to_string() == candidate.terminal_id)
-                    .is_some_and(|terminal| terminal.agent_name.as_deref() == Some(target))
+                    .is_some_and(|terminal| {
+                        terminal.agent_name.as_deref() == Some(target)
+                            // A sleeping agent stays addressable by name, so a
+                            // message can be queued for it and wake it.
+                            || (terminal.agent_name.is_none()
+                                && terminal
+                                    .sleep
+                                    .as_ref()
+                                    .is_some_and(|sleep| sleep.agent_name == target))
+                    })
             })
             .collect();
         if let Some(resolved) = self.single_terminal_match(target, name_matches)? {
@@ -110,7 +119,7 @@ impl App {
             .terminals
             .values()
             .find(|terminal| terminal.id.to_string() == target.terminal_id)
-            .is_some_and(|terminal| terminal.is_agent_terminal())
+            .is_some_and(|terminal| terminal.is_agent_terminal() || terminal.sleep.is_some())
     }
 
     fn single_terminal_match(
