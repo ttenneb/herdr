@@ -5,7 +5,7 @@ use crate::api::schema::{HandoffSendParams, HerdrHandoff, Method, Request};
 pub(super) fn run_handoff_command(args: &[String]) -> std::io::Result<i32> {
     match args.first().map(String::as_str) {
         Some("validate") if args.len() == 2 => validate(&args[1]),
-        Some("send") if args.len() == 2 => send(&args[1]),
+        Some("send") if args.len() >= 2 => send(&args[1], &args[2..]),
         Some("help" | "--help" | "-h") => {
             print_help();
             Ok(0)
@@ -59,7 +59,19 @@ fn validate(source: &str) -> std::io::Result<i32> {
     Ok(0)
 }
 
-fn send(source: &str) -> std::io::Result<i32> {
+fn send(source: &str, rest: &[String]) -> std::io::Result<i32> {
+    let mut options = crate::api::schema::MessageSendOptions::default();
+    let mut index = 0;
+    while index < rest.len() {
+        match super::parse_message_send_option(rest, index, &mut options) {
+            None => return Ok(2),
+            Some(0) => {
+                eprintln!("unknown option: {}", rest[index]);
+                return Ok(2);
+            }
+            Some(consumed) => index += consumed,
+        }
+    }
     let envelope = match read_envelope(source) {
         Ok(value) => value,
         Err(err) => {
@@ -75,19 +87,22 @@ fn send(source: &str) -> std::io::Result<i32> {
         id: "cli:handoff:send".into(),
         method: Method::HandoffSend(HandoffSendParams {
             envelope,
-            send: Default::default(),
+            send: options,
         }),
     })?;
-    let admitted =
-        response["result"]["receipt"]["outcome"].as_str() == Some("runtime_transaction_admitted");
-    let code = super::print_response(&response)?;
+    let admitted = matches!(
+        response["result"]["receipt"]["outcome"].as_str(),
+        Some("runtime_transaction_admitted" | "mailbox_admitted")
+    );
+    let code = super::print_send_response(&response)?;
     Ok(if code == 0 && !admitted { 1 } else { code })
 }
 
 fn print_help() {
     eprintln!("herdr handoff commands:");
     eprintln!("  herdr handoff validate <JSON|PATH|->");
-    eprintln!("  herdr handoff send <JSON|PATH|->");
+    eprintln!("  herdr handoff send <JSON|PATH|-> [--transport auto|mailbox|pty] [--edit-pending|--send-new] [--expect-revision N]");
+    eprintln!("  exit 4: a message from you to this recipient is still pending (JSON on stdout)");
 }
 
 #[cfg(test)]

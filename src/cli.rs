@@ -748,6 +748,79 @@ pub(super) fn parse_attach_target(args: &[String], usage: &str) -> Result<(Strin
     Ok((target.clone(), takeover))
 }
 
+/// Parses one Messages send option at `args[index]`. Returns how many
+/// arguments it consumed, `Some(0)` for an unknown option, `None` on error.
+pub(super) fn parse_message_send_option(
+    args: &[String],
+    index: usize,
+    options: &mut crate::api::schema::MessageSendOptions,
+) -> Option<usize> {
+    use crate::api::schema::{MessageTransport, PendingChoice};
+    match args[index].as_str() {
+        "--edit-pending" | "--send-new" => {
+            if options.on_pending.is_some() {
+                eprintln!("--edit-pending and --send-new are mutually exclusive");
+                return None;
+            }
+            options.on_pending = Some(if args[index] == "--edit-pending" {
+                PendingChoice::EditPending
+            } else {
+                PendingChoice::SendNew
+            });
+            Some(1)
+        }
+        "--expect-revision" => {
+            let Some(revision) = args.get(index + 1).and_then(|value| value.parse().ok()) else {
+                eprintln!("--expect-revision requires a positive integer");
+                return None;
+            };
+            options.expect_revision = Some(revision);
+            Some(2)
+        }
+        "--transport" => {
+            options.transport = Some(match args.get(index + 1).map(String::as_str) {
+                Some("auto") => MessageTransport::Auto,
+                Some("mailbox") => MessageTransport::Mailbox,
+                Some("pty") => MessageTransport::Pty,
+                _ => {
+                    eprintln!("--transport must be auto, mailbox or pty");
+                    return None;
+                }
+            });
+            Some(2)
+        }
+        _ => Some(0),
+    }
+}
+
+/// Exit code 4: this sender already has a message waiting for the recipient
+/// (`pending_exists`) or `--edit-pending` found it picked up (`pending_claimed`).
+/// The JSON goes to stdout so an agent can read the pending message; one plain
+/// line goes to stderr.
+pub(super) const PENDING_EXIT_CODE: i32 = 4;
+
+pub(super) fn print_send_response(response: &serde_json::Value) -> std::io::Result<i32> {
+    match response["error"]["code"].as_str() {
+        Some(code @ ("pending_exists" | "pending_claimed")) => {
+            println!("{}", serde_json::to_string(response).unwrap());
+            let subject = response["error"]["pending"]["subject"]
+                .as_str()
+                .unwrap_or("(unknown)");
+            if code == "pending_exists" {
+                eprintln!(
+                    "a message to this recipient is still pending (subject: {subject}); rerun with --edit-pending or --send-new"
+                );
+            } else {
+                eprintln!(
+                    "the pending message was already picked up or changed; rerun with --send-new"
+                );
+            }
+            Ok(PENDING_EXIT_CODE)
+        }
+        _ => print_response(response),
+    }
+}
+
 pub(super) fn print_response(response: &serde_json::Value) -> std::io::Result<i32> {
     if response.get("error").is_some() {
         eprintln!("{}", serde_json::to_string(response).unwrap());

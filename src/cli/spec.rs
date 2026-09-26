@@ -132,8 +132,24 @@ fn handoff_command() -> Command {
         )
         .subcommand(
             Command::new("send")
-                .about("Submit a handoff through the normal prompt path")
-                .arg(source()),
+                .about("Submit a handoff through the recipient's Messages queue or the normal prompt path")
+                .arg(source())
+                .arg(
+                    option("transport", "MODE")
+                        .value_parser(["auto", "mailbox", "pty"])
+                        .help("auto (default): the recipient's Messages queue when it has one, else typed into the pane; mailbox or pty force one path"),
+                )
+                .arg(
+                    flag("edit-pending")
+                        .conflicts_with("send-new")
+                        .help("If your earlier message to this recipient is still waiting, replace its text"),
+                )
+                .arg(flag("send-new").help("If your earlier message is still waiting, queue this one as well"))
+                .arg(
+                    option("expect-revision", "N")
+                        .requires("edit-pending")
+                        .help("With --edit-pending: only edit if the waiting message is still at revision N"),
+                ),
         )
 }
 
@@ -676,8 +692,24 @@ fn agent_command() -> Command {
                         .requires("wait")
                         .help("Fail after this many milliseconds"),
                 )
+                .arg(
+                    option("transport", "MODE")
+                        .value_parser(["auto", "mailbox", "pty"])
+                        .help("auto (default): the recipient's Messages queue when it has one, else typed into the pane; mailbox or pty force one path"),
+                )
+                .arg(
+                    flag("edit-pending")
+                        .conflicts_with("send-new")
+                        .help("If your earlier message to this recipient is still waiting, replace its text"),
+                )
+                .arg(flag("send-new").help("If your earlier message is still waiting, queue this one as well"))
+                .arg(
+                    option("expect-revision", "N")
+                        .requires("edit-pending")
+                        .help("With --edit-pending: only edit if the waiting message is still at revision N"),
+                )
                 .after_help(
-                    "If the agent is already blocked, submission is rejected with agent_blocked before any input is sent. When an accepted submission starts from another non-working state, --wait first requires an observed state change within 5000ms; otherwise it returns agent_prompt_stalled. A shorter --timeout returns timeout instead. It then matches idle, done, or blocked by default, or any exact --until state. It does not track turns: if the agent is already working, that active turn's completion may match. Without --timeout, the settled-state wait is indefinite.",
+                    "Exit code 4 (JSON on stdout): you already have a message waiting for this recipient (pending_exists), or --edit-pending found it picked up (pending_claimed). If the agent is already blocked, submission is rejected with agent_blocked before any input is sent. When an accepted submission starts from another non-working state, --wait first requires an observed state change within 5000ms; otherwise it returns agent_prompt_stalled. A shorter --timeout returns timeout instead. It then matches idle, done, or blocked by default, or any exact --until state. It does not track turns: if the agent is already working, that active turn's completion may match. Without --timeout, the settled-state wait is indefinite.",
                 ),
         )
         .subcommand(

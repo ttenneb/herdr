@@ -814,6 +814,97 @@ mod tests {
     }
 
     #[test]
+    fn watch_parks_until_the_journal_changes_and_close_releases_the_binding() {
+        let (mut app, directory, sender) = active_app();
+        let mut listener = listener(&directory);
+        let mut client = UnixStream::connect(listener.path()).expect("connect bootstrap socket");
+        client
+            .set_read_timeout(Some(Duration::from_secs(1)))
+            .expect("set read timeout");
+        let descriptor = bootstrap(&mut listener, &mut app, &mut client);
+        assert_eq!(
+            descriptor["result"]["messages"]["watchMethod"],
+            "mailbox.watch"
+        );
+        assert!(descriptor["result"].get("recipientOnly").is_none());
+        let binding = descriptor["result"]["bindingGeneration"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        assert!(app.attached_messages_recipient(&sender).is_some());
+        let first = exchange(
+            &mut listener,
+            &mut app,
+            &mut client,
+            json!({"method":"mailbox.watch","requestId":"w0","bindingGeneration":binding,
+                   "params":{"protocol":crate::mailbox_v1::PROTOCOL}}),
+        );
+        assert_eq!(first["result"]["changed"], false);
+        let marker = first["result"]["marker"].as_u64().unwrap();
+        // Parked: no response while nothing changes.
+        let frame = json!({"method":"mailbox.watch","requestId":"w1","bindingGeneration":binding,
+            "params":{"protocol":crate::mailbox_v1::PROTOCOL,"afterMarker":marker,"timeoutMs":5000}});
+        client.write_all(format!("{frame}\n").as_bytes()).unwrap();
+        listener.poll(&mut app).unwrap();
+        client
+            .set_read_timeout(Some(Duration::from_millis(100)))
+            .unwrap();
+        let mut byte = [0_u8; 1];
+        assert!(
+            client.read_exact(&mut byte).is_err(),
+            "watch must be parked"
+        );
+        // Another writer appends; the next poll answers the watch.
+        crate::mailbox::MailboxStore::open(&directory)
+            .unwrap()
+            .append_offline_head(crate::mailbox::MailboxHead {
+                stable_id: "watch-stable".into(),
+                revision: 1,
+                digest: "c".repeat(64),
+                delivery_digest: "d".repeat(64),
+                recipient: crate::mailbox::RecipientKey {
+                    recipient_id: sender.clone(),
+                    generation: "1".into(),
+                },
+                subject: "s".into(),
+                body: "b".into(),
+                recipient_generation: "1".into(),
+                sender: "someone".into(),
+                target: sender.clone(),
+                grant_id: "g".into(),
+                message_id: "m".into(),
+                kind: "advisory".into(),
+                priority: "normal".into(),
+                original_sequence: 1,
+                enqueue_epoch: 0,
+                accepted_at: 1,
+                delivery: None,
+            })
+            .unwrap();
+        listener.poll(&mut app).unwrap();
+        client
+            .set_read_timeout(Some(Duration::from_secs(1)))
+            .unwrap();
+        let mut response = Vec::new();
+        loop {
+            client.read_exact(&mut byte).unwrap();
+            if byte[0] == b'\n' {
+                break;
+            }
+            response.push(byte[0]);
+        }
+        let response: Value = serde_json::from_slice(&response).unwrap();
+        assert_eq!(response["requestId"], "w1");
+        assert_eq!(response["result"]["changed"], true);
+        assert_ne!(response["result"]["marker"].as_u64().unwrap(), marker);
+        // Closing the stream releases the binding: no longer "has Messages".
+        drop(client);
+        listener.poll(&mut app).unwrap();
+        assert!(app.attached_messages_recipient(&sender).is_none());
+        std::fs::remove_dir_all(directory).ok();
+    }
+
+    #[test]
     fn bootstrap_success_authenticates_all_mailbox_dispatches_with_server_scope() {
         let (mut app, directory, sender) = active_app();
         let mut listener = listener(&directory);

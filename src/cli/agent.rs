@@ -793,7 +793,7 @@ fn agent_rename(args: &[String]) -> std::io::Result<i32> {
 fn agent_prompt(args: &[String]) -> std::io::Result<i32> {
     let Some(target) = args.first() else {
         eprintln!(
-            "usage: herdr agent prompt <target> <text> [--wait] [--until STATUS]... [--timeout MS]"
+            "usage: herdr agent prompt <target> <text> [--wait] [--until STATUS]... [--timeout MS] [--transport auto|mailbox|pty] [--edit-pending|--send-new] [--expect-revision N]"
         );
         return Ok(2);
     };
@@ -804,8 +804,17 @@ fn agent_prompt(args: &[String]) -> std::io::Result<i32> {
     let mut wait = false;
     let mut until = Vec::new();
     let mut timeout_ms = None;
+    let mut send = crate::api::schema::MessageSendOptions::default();
     let mut index = 2;
     while index < args.len() {
+        match super::parse_message_send_option(args, index, &mut send) {
+            None => return Ok(2),
+            Some(0) => {}
+            Some(consumed) => {
+                index += consumed;
+                continue;
+            }
+        }
         match args[index].as_str() {
             "--wait" => {
                 wait = true;
@@ -857,10 +866,10 @@ fn agent_prompt(args: &[String]) -> std::io::Result<i32> {
             target: target.clone(),
             text: text.clone(),
             wait: wait.then_some(AgentPromptWaitOptions { until, timeout_ms }),
-            send: Default::default(),
+            send,
         }),
     })?;
-    super::print_response(&response)
+    super::print_send_response(&response)
 }
 
 fn agent_send_keys(args: &[String]) -> std::io::Result<i32> {

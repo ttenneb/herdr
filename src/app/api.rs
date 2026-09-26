@@ -11,6 +11,8 @@ mod handoffs_tests;
 mod integrations;
 mod layouts;
 mod mailbox;
+#[cfg(all(test, target_os = "linux"))]
+mod messages_tests;
 mod pane_graphics;
 mod panes;
 pub(crate) mod plugins;
