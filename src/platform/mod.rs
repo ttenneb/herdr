@@ -312,6 +312,8 @@ pub(crate) struct RemoteSshConfigPaths {
 
 #[cfg(unix)]
 mod unix_common;
+#[cfg(all(test, unix))]
+pub(crate) use unix_common::remote_bridge_endpoint_path_in;
 #[cfg(unix)]
 pub(crate) use unix_common::{begin_cli_output, end_cli_output};
 

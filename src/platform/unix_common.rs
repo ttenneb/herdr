@@ -153,7 +153,16 @@ pub(crate) fn remote_private_temp_base() -> PathBuf {
 }
 
 pub(crate) fn remote_bridge_endpoint_path(readable_name: &str, short_name: &str) -> PathBuf {
-    let tmp = std::env::temp_dir();
+    remote_bridge_endpoint_path_in(&std::env::temp_dir(), readable_name, short_name)
+}
+
+/// [`remote_bridge_endpoint_path`] for an explicit temporary directory (tests
+/// pass one instead of changing the process-wide `TMPDIR`).
+pub(crate) fn remote_bridge_endpoint_path_in(
+    tmp: &std::path::Path,
+    readable_name: &str,
+    short_name: &str,
+) -> PathBuf {
     let readable = tmp.join(readable_name);
     if fits_unix_socket_path(&readable) {
         return readable;

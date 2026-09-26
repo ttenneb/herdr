@@ -2143,6 +2143,11 @@ fn run_client_process(
 }
 
 fn local_forward_socket_path(target: &str, session_name: &str) -> PathBuf {
+    let (readable_name, short_name) = local_forward_socket_names(target, session_name);
+    crate::platform::remote_bridge_endpoint_path(&readable_name, &short_name)
+}
+
+fn local_forward_socket_names(target: &str, session_name: &str) -> (String, String) {
     let pid = std::process::id();
     let target_clean = sanitize_path_component(target);
     let session_clean = sanitize_path_component(session_name);
@@ -2150,7 +2155,7 @@ fn local_forward_socket_path(target: &str, session_name: &str) -> PathBuf {
     let target_prefix: String = target_clean.chars().take(8).collect();
     let hash = short_socket_hash(target, session_name);
     let short_name = format!("herdr-r-{pid}-{target_prefix}-{hash}.sock");
-    crate::platform::remote_bridge_endpoint_path(&readable_name, &short_name)
+    (readable_name, short_name)
 }
 
 #[cfg(all(test, unix))]
@@ -3368,15 +3373,15 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn local_forward_socket_path_falls_back_to_tmp_when_dir_is_long() {
-        let _guard = crate::test_env::lock();
-        // Force a TMPDIR long enough that even the hashed short name cannot
-        // fit inside it. The fallback should drop to /tmp.
-        let prior = std::env::var_os("TMPDIR");
+        // A temp dir long enough that even the hashed short name cannot fit
+        // inside it: the fallback should drop to /tmp. The directory is
+        // passed explicitly: changing the process-wide TMPDIR (and removing
+        // it again) raced every other test that uses std::env::temp_dir().
         let long_dir = std::env::temp_dir().join("a".repeat(80));
-        let _ = fs::create_dir_all(&long_dir);
-        std::env::set_var("TMPDIR", &long_dir);
-
-        let path = local_forward_socket_path("longish-host.example.com", "default");
+        let (readable_name, short_name) =
+            local_forward_socket_names("longish-host.example.com", "default");
+        let path =
+            crate::platform::remote_bridge_endpoint_path_in(&long_dir, &readable_name, &short_name);
         let fits = fits_unix_socket_path(&path);
         let parent = path.parent().map(Path::to_path_buf);
         let filename = path
@@ -3384,12 +3389,6 @@ mod tests {
             .and_then(|s| s.to_str())
             .unwrap_or("")
             .to_string();
-
-        match prior {
-            Some(v) => std::env::set_var("TMPDIR", v),
-            None => std::env::remove_var("TMPDIR"),
-        }
-        let _ = fs::remove_dir_all(&long_dir);
 
         assert!(fits, "fallback path still overflows: {}", path.display());
         assert_eq!(parent.as_deref(), Some(Path::new("/tmp")));
