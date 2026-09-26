@@ -3523,6 +3523,17 @@ async fn every_send_reports_its_method_and_typed_sends_leave_history() {
             .unwrap();
         assert_eq!(state["lifecycle"], "settled");
         assert_eq!(state["closedBy"], "typed");
+        // An admitted receipt with the row's exact revision and digest.
+        let receipt = snapshot["snapshot"]["receipts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|receipt| receipt["stableId"] == row["stableId"])
+            .expect("typed row has a receipt");
+        assert_eq!(receipt["status"], "admitted");
+        assert_eq!(receipt["revision"], row["revision"]);
+        assert_eq!(receipt["digest"], row["digest"]);
+        assert_eq!(receipt["deliveryDigest"], row["deliveryDigest"]);
         assert!(state.get("recoveryNeeded").is_none());
     }
     let claim = dispatch(
