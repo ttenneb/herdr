@@ -5688,6 +5688,9 @@ mod tests {
         app.local_terminal_notifications = false;
         app.local_input_source_switch = false;
 
+        // Another test may briefly point TMPDIR at an over-long directory; hold
+        // the shared env guard while choosing and binding the socket path.
+        let env_guard = crate::test_env::shared();
         let dir = std::env::temp_dir().join(format!(
             "hh-{}-{}",
             std::process::id(),
@@ -5700,6 +5703,7 @@ mod tests {
         let socket_path = dir.join("client.sock");
         let _ = fs::remove_file(&socket_path);
         let listener = bind_local_listener(&socket_path).expect("bind test listener");
+        drop(env_guard);
         let client_socket_identity =
             socket_file_identity(&socket_path).expect("test listener socket identity");
         #[cfg(unix)]
