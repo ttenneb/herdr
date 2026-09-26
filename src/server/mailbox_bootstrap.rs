@@ -753,6 +753,224 @@ mod tests {
         );
     }
 
+    /// A ready child → parent route whose child pane has a recipe on the same
+    /// session file its trusted Pi uses, and whose Pi has just exited.
+    fn ready_route_with_child_recipe() -> (
+        App,
+        PathBuf,
+        crate::delegation::DelegationId,
+        crate::delegation::DelegationId,
+        crate::layout::PaneId,
+        crate::terminal::TerminalId,
+    ) {
+        let (mut app, directory, child_sender) = active_app();
+        active_managed_recipient(&mut app, &directory);
+        let child_pane = app.state.workspaces[0].tabs[0].root_pane.unwrap();
+        let parent_pane = app.state.workspaces[1].tabs[0].root_pane.unwrap();
+        let parent = app
+            .state
+            .delegations
+            .create(Some(parent_pane), None, None)
+            .unwrap();
+        let child = app
+            .state
+            .delegations
+            .create(Some(child_pane), Some(parent), None)
+            .unwrap();
+        ready_test_route(&mut app, &directory, child, parent);
+        let child_terminal = app.state.workspaces[0]
+            .terminal_id(child_pane)
+            .unwrap()
+            .clone();
+        let session = directory.join(format!("{child_sender}.jsonl"));
+        let carry = app.state.terminals[&child_terminal]
+            .route_carry
+            .clone()
+            .expect("route_ready remembers the route on the child pane");
+        assert_eq!(carry.parent_delegation, parent.to_string());
+        assert_eq!(carry.session_path, session.display().to_string());
+        let (runtime, input) = crate::terminal::TerminalRuntime::test_with_channel(80, 24);
+        std::mem::forget(input);
+        app.terminal_runtimes
+            .insert(child_terminal.clone(), runtime);
+        app.state
+            .terminals
+            .get_mut(&child_terminal)
+            .unwrap()
+            .launch_recipe = crate::launch_recipe::LaunchRecipe::capture(
+            "sender",
+            "pi",
+            &["--session".into(), session.display().to_string()],
+            &[(
+                "PI_CODING_AGENT_SESSION_DIR".into(),
+                directory.display().to_string(),
+            )],
+        );
+        app.handle_internal_event(crate::events::AppEvent::StateChanged {
+            pane_id: child_pane,
+            agent: None,
+            state: crate::detect::AgentState::Idle,
+            visible_blocker: false,
+            visible_working: false,
+            process_exited: true,
+            observed_at: std::time::Instant::now(),
+        });
+        (app, directory, child, parent, child_pane, child_terminal)
+    }
+
+    /// The relaunched Pi (the test process stands in for it) is born after the
+    /// launch cutoff and observed Active.
+    fn relaunched_pi_attaches(
+        app: &mut App,
+        pane: crate::layout::PaneId,
+        terminal: &crate::terminal::TerminalId,
+        generation: u64,
+    ) {
+        let floor = app.managed_pi_launches[terminal].earliest_birth_ticks;
+        let pid = std::process::id();
+        app.mailbox_bootstrap_test_process_births.insert(
+            pid,
+            crate::platform::ProcessBirthIdentity {
+                pid,
+                start_ticks: floor,
+            },
+        );
+        app.handle_internal_event(crate::events::AppEvent::AgentProcessDetected {
+            pane_id: pane,
+            agent: crate::detect::Agent::Pi,
+            process_generation: generation,
+            observed_at: std::time::Instant::now(),
+        });
+    }
+
+    fn route_carry_outcome(
+        directory: &Path,
+        child: crate::delegation::DelegationId,
+        generation: u64,
+    ) -> String {
+        let record: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(
+                directory
+                    .join("route-carries")
+                    .join(format!("{child}-g{generation}.json")),
+            )
+            .expect("route carry record"),
+        )
+        .unwrap();
+        record["outcome"].as_str().unwrap().to_string()
+    }
+
+    #[tokio::test]
+    async fn sleep_then_wake_carries_the_delegation_route_to_the_new_generation() {
+        let (mut app, directory, child, parent, child_pane, child_terminal) =
+            ready_route_with_child_recipe();
+        app.state.terminals.get_mut(&child_terminal).unwrap().sleep =
+            Some(App::new_pane_sleep("sender".into(), 1));
+        let public = app.public_pane_id(0, child_pane).unwrap();
+        let outcome = app.wake_pane(
+            &public,
+            crate::app::wake::WakeTrigger {
+                cause: crate::app::wake::WakeCause::HeadAppended,
+                recipient_id: child_terminal.to_string(),
+                head_id: "h".into(),
+            },
+        );
+        assert!(
+            matches!(
+                outcome,
+                crate::app::wake::WakeOutcome::Started { generation: 2, .. }
+            ),
+            "{outcome:?}"
+        );
+        assert!(app.pending_route_carries.contains_key(&child_terminal));
+        relaunched_pi_attaches(&mut app, child_pane, &child_terminal, 2);
+        let route = app
+            .ready_delegation_routes
+            .get(&child)
+            .expect("route re-established");
+        assert_eq!(route.child_generation, 2);
+        assert_eq!(route.parent, parent);
+        assert_eq!(
+            route.child_terminal, child_terminal,
+            "same pane and terminal"
+        );
+        assert!(app.pending_route_carries.is_empty());
+        assert_eq!(route_carry_outcome(&directory, child, 2), "established");
+        drop(app);
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[tokio::test]
+    async fn recipe_restart_resume_carries_the_delegation_route() {
+        let (mut app, directory, child, parent, child_pane, child_terminal) =
+            ready_route_with_child_recipe();
+        let recipe = app.state.terminals[&child_terminal]
+            .launch_recipe
+            .clone()
+            .unwrap();
+        app.pending_managed_resumes.insert(
+            child_terminal.clone(),
+            crate::app::agent_resume::PendingManagedResume {
+                recipe,
+                public_pane_id: app.public_pane_id(0, child_pane).unwrap(),
+                fallback_command: "pi".into(),
+                deadline: std::time::Instant::now() + Duration::from_secs(5),
+            },
+        );
+        assert!(app.retry_pending_managed_resumes(std::time::Instant::now()));
+        assert!(app.pending_route_carries.contains_key(&child_terminal));
+        relaunched_pi_attaches(&mut app, child_pane, &child_terminal, 2);
+        let route = app
+            .ready_delegation_routes
+            .get(&child)
+            .expect("route re-established");
+        assert_eq!((route.child_generation, route.parent), (2, parent));
+        assert_eq!(route_carry_outcome(&directory, child, 2), "established");
+        drop(app);
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[tokio::test]
+    async fn hand_start_on_a_different_session_never_inherits_the_route() {
+        use std::os::unix::fs::PermissionsExt;
+        let (mut app, directory, child, _parent, child_pane, child_terminal) =
+            ready_route_with_child_recipe();
+        let other = directory.join("other.jsonl");
+        std::fs::write(
+            &other,
+            b"{\"type\":\"session\",\"version\":3,\"id\":\"other\",\"cwd\":\"/tmp\"}\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&other, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let started = app.handle_api_request(crate::api::schema::Request {
+            id: "hand-start".into(),
+            method: crate::api::schema::Method::AgentStart(crate::api::schema::AgentStartParams {
+                name: "sender".into(),
+                kind: "pi".into(),
+                pane_id: app.public_pane_id(0, child_pane).unwrap(),
+                args: vec!["--session".into(), other.display().to_string()],
+                env: vec![format!(
+                    "PI_CODING_AGENT_SESSION_DIR={}",
+                    directory.display()
+                )],
+                timeout_ms: None,
+            }),
+        });
+        assert!(!started.contains("\"error\""), "{started}");
+        assert!(app.state.terminals[&child_terminal].route_carry.is_none());
+        assert!(app.pending_route_carries.is_empty());
+        relaunched_pi_attaches(&mut app, child_pane, &child_terminal, 2);
+        assert_ne!(
+            app.ready_delegation_routes
+                .get(&child)
+                .map(|route| route.child_generation),
+            Some(2),
+            "a hand start never re-establishes the previous route"
+        );
+        drop(app);
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
     fn listener(directory: &Path) -> MailboxBootstrapListener {
         std::fs::create_dir_all(directory).expect("create test directory");
         MailboxBootstrapListener::bind_at(directory.join("mailbox.sock")).expect("bind listener")

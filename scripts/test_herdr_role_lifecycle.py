@@ -1,4 +1,6 @@
+import fcntl
 import hashlib
+import time
 import importlib.util
 import json
 import os
@@ -113,6 +115,8 @@ if a[:2]==["agent","get"]:
  if mode=="cleanup_uncertain" and s["phase"]=="started" and s.get("cleanup_failed"): print("bad"); sys.exit(0)
  if mode in ("production_hibernate_not_found","production_hibernate_other_error") and s["phase"]=="exited":
   code="agent_not_found" if mode=="production_hibernate_not_found" else "server_not_running"; print(json.dumps({{"id":"cli:agent:get","error":{{"code":code,"message":"post-hibernate observation"}}}}),file=sys.stderr); sys.exit(1)
+ if mode=="quiet" and s["phase"] in ("started","prompted"):
+  quiet=agent(s,"idle"); quiet["state_change_seq"]=1; emit({{"agent":quiet}}); sys.exit(0)
  if s["phase"]=="empty": emit({{"agent":agent(s,"unknown",False)}})
  elif s["phase"]=="exited": emit({{"agent":agent({{"phase":"empty","name":None,"gets":s["gets"]}},"unknown",False)}})
  else:
@@ -120,6 +124,7 @@ if a[:2]==["agent","get"]:
 elif a[:2]==["pane","get"]:
  pane=agent(s,"unknown",False); pane["terminal_id"]="wrong" if mode=="production_agent_not_found_bad_pane" else "term2"; emit({{"pane":pane}})
 elif a[:2]==["agent","start"]:
+ with events.open("a") as f: f.write("argv "+json.dumps(a)+"\\n")
  if mode=="require_adapter_env":
   expected="PI_TASKING_HERDR_ADAPTER_CONFIG="+{str(self.root / 'adapter.json')!r}; separator=a.index("--") if "--" in a else -1
   if "--env" not in a or a.index("--env")>=separator or a[a.index("--env")+1]!=expected: print(json.dumps({{"error":{{"code":"missing_child_environment"}}}}),file=sys.stderr); sys.exit(1)
@@ -214,6 +219,80 @@ else: sys.exit(9)
         self.assertIn("activationDigest", final); self.assertIn("promptDigest", final); self.assertIn("generation", final)
         self.assertEqual(len(final["generation"]), 32); self.assertRegex(final["generation"], r"^[a-z][a-z0-9_-]{0,31}$")
         events = self.events.read_text().splitlines(); self.assertEqual(sum(x == "herdr agent start" for x in events), 1); self.assertIn("herdr agent send-keys", events)
+
+    def test_prompt_consumed_then_quiet_idle_completes_without_waiting_for_the_timeout(self):
+        self.secure_write(self.mode, "quiet")
+        role = self.validated(); started = time.monotonic()
+        lifecycle.lifecycle_run(role, self.root, 0.001, 30, quiet_seconds=0.05)
+        self.assertLess(time.monotonic() - started, 10)
+        final = json.loads((Path(role["stateDir"]) / "activation-receipt.json").read_text())
+        self.assertEqual(final["phase"], "completed"); self.assertTrue(final["hibernated"]); self.assertFalse(final["turnObserved"])
+        self.assertIn("herdr agent send-keys", self.events.read_text().splitlines())
+
+    def schedule(self, role, activation_id="0123456789abcdef0123456789abcdef"):
+        request = self.queued_request(activation_id)
+        self.assertEqual(lifecycle.schedule_queued_input(role, request, self.root, self.issuer)["outcome"], "scheduled")
+        return lifecycle.queue_record_paths(role, activation_id)
+
+    def hold_role_lock(self, role, seconds):
+        state_dir = Path(role["stateDir"]); state_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+        held = (state_dir / "manager.lock").open("a+"); fcntl.flock(held, fcntl.LOCK_EX)
+        timer = threading.Timer(seconds, held.close); timer.start(); self.addCleanup(timer.cancel); self.addCleanup(held.close)
+
+    def test_queued_start_while_the_role_runs_is_accepted_waits_for_the_lock_and_completes(self):
+        # The old race: the @instance started while the current run held the
+        # role, so systemctl start failed and was recorded "rejected", yet
+        # systemd's Restart=on-failure then ran it anyway.
+        role = self.validated(); record_path, activation_path, _ = self.schedule(role)
+        self.hold_role_lock(role, 0.3)
+        runs = []
+        def runner(command, **kwargs):
+            self.assertIn("--no-block", command)
+            thread = threading.Thread(target=lambda: runs.append(lifecycle.lifecycle_run(role, self.root, 0.001, 5, activation_path, lock_wait_seconds=5)))
+            thread.start(); runs.append(thread)
+            return __import__("subprocess").CompletedProcess(command, 0, "", "")
+        started = lifecycle.start_queued_input_service(role, json.loads(record_path.read_text())["activationId"], self.root, runner=runner)
+        self.assertEqual(started["outcome"], "accepted")
+        runs[0].join(10); self.assertFalse(runs[0].is_alive())
+        record = json.loads(record_path.read_text())
+        self.assertEqual(record["serviceStart"]["outcome"], "accepted"); self.assertEqual(record["lifecycleOutcome"], "completed")
+        self.assertEqual(sum(line == "herdr agent start" for line in self.events.read_text().splitlines()), 1)
+
+    def test_lock_still_held_after_the_wait_fails_without_launching(self):
+        role = self.validated(); _, activation_path, _ = self.schedule(role)
+        self.hold_role_lock(role, 5)
+        with self.assertRaisesRegex(lifecycle.LifecycleError, "another lifecycle manager owns this role"):
+            lifecycle.lifecycle_run(role, self.root, 0.01, 5, activation_path, lock_wait_seconds=0.1)
+        self.assertFalse(self.events.exists() and "herdr agent start" in self.events.read_text())
+
+    def live_previous_generation(self):
+        (self.root / "fake-state.json").write_text(json.dumps({"phase": "prompted", "name": "gprevious", "gets": 5}))
+
+    def test_previous_generation_exiting_within_the_wait_does_not_inhibit(self):
+        role = self.validated(); _, activation_path, _ = self.schedule(role); self.live_previous_generation()
+        threading.Timer(0.2, lambda: (self.root / "fake-state.json").write_text(json.dumps({"phase": "exited", "name": "gprevious", "gets": 5}))).start()
+        lifecycle.lifecycle_run(role, self.root, 0.01, 5, activation_path, lock_wait_seconds=5)
+        self.assertFalse((Path(role["stateDir"]) / "relaunch-inhibit.json").exists())
+        self.assertEqual(json.loads((Path(role["stateDir"]) / "activation-receipt.json").read_text())["phase"], "completed")
+
+    def test_previous_generation_still_live_after_the_wait_inhibits_relaunch(self):
+        role = self.validated(); _, activation_path, _ = self.schedule(role); self.live_previous_generation()
+        with self.assertRaises(lifecycle.LifecycleInhibited):
+            lifecycle.lifecycle_run(role, self.root, 0.01, 5, activation_path, lock_wait_seconds=0.1)
+        self.assertTrue((Path(role["stateDir"]) / "relaunch-inhibit.json").exists())
+        self.assertNotIn("herdr agent start", self.events.read_text().splitlines())
+
+    def test_static_replay_and_static_unit_are_disabled(self):
+        self.assertEqual(lifecycle.main(["run", "--manifest", str(self.manifest_path), "--durable-root", str(self.root)]), 1)
+        self.assertEqual(lifecycle.main(["render-unit", "--manifest", str(self.manifest_path), "--durable-root", str(self.root), "--manager", str(MODULE_PATH.resolve())]), 1)
+        self.assertFalse(self.events.exists())
+
+    def test_launch_marks_the_pane_lifecycle_owned(self):
+        role = self.validated(); lifecycle.lifecycle_run(role, self.root, 0.001, 1)
+        argv = next(json.loads(line[5:]) for line in self.events.read_text().splitlines() if line.startswith("argv "))
+        separator = argv.index("--")
+        self.assertIn("HERDR_LIFECYCLE_ROLE=owner-1", argv[:separator])
+        self.assertEqual(argv[argv.index("HERDR_LIFECYCLE_ROLE=owner-1") - 1], "--env")
 
     def test_production_agent_not_found_preflight_accepts_only_exact_hibernated_pane(self):
         self.secure_write(self.mode, "production_agent_not_found")
@@ -488,7 +567,9 @@ else: sys.exit(9)
         started = lifecycle.start_queued_input_service(role, activation_id, self.root, runner=runner)
         self.assertEqual(started["outcome"], "accepted"); self.assertEqual(len(calls), 1)
         expected_unit = lifecycle.queued_unit_instance_name(role, activation_id)
-        self.assertEqual(calls[0][0], [str(self.systemctl), "--user", "start", expected_unit])
+        self.assertEqual(calls[0][0], [str(self.systemctl), "--user", "start", "--no-block", expected_unit])
+        record = json.loads(lifecycle.queue_record_paths(role, activation_id)[0].read_text())
+        self.assertEqual(record["serviceStart"]["acknowledgement"], "systemd_job_queued")
         duplicate = lifecycle.start_queued_input_service(role, activation_id, self.root, runner=runner)
         self.assertEqual(duplicate["outcome"], "duplicate"); self.assertEqual(len(calls), 1)
 

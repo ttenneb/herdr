@@ -104,6 +104,7 @@ mod tests {
 
     #[test]
     fn client_socket_path_defaults_to_config_dir() {
+        let _env = crate::test_env::lock();
         std::env::remove_var(crate::session::SESSION_ENV_VAR);
         crate::session::clear_explicit_session_for_test();
         let path = client_socket_path_from_overrides(None, None);

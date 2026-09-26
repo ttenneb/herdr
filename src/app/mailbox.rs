@@ -1454,6 +1454,19 @@ impl App {
             .collect()
     }
 
+    /// Whether the Messages bootstrap would currently accept this sender, and
+    /// with which generation and scope (`history_only`).
+    #[cfg(test)]
+    pub(crate) fn live_mailbox_bootstrap_candidate_for_test(
+        &self,
+        sender_key: &str,
+    ) -> Option<(u64, bool)> {
+        self.live_mailbox_bootstrap_candidates()
+            .into_iter()
+            .find(|candidate| candidate.sender_key == sender_key)
+            .map(|candidate| (candidate.process_generation, candidate.history_only))
+    }
+
     pub(crate) fn mailbox_bootstrap_foreground_job(
         &self,
         terminal_id: &crate::terminal::TerminalId,
@@ -1511,7 +1524,11 @@ impl App {
         if agent == crate::detect::Agent::Pi {
             self.bind_active_managed_pi_process(&terminal_id, process_generation);
         }
+        self.resolve_pane_wake_on_active(&terminal_id, process_generation);
         let _ = self.install_offline_mailbox_authority(record);
+        if !self.pending_route_carries.is_empty() {
+            self.retry_route_carries(std::time::Instant::now());
+        }
     }
 }
 

@@ -5148,6 +5148,9 @@ impl HeadlessServer {
         }
 
         changed |= self.app.handle_tab_bar_status_tasks(now);
+        changed |= self.app.handle_pane_wake_deadlines(now);
+        changed |= self.app.retry_pending_managed_resumes(now);
+        changed |= self.app.retry_route_carries(now);
 
         if geometry_dirty {
             self.app.pending_agent_resume_deadline = None;
@@ -5688,9 +5691,17 @@ mod tests {
         app.local_terminal_notifications = false;
         app.local_input_source_switch = false;
 
+        // Another test may briefly point TMPDIR at an over-long directory; hold
+        // the shared env guard while choosing and binding the socket path.
+        let env_guard = crate::test_env::shared();
+        // Parallel tests can read the same clock value; the counter keeps each
+        // socket directory distinct.
+        static NEXT_TEST_SERVER: std::sync::atomic::AtomicU64 =
+            std::sync::atomic::AtomicU64::new(0);
         let dir = std::env::temp_dir().join(format!(
-            "hh-{}-{}",
+            "hh-{}-{}-{}",
             std::process::id(),
+            NEXT_TEST_SERVER.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|d| d.as_nanos())
@@ -5700,6 +5711,7 @@ mod tests {
         let socket_path = dir.join("client.sock");
         let _ = fs::remove_file(&socket_path);
         let listener = bind_local_listener(&socket_path).expect("bind test listener");
+        drop(env_guard);
         let client_socket_identity =
             socket_file_identity(&socket_path).expect("test listener socket identity");
         #[cfg(unix)]
@@ -6764,7 +6776,7 @@ new_tab = "prefix+t"
                 .unwrap_or(0)
         ));
         std::fs::write(&path, "onboarding = false\n").unwrap();
-        let _guard = crate::config::test_config_env_lock().lock().unwrap();
+        let _guard = crate::test_env::lock();
         std::env::set_var(crate::config::CONFIG_PATH_ENV_VAR, &path);
 
         let mut server = test_headless_server();
@@ -6836,7 +6848,7 @@ next_tab = ""
             "onboarding = false\n[keys]\nnew_workspace = \"x\"\n[ui.toast]\ndelivery = \"off\"\n",
         )
         .unwrap();
-        let _guard = crate::config::test_config_env_lock().lock().unwrap();
+        let _guard = crate::test_env::lock();
         std::env::set_var(crate::config::CONFIG_PATH_ENV_VAR, &path);
 
         let mut server = test_headless_server();
@@ -7963,7 +7975,9 @@ next_tab = ""
                 clear_display_agent: false,
                 clear_state_labels: false,
                 seq: None,
-                ttl: Some(Duration::from_millis(1)),
+                // Long enough that the pre-expiry read cannot race the clock; expiry is
+                // driven explicitly below with a time past the deadline.
+                ttl: Some(Duration::from_secs(3600)),
             })
         );
 

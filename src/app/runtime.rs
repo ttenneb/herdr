@@ -581,7 +581,9 @@ impl App {
     }
 
     pub(crate) fn run_auto_update_check(&mut self) {
-        if !background_update_check_enabled(self.no_session, self.update_version_check_enabled) {
+        if !background_update_check_enabled(self.no_session, self.update_version_check_enabled)
+            || crate::build_info::is_custom_channel()
+        {
             self.next_auto_update_check = None;
             return;
         }
@@ -654,6 +656,9 @@ impl App {
             self.next_agent_manifest_update_check,
             self.agent_metadata_deadline,
             self.pending_agent_resume_deadline,
+            self.next_pane_wake_deadline(),
+            self.next_managed_resume_deadline(now),
+            self.next_route_carry_deadline(now),
             self.session_save_deadline,
             self.selection_autoscroll_deadline,
             self.selection_highlight_clear_deadline,

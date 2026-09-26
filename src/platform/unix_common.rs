@@ -3,10 +3,18 @@ use std::path::{Path, PathBuf};
 /// A Pi session is trustworthy only when its exact argv path is a canonical,
 /// owner-private, single-link JSONL with a recognizable session header.
 pub(crate) fn verified_pi_session_jsonl(path: &Path) -> bool {
-    checked_pi_session_jsonl(path).is_some()
+    checked_pi_session_jsonl(path, false).is_some()
 }
 
-fn checked_pi_session_jsonl(path: &Path) -> Option<()> {
+/// Launch-time form of [`verified_pi_session_jsonl`]: the same file checks,
+/// but a still-empty file is accepted because Pi writes its header in place
+/// into an existing empty `--session` file. The header is re-verified on
+/// every later identity read.
+pub(crate) fn launchable_pi_session_jsonl(path: &Path) -> bool {
+    checked_pi_session_jsonl(path, true).is_some()
+}
+
+fn checked_pi_session_jsonl(path: &Path, allow_empty: bool) -> Option<()> {
     use std::io::{BufRead, Read};
     use std::os::unix::fs::MetadataExt;
 
@@ -25,6 +33,9 @@ fn checked_pi_session_jsonl(path: &Path) -> Option<()> {
     let opened = file.metadata().ok()?;
     if opened.dev() != metadata.dev() || opened.ino() != metadata.ino() {
         return None;
+    }
+    if allow_empty && opened.len() == 0 {
+        return Some(());
     }
     let mut first_line = Vec::new();
     std::io::BufReader::new(file)

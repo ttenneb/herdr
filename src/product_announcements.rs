@@ -230,11 +230,6 @@ fn normalize_body(body: &str) -> String {
 mod tests {
     use super::*;
 
-    fn env_lock() -> &'static std::sync::Mutex<()> {
-        static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
-        LOCK.get_or_init(|| std::sync::Mutex::new(()))
-    }
-
     fn temp_path(name: &str) -> PathBuf {
         std::env::temp_dir().join(format!(
             "herdr-product-announcements-{name}-{}-{}.json",
@@ -308,7 +303,7 @@ mod tests {
 
     #[test]
     fn fake_announcement_body_env_creates_preview() {
-        let _guard = env_lock().lock().unwrap();
+        let _guard = crate::test_env::lock();
         unsafe {
             std::env::set_var(FAKE_ANNOUNCEMENT_BODY_ENV, "### Preview\n- Local body");
             std::env::set_var(FAKE_ANNOUNCEMENT_TITLE_ENV, "Local title");

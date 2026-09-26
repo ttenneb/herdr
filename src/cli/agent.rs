@@ -20,6 +20,7 @@ pub(super) fn run_agent_command(args: &[String]) -> std::io::Result<i32> {
         "get" => agent_get(&args[1..]),
         "read" => agent_read(&args[1..]),
         "send-keys" => agent_send_keys(&args[1..]),
+        "sleep" => agent_sleep(&args[1..]),
         "prompt" => agent_prompt(&args[1..]),
         "rename" => agent_rename(&args[1..]),
         "focus" => agent_focus(&args[1..]),
@@ -471,6 +472,19 @@ fn agent_get(args: &[String]) -> std::io::Result<i32> {
     super::print_response(&super::send_request(&Request {
         id: "cli:agent:get".into(),
         method: Method::AgentGet(AgentTarget {
+            target: target.clone(),
+        }),
+    })?)
+}
+
+fn agent_sleep(args: &[String]) -> std::io::Result<i32> {
+    let [target] = args else {
+        eprintln!("usage: herdr agent sleep <target>");
+        return Ok(2);
+    };
+    super::print_response(&super::send_request(&Request {
+        id: "cli:agent:sleep".into(),
+        method: Method::AgentSleep(AgentTarget {
             target: target.clone(),
         }),
     })?)

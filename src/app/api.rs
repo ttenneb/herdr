@@ -4,6 +4,7 @@ mod agent_view;
 mod agents;
 mod collections;
 mod delegations;
+pub(crate) use delegations::ROUTE_CARRY_TIMEOUT;
 mod env;
 mod handoffs;
 #[cfg(test)]
@@ -1419,6 +1420,7 @@ impl App {
             Method::TabClose(target) => return self.handle_tab_close(request.id, target),
             Method::AgentList(_) => return self.handle_agent_list(request.id),
             Method::AgentGet(target) => return self.handle_agent_get(request.id, target),
+            Method::AgentSleep(target) => return self.handle_agent_sleep(request.id, target),
             Method::AgentFocus(target) => return self.handle_agent_focus(request.id, target),
             Method::AgentRename(params) => return self.handle_agent_rename(request.id, params),
             Method::AgentViewSet(params) => return self.handle_agent_view_set(request.id, params),

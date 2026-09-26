@@ -40,6 +40,12 @@ Every parse, identity, readiness, or activation-transport failure after the star
 
 The manager does not poll while hibernated. Activation is therefore externally driven, including report delivery that needs a parent turn. Mailbox or Gate state alone is never an activation.
 
+Completion: a run completes when the agent shows activity and then returns to idle, or when it stays idle with an unchanged state sequence for `--quiet-seconds` (default 60 s) after the prompt was transported. The second case covers a turn that fails at once, for example with no API key, instead of waiting for the execution timeout. The completed receipt records `turnObserved`.
+
+Every launch passes the reserved `--env HERDR_LIFECYCLE_ROLE=<roleId>`, so Herdr never sleeps or wakes a lifecycle-owned pane itself.
+
+The static activation replay is disabled: `run` requires `--activation-id`, and `render-unit` refuses. Roles run only as queued `@` instances. An instance that starts while another run still owns the role waits for the role lock, and then for the previous generation's Pi to exit, for up to `--lock-wait-seconds` (default 300 s), asking systemd for start time with `EXTEND_TIMEOUT_USEC`. It writes a relaunch inhibit only if the pane is still live after that wait.
+
 ## Queued-input auto-release
 
 `schedule-queued-input` implements `QueuedInputActivationRequestV1` outside Pi. It accepts the exact versioned request plus a separately supplied secure exact tasking-issuer route. The request is rejected unless its 128-bit activation ID, batch and item IDs, 1–32 item bound, priority, correlation chain, depth, UTF-8 payload size, payload SHA-256, `accepted_queued_input` cause, authorized issuer, and complete managed-role recipient identity all match policy and the role manifest.
@@ -70,7 +76,7 @@ After `schedule-queued-input` returns `scheduled`, or `recover-queued-input` pro
   --activation-id 0123456789abcdef0123456789abcdef
 ```
 
-The manager revalidates the scheduled activation and then executes exactly `SYSTEMCTL --user start herdr-role-ROLE@ACTIVATION.service`, where `SYSTEMCTL` is the absolute executable pinned by the secure role manifest. Because the unit is `Type=notify`, a successful systemctl return follows the lifecycle manager's truthful `READY=1`, which is still emitted only after interactive readiness and prompt transport. The JSON result is `herdr.queued-input-service-start-result` v1 with the exact activation ID and one of `accepted`, `duplicate`, `uncertain`, or `rejected`; its generated schema is `docs/next/queued-input-service-start-v1.schema.json`.
+The manager revalidates the scheduled activation and then executes exactly `SYSTEMCTL --user start --no-block herdr-role-ROLE@ACTIVATION.service`, where `SYSTEMCTL` is the absolute executable pinned by the secure role manifest. A successful return means systemd queued the start job; the result records `acknowledgement: "systemd_job_queued"`. The run records its own lifecycle outcome in the scheduled record, so a queued job that waits for the role lock is never misreported as a rejected start. The JSON result is `herdr.queued-input-service-start-result` v1 with the exact activation ID and one of `accepted`, `duplicate`, `uncertain`, or `rejected`; its generated schema is `docs/next/queued-input-service-start-v1.schema.json`.
 
 Before invoking systemctl, the manager durably records an uncertain exact start attempt. A successful acknowledgement becomes `accepted`; another call returns `duplicate` without invoking systemctl again. Timeout or lost acknowledgement remains `uncertain` and repeated calls do not retry. After external same-unit evidence, `recover-queued-start --disposition started` marks the attempt proven and returns `duplicate`; `--disposition not-started` terminates it as rejected and requires a new activation ID. Empty settlement, receipts, imports, status, heartbeat, supervisor observations, invalid IDs, and unscheduled IDs cannot reach systemctl.
 

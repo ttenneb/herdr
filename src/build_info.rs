@@ -35,17 +35,33 @@ pub fn identity() -> BuildIdentity {
 }
 
 pub fn version() -> String {
-    match channel() {
-        "stable" => BASE_VERSION.to_string(),
-        channel => match build_id() {
-            Some(build_id) => format!("{BASE_VERSION}-{channel}.{build_id}"),
-            None => format!("{BASE_VERSION}-{channel}"),
+    version_for(BASE_VERSION, channel(), build_id())
+}
+
+fn version_for(base: &str, channel: &str, build_id: Option<&str>) -> String {
+    match channel {
+        "stable" => base.to_string(),
+        channel => match build_id {
+            Some(build_id) => format!("{base}-{channel}.{build_id}"),
+            None => format!("{base}-{channel}"),
         },
     }
 }
 
 pub fn is_preview() -> bool {
     channel() == "preview"
+}
+
+/// A channel other than the upstream `stable` and `preview` lines, such as a
+/// locally maintained `stabilized` build (`HERDR_BUILD_CHANNEL=stabilized`).
+/// Such a build is not on the upstream update path: upstream releases must not
+/// be offered or installed over it.
+pub fn is_custom_channel_name(channel: &str) -> bool {
+    !matches!(channel, "stable" | "preview")
+}
+
+pub fn is_custom_channel() -> bool {
+    is_custom_channel_name(channel())
 }
 
 fn non_empty(value: Option<&'static str>) -> Option<&'static str> {
@@ -61,6 +77,22 @@ fn non_empty(value: Option<&'static str>) -> Option<&'static str> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn custom_channel_version_names_the_channel_and_build() {
+        assert_eq!(super::version_for("0.8.4", "stable", Some("x")), "0.8.4");
+        assert_eq!(
+            super::version_for("0.8.4", "stabilized", Some("rc3.4a1ba76")),
+            "0.8.4-stabilized.rc3.4a1ba76"
+        );
+        assert_eq!(
+            super::version_for("0.8.4", "stabilized", None),
+            "0.8.4-stabilized"
+        );
+        assert!(super::is_custom_channel_name("stabilized"));
+        assert!(!super::is_custom_channel_name("stable"));
+        assert!(!super::is_custom_channel_name("preview"));
+    }
+
     #[test]
     fn stable_version_defaults_to_cargo_version() {
         assert!(!super::version().is_empty());

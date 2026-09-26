@@ -1,16 +1,14 @@
 #!/usr/bin/python3
-"""Generic direct-or-wake transport for a durable Pi mailbox.
+"""Direct transport for a durable Pi mailbox.
 
 The mailbox owner publishes one runtime registration. A compatible live process
-receives a bounded request on its Unix socket. Only an explicitly sleeping or
-stopped registration may schedule a nonblocking systemd wake. This module never
-uses a PTY and never waits for a role manager to become ready.
+receives a bounded request on its Unix socket. A sleeping or stopped
+registration is rejected with `wake_disabled`: Herdr wakes panes it put to
+sleep in-process, and this module never starts anything. It never uses a PTY.
 """
 from __future__ import annotations
 
 import argparse
-import fcntl
-import hashlib
 import json
 import os
 from pathlib import Path
@@ -18,11 +16,10 @@ import re
 import socket
 import stat
 import subprocess
-import tempfile
-import time
 from typing import Any
 
 MAILBOX_PROTOCOL = "herdr.pi-mailbox/v1"
+WAKE_DISABLED_REASON = "wake_disabled: sleeping recipients are woken in-process by Herdr, not by mailbox dispatch"
 DELIVERY_ID = re.compile(r"^[0-9a-f]{32}$")
 UNIT_NAME = re.compile(r"^[A-Za-z0-9_.@:-]{1,255}\.service$")
 MAX_JSON_BYTES = 64 * 1024
@@ -79,29 +76,6 @@ def _read_secure_json(path: Path, root: Path, label: str) -> dict[str, Any]:
     if not isinstance(value, dict):
         raise TransportError(f"{label} must contain an object")
     return value
-
-
-def _atomic_json(path: Path, value: dict[str, Any]) -> None:
-    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-    descriptor, temporary = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
-    try:
-        os.fchmod(descriptor, 0o600)
-        with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
-            json.dump(value, stream, sort_keys=True, separators=(",", ":"))
-            stream.write("\n")
-            stream.flush()
-            os.fsync(stream.fileno())
-        os.replace(temporary, path)
-        directory = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY)
-        try:
-            os.fsync(directory)
-        finally:
-            os.close(directory)
-    finally:
-        try:
-            os.unlink(temporary)
-        except FileNotFoundError:
-            pass
 
 
 def _exact_recipient(value: Any, label: str) -> dict[str, Any]:
@@ -227,20 +201,6 @@ def exchange_socket(path: Path, frame: dict[str, Any], root: Path, *, timeout: f
     return value
 
 
-def wake_receipt_id(manifest: dict[str, Any], runtime_generation: int) -> str:
-    material = json.dumps(
-        {
-            "version": 1,
-            "recipient": manifest["recipient"],
-            "runtimeGeneration": runtime_generation,
-            "unit": manifest["wakeUnit"],
-        },
-        sort_keys=True,
-        separators=(",", ":"),
-    ).encode()
-    return hashlib.sha256(material).hexdigest()
-
-
 def _result(request: dict[str, Any], outcome: str, route: str, mailbox: str, *, build: dict[str, Any] | None = None, receipt_id: str | None = None, reason: str | None = None) -> dict[str, Any]:
     result = {"kind": "herdr.mailbox.dispatch-result", "version": 1, "deliveryId": request.get("deliveryId", "invalid"), "outcome": outcome, "route": route, "mailboxPath": mailbox}
     if build is not None:
@@ -284,54 +244,11 @@ def dispatch(manifest: dict[str, Any], request: dict[str, Any], durable_root: Pa
             return _result(request, "uncertain", "live_direct", manifest["mailboxPath"], build=runtime["build"], reason=str(exc))
         return _result(request, live["outcome"], "live_direct", manifest["mailboxPath"], build=runtime["build"], receipt_id=live.get("receiptId"), reason=live.get("reason"))
 
-    if runtime["protocol"] != MAILBOX_PROTOCOL:
-        return _result(request, "rejected", "none", manifest["mailboxPath"], build=runtime["build"], reason="incompatible_sleeping_recipient")
-
-    state_dir = Path(manifest["stateDir"])
-    state_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
-    os.chmod(state_dir, 0o700)
-    dispatch_lock = (state_dir / "dispatch.lock").open("a+")
-    os.chmod(state_dir / "dispatch.lock", 0o600)
-    try:
-        fcntl.flock(dispatch_lock, fcntl.LOCK_EX)
-        wake_path = state_dir / "wake-intent.json"
-        if wake_path.exists():
-            wake = _read_secure_json(wake_path, root, "wake intent")
-            if wake.get("runtimeGeneration") == runtime["generation"] and wake.get("outcome") in {"accepted", "uncertain"}:
-                return _result(request, "duplicate" if wake["outcome"] == "accepted" else "uncertain", "systemd_wake", manifest["mailboxPath"], build=runtime["build"], receipt_id=wake.get("receiptId"), reason="wake already scheduled for this sleeping generation")
-
-        manager_lock = Path(manifest["managerLockPath"])
-        manager_lock.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-        held_check = manager_lock.open("a+")
-        os.chmod(manager_lock, 0o600)
-        try:
-            try:
-                fcntl.flock(held_check, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            except BlockingIOError:
-                return _result(request, "rejected", "none", manifest["mailboxPath"], build=runtime["build"], reason="lifecycle_manager_lock_held")
-        finally:
-            held_check.close()
-
-        receipt_id = wake_receipt_id(manifest, runtime["generation"])
-        wake = {"version": 1, "runtimeGeneration": runtime["generation"], "deliveryId": request["deliveryId"], "mailboxPath": manifest["mailboxPath"], "unit": manifest["wakeUnit"], "receiptId": receipt_id, "outcome": "uncertain", "attemptedAtEpochMs": int(time.time() * 1000)}
-        _atomic_json(wake_path, wake)
-        command = [manifest["systemctlPath"], "--user", "start", "--no-block", manifest["wakeUnit"]]
-        try:
-            completed = runner(command, check=False, capture_output=True, text=True, timeout=10)
-        except (OSError, subprocess.TimeoutExpired) as exc:
-            return _result(request, "uncertain", "systemd_wake", manifest["mailboxPath"], build=runtime["build"], receipt_id=receipt_id, reason=f"wake scheduling acknowledgement is uncertain: {exc}")
-        if completed.returncode != 0:
-            wake["outcome"] = "rejected"
-            wake["reason"] = (completed.stderr or "systemctl start failed").strip()[:2048]
-            _atomic_json(wake_path, wake)
-            return _result(request, "rejected", "systemd_wake", manifest["mailboxPath"], build=runtime["build"], receipt_id=receipt_id, reason=wake["reason"])
-        wake["outcome"] = "accepted"
-        wake["acceptedAtEpochMs"] = int(time.time() * 1000)
-        _atomic_json(wake_path, wake)
-        return _result(request, "accepted", "systemd_wake", manifest["mailboxPath"], build=runtime["build"], receipt_id=receipt_id)
-    finally:
-        dispatch_lock.close()
-
+    # The systemd wake that used to follow replayed a static role activation and
+    # could never deliver the message. Herdr now wakes panes it put to sleep
+    # in-process (`herdr agent sleep`, App::wake_pane), and lifecycle roles are
+    # activated only through `start-queued-input`. Nothing is started here.
+    return _result(request, "rejected", "none", manifest["mailboxPath"], build=runtime["build"], reason=WAKE_DISABLED_REASON)
 
 def _load_plain_json(path: Path, root: Path, label: str) -> dict[str, Any]:
     return _read_secure_json(path, root, label)
