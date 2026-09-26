@@ -653,18 +653,25 @@ impl App {
         }
         let (ws_idx, pane_id) = self.parse_current_public_pane_id(target).or_else(|| {
             // A sleeping agent is still addressed by the name it slept under.
-            let terminal_id = self
-                .state
-                .terminals
-                .values()
-                .find(|terminal| {
-                    terminal
-                        .sleep
-                        .as_ref()
-                        .is_some_and(|sleep| sleep.agent_name == target)
-                })?
-                .id
-                .clone();
+            let slept = self.state.terminals.values().find(|terminal| {
+                terminal
+                    .sleep
+                    .as_ref()
+                    .is_some_and(|sleep| sleep.agent_name == target)
+            });
+            // An agent whose Pi exited (hand quit, restarting) keeps its last
+            // name for its pane's queue, when exactly one such pane has it
+            // (a live agent with the name was already resolved first).
+            let exited = || {
+                let mut named = self.state.terminals.values().filter(|terminal| {
+                    terminal.agent_name.is_none()
+                        && terminal.messages_agent_name.as_deref() == Some(target)
+                        && self.pane_takes_messages(&terminal.id.to_string())
+                });
+                let only = named.next()?;
+                named.next().is_none().then_some(only)
+            };
+            let terminal_id = slept.or_else(exited)?.id.clone();
             self.state
                 .workspaces
                 .iter()

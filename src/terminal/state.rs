@@ -127,6 +127,10 @@ pub struct TerminalState {
     /// attached (no Messages support, or receive-only switched off) keeps
     /// typed input. Persisted with the queue key.
     pub messages_capable: bool,
+    /// The last agent name this pane's agent had. Kept when the agent exits
+    /// (hand quit, restart), so a Messages-capable pane is still addressed by
+    /// that name and its messages queue instead of failing agent_not_found.
+    pub messages_agent_name: Option<String>,
     pub id: TerminalId,
     pub cwd: PathBuf,
     pub detected_agent: Option<Agent>,
@@ -193,6 +197,7 @@ impl TerminalState {
         Self {
             queue_key: mint_queue_key(),
             messages_capable: false,
+            messages_agent_name: None,
             id,
             cwd,
             detected_agent: None,
@@ -1913,6 +1918,9 @@ impl TerminalState {
 
     pub fn set_agent_name(&mut self, name: String) {
         self.agent_name = (!name.is_empty()).then_some(name);
+        if self.agent_name.is_some() {
+            self.messages_agent_name = self.agent_name.clone();
+        }
         self.agent_name_owner = self.agent_name.as_ref().and_then(|_| {
             self.hook_authority
                 .as_ref()

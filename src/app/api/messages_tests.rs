@@ -2302,3 +2302,53 @@ async fn only_a_gone_executions_claim_can_be_dropped_or_retried() {
     .unwrap();
     assert_eq!(claim["claim"]["stableId"], retried["newStableId"]);
 }
+
+/// A named Pi agent whose Pi was quit by hand (or is restarting) is still
+/// addressed by its name: the prompt is queued in its pane, not refused with
+/// agent_not_found, and the pane is not woken (it was not put to sleep).
+#[tokio::test]
+async fn a_named_agent_with_no_attached_pi_still_receives_queued_messages() {
+    let mut fixture = fixture();
+    let terminal_id = fixture.app.state.workspaces[1]
+        .terminal_id(fixture.panes[1])
+        .unwrap()
+        .clone();
+    {
+        let terminal = fixture.app.state.terminals.get_mut(&terminal_id).unwrap();
+        terminal.set_agent_name("worker".into());
+        terminal.set_detected_state(Some(Agent::Pi), AgentState::Idle);
+        terminal.messages_capable = true;
+    }
+    // The human quits Pi: the process exits and the pane is back at a shell.
+    fixture
+        .app
+        .handle_internal_event(crate::events::AppEvent::StateChanged {
+            pane_id: fixture.panes[1],
+            agent: None,
+            state: AgentState::Idle,
+            visible_blocker: false,
+            visible_working: false,
+            process_exited: true,
+            observed_at: std::time::Instant::now(),
+        });
+    let response = fixture.app.handle_agent_prompt(
+        "by-name".into(),
+        AgentPromptParams {
+            target: "worker".into(),
+            text: "for when you are back".into(),
+            wait: None,
+            send: MessageSendOptions::default(),
+        },
+    );
+    let success: SuccessResponse = serde_json::from_str(&response)
+        .unwrap_or_else(|_| panic!("queued, not refused: {response}"));
+    let ResponseResult::AgentPrompted { delivery, .. } = success.result else {
+        panic!("prompted")
+    };
+    assert_eq!(delivery.expect("delivery").path, "mailbox");
+    assert!(fixture.rx[1].try_recv().is_err(), "nothing typed");
+    assert!(
+        fixture.app.pane_wakes.is_empty(),
+        "a hand quit is never woken"
+    );
+}
