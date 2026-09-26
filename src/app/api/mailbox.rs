@@ -312,35 +312,46 @@ impl App {
                     },
                 )
             }
-            "child_delegation_bind_todo" => {
+            "todo_delegation_bind" => {
                 #[derive(serde::Deserialize)]
                 #[serde(rename_all = "camelCase", deny_unknown_fields)]
-                struct BindTodoParams {
+                struct ChildSession {
+                    agent: String,
+                    kind: crate::agent_resume::AgentSessionRefKind,
+                    source: String,
+                    value: String,
+                }
+                #[derive(serde::Deserialize)]
+                #[serde(rename_all = "camelCase", deny_unknown_fields)]
+                struct BindParams {
                     protocol: String,
-                    child_delegation_id: String,
+                    child_pane_id: String,
+                    child_session: ChildSession,
                     todo_delegation_id: String,
-                    parent_task_id: String,
+                    parent_task_id: u64,
                 }
                 self.require_child_report_signals()?;
-                let params: BindTodoParams = serde_json::from_value(params)
+                let params: BindParams = serde_json::from_value(params)
                     .map_err(|_| MailboxBootstrapError::InvalidRequest)?;
                 if params.protocol != crate::mailbox_v1::PROTOCOL {
                     return Err(MailboxBootstrapError::InvalidRequest);
                 }
-                let child: crate::delegation::DelegationId = params
-                    .child_delegation_id
-                    .parse()
-                    .map_err(|_| MailboxBootstrapError::InvalidRequest)?;
-                let cursor = self.bind_parent_todo(
+                let child_session = crate::api::schema::AgentSessionInfo {
+                    source: params.child_session.source,
+                    agent: params.child_session.agent,
+                    kind: params.child_session.kind,
+                    value: params.child_session.value,
+                };
+                let cursor = self.bind_todo_delegation(
                     session,
-                    child,
+                    &params.child_pane_id,
+                    &child_session,
                     crate::child_report_closure::ParentTodo {
                         delegation_id: params.todo_delegation_id,
                         parent_task_id: params.parent_task_id,
                     },
                 )?;
-                return Ok(serde_json::json!({"type":"child_delegation_bind_todo",
-                                             "bindingCursor":cursor}));
+                return Ok(serde_json::json!({"type":"todo_delegation_bind","cursor":cursor}));
             }
             "child_report_signals" | "report_recovery_wait" => {
                 #[derive(serde::Deserialize)]
@@ -383,7 +394,7 @@ impl App {
                 if params.protocol != crate::mailbox_v1::PROTOCOL {
                     return Err(MailboxBootstrapError::InvalidRequest);
                 }
-                let (cursor, created) = self.request_report_recovery(
+                let cursor = self.request_report_recovery(
                     session,
                     params.signal_cursor,
                     &params.route_epoch,
@@ -393,8 +404,7 @@ impl App {
                     &params.state_digest,
                 )?;
                 return Ok(serde_json::json!({"type":"report_recovery_request",
-                    "recoveryCursor":cursor, "signalCursor":params.signal_cursor,
-                    "created":created}));
+                    "signalCursor":params.signal_cursor, "recoveryCursor":cursor}));
             }
             "report_recovery_decline" => {
                 #[derive(serde::Deserialize)]
@@ -402,6 +412,7 @@ impl App {
                 struct DeclineParams {
                     protocol: String,
                     signal_cursor: u64,
+                    recovery_cursor: u64,
                     reason: crate::child_report_closure::DeclineReason,
                 }
                 self.require_child_report_signals()?;
@@ -410,10 +421,30 @@ impl App {
                 if params.protocol != crate::mailbox_v1::PROTOCOL {
                     return Err(MailboxBootstrapError::InvalidRequest);
                 }
-                let cursor =
-                    self.decline_report_recovery(session, params.signal_cursor, params.reason)?;
-                return Ok(serde_json::json!({"type":"report_recovery_decline",
-                    "declineCursor":cursor, "signalCursor":params.signal_cursor}));
+                let cursor = self.decline_report_recovery(
+                    session,
+                    params.signal_cursor,
+                    params.recovery_cursor,
+                    params.reason,
+                )?;
+                return Ok(serde_json::json!({"type":"report_recovery_decline","cursor":cursor}));
+            }
+            "report_recovery_wake_request" => {
+                #[derive(serde::Deserialize)]
+                #[serde(rename_all = "camelCase", deny_unknown_fields)]
+                struct WakeParams {
+                    protocol: String,
+                    signal_cursor: u64,
+                }
+                self.require_child_report_signals()?;
+                let params: WakeParams = serde_json::from_value(params)
+                    .map_err(|_| MailboxBootstrapError::InvalidRequest)?;
+                if params.protocol != crate::mailbox_v1::PROTOCOL {
+                    return Err(MailboxBootstrapError::InvalidRequest);
+                }
+                let wake_cursor = self.request_recovery_wake(session, params.signal_cursor)?;
+                return Ok(serde_json::json!({"type":"report_recovery_wake_request",
+                    "signalCursor":params.signal_cursor, "wakeCursor":wake_cursor}));
             }
             "mailbox.provision_recipient" => {
                 #[derive(serde::Deserialize)]

@@ -420,6 +420,10 @@ impl MailboxStore {
         &self,
         mut head: MailboxHead,
     ) -> Result<AdmissionReceipt, MailboxError> {
+        // Peer and generic submits can never carry the server-only wake kind.
+        if head.kind == crate::child_report_closure::RECOVERY_WAKE_KIND {
+            return Err(MailboxError::InvalidRecord);
+        }
         self.with_exclusive_lock(|| {
             let recovered = self.load()?;
             head.enqueue_epoch = recovered
@@ -467,6 +471,55 @@ impl MailboxStore {
         })
     }
 
+    /// #161: the only writer of a `recovery_wake` head. The stable ID is keyed
+    /// by the signal, so an existing head (including after a restart) is never
+    /// appended again; `Ok(false)` means it was already delivered.
+    pub(crate) fn append_server_recovery_wake(
+        &self,
+        mut head: MailboxHead,
+    ) -> Result<bool, MailboxError> {
+        if head.kind != crate::child_report_closure::RECOVERY_WAKE_KIND {
+            return Err(MailboxError::InvalidRecord);
+        }
+        self.with_exclusive_lock(|| {
+            let recovered = self.load()?;
+            if let Some(existing) = recovered.heads.get(&head.stable_id) {
+                return if existing.kind == head.kind
+                    && existing.recipient == head.recipient
+                    && existing.subject == head.subject
+                    && existing.body == head.body
+                {
+                    Ok(false)
+                } else {
+                    Err(MailboxError::ConflictingDuplicate)
+                };
+            }
+            if recovered.receipts.contains_key(&head.delivery_digest) {
+                return Err(MailboxError::ConflictingDuplicate);
+            }
+            head.enqueue_epoch = recovered
+                .heads
+                .values()
+                .map(|existing| existing.enqueue_epoch)
+                .max()
+                .unwrap_or(0)
+                .checked_add(1)
+                .ok_or(MailboxError::InvalidRecord)?;
+            validate_head(&head)?;
+            self.append_synced(&MailboxRecord::Head { head: head.clone() })?;
+            self.append_synced(&MailboxRecord::Receipt {
+                receipt: AdmissionReceipt {
+                    delivery_digest: head.delivery_digest.clone(),
+                    stable_id: head.stable_id.clone(),
+                    revision: head.revision,
+                    digest: head.digest.clone(),
+                    status: ReceiptStatus::Admitted,
+                },
+            })?;
+            Ok(true)
+        })
+    }
+
     /// Appends the head and forces it to stable storage before appending the exact receipt.
     /// A caller must not treat either return value as a Pi or model acknowledgement.
     pub fn append_head_and_receipt(
@@ -474,6 +527,9 @@ impl MailboxStore {
         head: MailboxHead,
         receipt: AdmissionReceipt,
     ) -> Result<(), MailboxError> {
+        if head.kind == crate::child_report_closure::RECOVERY_WAKE_KIND {
+            return Err(MailboxError::InvalidRecord);
+        }
         self.with_exclusive_lock(|| {
             validate_head(&head)?;
             validate_receipt(&receipt)?;
@@ -525,6 +581,10 @@ impl MailboxStore {
                 .get(&edit.stable_id)
                 .cloned()
                 .ok_or(MailboxError::EditConflict)?;
+            // A server recovery wake is never editable.
+            if current.kind == crate::child_report_closure::RECOVERY_WAKE_KIND {
+                return Err(MailboxError::EditConflict);
+            }
             if current.revision != edit.revision || current.digest != edit.digest {
                 return Err(MailboxError::EditConflict);
             }

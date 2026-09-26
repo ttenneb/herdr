@@ -234,6 +234,8 @@ pub fn validate_request(request: &Request) -> Result<(), TransportError> {
                 || value.delivery_digest.len() != 64
                 || value.message_id.is_empty()
                 || value.kind.is_empty()
+                // #159/#161: only the server mints a recovery wake.
+                || value.kind == crate::child_report_closure::RECOVERY_WAKE_KIND
                 || value.priority.is_empty()
                 || value.original_sequence == 0 =>
         {

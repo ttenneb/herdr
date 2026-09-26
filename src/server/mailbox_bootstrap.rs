@@ -82,29 +82,23 @@ pub(crate) struct ParentReportAdvertisement {
     pub protocol: &'static str,
     pub recipient: crate::mailbox::RecipientKey,
     pub grant_id: String,
-    /// #159: offered only to a covered child with a durable done ACK and a
-    /// closure barrier on this route.
+    /// #159/#161: offered only to a covered child, always alongside
+    /// `todoStateMethod`.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub recovery: Option<ChildRecoveryAdvertisement>,
+    pub recovery_wait_method: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub recovery_decline_method: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub recovery_wake_method: Option<&'static str>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct ParentSignalsAdvertisement {
     pub method: &'static str,
+    pub recovery_method: &'static str,
     pub bind_method: &'static str,
-    pub recovery_request_method: &'static str,
     pub protocol: &'static str,
-    pub max_wait_ms: u64,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub(crate) struct ChildRecoveryAdvertisement {
-    pub wait_method: &'static str,
-    pub decline_method: &'static str,
-    pub protocol: &'static str,
-    pub max_wait_ms: u64,
 }
 
 impl MailboxBootstrapDescriptor {
@@ -133,23 +127,21 @@ impl MailboxBootstrapDescriptor {
                     protocol: crate::mailbox_v1::PROTOCOL,
                     recipient: route.recipient.clone(),
                     grant_id: route.grant_id.clone(),
-                    recovery: session
+                    recovery_wait_method: session.child_recovery.then_some("report_recovery_wait"),
+                    recovery_decline_method: session
                         .child_recovery
-                        .then_some(ChildRecoveryAdvertisement {
-                            wait_method: "report_recovery_wait",
-                            decline_method: "report_recovery_decline",
-                            protocol: crate::mailbox_v1::PROTOCOL,
-                            max_wait_ms: crate::child_report_closure::MAX_WAIT_MS,
-                        }),
+                        .then_some("report_recovery_decline"),
+                    recovery_wake_method: session
+                        .child_recovery
+                        .then_some("report_recovery_wake_request"),
                 }),
             parent_signals: session
                 .parent_signals
                 .then_some(ParentSignalsAdvertisement {
                     method: "child_report_signals",
-                    bind_method: "child_delegation_bind_todo",
-                    recovery_request_method: "report_recovery_request",
+                    recovery_method: "report_recovery_request",
+                    bind_method: "todo_delegation_bind",
                     protocol: crate::mailbox_v1::PROTOCOL,
-                    max_wait_ms: crate::child_report_closure::MAX_WAIT_MS,
                 }),
             endpoint: endpoint.display().to_string(),
             caller: session.caller.clone(),
@@ -3645,7 +3637,25 @@ mod tests {
         let mut child = connect(&listener);
         let descriptor = bootstrap(&mut listener, &mut app, &mut child);
         assert_eq!(descriptor["result"]["caller"], child_key, "{descriptor}");
-        assert!(descriptor["result"]["parentReport"]["recovery"].is_null());
+        let covered = enabled && register;
+        for (field, method) in [
+            ("recoveryWaitMethod", "report_recovery_wait"),
+            ("recoveryDeclineMethod", "report_recovery_decline"),
+            ("recoveryWakeMethod", "report_recovery_wake_request"),
+        ] {
+            if covered {
+                assert_eq!(descriptor["result"]["parentReport"][field], method);
+                assert_eq!(
+                    descriptor["result"]["parentReport"]["todoStateMethod"],
+                    "todo_state"
+                );
+            } else {
+                assert!(
+                    descriptor["result"]["parentReport"][field].is_null(),
+                    "{field}"
+                );
+            }
+        }
         let child_binding = descriptor["result"]["bindingGeneration"]
             .as_str()
             .unwrap()
@@ -3746,7 +3756,7 @@ mod tests {
 
     fn recovery_request(signal: &Value) -> Value {
         json!({"protocol":crate::mailbox_v1::PROTOCOL,
-               "signalCursor":signal["signalCursor"],
+               "signalCursor":signal["cursor"],
                "routeEpoch":signal["route"]["routeEpoch"],
                "childTerminalId":signal["route"]["childTerminalId"],
                "localRoot":signal["todo"]["localRoot"],
@@ -3791,8 +3801,9 @@ mod tests {
             "child_report_signals"
         );
         assert_eq!(
-            fx.parent_descriptor["result"]["parentSignals"]["recoveryRequestMethod"],
-            "report_recovery_request"
+            fx.parent_descriptor["result"]["parentSignals"],
+            json!({"method":"child_report_signals","recoveryMethod":"report_recovery_request",
+                   "bindMethod":"todo_delegation_bind","protocol":crate::mailbox_v1::PROTOCOL})
         );
         assert_eq!(
             call(&mut fx, false, "todo_state", todo(1, false))["result"]["type"],
@@ -3818,13 +3829,25 @@ mod tests {
         for count in ["pathAttemptCount", "preparedCount", "admittedReportCount"] {
             assert_eq!(signal["closure"][count], 0, "{count}");
         }
+        // Pi's cross-check: todoStateCursor < closureCursor < cursor.
+        assert!(done_cursor < signal["closure"]["closureCursor"].as_u64().unwrap());
         assert!(
             signal["closure"]["closureCursor"].as_u64().unwrap()
-                < signal["signalCursor"].as_u64().unwrap()
+                < signal["cursor"].as_u64().unwrap()
+        );
+        assert_eq!(signal["closure"]["coverageQualified"], true);
+        assert_eq!(
+            signal
+                .as_object()
+                .unwrap()
+                .keys()
+                .cloned()
+                .collect::<Vec<_>>(),
+            ["closure", "cursor", "recovery", "route", "todo", "type"]
         );
         assert!(signal["parentTodo"].is_null());
         assert_eq!(signal["recovery"]["available"], true);
-        let signal_cursor = signal["signalCursor"].as_u64().unwrap();
+        let signal_cursor = signal["cursor"].as_u64().unwrap();
         assert!(signals(&mut fx, signal_cursor).is_empty());
         // The barrier carries the only AllPathsTrusted mint.
         assert!(closure_journal(&fx).committed().any(|record| matches!(
@@ -3862,7 +3885,11 @@ mod tests {
             "report_recovery_request",
             recovery_request(&signal),
         );
-        assert_eq!(requested["result"]["created"], true, "{requested}");
+        assert_eq!(
+            requested["result"]["type"], "report_recovery_request",
+            "{requested}"
+        );
+        assert_eq!(requested["result"]["signalCursor"], signal_cursor);
         let recovery_cursor = requested["result"]["recoveryCursor"].as_u64().unwrap();
         let repeat = call(
             &mut fx,
@@ -3871,20 +3898,19 @@ mod tests {
             recovery_request(&signal),
         );
         assert_eq!(repeat["result"]["recoveryCursor"], recovery_cursor);
-        assert_eq!(repeat["result"]["created"], false);
+        assert!(recovery_cursor > signal_cursor);
         let waited = call(
             &mut fx,
             false,
             "report_recovery_wait",
             json!({"protocol":crate::mailbox_v1::PROTOCOL,"afterCursor":0}),
         );
+        assert_eq!(waited["result"]["type"], "report_recovery_wait");
         assert_eq!(
-            waited["result"]["requests"][0]["signalCursor"],
-            signal_cursor
-        );
-        assert_eq!(
-            waited["result"]["requests"][0]["recoveryCursor"],
-            recovery_cursor
+            waited["result"]["requests"],
+            json!([{"signalCursor":signal_cursor,"recoveryCursor":recovery_cursor,
+                    "routeEpoch":signal["route"]["routeEpoch"],"localRoot":"child-root",
+                    "localRevision":2,"stateDigest":state_digest(2)}])
         );
         // Exactly one delivery through the existing bound path.
         assert_eq!(
@@ -3918,7 +3944,7 @@ mod tests {
         let mut renewed = connect(&fx.listener);
         let descriptor = bootstrap(&mut fx.listener, &mut fx.app, &mut renewed);
         assert_eq!(
-            descriptor["result"]["parentReport"]["recovery"]["waitMethod"], "report_recovery_wait",
+            descriptor["result"]["parentReport"]["recoveryWaitMethod"], "report_recovery_wait",
             "{descriptor}"
         );
         finish(fx);
@@ -4141,93 +4167,145 @@ mod tests {
     #[test]
     fn parent_todo_binding_decline_and_reopen_stay_exact() {
         let mut fx = covered_fixture(true, true, Some(0));
-        let bind = |todo_id: &str, task: &str, child: String| {
-            json!({"protocol":crate::mailbox_v1::PROTOCOL,"childDelegationId":child,
-                   "todoDelegationId":todo_id,"parentTaskId":task})
+        call(&mut fx, false, "todo_state", todo(1, false));
+        let route = current_route(&fx);
+        let child_session = serde_json::to_value(&route.child_session).unwrap();
+        let bind = |pane: &str, session: &Value, task: u64| {
+            json!({"protocol":crate::mailbox_v1::PROTOCOL,"childPaneId":pane,
+                   "childSession":session,"todoDelegationId":"AbCdEfGhIjKlMnOpQrSt_-",
+                   "parentTaskId":task})
         };
-        let child = fx.child_id.to_string();
+        let pane = route.child_pane_id.clone();
         assert_eq!(
             call(
                 &mut fx,
                 false,
-                "child_delegation_bind_todo",
-                bind("pi-d1", "7", child.clone())
+                "todo_delegation_bind",
+                bind(&pane, &child_session, 7)
             )["error"]["code"],
-            "grant_revoked",
-            "a child cannot bind its parent's Todo"
+            "invalid_request",
+            "a child is not the parent of any delegation"
         );
-        let bound = call(
-            &mut fx,
-            true,
-            "child_delegation_bind_todo",
-            bind("pi-d1", "7", child.clone()),
-        );
-        let binding_cursor = bound["result"]["bindingCursor"].as_u64().unwrap();
-        let again = call(
-            &mut fx,
-            true,
-            "child_delegation_bind_todo",
-            bind("pi-d1", "7", child.clone()),
-        );
-        assert_eq!(again["result"]["bindingCursor"], binding_cursor);
+        let mut other_session = child_session.clone();
+        other_session["value"] = json!("/elsewhere.jsonl");
         assert_eq!(
             call(
                 &mut fx,
                 true,
-                "child_delegation_bind_todo",
-                bind("pi-d1", "8", child.clone())
+                "todo_delegation_bind",
+                bind(&pane, &other_session, 7)
+            )["error"]["code"],
+            "invalid_request",
+            "no child delegation with that exact session"
+        );
+        assert_eq!(
+            call(
+                &mut fx,
+                true,
+                "todo_delegation_bind",
+                bind("w0:p404", &child_session, 7)
             )["error"]["code"],
             "invalid_request"
         );
-        call(&mut fx, false, "todo_state", todo(1, true));
+        let mut short_id = bind(&pane, &child_session, 7);
+        short_id["todoDelegationId"] = json!("d1");
+        assert_eq!(
+            call(&mut fx, true, "todo_delegation_bind", short_id)["error"]["code"],
+            "invalid_request"
+        );
+        let bound = call(
+            &mut fx,
+            true,
+            "todo_delegation_bind",
+            bind(&pane, &child_session, 7),
+        );
+        assert_eq!(bound["result"]["type"], "todo_delegation_bind", "{bound}");
+        let binding_cursor = bound["result"]["cursor"].as_u64().unwrap();
+        let again = call(
+            &mut fx,
+            true,
+            "todo_delegation_bind",
+            bind(&pane, &child_session, 7),
+        );
+        assert_eq!(again["result"]["cursor"], binding_cursor);
+        assert_eq!(
+            call(
+                &mut fx,
+                true,
+                "todo_delegation_bind",
+                bind(&pane, &child_session, 8)
+            )["error"]["code"],
+            "invalid_request",
+            "conflicting rebind"
+        );
+        call(&mut fx, false, "todo_state", todo(2, true));
         let signal = signals(&mut fx, 0)[0].clone();
         assert_eq!(signal["type"], "missing_after_done", "{signal}");
-        assert_eq!(signal["parentTodo"]["delegationId"], "pi-d1");
-        assert_eq!(signal["parentTodo"]["parentTaskId"], "7");
-        let decline = |reason: &str| {
-            json!({"protocol":crate::mailbox_v1::PROTOCOL,
-                   "signalCursor":signal["signalCursor"],"reason":reason})
+        assert_eq!(
+            signal["parentTodo"],
+            json!({"delegationId":"AbCdEfGhIjKlMnOpQrSt_-","parentTaskId":7})
+        );
+        let signal_cursor = signal["cursor"].as_u64().unwrap();
+        let decline = |recovery_cursor: u64, reason: &str| {
+            json!({"protocol":crate::mailbox_v1::PROTOCOL,"signalCursor":signal_cursor,
+                   "recoveryCursor":recovery_cursor,"reason":reason})
         };
         assert_eq!(
             call(
                 &mut fx,
                 false,
                 "report_recovery_decline",
-                decline("no_exported_report")
+                decline(signal_cursor + 1, "no_exported_report")
             )["error"]["code"],
             "invalid_request",
             "no request, nothing to decline"
         );
-        call(
+        let requested = call(
             &mut fx,
             true,
             "report_recovery_request",
             recovery_request(&signal),
         );
+        let recovery_cursor = requested["result"]["recoveryCursor"].as_u64().unwrap();
         assert_eq!(
             call(
                 &mut fx,
                 true,
                 "report_recovery_decline",
-                decline("no_exported_report")
+                decline(recovery_cursor, "no_exported_report")
             )["error"]["code"],
             "grant_missing",
             "the parent is not the covered child"
         );
-        let declined = call(
-            &mut fx,
-            false,
-            "report_recovery_decline",
-            decline("no_exported_report"),
-        );
-        let decline_cursor = declined["result"]["declineCursor"].as_u64().unwrap();
         assert_eq!(
             call(
                 &mut fx,
                 false,
                 "report_recovery_decline",
-                decline("no_exported_report")
-            )["result"]["declineCursor"],
+                decline(recovery_cursor + 1, "no_exported_report")
+            )["error"]["code"],
+            "invalid_request",
+            "wrong recovery cursor"
+        );
+        let declined = call(
+            &mut fx,
+            false,
+            "report_recovery_decline",
+            decline(recovery_cursor, "no_exported_report"),
+        );
+        assert_eq!(
+            declined["result"]["type"], "report_recovery_decline",
+            "{declined}"
+        );
+        let decline_cursor = declined["result"]["cursor"].as_u64().unwrap();
+        assert!(decline_cursor > recovery_cursor);
+        assert_eq!(
+            call(
+                &mut fx,
+                false,
+                "report_recovery_decline",
+                decline(recovery_cursor, "no_exported_report")
+            )["result"]["cursor"],
             decline_cursor
         );
         assert_eq!(
@@ -4235,21 +4313,48 @@ mod tests {
                 &mut fx,
                 false,
                 "report_recovery_decline",
-                decline("already_admitted")
+                decline(recovery_cursor, "already_admitted")
             )["error"]["code"],
             "invalid_request"
         );
         assert_eq!(
-            call(&mut fx, false, "report_path_attempt", path_attempt(1, "a"))["error"]["code"],
+            call(&mut fx, false, "report_path_attempt", path_attempt(2, "a"))["error"]["code"],
             "egress_frozen",
             "a declined recovery keeps egress frozen"
         );
-        assert_eq!(signals(&mut fx, 0)[0]["recovery"]["available"], false);
+        assert_eq!(
+            call(
+                &mut fx,
+                false,
+                "report_recovery_wake_request",
+                json!({"protocol":crate::mailbox_v1::PROTOCOL,"signalCursor":signal_cursor})
+            )["error"]["code"],
+            "invalid_request",
+            "no wake after a decline"
+        );
+        let page = signals(&mut fx, 0);
+        assert_eq!(page.len(), 2, "{page:?}");
+        assert_eq!(page[0]["recovery"]["available"], false);
+        assert_eq!(page[1]["type"], "report_unknown");
+        assert_eq!(page[1]["reason"], "recovery_declined_no_exported_report");
+        assert_eq!(page[1]["parentTodo"], page[0]["parentTodo"]);
+        assert!(page[1]["cursor"].as_u64().unwrap() > decline_cursor);
+        let waited = call(
+            &mut fx,
+            false,
+            "report_recovery_wait",
+            json!({"protocol":crate::mailbox_v1::PROTOCOL,"afterCursor":0}),
+        );
+        assert_eq!(
+            waited["result"]["requests"],
+            json!([]),
+            "declined requests are settled"
+        );
         // Reopened work makes the old signal non-current and unfreezes the
         // bound path for the new revision.
-        call(&mut fx, false, "todo_state", todo(2, false));
+        call(&mut fx, false, "todo_state", todo(3, false));
         assert_eq!(
-            call(&mut fx, false, "report_path_attempt", path_attempt(2, "b"))["result"]["type"],
+            call(&mut fx, false, "report_path_attempt", path_attempt(3, "b"))["result"]["type"],
             "report_path_attempt"
         );
         finish(fx);
@@ -4402,7 +4507,7 @@ mod tests {
             woken["result"]["signals"][0]["type"], "missing_after_done",
             "{woken}"
         );
-        let next = woken["result"]["nextCursor"].as_u64().unwrap();
+        let next = woken["result"]["throughCursor"].as_u64().unwrap();
         let frame = json!({"method":"child_report_signals","requestId":"expire",
             "bindingGeneration":fx.parent_binding,
             "params":{"protocol":crate::mailbox_v1::PROTOCOL,"afterCursor":next,"waitMs":1}});
@@ -4417,5 +4522,235 @@ mod tests {
         assert_eq!(expired["requestId"], "expire");
         assert_eq!(expired["result"]["signals"], json!([]));
         finish(fx);
+    }
+
+    fn wake(fx: &mut Covered, as_parent: bool, signal_cursor: u64) -> Value {
+        call(
+            fx,
+            as_parent,
+            "report_recovery_wake_request",
+            json!({"protocol":crate::mailbox_v1::PROTOCOL,"signalCursor":signal_cursor}),
+        )
+    }
+
+    fn wake_heads(fx: &Covered) -> Vec<crate::mailbox::MailboxHead> {
+        crate::mailbox::MailboxStore::existing(&fx.directory)
+            .load()
+            .unwrap()
+            .heads
+            .into_values()
+            .filter(|head| head.kind == crate::child_report_closure::RECOVERY_WAKE_KIND)
+            .collect()
+    }
+
+    #[test]
+    fn recovery_wake_is_issued_once_per_signal_and_only_to_the_covered_child() {
+        let mut fx = covered_fixture(true, true, Some(0));
+        call(&mut fx, false, "todo_state", todo(1, true));
+        let signal = signals(&mut fx, 0)[0].clone();
+        let signal_cursor = signal["cursor"].as_u64().unwrap();
+        assert_eq!(
+            wake(&mut fx, false, signal_cursor)["error"]["code"],
+            "invalid_request",
+            "no wake without an open recovery request"
+        );
+        call(
+            &mut fx,
+            true,
+            "report_recovery_request",
+            recovery_request(&signal),
+        );
+        assert_eq!(
+            wake(&mut fx, true, signal_cursor)["error"]["code"],
+            "grant_missing",
+            "the parent is not the covered child"
+        );
+        let binding = fx.child_binding.clone();
+        fx.child_binding = "forged".into();
+        assert_eq!(
+            wake(&mut fx, false, signal_cursor)["error"]["code"],
+            "grant_revoked",
+            "a stale or forged child binding is refused"
+        );
+        fx.child_binding = binding;
+        assert!(wake_heads(&fx).is_empty());
+        let issued = wake(&mut fx, false, signal_cursor);
+        assert_eq!(
+            issued["result"]["type"], "report_recovery_wake_request",
+            "{issued}"
+        );
+        assert_eq!(issued["result"]["signalCursor"], signal_cursor);
+        let wake_cursor = issued["result"]["wakeCursor"].as_u64().unwrap();
+        assert!(wake_cursor > signal_cursor);
+        let heads = wake_heads(&fx);
+        assert_eq!(heads.len(), 1);
+        let head = &heads[0];
+        assert_eq!(head.subject, "System recovery request");
+        assert_eq!(head.revision, 1);
+        assert_eq!(head.priority, "normal");
+        assert_eq!(
+            head.body,
+            format!("{{\"signalCursor\":{signal_cursor},\"wakeCursor\":{wake_cursor}}}")
+        );
+        assert_eq!(
+            head.recipient.recipient_id,
+            current_route(&fx).child_terminal_id
+        );
+        // The server-minted head is never editable.
+        assert!(crate::mailbox::MailboxStore::existing(&fx.directory)
+            .edit_unclaimed_head(crate::mailbox::MailboxHeadEdit {
+                stable_id: head.stable_id.clone(),
+                revision: head.revision,
+                digest: head.digest.clone(),
+                subject: "edited".into(),
+                body: "edited".into(),
+            })
+            .is_err());
+        let repeat = wake(&mut fx, false, signal_cursor);
+        assert_eq!(repeat["result"]["wakeCursor"], wake_cursor);
+        assert_eq!(wake_heads(&fx).len(), 1, "a repeat delivers nothing new");
+        // The woken child's report uses the existing one-delivery unfreeze.
+        assert_eq!(
+            call(&mut fx, false, "report_prepared", preparation(1, "a"))["result"]["type"],
+            "report_prepared"
+        );
+        let delivered = call(&mut fx, false, "report_submit_parent", submission("a"));
+        assert!(delivered["ok"].as_bool().unwrap(), "{delivered}");
+        // Across a restart the durable wake record and head stable ID still
+        // allow exactly one head.
+        fx.app.mailbox_bootstrap_boot_nonce = Some("f".repeat(64));
+        assert_eq!(
+            wake(&mut fx, false, signal_cursor)["result"]["wakeCursor"],
+            wake_cursor
+        );
+        let restarted = crate::mailbox::MailboxStore::existing(&fx.directory);
+        assert_eq!(
+            restarted.append_server_recovery_wake(head.clone()),
+            Ok(false)
+        );
+        assert_eq!(wake_heads(&fx).len(), 1);
+        assert_eq!(
+            closure_journal(&fx)
+                .records
+                .iter()
+                .filter(|record| matches!(
+                    record,
+                    crate::child_report_closure::ClosureRecord::RecoveryWakeIssued { .. }
+                ))
+                .count(),
+            1
+        );
+        finish(fx);
+    }
+
+    #[test]
+    fn unissuable_recovery_wake_settles_unknown_through_the_decline_path() {
+        let mut fx = covered_fixture(true, true, Some(0));
+        call(&mut fx, false, "todo_state", todo(1, true));
+        let signal = signals(&mut fx, 0)[0].clone();
+        let signal_cursor = signal["cursor"].as_u64().unwrap();
+        call(
+            &mut fx,
+            true,
+            "report_recovery_request",
+            recovery_request(&signal),
+        );
+        // Occupy the wake's stable ID so the server head cannot be minted.
+        let blocker = crate::mailbox::MailboxHead {
+            stable_id: crate::child_report_closure::recovery_wake_stable_id(signal_cursor),
+            revision: 1,
+            digest: "a".repeat(64),
+            delivery_digest: "c".repeat(64),
+            recipient: crate::mailbox::RecipientKey {
+                recipient_id: fx.parent_key.clone(),
+                generation: "1".into(),
+            },
+            subject: "s".into(),
+            body: "b".into(),
+            recipient_generation: "1".into(),
+            sender: "x".into(),
+            target: fx.parent_key.clone(),
+            grant_id: "g".into(),
+            message_id: "m".into(),
+            kind: "info".into(),
+            priority: "normal".into(),
+            original_sequence: 1,
+            enqueue_epoch: 0,
+            accepted_at: 1,
+        };
+        crate::mailbox::MailboxStore::existing(&fx.directory)
+            .append_offline_head(blocker)
+            .unwrap();
+        assert_eq!(
+            wake(&mut fx, false, signal_cursor)["error"]["code"],
+            "grant_revoked"
+        );
+        assert!(wake_heads(&fx).is_empty());
+        let page = signals(&mut fx, 0);
+        assert_eq!(page.len(), 2, "{page:?}");
+        assert_eq!(page[1]["type"], "report_unknown");
+        assert_eq!(page[1]["reason"], "recovery_declined_no_exported_report");
+        // Settled: a repeat cannot issue a late wake.
+        assert!(wake(&mut fx, false, signal_cursor)["error"].is_object());
+        assert!(wake_heads(&fx).is_empty());
+        finish(fx);
+    }
+
+    #[test]
+    fn peers_and_generic_api_cannot_mint_wakes_or_call_accepted_stream_methods() {
+        let mut fx = covered_fixture(true, false, Some(0));
+        let mut forged = submission("wake");
+        forged["kind"] = json!("recovery_wake");
+        forged["subject"] = json!("System recovery request");
+        let peer = call(&mut fx, false, "report_submit", forged.clone());
+        assert_eq!(peer["ok"], false, "{peer}");
+        let mut generic = forged.clone();
+        generic["stableId"] = json!("generic-wake");
+        let child_key = current_route_key(&mut fx);
+        let response = fx.app.handle_api_request(crate::api::schema::Request {
+            id: "forged-wake".into(),
+            method: crate::api::schema::Method::MailboxOfflineSubmit(
+                crate::api::schema::MailboxOfflineSubmitParams {
+                    caller: child_key.clone(),
+                    grant_id: format!("offline:{child_key}:1"),
+                    recipient: crate::mailbox::RecipientKey {
+                        recipient_id: child_key.clone(),
+                        generation: "1".into(),
+                    },
+                    submit: serde_json::from_value(generic).unwrap(),
+                },
+            ),
+        });
+        assert!(response.contains("\"error\""), "{response}");
+        assert!(wake_heads(&fx).is_empty());
+        // Only the accepted Pi stream knows these methods; the generic API
+        // request decoder rejects each of them before any dispatch.
+        for method in [
+            "todo_state",
+            "report_path_attempt",
+            "report_prepared",
+            "report_submit_parent",
+            "todo_delegation_bind",
+            "child_report_signals",
+            "report_recovery_request",
+            "report_recovery_wait",
+            "report_recovery_decline",
+            "report_recovery_wake_request",
+        ] {
+            let line = json!({"id":"forged","method":method,"params":{
+                "protocol":crate::mailbox_v1::PROTOCOL,"signalCursor":1,"afterCursor":0,
+                "localRoot":"child-root","localRevision":1,"stateDigest":state_digest(1),
+                "state":"done"}})
+            .to_string();
+            assert!(
+                serde_json::from_str::<crate::api::schema::Request>(&line).is_err(),
+                "{method} must not decode as a generic API request"
+            );
+        }
+        finish(fx);
+    }
+
+    fn current_route_key(fx: &mut Covered) -> String {
+        fx.child_terminal.to_string()
     }
 }

@@ -10,10 +10,12 @@
 //! or (for an exact admitted report) no signal at all.
 //!
 //! The records live in their own append-only file next to the mailbox journal
-//! and are written under the mailbox's exclusive lock. Cursors in this file
-//! (`signalCursor`, `closureCursor`, recovery cursors) are closure-journal
-//! positions; `todoStateCursor` is a mailbox-journal cursor. The two spaces are
-//! never mixed. An older Herdr that does not know this file ignores it.
+//! and are written under the mailbox's exclusive lock. Closure cursors (the
+//! signal `cursor`, `closureCursor`, recovery, decline and wake cursors) are
+//! strictly increasing and always minted above the mailbox cursor current at
+//! write time, so `todoStateCursor < closureCursor < cursor` holds although
+//! `todoStateCursor` is a mailbox-journal cursor. An older Herdr that does not
+//! know this file ignores it.
 
 use std::fs::{File, OpenOptions};
 use std::io::{BufRead, BufReader, Write};
@@ -26,6 +28,19 @@ use crate::mailbox::{MailboxError, MailboxStore, RecoveredMailbox};
 pub const CLOSURE_STREAM_FILE: &str = "child-report-closure.v1.jsonl";
 /// Upper bound on records returned by one signal/recovery page.
 pub const MAX_PAGE: usize = 64;
+/// Upper bound on recovery requests returned to a child by one wait.
+pub const MAX_RECOVERY_PAGE: usize = 8;
+pub const RECOVERY_WAKE_KIND: &str = "recovery_wake";
+pub const RECOVERY_WAKE_SUBJECT: &str = "System recovery request";
+
+/// Canonical wake head body; Pi renders fixed text and never this body.
+pub fn recovery_wake_body(signal_cursor: u64, wake_cursor: u64) -> String {
+    format!("{{\"signalCursor\":{signal_cursor},\"wakeCursor\":{wake_cursor}}}")
+}
+
+pub fn recovery_wake_stable_id(signal_cursor: u64) -> String {
+    format!("recovery-wake-{signal_cursor}")
+}
 /// Upper bound on a parked long-poll.
 pub const MAX_WAIT_MS: u64 = 30_000;
 /// The only HERDR_* variables a covered (sandboxed) child launch may inherit.
@@ -168,6 +183,21 @@ pub enum UnknownReason {
     RouteReplaced,
     ChildProcessGone,
     CoverageUnqualified,
+    RecoveryDeclinedNoExportedReport,
+    RecoveryDeclinedPriorAttemptUncertain,
+    RecoveryDeclinedAlreadyAdmitted,
+    RecoveryDeclinedStateMismatch,
+}
+
+impl UnknownReason {
+    pub fn declined(reason: DeclineReason) -> Self {
+        match reason {
+            DeclineReason::NoExportedReport => Self::RecoveryDeclinedNoExportedReport,
+            DeclineReason::PriorAttemptUncertain => Self::RecoveryDeclinedPriorAttemptUncertain,
+            DeclineReason::AlreadyAdmitted => Self::RecoveryDeclinedAlreadyAdmitted,
+            DeclineReason::StateMismatch => Self::RecoveryDeclinedStateMismatch,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -233,16 +263,52 @@ pub struct ClosureCounts {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct SignalClosure {
+    pub coverage_qualified: bool,
     pub closure_cursor: u64,
-    #[serde(flatten)]
-    pub counts: ClosureCounts,
+    pub path_attempt_count: u64,
+    pub prepared_count: u64,
+    pub admitted_report_count: u64,
+}
+
+impl SignalClosure {
+    pub fn new(coverage_qualified: bool, closure_cursor: u64, counts: ClosureCounts) -> Self {
+        Self {
+            coverage_qualified,
+            closure_cursor,
+            path_attempt_count: counts.path_attempt_count,
+            prepared_count: counts.prepared_count,
+            admitted_report_count: counts.admitted_report_count,
+        }
+    }
+
+    pub fn counts(&self) -> ClosureCounts {
+        ClosureCounts {
+            path_attempt_count: self.path_attempt_count,
+            prepared_count: self.prepared_count,
+            admitted_report_count: self.admitted_report_count,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ParentTodo {
     pub delegation_id: String,
-    pub parent_task_id: String,
+    pub parent_task_id: u64,
+}
+
+impl ParentTodo {
+    /// Pi's Todo delegation IDs are exactly 22 URL-safe base64 characters;
+    /// anything else would make every echoing signal undecodable for Pi.
+    pub fn valid(&self) -> bool {
+        self.delegation_id.len() == 22
+            && self
+                .delegation_id
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_')
+            && self.parent_task_id > 0
+            && self.parent_task_id < (1 << 53)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -255,6 +321,7 @@ pub struct SignalRecovery {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ChildReportSignal {
+    #[serde(rename = "cursor")]
     pub signal_cursor: u64,
     #[serde(rename = "type")]
     pub signal_type: SignalType,
@@ -322,8 +389,21 @@ pub enum ClosureRecord {
     RecoveryDeclined {
         cursor: u64,
         signal_cursor: u64,
+        recovery_cursor: u64,
         route: RouteIdentity,
         reason: DeclineReason,
+        /// True when the server settled an unissuable or unverifiable wake.
+        #[serde(default)]
+        server_settled: bool,
+    },
+    /// #161: exactly one report-only wake per signal. The head's stable ID is
+    /// derived from the signal cursor, so it cannot be delivered twice.
+    RecoveryWakeIssued {
+        cursor: u64,
+        signal_cursor: u64,
+        recovery_cursor: u64,
+        route: RouteIdentity,
+        stable_id: String,
     },
     /// Written only after the preceding records `first..=last` were fsynced
     /// and read back exactly. Authority-bearing reads (domains, signals,
@@ -347,6 +427,7 @@ impl ClosureRecord {
             | Self::Signal { cursor, .. }
             | Self::RecoveryRequested { cursor, .. }
             | Self::RecoveryDeclined { cursor, .. }
+            | Self::RecoveryWakeIssued { cursor, .. }
             | Self::Commit { cursor, .. } => *cursor,
         }
     }
@@ -355,10 +436,14 @@ impl ClosureRecord {
         match self {
             Self::Signal { cursor, signal } => {
                 signal.signal_cursor == *cursor
+                    && signal.todo.todo_state_cursor < signal.closure.closure_cursor
+                    && signal.closure.closure_cursor < *cursor
+                    && signal.parent_todo.as_ref().is_none_or(ParentTodo::valid)
                     && match signal.signal_type {
                         SignalType::MissingAfterDone => {
                             signal.reason.is_none()
-                                && signal.closure.counts == ClosureCounts::default()
+                                && signal.closure.coverage_qualified
+                                && signal.closure.counts() == ClosureCounts::default()
                         }
                         SignalType::ReportUnknown => {
                             signal.reason.is_some() && !signal.recovery.available
@@ -395,33 +480,46 @@ impl ClosureRecord {
     }
 }
 
-/// Recovered closure journal. Record `n` (1-based) always carries cursor `n`.
+/// Recovered closure journal. Cursors are strictly increasing, not dense.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct ClosureJournal {
     pub records: Vec<ClosureRecord>,
     committed: Vec<bool>,
+    /// Mailbox cursor observed by the current transaction; new closure
+    /// cursors are minted above it.
+    floor: u64,
 }
 
 impl ClosureJournal {
+    pub fn last_cursor(&self) -> u64 {
+        self.records.last().map_or(0, ClosureRecord::cursor)
+    }
+
     pub fn next_cursor(&self) -> u64 {
-        self.records.len() as u64 + 1
+        self.last_cursor().max(self.floor) + 1
     }
 
     fn push(&mut self, record: ClosureRecord) -> Result<(), MailboxError> {
-        if record.cursor() != self.next_cursor() || !record.valid() {
+        if record.cursor() <= self.last_cursor() || !record.valid() {
             return Err(MailboxError::CorruptRecord);
         }
-        if let ClosureRecord::Commit {
-            cursor,
-            first,
-            last,
-        } = &record
-        {
-            if *first == 0 || first > last || *last + 1 != *cursor {
+        if let ClosureRecord::Commit { first, last, .. } = &record {
+            // A commit covers exactly an uncommitted run ending at the tail.
+            if *first == 0 || first > last || *last != self.last_cursor() {
                 return Err(MailboxError::CorruptRecord);
             }
-            for index in (*first - 1)..*last {
-                self.committed[index as usize] = true;
+            let mut covered = false;
+            for (existing, committed) in self.records.iter().zip(self.committed.iter_mut()) {
+                if (*first..=*last).contains(&existing.cursor()) {
+                    if *committed || matches!(existing, ClosureRecord::Commit { .. }) {
+                        return Err(MailboxError::CorruptRecord);
+                    }
+                    *committed = true;
+                    covered = true;
+                }
+            }
+            if !covered {
+                return Err(MailboxError::CorruptRecord);
             }
         }
         self.records.push(record);
@@ -569,6 +667,18 @@ impl ClosureJournal {
         })
     }
 
+    pub fn wake(&self, signal_cursor: u64) -> Option<(u64, &str)> {
+        self.records.iter().find_map(|record| match record {
+            ClosureRecord::RecoveryWakeIssued {
+                cursor,
+                signal_cursor: signal,
+                stable_id,
+                ..
+            } if *signal == signal_cursor => Some((*cursor, stable_id.as_str())),
+            _ => None,
+        })
+    }
+
     pub fn decline(&self, signal_cursor: u64) -> Option<(u64, DeclineReason)> {
         self.records.iter().find_map(|record| match record {
             ClosureRecord::RecoveryDeclined {
@@ -626,7 +736,7 @@ impl ClosureJournal {
                 }
                 _ => None,
             })
-            .take(MAX_PAGE)
+            .take(MAX_RECOVERY_PAGE)
             .collect()
     }
 }
@@ -678,14 +788,15 @@ pub fn closure_transaction<T>(
 ) -> Result<T, MailboxError> {
     store.with_exclusive_lock(|| {
         let mailbox = store.load()?;
-        let journal = load_closure(store)?;
+        let mut journal = load_closure(store)?;
+        journal.floor = mailbox.record_cursor;
         let (records, result) = plan(&mailbox, &journal)?;
-        let mut expected = journal.next_cursor();
+        let mut previous = journal.next_cursor() - 1;
         for record in &records {
-            if record.cursor() != expected || !record.valid() {
+            if record.cursor() <= previous || !record.valid() {
                 return Err(MailboxError::InvalidRecord);
             }
-            expected += 1;
+            previous = record.cursor();
         }
         if records.is_empty() {
             return Ok(result);
@@ -713,9 +824,9 @@ pub fn closure_transaction<T>(
             return Err(MailboxError::CorruptRecord);
         }
         let commit = ClosureRecord::Commit {
-            cursor: expected,
-            first: journal.next_cursor(),
-            last: expected - 1,
+            cursor: previous + 1,
+            first: records[0].cursor(),
+            last: previous,
         };
         serde_json::to_writer(&mut stream, &commit)
             .map_err(|error| MailboxError::Io(error.to_string()))?;
@@ -1097,7 +1208,7 @@ mod tests {
     #[test]
     fn journal_serves_only_committed_authority_and_rejects_invalid_records() {
         let current = route();
-        let signal = |cursor, signal_type, reason, counts| ClosureRecord::Signal {
+        let signal = |cursor, signal_type, reason, counts: ClosureCounts| ClosureRecord::Signal {
             cursor,
             signal: ChildReportSignal {
                 signal_cursor: cursor,
@@ -1109,12 +1220,13 @@ mod tests {
                     local_revision: 1,
                     state_digest: "a".repeat(64),
                     state: LocalTodoState::Done,
-                    todo_state_cursor: 1,
+                    todo_state_cursor: 40,
                 },
-                closure: SignalClosure {
-                    closure_cursor: 1,
+                closure: SignalClosure::new(
+                    signal_type == SignalType::MissingAfterDone,
+                    45,
                     counts,
-                },
+                ),
                 parent_todo: None,
                 recovery: SignalRecovery {
                     available: signal_type == SignalType::MissingAfterDone,
@@ -1125,28 +1237,52 @@ mod tests {
             path_attempt_count: 1,
             ..ClosureCounts::default()
         };
-        // missing_after_done with any nonzero count, or without a reason
-        // rule, is not a decodable record.
-        assert!(!signal(1, SignalType::MissingAfterDone, None, busy).valid());
+        assert!(!signal(50, SignalType::MissingAfterDone, None, busy).valid());
         assert!(!signal(
-            1,
+            50,
             SignalType::MissingAfterDone,
             Some(UnknownReason::InFlight),
             ClosureCounts::default()
         )
         .valid());
-        assert!(!signal(1, SignalType::ReportUnknown, None, busy).valid());
+        assert!(!signal(50, SignalType::ReportUnknown, None, busy).valid());
+        // Pi's ordering check: todoStateCursor < closureCursor < cursor.
+        assert!(!signal(
+            45,
+            SignalType::MissingAfterDone,
+            None,
+            ClosureCounts::default()
+        )
+        .valid());
+        let wire = serde_json::to_value(
+            match signal(
+                50,
+                SignalType::MissingAfterDone,
+                None,
+                ClosureCounts::default(),
+            ) {
+                ClosureRecord::Signal { signal, .. } => signal,
+                _ => unreachable!(),
+            },
+        )
+        .unwrap();
+        assert_eq!(wire["cursor"], 50);
+        assert_eq!(
+            wire["closure"],
+            serde_json::json!({"coverageQualified":true,"closureCursor":45,
+                "pathAttemptCount":0,"preparedCount":0,"admittedReportCount":0})
+        );
         let mut journal = ClosureJournal::default();
         journal
             .push(signal(
-                1,
+                50,
                 SignalType::MissingAfterDone,
                 None,
                 ClosureCounts::default(),
             ))
             .unwrap();
         assert!(
-            journal.signal(1).is_none(),
+            journal.signal(50).is_none(),
             "uncommitted signal is not served"
         );
         assert!(journal
@@ -1154,31 +1290,66 @@ mod tests {
             .is_empty());
         journal
             .push(ClosureRecord::Commit {
-                cursor: 2,
-                first: 1,
-                last: 1,
+                cursor: 51,
+                first: 50,
+                last: 50,
             })
             .unwrap();
-        assert!(journal.signal(1).is_some());
+        assert!(journal.signal(50).is_some());
         assert_eq!(journal.signals_for_parent("parent-terminal", 3, 0).len(), 1);
         assert!(journal
             .signals_for_parent("parent-terminal", 4, 0)
             .is_empty());
-        // Cursor gaps and malformed commits are corrupt.
+        // Cursors must increase; a commit must cover the uncommitted tail.
         assert!(journal
             .push(ClosureRecord::Commit {
-                cursor: 4,
-                first: 1,
-                last: 3,
+                cursor: 51,
+                first: 50,
+                last: 51,
             })
             .is_err());
         assert!(journal
             .push(ClosureRecord::Commit {
-                cursor: 3,
-                first: 0,
-                last: 2,
+                cursor: 60,
+                first: 50,
+                last: 51,
             })
             .is_err());
+        journal.floor = 99;
+        assert_eq!(
+            journal.next_cursor(),
+            100,
+            "minted above the mailbox cursor"
+        );
+    }
+
+    #[test]
+    fn parent_todo_echo_must_be_decodable_by_pi() {
+        let valid = ParentTodo {
+            delegation_id: "AbCdEfGhIjKlMnOpQrSt_-".into(),
+            parent_task_id: 7,
+        };
+        assert!(valid.valid());
+        for invalid in [
+            ParentTodo {
+                delegation_id: "short".into(),
+                ..valid.clone()
+            },
+            ParentTodo {
+                delegation_id: "AbCdEfGhIjKlMnOpQrSt_!".into(),
+                ..valid.clone()
+            },
+            ParentTodo {
+                parent_task_id: 0,
+                ..valid.clone()
+            },
+            ParentTodo {
+                parent_task_id: 1 << 53,
+                ..valid.clone()
+            },
+        ] {
+            assert!(!invalid.valid(), "{invalid:?}");
+        }
     }
 
     fn policy(birth: BirthRecord) -> CoveredLaunchPolicy {

@@ -1057,7 +1057,7 @@ impl App {
             }
             let child_recovery = parent_report
                 .as_ref()
-                .is_some_and(|route| self.covered_child_done_acked(route));
+                .is_some_and(|route| self.covered_child_recovery_advertised(route));
             let session = MailboxBootstrapSession {
                 caller: candidate.sender_key.clone(),
                 parent_signals: self.child_report_signals_enabled && !candidate.history_only,

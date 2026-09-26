@@ -277,9 +277,11 @@ impl App {
         .map_err(|error| error.to_string())
     }
 
-    /// Whether a covered child's bound path already produced a durable done
-    /// ACK with a closure barrier on this exact route.
-    pub(crate) fn covered_child_done_acked(
+    /// Recovery wait/decline/wake are advertised to a covered child whose
+    /// domain names its current route. Pi registers its recovery loop from the
+    /// bootstrap descriptor; the methods themselves act only after a done ACK,
+    /// a closure barrier and an exact parent request.
+    pub(crate) fn covered_child_recovery_advertised(
         &self,
         route: &crate::app::mailbox::BoundParentReportRoute,
     ) -> bool {
@@ -289,20 +291,11 @@ impl App {
         let Some(identity) = self.current_child_route(&route.child_delegation.to_string()) else {
             return false;
         };
-        let Ok(journal) = self.closure_journal() else {
-            return false;
-        };
-        let Ok(mailbox) = MailboxStore::existing(&self.sender_authority_dir).load() else {
-            return false;
-        };
-        journal
-            .latest_domain_for_delegation(&identity.child_delegation_id)
-            .is_some()
-            && latest_done_on_route(&mailbox, &identity).is_some_and(|done| {
-                journal
-                    .barrier(&identity, &done.local_root, done.local_revision)
-                    .is_some()
-            })
+        self.closure_journal().is_ok_and(|journal| {
+            journal
+                .latest_domain_for_delegation(&identity.child_delegation_id)
+                .is_some_and(|domain| domain.route == identity)
+        })
     }
 
     /// Generic/self/provisioned sends by a covered child are denied outright.
@@ -491,10 +484,7 @@ impl App {
                         reason: decision.reason,
                         route: route.clone(),
                         todo: done,
-                        closure: SignalClosure {
-                            closure_cursor,
-                            counts: decision.counts,
-                        },
+                        closure: SignalClosure::new(missing, closure_cursor, decision.counts),
                         parent_todo: journal
                             .parent_todo(&route.child_delegation_id, &route.route_epoch)
                             .cloned(),
@@ -589,23 +579,102 @@ impl App {
         Ok(())
     }
 
-    /// Parent-owned Pi Todo binding for its child delegation, supplied only on
-    /// the parent's own accepted stream and bound to the current route epoch.
-    pub(crate) fn bind_parent_todo(
+    /// A decline (by the child, or by the server settling a wake it could not
+    /// issue or verify) plus the parent's `report_unknown` for it.
+    fn decline_records(
+        journal: &ClosureJournal,
+        signal: &ChildReportSignal,
+        recovery_cursor: u64,
+        reason: DeclineReason,
+        server_settled: bool,
+    ) -> Vec<ClosureRecord> {
+        let decline_cursor = journal.next_cursor();
+        let mut unknown = signal.clone();
+        unknown.signal_cursor = decline_cursor + 1;
+        unknown.signal_type = SignalType::ReportUnknown;
+        unknown.reason = Some(UnknownReason::declined(reason));
+        unknown.recovery = SignalRecovery { available: false };
+        vec![
+            ClosureRecord::RecoveryDeclined {
+                cursor: decline_cursor,
+                signal_cursor: signal.signal_cursor,
+                recovery_cursor,
+                route: signal.route.clone(),
+                reason,
+                server_settled,
+            },
+            ClosureRecord::Signal {
+                cursor: decline_cursor + 1,
+                signal: unknown,
+            },
+        ]
+    }
+
+    /// Settle an open recovery as UNKNOWN when the server cannot issue or
+    /// verify its wake. Idempotent; an existing decline wins.
+    fn settle_unissued_wake(&self, signal_cursor: u64) {
+        let Ok(store) = MailboxStore::open(&self.sender_authority_dir) else {
+            return;
+        };
+        let _ = closure::closure_transaction(&store, |_, journal| {
+            let (Some(signal), Some((recovery_cursor, _))) = (
+                journal.signal(signal_cursor).cloned(),
+                journal.recovery_request(signal_cursor),
+            ) else {
+                return Ok((vec![], ()));
+            };
+            if journal.decline(signal_cursor).is_some() {
+                return Ok((vec![], ()));
+            }
+            Ok((
+                Self::decline_records(
+                    journal,
+                    &signal,
+                    recovery_cursor,
+                    DeclineReason::NoExportedReport,
+                    true,
+                ),
+                (),
+            ))
+        });
+    }
+
+    /// Parent-owned Pi Todo binding for one of its own current child
+    /// delegations, resolved from the child pane and exact child session on
+    /// the parent's own accepted stream. None, ambiguity and a conflicting
+    /// rebind are rejected.
+    pub(crate) fn bind_todo_delegation(
         &mut self,
         session: &MailboxBootstrapSession,
-        child: crate::delegation::DelegationId,
+        child_pane_id: &str,
+        child_session: &crate::api::schema::AgentSessionInfo,
         parent_todo: ParentTodo,
     ) -> Result<u64, MailboxBootstrapError> {
         self.require_child_report_signals()?;
         self.require_live_session(session)?;
-        if [&parent_todo.delegation_id, &parent_todo.parent_task_id]
-            .iter()
-            .any(|value| value.is_empty() || value.len() > 128)
-        {
+        if !parent_todo.valid() || child_pane_id.is_empty() || child_pane_id.len() > 256 {
             return Err(MailboxBootstrapError::InvalidRequest);
         }
-        let identity = self.parent_current_route_identity(session, child)?;
+        let children: Vec<_> = self
+            .ready_delegation_routes
+            .values()
+            .filter(|ready| {
+                ready.parent_terminal.to_string() == session.caller
+                    && ready.parent_generation == session.active_execution_generation
+            })
+            .map(|ready| ready.child)
+            .collect();
+        let matches: Vec<RouteIdentity> = children
+            .into_iter()
+            .filter_map(|child| self.parent_current_route_identity(session, child).ok())
+            .filter(|identity| {
+                identity.child_pane_id == child_pane_id && &identity.child_session == child_session
+            })
+            .collect();
+        let [identity] = matches.as_slice() else {
+            return Err(MailboxBootstrapError::InvalidRequest);
+        };
+        let identity = identity.clone();
         let store = self.closure_store()?;
         let result = closure::closure_transaction(&store, |_, journal| {
             if let Some((cursor, existing)) = journal
@@ -632,11 +701,16 @@ impl App {
         })
         .map_err(store_error)?;
         let cursor = result?;
+        let child: crate::delegation::DelegationId = identity
+            .child_delegation_id
+            .parse()
+            .map_err(|_| MailboxBootstrapError::InvalidRequest)?;
         self.parent_current_route_identity(session, child)?;
         Ok(cursor)
     }
 
-    /// One bounded page of signals for this exact parent execution.
+    /// One bounded page of signals for this exact parent execution. The
+    /// returned `throughCursor` never skips an unreturned signal.
     pub(crate) fn child_report_signals_page(
         &self,
         session: &MailboxBootstrapSession,
@@ -645,7 +719,7 @@ impl App {
         self.require_child_report_signals()?;
         self.require_live_session(session)?;
         let journal = self.closure_journal()?;
-        if after_cursor >= journal.next_cursor() {
+        if after_cursor > journal.last_cursor() {
             return Err(MailboxBootstrapError::InvalidRequest);
         }
         let mailbox = MailboxStore::existing(&self.sender_authority_dir)
@@ -663,14 +737,18 @@ impl App {
                 signal
             })
             .collect();
-        let next_cursor = signals
-            .last()
-            .map(|signal| signal.signal_cursor)
-            .unwrap_or(after_cursor);
-        Ok(json!({"type":"child_report_signals","signals":signals,"nextCursor":next_cursor}))
+        let through_cursor = if signals.len() == closure::MAX_PAGE {
+            signals
+                .last()
+                .map_or(after_cursor, |signal| signal.signal_cursor)
+        } else {
+            journal.last_cursor().max(after_cursor)
+        };
+        Ok(json!({"type":"child_report_signals","signals":signals,"throughCursor":through_cursor}))
     }
 
     /// Parent asks the server to relay one recovery request to the child.
+    /// A repeat returns the same recovery cursor.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn request_report_recovery(
         &mut self,
@@ -681,7 +759,7 @@ impl App {
         local_root: &str,
         local_revision: u64,
         state_digest: &str,
-    ) -> Result<(u64, bool), MailboxBootstrapError> {
+    ) -> Result<u64, MailboxBootstrapError> {
         self.require_child_report_signals()?;
         self.require_live_session(session)?;
         let journal = self.closure_journal()?;
@@ -703,7 +781,7 @@ impl App {
             return Err(MailboxBootstrapError::InvalidRequest);
         }
         if let Some((cursor, _)) = journal.recovery_request(signal_cursor) {
-            return Ok((cursor, false));
+            return Ok(cursor);
         }
         let child: crate::delegation::DelegationId = signal
             .route
@@ -724,9 +802,8 @@ impl App {
         }
         closure::closure_transaction(&store, |mailbox, journal| {
             if let Some((cursor, _)) = journal.recovery_request(signal_cursor) {
-                return Ok((vec![], (cursor, false)));
+                return Ok((vec![], cursor));
             }
-            // Re-check under the lock: nothing on the route moved since.
             if journal
                 .latest_signal_for_child(&signal.route.child_delegation_id)
                 .map(|latest| latest.signal_cursor)
@@ -743,13 +820,13 @@ impl App {
                     route: signal.route.clone(),
                     mailbox_cursor: mailbox.record_cursor,
                 }],
-                (cursor, true),
+                cursor,
             ))
         })
         .map_err(|_| MailboxBootstrapError::GrantRevoked)
     }
 
-    /// Recovery requests for this covered child's current route.
+    /// Open (undeclined) recovery requests for this covered child's route.
     pub(crate) fn recovery_requests_page(
         &self,
         session: &MailboxBootstrapSession,
@@ -758,7 +835,7 @@ impl App {
         self.require_child_report_signals()?;
         let route = self.covered_child_route(session)?;
         let journal = self.closure_journal()?;
-        if after_cursor >= journal.next_cursor() {
+        if after_cursor > journal.last_cursor() {
             return Err(MailboxBootstrapError::InvalidRequest);
         }
         let requests: Vec<Value> = journal
@@ -769,22 +846,19 @@ impl App {
                 after_cursor,
             )
             .into_iter()
+            .filter(|(_, signal)| journal.decline(signal.signal_cursor).is_none())
             .map(|(cursor, signal)| {
                 json!({
-                    "recoveryCursor": cursor,
                     "signalCursor": signal.signal_cursor,
-                    "route": signal.route,
-                    "todo": signal.todo,
-                    "parentTodo": signal.parent_todo,
-                    "declined": journal.decline(signal.signal_cursor).map(|(_, reason)| reason),
+                    "recoveryCursor": cursor,
+                    "routeEpoch": signal.route.route_epoch,
+                    "localRoot": signal.todo.local_root,
+                    "localRevision": signal.todo.local_revision,
+                    "stateDigest": signal.todo.state_digest,
                 })
             })
             .collect();
-        let next_cursor = requests
-            .last()
-            .and_then(|request| request["recoveryCursor"].as_u64())
-            .unwrap_or(after_cursor);
-        Ok(json!({"type":"report_recovery_requests","requests":requests,"nextCursor":next_cursor}))
+        Ok(json!({"type":"report_recovery_wait","requests":requests}))
     }
 
     fn covered_child_route(
@@ -805,21 +879,28 @@ impl App {
         Ok(identity)
     }
 
-    /// The child declines a recovery request; the parent records UNKNOWN.
+    /// The child declines a recovery request; the parent then receives a
+    /// `report_unknown` with reason `recovery_declined_<reason>`.
     pub(crate) fn decline_report_recovery(
         &mut self,
         session: &MailboxBootstrapSession,
         signal_cursor: u64,
+        recovery_cursor: u64,
         reason: DeclineReason,
     ) -> Result<u64, MailboxBootstrapError> {
         self.require_child_report_signals()?;
         let route = self.covered_child_route(session)?;
         let store = self.closure_store()?;
         let result = closure::closure_transaction(&store, |_, journal| {
-            let Some(signal) = journal.signal(signal_cursor) else {
+            let Some(signal) = journal.signal(signal_cursor).cloned() else {
                 return Ok((vec![], Err(MailboxBootstrapError::InvalidRequest)));
             };
-            if signal.route != route || journal.recovery_request(signal_cursor).is_none() {
+            if signal.route != route
+                || journal
+                    .recovery_request(signal_cursor)
+                    .map(|(cursor, _)| cursor)
+                    != Some(recovery_cursor)
+            {
                 return Ok((vec![], Err(MailboxBootstrapError::InvalidRequest)));
             }
             if let Some((cursor, existing)) = journal.decline(signal_cursor) {
@@ -832,18 +913,142 @@ impl App {
                     },
                 ));
             }
-            let cursor = journal.next_cursor();
-            Ok((
-                vec![ClosureRecord::RecoveryDeclined {
-                    cursor,
-                    signal_cursor,
-                    route: route.clone(),
-                    reason,
-                }],
-                Ok(cursor),
-            ))
+            let records = Self::decline_records(journal, &signal, recovery_cursor, reason, false);
+            let cursor = records[0].cursor();
+            Ok((records, Ok(cursor)))
         })
         .map_err(store_error)?;
         result
+    }
+
+    /// #161: one report-only wake for a covered child that finished without
+    /// exporting its report. Journals exactly one wake per signal, then
+    /// delivers one server-minted `recovery_wake` head whose stable ID is
+    /// derived from the signal. A repeat returns the same cursor and delivers
+    /// nothing. An unissuable or unverifiable wake settles the request as
+    /// UNKNOWN through the decline path.
+    pub(crate) fn request_recovery_wake(
+        &mut self,
+        session: &MailboxBootstrapSession,
+        signal_cursor: u64,
+    ) -> Result<u64, MailboxBootstrapError> {
+        self.require_child_report_signals()?;
+        let route = self.covered_child_route(session)?;
+        let journal = self.closure_journal()?;
+        let signal = journal
+            .signal(signal_cursor)
+            .cloned()
+            .ok_or(MailboxBootstrapError::InvalidRequest)?;
+        if signal.route != route {
+            return Err(MailboxBootstrapError::InvalidRequest);
+        }
+        let Some((recovery_cursor, _)) = journal.recovery_request(signal_cursor) else {
+            return Err(MailboxBootstrapError::InvalidRequest);
+        };
+        let store = self.closure_store()?;
+        let stable_id = closure::recovery_wake_stable_id(signal_cursor);
+        let delivered = |store: &MailboxStore, wake_cursor: u64| {
+            store.load().is_ok_and(|mailbox| {
+                mailbox.heads.get(&stable_id).is_some_and(|head| {
+                    head.kind == closure::RECOVERY_WAKE_KIND
+                        && head.recipient == session.recipient
+                        && head.body == closure::recovery_wake_body(signal_cursor, wake_cursor)
+                        && mailbox
+                            .receipts
+                            .get(&head.delivery_digest)
+                            .is_some_and(|receipt| {
+                                receipt.stable_id == head.stable_id
+                                    && receipt.status == crate::mailbox::ReceiptStatus::Admitted
+                            })
+                })
+            })
+        };
+        if let Some((wake_cursor, _)) = journal.wake(signal_cursor) {
+            if delivered(&store, wake_cursor) {
+                return Ok(wake_cursor);
+            }
+            self.settle_unissued_wake(signal_cursor);
+            return Err(MailboxBootstrapError::GrantRevoked);
+        }
+        if journal.decline(signal_cursor).is_some() {
+            return Err(MailboxBootstrapError::InvalidRequest);
+        }
+        let recoverable = {
+            let mailbox = store.load().map_err(store_error)?;
+            self.signal_recoverable(&journal, &mailbox, &signal)
+        };
+        if !recoverable {
+            self.suspend_if_not_current(&store, &signal.route.child_delegation_id);
+            self.settle_unissued_wake(signal_cursor);
+            return Err(MailboxBootstrapError::GrantRevoked);
+        }
+        let issued = closure::closure_transaction(&store, |_, journal| {
+            if let Some((cursor, _)) = journal.wake(signal_cursor) {
+                return Ok((vec![], Some(cursor)));
+            }
+            if journal.decline(signal_cursor).is_some() {
+                return Ok((vec![], None));
+            }
+            let cursor = journal.next_cursor();
+            Ok((
+                vec![ClosureRecord::RecoveryWakeIssued {
+                    cursor,
+                    signal_cursor,
+                    recovery_cursor,
+                    route: route.clone(),
+                    stable_id: stable_id.clone(),
+                }],
+                Some(cursor),
+            ))
+        });
+        let wake_cursor = match issued {
+            Ok(Some(cursor)) => cursor,
+            Ok(None) => return Err(MailboxBootstrapError::InvalidRequest),
+            Err(_) => {
+                self.settle_unissued_wake(signal_cursor);
+                return Err(MailboxBootstrapError::GrantRevoked);
+            }
+        };
+        let head = recovery_wake_head(&session.recipient, &stable_id, signal_cursor, wake_cursor);
+        let appended = store.append_server_recovery_wake(head);
+        if appended.is_err() || !delivered(&store, wake_cursor) {
+            self.settle_unissued_wake(signal_cursor);
+            return Err(MailboxBootstrapError::GrantRevoked);
+        }
+        Ok(wake_cursor)
+    }
+}
+
+/// The server-minted wake head: fixed subject, revision 1, normal priority
+/// and a canonical `{signalCursor,wakeCursor}` body that Pi never renders.
+fn recovery_wake_head(
+    recipient: &crate::mailbox::RecipientKey,
+    stable_id: &str,
+    signal_cursor: u64,
+    wake_cursor: u64,
+) -> crate::mailbox::MailboxHead {
+    use sha2::Digest as _;
+    let body = closure::recovery_wake_body(signal_cursor, wake_cursor);
+    let hex = |bytes: &[u8]| format!("{:x}", sha2::Sha256::digest(bytes));
+    crate::mailbox::MailboxHead {
+        stable_id: stable_id.to_owned(),
+        revision: 1,
+        digest: hex(format!("{}\n{body}", closure::RECOVERY_WAKE_SUBJECT).as_bytes()),
+        delivery_digest: hex(format!("recovery-wake-delivery:{stable_id}").as_bytes()),
+        recipient: recipient.clone(),
+        subject: closure::RECOVERY_WAKE_SUBJECT.into(),
+        body,
+        recipient_generation: recipient.generation.clone(),
+        sender: "herdr:server".into(),
+        target: recipient.recipient_id.clone(),
+        grant_id: "server:recovery-wake".into(),
+        message_id: stable_id.to_owned(),
+        kind: closure::RECOVERY_WAKE_KIND.into(),
+        priority: "normal".into(),
+        original_sequence: 1,
+        enqueue_epoch: 0,
+        accepted_at: std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(1, |elapsed| elapsed.as_secs().max(1)),
     }
 }
