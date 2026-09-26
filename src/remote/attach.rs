@@ -3316,11 +3316,6 @@ mod tests {
     }
 
     #[cfg(unix)]
-    fn remote_env_lock() -> &'static std::sync::Mutex<()> {
-        static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
-        LOCK.get_or_init(|| std::sync::Mutex::new(()))
-    }
-
     #[cfg(unix)]
     fn socket_path_byte_len(path: &Path) -> usize {
         use std::os::unix::ffi::OsStrExt;
@@ -3330,7 +3325,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn local_forward_socket_path_uses_readable_name_when_it_fits() {
-        let _guard = remote_env_lock().lock().unwrap();
+        let _guard = crate::test_env::lock();
         // Short target + session leave plenty of room — keep the human-
         // readable form so the socket path stays grep-friendly.
         let path = local_forward_socket_path("dev", "default");
@@ -3355,7 +3350,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn local_forward_socket_path_fits_in_sun_path() {
-        let _guard = remote_env_lock().lock().unwrap();
+        let _guard = crate::test_env::lock();
         // Worst case for the readable form: macOS-style 49-char TMPDIR +
         // max-length sanitized components. Should fall back to the hashed
         // short name, which fits under TMPDIR.
@@ -3373,7 +3368,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn local_forward_socket_path_falls_back_to_tmp_when_dir_is_long() {
-        let _guard = remote_env_lock().lock().unwrap();
+        let _guard = crate::test_env::lock();
         // Force a TMPDIR long enough that even the hashed short name cannot
         // fit inside it. The fallback should drop to /tmp.
         let prior = std::env::var_os("TMPDIR");

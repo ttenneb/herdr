@@ -1,7 +1,5 @@
 use std::io;
 use std::path::PathBuf;
-#[cfg(test)]
-use std::sync::{Mutex, MutexGuard, OnceLock};
 
 use portable_pty::CommandBuilder;
 
@@ -215,7 +213,6 @@ pub(crate) fn home_dir() -> io::Result<PathBuf> {
 }
 
 #[cfg(test)]
-pub(crate) fn integration_env_lock() -> MutexGuard<'static, ()> {
-    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-    LOCK.get_or_init(|| Mutex::new(())).lock().unwrap()
+pub(crate) fn integration_env_lock() -> crate::test_env::EnvGuard {
+    crate::test_env::lock()
 }

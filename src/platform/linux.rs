@@ -966,13 +966,7 @@ fn process_session_id(pid: u32) -> Option<i32> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::{Mutex, OnceLock};
     use std::{cell::RefCell, collections::HashMap};
-
-    fn env_lock() -> &'static Mutex<()> {
-        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        LOCK.get_or_init(|| Mutex::new(()))
-    }
 
     #[test]
     fn wsl_marker_detection_matches_kernel_release_text() {
@@ -1233,7 +1227,7 @@ mod tests {
 
     #[test]
     fn clipboard_commands_prefer_wayland_when_available() {
-        let _guard = env_lock().lock().unwrap();
+        let _guard = crate::test_env::lock();
         unsafe {
             std::env::set_var("WAYLAND_DISPLAY", "wayland-0");
             std::env::remove_var("DISPLAY");
@@ -1246,7 +1240,6 @@ mod tests {
     #[test]
     fn wl_copy_owner_does_not_block_clipboard_write() {
         use std::ffi::OsString;
-        use std::os::unix::fs::PermissionsExt;
         use std::path::PathBuf;
         use std::sync::mpsc;
         use std::time::{Duration, Instant, SystemTime};
@@ -1277,7 +1270,7 @@ mod tests {
             }
         }
 
-        let _guard = env_lock().lock().unwrap();
+        let _guard = crate::test_env::lock();
         let unique = SystemTime::now()
             .duration_since(SystemTime::UNIX_EPOCH)
             .expect("system time should follow unix epoch")
@@ -1296,17 +1289,10 @@ mod tests {
         let marker = temp_dir.join("owner-pid");
         let payload = temp_dir.join("payload");
         let args = temp_dir.join("args");
-        std::fs::write(
+        crate::test_env::write_executable(
             &fake_wl_copy,
             "#!/bin/sh\ncat > \"$HERDR_TEST_WL_COPY_PAYLOAD\"\nprintf '%s\\n' \"$@\" > \"$HERDR_TEST_WL_COPY_ARGS\"\nprintf '%s' \"$$\" > \"$HERDR_TEST_WL_COPY_MARKER\"\nexec sleep 30\n",
-        )
-        .expect("fake wl-copy should be written");
-        let mut permissions = std::fs::metadata(&fake_wl_copy)
-            .expect("fake wl-copy metadata")
-            .permissions();
-        permissions.set_mode(0o700);
-        std::fs::set_permissions(&fake_wl_copy, permissions)
-            .expect("fake wl-copy should be executable");
+        );
 
         let test_path = match cleanup.old_path.as_ref() {
             Some(path) => {
@@ -1374,7 +1360,6 @@ mod tests {
     #[test]
     fn failed_wl_copy_uses_x11_fallback() {
         use std::ffi::OsString;
-        use std::os::unix::fs::PermissionsExt;
         use std::path::PathBuf;
         use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -1406,7 +1391,7 @@ mod tests {
             }
         }
 
-        let _guard = env_lock().lock().unwrap();
+        let _guard = crate::test_env::lock();
         let unique = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .expect("system time should follow unix epoch")
@@ -1425,21 +1410,14 @@ mod tests {
         let payload = temp_dir.join("xclip-payload");
         let fake_wl_copy = temp_dir.join("wl-copy");
         let fake_xclip = temp_dir.join("xclip");
-        std::fs::write(&fake_wl_copy, "#!/bin/sh\n/bin/cat >/dev/null\nexit 7\n")
-            .expect("fake wl-copy should be written");
-        std::fs::write(
+        crate::test_env::write_executable(
+            &fake_wl_copy,
+            "#!/bin/sh\n/bin/cat >/dev/null\nexit 7\n",
+        );
+        crate::test_env::write_executable(
             &fake_xclip,
             "#!/bin/sh\n/bin/cat > \"$HERDR_TEST_XCLIP_PAYLOAD\"\n",
-        )
-        .expect("fake xclip should be written");
-        for command in [&fake_wl_copy, &fake_xclip] {
-            let mut permissions = std::fs::metadata(command)
-                .expect("fake clipboard command metadata")
-                .permissions();
-            permissions.set_mode(0o700);
-            std::fs::set_permissions(command, permissions)
-                .expect("fake clipboard command should be executable");
-        }
+        );
 
         unsafe {
             std::env::set_var("PATH", &temp_dir);
@@ -1458,6 +1436,7 @@ mod tests {
 
     #[test]
     fn finite_clipboard_commands_report_exit_status() {
+        let _env = crate::test_env::shared();
         let success = ClipboardCommand {
             program: "sh",
             args: &["-c", "cat >/dev/null"],
@@ -1473,7 +1452,7 @@ mod tests {
 
     #[test]
     fn clipboard_commands_include_x11_fallbacks() {
-        let _guard = env_lock().lock().unwrap();
+        let _guard = crate::test_env::lock();
         unsafe {
             std::env::remove_var("WAYLAND_DISPLAY");
             std::env::set_var("DISPLAY", ":0");
@@ -1486,7 +1465,7 @@ mod tests {
 
     #[test]
     fn read_clipboard_text_commands_include_session_backends() {
-        let _guard = env_lock().lock().unwrap();
+        let _guard = crate::test_env::lock();
         unsafe {
             std::env::set_var("WAYLAND_DISPLAY", "wayland-0");
             std::env::set_var("DISPLAY", ":0");
@@ -1501,6 +1480,7 @@ mod tests {
 
     #[test]
     fn read_clipboard_text_with_command_reads_utf8() {
+        let _env = crate::test_env::shared();
         let command = ClipboardCommand {
             program: "printf",
             args: &["feature/linear-302"],
@@ -1514,6 +1494,7 @@ mod tests {
 
     #[test]
     fn read_clipboard_text_with_command_rejects_oversized_output() {
+        let _env = crate::test_env::shared();
         let command = ClipboardCommand {
             program: "sh",
             args: &["-c", "yes x | head -c 1048578"],
@@ -1524,6 +1505,7 @@ mod tests {
 
     #[test]
     fn read_clipboard_image_with_spawned_command_reads_under_limit() {
+        let _env = crate::test_env::shared();
         let mut command = Command::new("sh");
         command.arg("-c").arg("printf image");
 
@@ -1535,6 +1517,7 @@ mod tests {
 
     #[test]
     fn read_clipboard_image_with_spawned_command_rejects_over_limit() {
+        let _env = crate::test_env::shared();
         let mut command = Command::new("sh");
         command.arg("-c").arg("printf oversized");
 
@@ -1546,25 +1529,12 @@ mod tests {
 
     #[test]
     fn read_clipboard_image_rejects_xclip_text_served_for_image_target() {
-        let _guard = env_lock().lock().unwrap();
+        let _guard = crate::test_env::lock();
         let temp_dir =
             std::env::temp_dir().join(format!("herdr-fake-xclip-{}", std::process::id()));
         std::fs::create_dir_all(&temp_dir).expect("temp dir should be created");
         let fake_xclip = temp_dir.join("xclip");
-        std::fs::write(&fake_xclip, "#!/bin/sh\nprintf '# Tasks'\n")
-            .expect("fake xclip should be written");
-
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-
-            let mut permissions = std::fs::metadata(&fake_xclip)
-                .expect("fake xclip metadata")
-                .permissions();
-            permissions.set_mode(0o700);
-            std::fs::set_permissions(&fake_xclip, permissions)
-                .expect("fake xclip should be executable");
-        }
+        crate::test_env::write_executable(&fake_xclip, "#!/bin/sh\nprintf '# Tasks'\n");
 
         let old_path = std::env::var_os("PATH");
         let test_path = match old_path.as_ref() {
@@ -1598,30 +1568,14 @@ mod tests {
 
     #[test]
     fn read_clipboard_image_rejects_wayland_xclip_fallback_text_for_image_target() {
-        let _guard = env_lock().lock().unwrap();
+        let _guard = crate::test_env::lock();
         let temp_dir =
             std::env::temp_dir().join(format!("herdr-fake-wayland-xclip-{}", std::process::id()));
         std::fs::create_dir_all(&temp_dir).expect("temp dir should be created");
         let fake_wl_paste = temp_dir.join("wl-paste");
         let fake_xclip = temp_dir.join("xclip");
-        std::fs::write(&fake_wl_paste, "#!/bin/sh\nexit 1\n")
-            .expect("fake wl-paste should be written");
-        std::fs::write(&fake_xclip, "#!/bin/sh\nprintf '# Tasks'\n")
-            .expect("fake xclip should be written");
-
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-
-            for command in [&fake_wl_paste, &fake_xclip] {
-                let mut permissions = std::fs::metadata(command)
-                    .expect("fake clipboard command metadata")
-                    .permissions();
-                permissions.set_mode(0o700);
-                std::fs::set_permissions(command, permissions)
-                    .expect("fake clipboard command should be executable");
-            }
-        }
+        crate::test_env::write_executable(&fake_wl_paste, "#!/bin/sh\nexit 1\n");
+        crate::test_env::write_executable(&fake_xclip, "#!/bin/sh\nprintf '# Tasks'\n");
 
         let old_path = std::env::var_os("PATH");
         let test_path = match old_path.as_ref() {
@@ -1656,6 +1610,7 @@ mod tests {
 
     #[test]
     fn read_validated_clipboard_image_accepts_real_png_payload() {
+        let _env = crate::test_env::shared();
         assert_eq!(
             read_validated_clipboard_image(
                 "sh",
@@ -1702,7 +1657,7 @@ mod tests {
 
     #[test]
     fn desktop_notification_separates_option_like_titles() {
-        let _guard = env_lock().lock().unwrap();
+        let _guard = crate::test_env::lock();
         unsafe {
             std::env::remove_var("WAYLAND_DISPLAY");
             std::env::set_var("DISPLAY", ":0");

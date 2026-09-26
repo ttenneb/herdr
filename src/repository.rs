@@ -264,6 +264,7 @@ mod tests {
 
     #[test]
     fn live_git_identity_replaces_stale_membership_at_the_same_path() {
+        let _env = crate::test_env::shared();
         let path = std::env::temp_dir().join(format!(
             "herdr-repository-replacement-{}-{}",
             std::process::id(),

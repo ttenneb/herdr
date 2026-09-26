@@ -3861,7 +3861,7 @@ command = ["sh", "-c", "printf %s ${{HERDR_PANE_ID-unset}} > '{}'; sleep 1"]
 
     #[test]
     fn direct_resource_action_invoke_rejects_deleted_manifest_after_refresh() {
-        let _guard = crate::config::test_config_env_lock().lock().unwrap();
+        let _guard = crate::test_env::lock();
         let previous_config_home = std::env::var_os("XDG_CONFIG_HOME");
         let base = unique_temp_path("plugin-deleted-resource-action");
         std::env::set_var("XDG_CONFIG_HOME", &base);
@@ -3945,7 +3945,7 @@ command = ["does-not-run"]
 
     #[test]
     fn non_cli_plugin_consumers_refresh_global_enabled_state() {
-        let _guard = crate::config::test_config_env_lock().lock().unwrap();
+        let _guard = crate::test_env::lock();
         let previous_config_home = std::env::var_os("XDG_CONFIG_HOME");
         let base = unique_temp_path("plugin-global-refresh");
         std::env::set_var("XDG_CONFIG_HOME", &base);

@@ -1035,6 +1035,7 @@ mod tests {
 
     #[test]
     fn existing_checkout_requires_the_checkout_root() {
+        let _env = crate::test_env::shared();
         let root = std::env::temp_dir().join(format!(
             "herdr-run-checkout-root-{}-{}",
             std::process::id(),
@@ -1095,15 +1096,12 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn profile_helper_requires_exact_verified_receipt() {
-        use std::os::unix::fs::PermissionsExt;
+        let _env = crate::test_env::shared();
         let root =
             std::env::temp_dir().join(format!("herdr-profile-helper-{}", std::process::id()));
         std::fs::create_dir_all(&root).unwrap();
         let helper = root.join("helper");
-        std::fs::write(&helper, "#!/bin/sh\nprintf '%s\\n' '{\"version\":1,\"applied\":true,\"verified\":true,\"workspaceId\":\"w1\",\"paneId\":\"w1:p1\",\"terminalId\":\"term1\",\"agentSession\":{\"source\":\"herdr:pi\",\"agent\":\"pi\",\"kind\":\"id\",\"value\":\"session1\"},\"profile\":\"owner.md\"}'\n").unwrap();
-        let mut permissions = std::fs::metadata(&helper).unwrap().permissions();
-        permissions.set_mode(0o700);
-        std::fs::set_permissions(&helper, permissions).unwrap();
+        crate::test_env::write_executable(&helper, "#!/bin/sh\nprintf '%s\\n' '{\"version\":1,\"applied\":true,\"verified\":true,\"workspaceId\":\"w1\",\"paneId\":\"w1:p1\",\"terminalId\":\"term1\",\"agentSession\":{\"source\":\"herdr:pi\",\"agent\":\"pi\",\"kind\":\"id\",\"value\":\"session1\"},\"profile\":\"owner.md\"}'\n");
         let identity = CanonicalHerdrIdentity {
             workspace_id: "w1".into(),
             pane_id: "w1:p1".into(),
@@ -1119,7 +1117,7 @@ mod tests {
         let mut replacement = identity.clone();
         replacement.pane_id = "w1:p2".into();
         assert!(apply_profile(&helper, &replacement, "owner.md", Duration::from_secs(1)).is_err());
-        std::fs::write(&helper, "#!/bin/sh\nexec sleep 5\n").unwrap();
+        crate::test_env::write_executable(&helper, "#!/bin/sh\nexec sleep 5\n");
         let started = std::time::Instant::now();
         let error =
             apply_profile(&helper, &identity, "owner.md", Duration::from_millis(25)).unwrap_err();

@@ -44,47 +44,56 @@ pub(crate) fn spawn_with_portable_pty(
 #[cfg(all(test, target_os = "linux"))]
 mod tests {
     use super::*;
-    use std::sync::{Mutex, OnceLock};
+    use std::os::fd::{AsRawFd, RawFd};
 
-    fn pty_fd_test_lock() -> &'static Mutex<()> {
-        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        LOCK.get_or_init(|| Mutex::new(()))
+    fn pts_number(fd: RawFd) -> Option<u32> {
+        let mut number: libc::c_uint = 0;
+        (unsafe { libc::ioctl(fd, libc::TIOCGPTN, &mut number) } == 0).then_some(number)
     }
 
-    fn parent_pty_fd_targets() -> Vec<String> {
-        let Ok(entries) = std::fs::read_dir("/proc/self/fd") else {
-            return Vec::new();
-        };
-        let mut targets: Vec<String> = entries
-            .filter_map(Result::ok)
-            .filter_map(|entry| std::fs::read_link(entry.path()).ok())
-            .map(|target| target.to_string_lossy().into_owned())
-            .filter(|target| target.starts_with("/dev/pts/") || target == "/dev/ptmx")
-            .collect();
-        targets.sort();
-        targets
-    }
-
-    fn parent_pty_fd_count() -> usize {
-        parent_pty_fd_targets().len()
+    /// Parent descriptors that belong to one pty pair: masters are `/dev/ptmx`
+    /// fds whose pty number matches, slaves are `/dev/pts/<number>`. Other
+    /// tests open their own ptys concurrently, so a process-wide count of pty
+    /// fds is not a property of this setup; this is.
+    fn parent_fds_for_pty(number: u32) -> (Vec<RawFd>, Vec<RawFd>) {
+        let slave = format!("/dev/pts/{number}");
+        let (mut masters, mut slaves) = (Vec::new(), Vec::new());
+        for entry in std::fs::read_dir("/proc/self/fd").expect("list /proc/self/fd") {
+            let Ok(entry) = entry else { continue };
+            let Some(fd) = entry
+                .file_name()
+                .to_str()
+                .and_then(|n| n.parse::<RawFd>().ok())
+            else {
+                continue;
+            };
+            let Ok(target) = std::fs::read_link(entry.path()) else {
+                continue;
+            };
+            if target == std::path::Path::new("/dev/ptmx") && pts_number(fd) == Some(number) {
+                masters.push(fd);
+            } else if target == std::path::Path::new(&slave) {
+                slaves.push(fd);
+            }
+        }
+        (masters, slaves)
     }
 
     #[test]
     fn portable_pty_setup_leaves_one_parent_pty_fd() {
-        let _guard = pty_fd_test_lock().lock().expect("pty fd test lock");
-        let before = parent_pty_fd_count();
         let mut cmd = CommandBuilder::new("/bin/cat");
         cmd.env(crate::HERDR_ENV_VAR, crate::HERDR_ENV_VALUE);
 
         let mut spawned =
             spawn_with_portable_pty(24, 80, cmd).expect("portable pty setup succeeds");
-        let after_spawn = parent_pty_fd_count();
+        let master = spawned.master_fd.as_raw_fd();
+        let number = pts_number(master).expect("spawned master is a pty master");
+        let (masters, slaves) = parent_fds_for_pty(number);
 
         assert_eq!(
-            after_spawn,
-            before + 1,
-            "portable-pty setup should leave only the Herdr-owned master fd in the parent: {:?}",
-            parent_pty_fd_targets()
+            (masters, slaves),
+            (vec![master], Vec::new()),
+            "portable-pty setup should leave only the Herdr-owned master fd of pty {number} in the parent"
         );
 
         let _ = spawned.child.kill();

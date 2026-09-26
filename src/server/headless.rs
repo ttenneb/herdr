@@ -6764,7 +6764,7 @@ new_tab = "prefix+t"
                 .unwrap_or(0)
         ));
         std::fs::write(&path, "onboarding = false\n").unwrap();
-        let _guard = crate::config::test_config_env_lock().lock().unwrap();
+        let _guard = crate::test_env::lock();
         std::env::set_var(crate::config::CONFIG_PATH_ENV_VAR, &path);
 
         let mut server = test_headless_server();
@@ -6836,7 +6836,7 @@ next_tab = ""
             "onboarding = false\n[keys]\nnew_workspace = \"x\"\n[ui.toast]\ndelivery = \"off\"\n",
         )
         .unwrap();
-        let _guard = crate::config::test_config_env_lock().lock().unwrap();
+        let _guard = crate::test_env::lock();
         std::env::set_var(crate::config::CONFIG_PATH_ENV_VAR, &path);
 
         let mut server = test_headless_server();
@@ -7963,7 +7963,9 @@ next_tab = ""
                 clear_display_agent: false,
                 clear_state_labels: false,
                 seq: None,
-                ttl: Some(Duration::from_millis(1)),
+                // Long enough that the pre-expiry read cannot race the clock; expiry is
+                // driven explicitly below with a time past the deadline.
+                ttl: Some(Duration::from_secs(3600)),
             })
         );
 
