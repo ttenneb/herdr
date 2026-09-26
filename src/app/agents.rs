@@ -632,6 +632,37 @@ impl App {
         })
     }
 
+    /// Identity shown by `agent.get` and matched by handoffs and assignments.
+    ///
+    /// A trusted managed Pi launch always wins and is marked `managed`. A live
+    /// Pi without one shows its pane-reported session exactly as herdr 0.8.4
+    /// did (herdr-agent-state's `pane.report_agent_session`), marked
+    /// `reported`. A reported session never grants mailbox, bound-report or
+    /// route authority: those read `trusted_managed_pi_session` directly. A
+    /// pane that no longer runs Pi shows nothing for a former managed Pi.
+    fn agent_session_for_info(
+        &self,
+        terminal: &crate::terminal::TerminalState,
+        pi_label: bool,
+        reported: Option<crate::api::schema::AgentSessionInfo>,
+    ) -> (
+        Option<crate::api::schema::AgentSessionInfo>,
+        Option<crate::api::schema::AgentSessionTrust>,
+    ) {
+        use crate::api::schema::AgentSessionTrust;
+        let managed_pi = terminal.managed_agent_kind() == Some(crate::detect::Agent::Pi);
+        if managed_pi || pi_label {
+            if let Some(trusted) = self.trusted_managed_pi_session(terminal) {
+                return (Some(trusted), Some(AgentSessionTrust::Managed));
+            }
+            if !pi_label {
+                return (None, None);
+            }
+        }
+        let trust = reported.as_ref().map(|_| AgentSessionTrust::Reported);
+        (reported, trust)
+    }
+
     pub(super) fn agent_info(
         &self,
         ws_idx: usize,
@@ -645,6 +676,8 @@ impl App {
         }
         let pane = self.pane_info(ws_idx, pane_id)?;
         let pi_label = pane.agent.as_deref() == Some("pi");
+        let (agent_session, agent_session_trust) =
+            self.agent_session_for_info(terminal, pi_label, pane.agent_session.clone());
         Some(crate::api::schema::AgentInfo {
             terminal_id: pane.terminal_id,
             name: terminal.agent_name.clone(),
@@ -657,17 +690,8 @@ impl App {
             screen_detection_skipped: terminal.full_lifecycle_hook_authority_active(),
             state_labels: pane.state_labels,
             tokens: pane.tokens,
-            // Managed Pi identity is derived from this execution, not from a
-            // pane-scoped report that any local API client could have supplied.
-            agent_session: if terminal.managed_agent_kind() == Some(crate::detect::Agent::Pi)
-                || pi_label
-            {
-                // A stopped managed Pi must not fall back to a stale pane
-                // report merely because its managed name was cleared.
-                self.trusted_managed_pi_session(terminal)
-            } else {
-                pane.agent_session
-            },
+            agent_session,
+            agent_session_trust,
             workspace_id: pane.workspace_id,
             tab_id: pane.tab_id,
             pane_id: pane.pane_id,

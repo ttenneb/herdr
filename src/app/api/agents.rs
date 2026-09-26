@@ -949,10 +949,186 @@ mod tests {
                 .unwrap(),
         });
         stopped.clear_agent_name();
-        assert!(
-            get_child(&mut app).is_none(),
-            "stopped Pi cannot fall back to an old pane report"
+        // #173 (Option A): while the pane still runs Pi, agent.get shows the
+        // pane-reported session as 0.8.4 did, but only as `reported`; the
+        // revoked execution never regains trusted identity or authority.
+        assert!(app
+            .trusted_managed_pi_session(app.state.terminals.get(&child_terminal).unwrap())
+            .is_none());
+        let response = app.handle_agent_get(
+            "child".into(),
+            AgentTarget {
+                target: child_target.clone(),
+            },
         );
+        let result: SuccessResponse = serde_json::from_str(&response).unwrap();
+        let ResponseResult::AgentInfo { agent } = result.result else {
+            panic!("agent get")
+        };
+        assert_eq!(
+            agent.agent_session_trust,
+            Some(crate::api::schema::AgentSessionTrust::Reported),
+            "a revoked managed execution is never shown as managed"
+        );
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    // #173: the trusted managed launch always wins over a pane report; a live
+    // Pi without trust shows its reported session (as 0.8.4 did), marked
+    // `reported`; a stopped managed Pi shows neither.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn trusted_launch_wins_over_report_and_live_untrusted_pi_falls_back_to_reported() {
+        use crate::api::schema::{AgentSessionTrust, PaneReportAgentSessionParams};
+        use std::os::unix::fs::PermissionsExt;
+        let mut app = app_with_agent();
+        let directory = std::env::temp_dir().join(format!(
+            "herdr-pi-trust-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&directory).unwrap();
+        app.sender_authority_dir = directory.clone();
+        let pane = app.state.workspaces[0].tabs[0].root_pane.unwrap();
+        let terminal_id = app.state.workspaces[0].terminal_id(pane).unwrap().clone();
+        let sender = terminal_id.to_string();
+        let session = directory.join("managed.jsonl");
+        std::fs::write(
+            &session,
+            b"{\"type\":\"session\",\"version\":3,\"id\":\"managed\",\"cwd\":\"/tmp\"}\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&session, std::fs::Permissions::from_mode(0o600)).unwrap();
+        crate::sender_authority::SenderAuthorityStore::for_sender(&directory, &sender)
+            .unwrap()
+            .cas(
+                None,
+                crate::sender_authority::SenderAuthorityRecord {
+                    sender_key: sender.clone(),
+                    process_generation: 1,
+                    phase: crate::sender_authority::SenderAuthorityPhase::Preparing,
+                    transition_revision: 1,
+                },
+            )
+            .unwrap();
+        let terminal = app.state.terminals.get_mut(&terminal_id).unwrap();
+        terminal.begin_managed_agent(
+            "managed".into(),
+            Agent::Pi,
+            std::time::Instant::now(),
+            Duration::from_secs(3),
+            Duration::from_secs(30),
+        );
+        terminal.set_managed_agent_generation(1);
+        app.install_mailbox_bootstrap_test_foreground_job(
+            terminal_id.clone(),
+            crate::platform::ForegroundJob {
+                process_group_id: std::process::id(),
+                processes: vec![crate::platform::ForegroundProcess {
+                    pid: std::process::id(),
+                    name: "node".into(),
+                    argv0: None,
+                    argv: Some(vec![
+                        "node".into(),
+                        "/opt/node_modules/@earendil-works/pi-coding-agent/dist/cli.js".into(),
+                        "--session".into(),
+                        session.display().to_string(),
+                    ]),
+                    cmdline: None,
+                }],
+            },
+        );
+        let birth = crate::platform::process_birth_identity(std::process::id()).unwrap();
+        app.managed_pi_launches.insert(
+            terminal_id.clone(),
+            crate::app::agents::ManagedPiLaunch {
+                generation: 1,
+                session_path: session.display().to_string(),
+                earliest_birth_ticks: birth.start_ticks,
+                process: None,
+            },
+        );
+        app.handle_internal_event(AppEvent::AgentProcessDetected {
+            pane_id: pane,
+            agent: Agent::Pi,
+            process_generation: 1,
+            observed_at: std::time::Instant::now(),
+        });
+        app.handle_internal_event(AppEvent::StateChanged {
+            pane_id: pane,
+            agent: Some(Agent::Pi),
+            state: AgentState::Idle,
+            visible_blocker: false,
+            visible_working: false,
+            process_exited: false,
+            observed_at: std::time::Instant::now(),
+        });
+        let target = app.public_pane_id(0, pane).unwrap();
+        // The Pi's own herdr-agent-state integration reports a different path.
+        let reported_path = directory.join("reported.jsonl").display().to_string();
+        app.handle_pane_report_agent_session(
+            "report".into(),
+            PaneReportAgentSessionParams {
+                pane_id: target.clone(),
+                source: "herdr:pi".into(),
+                agent: "pi".into(),
+                seq: Some(1),
+                agent_session_id: None,
+                agent_session_path: Some(reported_path.clone()),
+                session_start_source: Some("startup".into()),
+            },
+        );
+        let get = |app: &mut App| {
+            let response = app.handle_agent_get(
+                "trust".into(),
+                AgentTarget {
+                    target: target.clone(),
+                },
+            );
+            // A pane whose agent has exited may no longer resolve as an agent.
+            let Ok(result) = serde_json::from_str::<SuccessResponse>(&response) else {
+                return (None, None);
+            };
+            let ResponseResult::AgentInfo { agent } = result.result else {
+                panic!("agent get")
+            };
+            (
+                agent.agent_session.map(|s| s.value),
+                agent.agent_session_trust,
+            )
+        };
+        assert_eq!(
+            get(&mut app),
+            (
+                Some(session.display().to_string()),
+                Some(AgentSessionTrust::Managed)
+            ),
+            "a trusted managed launch wins over any pane report"
+        );
+        // Trust lost (e.g. restored server) while the same Pi stays live: the
+        // identity falls back to the report and is marked as such.
+        app.managed_pi_launches.remove(&terminal_id);
+        assert!(app
+            .trusted_managed_pi_session(app.state.terminals.get(&terminal_id).unwrap())
+            .is_none());
+        assert_eq!(
+            get(&mut app),
+            (Some(reported_path), Some(AgentSessionTrust::Reported))
+        );
+        // A stopped managed Pi never falls back to a stale report.
+        app.handle_internal_event(AppEvent::StateChanged {
+            pane_id: pane,
+            agent: None,
+            state: AgentState::Idle,
+            visible_blocker: false,
+            visible_working: false,
+            process_exited: true,
+            observed_at: std::time::Instant::now(),
+        });
+        assert_eq!(get(&mut app), (None, None));
         std::fs::remove_dir_all(directory).unwrap();
     }
 
