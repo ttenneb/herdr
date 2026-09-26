@@ -27,7 +27,7 @@ pub(crate) struct ManagedPiLaunch {
     pub(crate) process: Option<crate::platform::ProcessBirthIdentity>,
 }
 
-fn explicit_pi_session_path(argv: &[String]) -> Option<String> {
+pub(super) fn explicit_pi_session_path(argv: &[String]) -> Option<String> {
     let mut path = None;
     let mut args = argv.iter();
     while let Some(arg) = args.next() {
@@ -45,6 +45,75 @@ fn explicit_pi_session_path(argv: &[String]) -> Option<String> {
     let value = path?;
     crate::agent_resume::AgentSessionRef::path(value)?;
     (std::path::Path::new(value).extension()? == "jsonl").then(|| value.to_string())
+}
+
+/// Launch authority persisted by [`App::prepare_managed_launch`].
+#[derive(Debug)]
+pub(crate) struct PreparedManagedLaunch {
+    pub(crate) generation: u64,
+    pi_session: Option<(String, u64)>,
+}
+
+/// `NAME=value` from an `agent.start` environment list.
+fn launch_env_value(values: &[String], name: &str) -> Option<String> {
+    values.iter().find_map(|entry| {
+        entry
+            .split_once('=')
+            .filter(|(key, _)| *key == name)
+            .map(|(_, value)| value.to_string())
+    })
+}
+
+/// Pi's session directory as Pi resolves it for this launch:
+/// `PI_CODING_AGENT_SESSION_DIR`, else `sessionDir` from
+/// `<agent dir>/settings.json`, else `<agent dir>/sessions`, where the agent dir
+/// is `PI_CODING_AGENT_DIR` or `~/.pi/agent`. Launch environment wins over the
+/// server environment. A relative or unresolvable directory yields `None`.
+fn pi_session_root(launch_env: &impl Fn(&str) -> Option<String>) -> Option<std::path::PathBuf> {
+    let lookup = |name: &str| {
+        launch_env(name)
+            .or_else(|| std::env::var(name).ok())
+            .filter(|value| !value.is_empty())
+    };
+    let home = lookup("HOME").map(std::path::PathBuf::from);
+    let expand = |value: &str| -> Option<std::path::PathBuf> {
+        let path = match value.strip_prefix('~') {
+            Some(rest) if rest.is_empty() || rest.starts_with('/') => {
+                home.as_ref()?.join(rest.trim_start_matches('/'))
+            }
+            Some(_) => return None,
+            None => std::path::PathBuf::from(value),
+        };
+        path.is_absolute().then_some(path)
+    };
+    if let Some(dir) = lookup("PI_CODING_AGENT_SESSION_DIR") {
+        return expand(&dir);
+    }
+    let agent_dir = match lookup("PI_CODING_AGENT_DIR") {
+        Some(dir) => expand(&dir)?,
+        None => home.as_ref()?.join(".pi/agent"),
+    };
+    let configured = std::fs::read(agent_dir.join("settings.json"))
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
+        .and_then(|settings| settings.get("sessionDir")?.as_str().map(str::to_string));
+    match configured {
+        Some(dir) => expand(&dir),
+        None => Some(agent_dir.join("sessions")),
+    }
+}
+
+/// A `--session` path earns a managed launch record only if it is an existing,
+/// canonical, owner-private (0600), single-link JSONL that is empty or has a
+/// valid Pi header, and it lies inside Pi's session directory for this launch.
+/// Anything else still launches, but its identity stays `reported`.
+fn trusted_launch_session_path(path: &str, launch_env: &impl Fn(&str) -> Option<String>) -> bool {
+    let path = std::path::Path::new(path);
+    let Some(root) = pi_session_root(launch_env).and_then(|root| std::fs::canonicalize(root).ok())
+    else {
+        return false;
+    };
+    path.starts_with(&root) && path != root && crate::platform::launchable_pi_session_jsonl(path)
 }
 
 fn valid_agent_environment(values: &[String]) -> bool {
@@ -282,6 +351,111 @@ impl App {
         Ok(process_generation)
     }
 
+    /// The one managed-launch path shared by `agent.start` and
+    /// `collection.helper_launch`. Call it immediately before the agent process
+    /// is spawned or its command is submitted. It persists a fresh
+    /// sender-authority generation for `terminal_id` (so nothing earlier can act
+    /// as this launch) and drops any previous launch record for the terminal.
+    /// For a Pi whose argv names exactly one `--session` file that passes the
+    /// launch checks (see [`trusted_launch_session_path`]), it also samples the
+    /// birth-tick cutoff and waits past it, so only a process born after this
+    /// point can ever bind to the recorded session.
+    ///
+    /// Nothing in memory is bound until [`Self::commit_managed_launch`]; any
+    /// failure after this returns must call [`Self::abandon_managed_launch`].
+    pub(super) fn prepare_managed_launch(
+        &mut self,
+        terminal_id: &crate::terminal::TerminalId,
+        kind: crate::detect::Agent,
+        argv: &[String],
+        launch_env: impl Fn(&str) -> Option<String>,
+    ) -> Result<PreparedManagedLaunch, AgentStartError> {
+        let generation = self.allocate_sender_authority_generation(terminal_id.to_string())?;
+        self.managed_pi_launches.remove(terminal_id);
+        // A process born in this coarse kernel tick is ambiguous. Sample the
+        // strict cutoff, then wait for that tick before the process can start
+        // so even a fast legitimate Pi is not penalized by the cutoff.
+        let pi_session = (kind == crate::detect::Agent::Pi)
+            .then(|| {
+                explicit_pi_session_path(argv)
+                    .filter(|path| trusted_launch_session_path(path, &launch_env))
+                    .zip(crate::platform::first_post_launch_birth_tick())
+            })
+            .flatten();
+        if let Some((_, cutoff)) = pi_session.as_ref() {
+            if !crate::platform::wait_until_birth_tick(*cutoff) {
+                self.abandon_managed_launch(terminal_id, generation);
+                return Err(AgentStartError::AuthorityPersistence(
+                    "process birth clock did not advance before launch".into(),
+                ));
+            }
+        }
+        Ok(PreparedManagedLaunch {
+            generation,
+            pi_session,
+        })
+    }
+
+    /// Bind a prepared launch once its terminal and runtime exist and the
+    /// terminal has begun its managed agent: the generation goes to both, and a
+    /// trusted Pi session is recorded for Active-time process binding.
+    pub(super) fn commit_managed_launch(
+        &mut self,
+        terminal_id: &crate::terminal::TerminalId,
+        prepared: PreparedManagedLaunch,
+    ) {
+        if let Some(runtime) = self.terminal_runtimes.get(terminal_id) {
+            runtime.set_managed_agent_generation(prepared.generation);
+        }
+        if let Some(terminal) = self.state.terminals.get_mut(terminal_id) {
+            terminal.set_managed_agent_generation(prepared.generation);
+        }
+        if let Some((session_path, earliest_birth_ticks)) = prepared.pi_session {
+            self.managed_pi_launches.insert(
+                terminal_id.clone(),
+                ManagedPiLaunch {
+                    generation: prepared.generation,
+                    session_path,
+                    earliest_birth_ticks,
+                    process: None,
+                },
+            );
+        }
+    }
+
+    /// Undo a prepared (or committed) launch whose process did not start: no
+    /// launch record survives, the runtime stops tagging observations with the
+    /// generation, and the durable generation is invalidated so it can never be
+    /// promoted. The next launch allocates a newer generation.
+    pub(super) fn abandon_managed_launch(
+        &mut self,
+        terminal_id: &crate::terminal::TerminalId,
+        generation: u64,
+    ) {
+        if self
+            .managed_pi_launches
+            .get(terminal_id)
+            .is_some_and(|launch| launch.generation == generation)
+        {
+            self.managed_pi_launches.remove(terminal_id);
+        }
+        if let Some(runtime) = self.terminal_runtimes.get(terminal_id) {
+            runtime.set_managed_agent_generation(0);
+        }
+        if let Some(terminal) = self.state.terminals.get_mut(terminal_id) {
+            if terminal.accepts_managed_agent_generation(generation) {
+                terminal.set_managed_agent_generation(0);
+            }
+        }
+        if let Ok(store) = crate::sender_authority::SenderAuthorityStore::for_sender(
+            &self.sender_authority_dir,
+            &terminal_id.to_string(),
+        ) {
+            // Only a non-authoritative (Preparing) record is invalidated here.
+            let _ = store.recover();
+        }
+    }
+
     pub(super) fn start_agent(
         &mut self,
         params: AgentStartParams,
@@ -326,56 +500,46 @@ impl App {
                 .ok_or(AgentStartError::InvalidArgument)?;
         let bytes = crate::app::api_helpers::encode_api_submission(runtime, &command);
         let timeout = self.agent_start_timeout(&params)?;
-        // Persist the new generation before mutating launch state or sending
-        // bytes. A failed clock wait below aborts without submitting input.
-        let process_generation =
-            self.allocate_sender_authority_generation(terminal_id.to_string())?;
-
-        // A process born in this coarse kernel tick is ambiguous. Sample the
-        // strict cutoff, then wait for that tick before submitting the command
-        // so even a fast legitimate Pi is not penalized by the cutoff.
-        let managed_pi_launch = (kind == crate::detect::Agent::Pi)
-            .then(|| {
-                explicit_pi_session_path(&argv).zip(crate::platform::first_post_launch_birth_tick())
-            })
-            .flatten();
-        self.managed_pi_launches.remove(&terminal_id);
-        if let Some((_, cutoff)) = managed_pi_launch.as_ref() {
-            if !crate::platform::wait_until_birth_tick(*cutoff) {
-                return Err(AgentStartError::AuthorityPersistence(
-                    "process birth clock did not advance before launch".into(),
-                ));
-            }
-            // The wait must not turn a previously shell-only pane into a
-            // launch against a newly foregrounded Pi.
-            if available_shell_name(runtime).as_deref() != Some(shell_name.as_str()) {
-                return Err(AgentStartError::TargetBusy(params.pane_id));
-            }
+        // Persist the new generation, and for a Pi --session launch wait out the
+        // birth-tick cutoff, before mutating launch state or sending bytes.
+        let managed = self.prepare_managed_launch(&terminal_id, kind, &argv, |name| {
+            launch_env_value(&params.env, name)
+        })?;
+        let generation = managed.generation;
+        // The wait must not turn a previously shell-only pane into a launch
+        // against a newly foregrounded Pi.
+        let shell_unchanged = self
+            .terminal_runtimes
+            .get(&terminal_id)
+            .and_then(available_shell_name)
+            .as_deref()
+            == Some(shell_name.as_str());
+        if !shell_unchanged {
+            self.abandon_managed_launch(&terminal_id, generation);
+            return Err(AgentStartError::TargetBusy(params.pane_id));
         }
         let now = Instant::now();
-        let terminal = self
-            .state
-            .terminals
-            .get_mut(&terminal_id)
-            .ok_or_else(|| AgentStartError::TargetUnavailable(params.pane_id.clone()))?;
-        runtime.set_managed_agent_generation(process_generation);
+        let Some(terminal) = self.state.terminals.get_mut(&terminal_id) else {
+            self.abandon_managed_launch(&terminal_id, generation);
+            return Err(AgentStartError::TargetUnavailable(params.pane_id));
+        };
         terminal.begin_managed_agent(name.clone(), kind, now, AGENT_START_SETTLE_DELAY, timeout);
-        terminal.set_managed_agent_generation(process_generation);
-        if let Err(err) = runtime.try_send_bytes(Bytes::from(bytes)) {
-            terminal.clear_agent_name();
-            runtime.set_managed_agent_generation(0);
-            return Err(AgentStartError::InputFailed(err.to_string()));
-        }
-        if let Some((session_path, earliest_birth_ticks)) = managed_pi_launch {
-            self.managed_pi_launches.insert(
-                terminal_id.clone(),
-                ManagedPiLaunch {
-                    generation: process_generation,
-                    session_path,
-                    earliest_birth_ticks,
-                    process: None,
-                },
-            );
+        self.commit_managed_launch(&terminal_id, managed);
+        let sent = self
+            .terminal_runtimes
+            .get(&terminal_id)
+            .ok_or_else(|| "terminal runtime disappeared".to_string())
+            .and_then(|runtime| {
+                runtime
+                    .try_send_bytes(Bytes::from(bytes))
+                    .map_err(|err| err.to_string())
+            });
+        if let Err(err) = sent {
+            if let Some(terminal) = self.state.terminals.get_mut(&terminal_id) {
+                terminal.clear_agent_name();
+            }
+            self.abandon_managed_launch(&terminal_id, generation);
+            return Err(AgentStartError::InputFailed(err));
         }
         self.acknowledge_terminal_input(&terminal_id);
         self.state.mark_session_dirty();

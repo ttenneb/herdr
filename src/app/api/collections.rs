@@ -939,6 +939,7 @@ impl App {
             shell_config,
             extra_env,
             None,
+            crate::terminal::TerminalId::alloc(),
         ) {
             Ok(new_pane) => new_pane,
             Err(err) => {
@@ -1137,6 +1138,28 @@ impl App {
             .cwd
             .map(std::path::PathBuf::from)
             .or_else(|| Some(self.resolve_new_terminal_cwd(follow_cwd)));
+        let helper_terminal_id = crate::terminal::TerminalId::alloc();
+        // A helper that names its own --session file gets exactly the managed
+        // launch that agent.start gives (generation, birth-tick cutoff, launch
+        // record, session-file checks). Without --session the helper keeps the
+        // unmanaged path below unchanged.
+        let managed = if kind == crate::detect::Agent::Pi
+            && crate::app::agents::explicit_pi_session_path(&argv).is_some()
+        {
+            let launch_env = extra_env.clone();
+            match self.prepare_managed_launch(&helper_terminal_id, kind, &argv, |name| {
+                launch_env
+                    .iter()
+                    .find(|(key, _)| key == name)
+                    .map(|(_, value)| value.clone())
+            }) {
+                Ok(prepared) => Some(prepared),
+                Err(err) => return encode_error_body(id, self.agent_start_error_body(err)),
+            }
+        } else {
+            None
+        };
+        let managed_generation = managed.as_ref().map(|prepared| prepared.generation);
         let shell_config =
             crate::pane::PaneShellConfig::new(&self.state.default_shell, self.state.shell_mode);
         let mut new_pane = match self.state.workspaces[ws_idx].create_collection_member(
@@ -1151,10 +1174,14 @@ impl App {
             shell_config,
             extra_env,
             Some(&argv),
+            helper_terminal_id.clone(),
         ) {
             Ok(new_pane) => new_pane,
             Err(err) => {
-                return encode_error(id, "collection_helper_launch_failed", err.to_string())
+                if let Some(generation) = managed_generation {
+                    self.abandon_managed_launch(&helper_terminal_id, generation);
+                }
+                return encode_error(id, "collection_helper_launch_failed", err.to_string());
             }
         };
         let pane_id = new_pane.pane_id;
@@ -1172,6 +1199,9 @@ impl App {
         self.state
             .terminals
             .insert(new_pane.terminal.id.clone(), new_pane.terminal);
+        if let Some(prepared) = managed {
+            self.commit_managed_launch(&helper_terminal_id, prepared);
+        }
         // Always select the newly allocated helper. In a nonempty Collection, leaving an
         // older member selected risks assigning or observing the old busy pane instead.
         self.select_new_collection_helper(ws_idx, pane_id, collection_id);
@@ -1183,6 +1213,9 @@ impl App {
             {
                 Ok(value) => Some(value),
                 Err(err) => {
+                    if let Some(generation) = managed_generation {
+                        self.abandon_managed_launch(&helper_terminal_id, generation);
+                    }
                     let pane_id = self.public_pane_id(ws_idx, pane_id).unwrap_or_default();
                     let rollback = self.handle_collection_helper_abort(
                         format!("{id}:rollback"),
@@ -1974,6 +2007,316 @@ mod tests {
             assert!(aborted.get("error").is_none(), "{aborted}");
         }
         std::fs::remove_dir_all(fake_root).expect("remove fake agent directory");
+    }
+
+    /// A fake `pi` on a private PATH and a Pi session root holding one
+    /// private, still-empty session file, as collection-helper-launch.sh
+    /// creates it.
+    #[cfg(unix)]
+    struct HelperFixture {
+        root: std::path::PathBuf,
+        session: String,
+        env: std::collections::HashMap<String, String>,
+    }
+
+    #[cfg(unix)]
+    impl HelperFixture {
+        fn new(tag: &str) -> Self {
+            use std::os::unix::fs::OpenOptionsExt;
+            let root = std::env::temp_dir().join(format!(
+                "herdr-helper-managed-{tag}-{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            ));
+            let bin = root.join("bin");
+            let sessions = root.join("sessions").join("--tmp-work--");
+            std::fs::create_dir_all(&bin).unwrap();
+            std::fs::create_dir_all(&sessions).unwrap();
+            crate::test_env::write_executable(
+                &bin.join("pi"),
+                "#!/bin/sh\nwhile IFS= read -r line; do :; done\n",
+            );
+            let session = sessions.join("2026-01-01T00-00-00-000Z_helper.jsonl");
+            std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(&session)
+                .unwrap();
+            let env = std::collections::HashMap::from([
+                ("PATH".to_string(), bin.display().to_string()),
+                (
+                    "PI_CODING_AGENT_SESSION_DIR".to_string(),
+                    root.join("sessions").display().to_string(),
+                ),
+            ]);
+            Self {
+                root,
+                session: session.display().to_string(),
+                env,
+            }
+        }
+
+        fn launch(
+            &self,
+            app: &mut App,
+            collection_id: &str,
+            args: Vec<String>,
+        ) -> serde_json::Value {
+            request(
+                app,
+                Method::CollectionHelperLaunch(CollectionHelperLaunchParams {
+                    collection_id: collection_id.to_string(),
+                    cwd: None,
+                    env: self.env.clone(),
+                    delegation_parent_id: None,
+                    purpose: Some("managed helper".into()),
+                    name: "helper".into(),
+                    kind: "pi".into(),
+                    args,
+                    timeout_ms: Some(5_000),
+                }),
+            )
+        }
+    }
+
+    #[cfg(unix)]
+    fn launched_helper(
+        app: &App,
+        response: &serde_json::Value,
+    ) -> (crate::layout::PaneId, crate::terminal::TerminalId, String) {
+        assert!(response.get("error").is_none(), "{response}");
+        let public = response["result"]["launched"]["created"]["pane"]["pane_id"]
+            .as_str()
+            .expect("created pane")
+            .to_string();
+        let (_, pane) = app.parse_pane_id(&public).expect("helper pane");
+        let terminal = app
+            .state
+            .terminals
+            .keys()
+            .find(|id| {
+                id.to_string()
+                    == response["result"]["launched"]["agent"]["terminal_id"]
+                        .as_str()
+                        .unwrap()
+            })
+            .expect("helper terminal")
+            .clone();
+        (pane, terminal, public)
+    }
+
+    /// Simulate the launched Pi: its header lands in the session file, the
+    /// server sees a Pi foreground process (the real helper child, born after
+    /// the launch cutoff) and observes it under the helper's generation.
+    #[cfg(target_os = "linux")]
+    fn observe_helper_pi(
+        app: &mut App,
+        pane: crate::layout::PaneId,
+        terminal: &crate::terminal::TerminalId,
+        session: &str,
+        generation: u64,
+    ) {
+        std::fs::write(
+            session,
+            b"{\"type\":\"session\",\"version\":3,\"id\":\"helper\",\"cwd\":\"/tmp\"}\n",
+        )
+        .unwrap();
+        let pid = app
+            .terminal_runtimes
+            .get(terminal)
+            .expect("helper runtime")
+            .child_pid()
+            .expect("helper pid");
+        app.install_mailbox_bootstrap_test_foreground_job(
+            terminal.clone(),
+            crate::platform::ForegroundJob {
+                process_group_id: pid,
+                processes: vec![crate::platform::ForegroundProcess {
+                    pid,
+                    name: "pi".into(),
+                    argv0: None,
+                    argv: Some(vec!["pi".into()]),
+                    cmdline: Some("pi".into()),
+                }],
+            },
+        );
+        app.handle_internal_event(crate::events::AppEvent::AgentProcessDetected {
+            pane_id: pane,
+            agent: crate::detect::Agent::Pi,
+            process_generation: generation,
+            observed_at: std::time::Instant::now(),
+        });
+    }
+
+    #[cfg(unix)]
+    fn helper_trust(app: &mut App, public: &str) -> Option<crate::api::schema::AgentSessionTrust> {
+        let response = request(
+            app,
+            Method::AgentGet(crate::api::schema::AgentTarget {
+                target: public.to_string(),
+            }),
+        );
+        serde_json::from_value(response["result"]["agent"]["agent_session_trust"].clone())
+            .expect("trust")
+    }
+
+    #[cfg(unix)]
+    fn abort_helper(app: &mut App, collection_id: &str, public: String, terminal: String) {
+        let aborted = request(
+            app,
+            Method::CollectionHelperAbort(CollectionHelperAbortParams {
+                collection_id: collection_id.to_string(),
+                pane_id: public,
+                terminal_id: terminal,
+            }),
+        );
+        assert!(aborted.get("error").is_none(), "{aborted}");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn helper_with_session_gets_managed_trust_and_messages() {
+        let _env = crate::test_env::shared();
+        let fixture = HelperFixture::new("session");
+        let (mut app, root, _, _) = app_with_panes();
+        let collection_id = create_collection(&mut app, root);
+        let response = fixture.launch(
+            &mut app,
+            &collection_id,
+            vec!["--session".into(), fixture.session.clone()],
+        );
+        let (pane, terminal, public) = launched_helper(&app, &response);
+        let launch = app
+            .managed_pi_launches
+            .get(&terminal)
+            .expect("helper launch is recorded like agent.start");
+        assert_eq!(launch.session_path, fixture.session);
+        let generation = launch.generation;
+        assert_eq!(generation, 1);
+        assert!(app.state.terminals[&terminal].accepts_managed_agent_generation(generation));
+
+        observe_helper_pi(&mut app, pane, &terminal, &fixture.session, generation);
+        assert_eq!(
+            helper_trust(&mut app, &public),
+            Some(crate::api::schema::AgentSessionTrust::Managed)
+        );
+        assert_eq!(
+            app.live_mailbox_bootstrap_candidate_for_test(&terminal.to_string()),
+            Some((generation, false)),
+            "the helper can attach to Messages with full scope"
+        );
+        abort_helper(&mut app, &collection_id, public, terminal.to_string());
+        std::fs::remove_dir_all(&fixture.root).unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn helper_without_session_stays_reported_without_messages() {
+        let _env = crate::test_env::shared();
+        let fixture = HelperFixture::new("plain");
+        let (mut app, root, _, _) = app_with_panes();
+        let collection_id = create_collection(&mut app, root);
+        let response = fixture.launch(&mut app, &collection_id, Vec::new());
+        let (pane, terminal, public) = launched_helper(&app, &response);
+        let argv = response["result"]["launched"]["argv"].as_array().unwrap();
+        assert_eq!(
+            argv.iter()
+                .map(|arg| arg.as_str().unwrap())
+                .collect::<Vec<_>>(),
+            ["pi", "--exclude-tools", "ask_user_question"],
+            "unchanged helper argv"
+        );
+        assert!(!app.managed_pi_launches.contains_key(&terminal));
+        assert!(app.state.terminals[&terminal].accepts_managed_agent_generation(0));
+        assert!(
+            crate::sender_authority::SenderAuthorityStore::for_sender(
+                &app.sender_authority_dir,
+                &terminal.to_string()
+            )
+            .unwrap()
+            .load()
+            .unwrap()
+            .is_none(),
+            "no sender generation is allocated for an unmanaged helper"
+        );
+
+        observe_helper_pi(&mut app, pane, &terminal, &fixture.session, 0);
+        app.handle_pane_report_agent_session(
+            "report".into(),
+            crate::api::schema::PaneReportAgentSessionParams {
+                pane_id: public.clone(),
+                source: "herdr:pi".into(),
+                agent: "pi".into(),
+                seq: Some(1),
+                agent_session_id: None,
+                agent_session_path: Some(fixture.session.clone()),
+                session_start_source: Some("startup".into()),
+            },
+        );
+        assert_eq!(
+            helper_trust(&mut app, &public),
+            Some(crate::api::schema::AgentSessionTrust::Reported)
+        );
+        assert_eq!(
+            app.live_mailbox_bootstrap_candidate_for_test(&terminal.to_string()),
+            None
+        );
+        abort_helper(&mut app, &collection_id, public, terminal.to_string());
+        std::fs::remove_dir_all(&fixture.root).unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn failed_managed_helper_launch_leaves_no_record_or_promotable_generation() {
+        let _env = crate::test_env::shared();
+        let fixture = HelperFixture::new("failed");
+        let (mut app, root, _, _) = app_with_panes();
+        let collection_id = create_collection(&mut app, root);
+        let terminals_before = app.state.terminals.len();
+        crate::workspace::fail_next_collection_mutation_for_test();
+        let response = fixture.launch(
+            &mut app,
+            &collection_id,
+            vec!["--session".into(), fixture.session.clone()],
+        );
+        assert_eq!(
+            response["error"]["code"], "collection_helper_launch_failed",
+            "{response}"
+        );
+        assert_eq!(app.state.terminals.len(), terminals_before);
+        assert!(app.managed_pi_launches.is_empty());
+        let records: Vec<crate::sender_authority::SenderAuthorityRecord> =
+            std::fs::read_dir(&app.sender_authority_dir)
+                .unwrap()
+                .filter_map(Result::ok)
+                .filter(|entry| {
+                    entry
+                        .file_name()
+                        .to_string_lossy()
+                        .starts_with("sender-authority-")
+                })
+                .map(|entry| serde_json::from_slice(&std::fs::read(entry.path()).unwrap()).unwrap())
+                .collect();
+        assert_eq!(records.len(), 1, "exactly the prepared generation");
+        assert_eq!(
+            records[0].phase,
+            crate::sender_authority::SenderAuthorityPhase::Invalidated
+        );
+
+        // The Collection is still usable and the next helper is managed.
+        let response = fixture.launch(
+            &mut app,
+            &collection_id,
+            vec!["--session".into(), fixture.session.clone()],
+        );
+        let (_, terminal, public) = launched_helper(&app, &response);
+        assert!(app.managed_pi_launches.contains_key(&terminal));
+        abort_helper(&mut app, &collection_id, public, terminal.to_string());
+        std::fs::remove_dir_all(&fixture.root).unwrap();
     }
 
     #[cfg(unix)]

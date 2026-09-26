@@ -304,6 +304,18 @@ pub(crate) fn verified_pi_session_jsonl(_path: &std::path::Path) -> bool {
     false
 }
 
+/// Launch-time check for a managed Pi `--session` file: as
+/// [`verified_pi_session_jsonl`], but an empty file is accepted.
+#[cfg(unix)]
+pub(crate) fn launchable_pi_session_jsonl(path: &std::path::Path) -> bool {
+    unix_common::launchable_pi_session_jsonl(path)
+}
+
+#[cfg(not(unix))]
+pub(crate) fn launchable_pi_session_jsonl(_path: &std::path::Path) -> bool {
+    false
+}
+
 #[cfg(not(unix))]
 pub(crate) fn begin_cli_output() {}
 

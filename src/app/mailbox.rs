@@ -1267,6 +1267,19 @@ impl App {
             .collect()
     }
 
+    /// Whether the Messages bootstrap would currently accept this sender, and
+    /// with which generation and scope (`history_only`).
+    #[cfg(test)]
+    pub(crate) fn live_mailbox_bootstrap_candidate_for_test(
+        &self,
+        sender_key: &str,
+    ) -> Option<(u64, bool)> {
+        self.live_mailbox_bootstrap_candidates()
+            .into_iter()
+            .find(|candidate| candidate.sender_key == sender_key)
+            .map(|candidate| (candidate.process_generation, candidate.history_only))
+    }
+
     pub(crate) fn mailbox_bootstrap_foreground_job(
         &self,
         terminal_id: &crate::terminal::TerminalId,
