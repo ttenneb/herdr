@@ -1548,7 +1548,7 @@ impl App {
             &self.inbox_recipients(&session.caller),
             &crate::app::messages::session_execution(session),
             current.as_deref(),
-            &|execution| self.execution_alive(execution),
+            &|execution| self.execution_alive(execution, &session.caller),
         )
         .map_err(|_| MailboxBootstrapError::GrantMissing)?;
         let settled: std::collections::HashSet<_> = snapshot

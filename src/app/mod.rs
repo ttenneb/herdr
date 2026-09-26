@@ -188,6 +188,10 @@ pub struct App {
     /// Test override for a process's age (the typed fallback's 30 s rule).
     #[cfg(test)]
     pub(crate) messages_test_process_ages: HashMap<u32, std::time::Duration>,
+    /// Test override: executions treated as alive elsewhere (e.g. a managed
+    /// generation) without building that state.
+    #[cfg(test)]
+    pub(crate) messages_test_live_executions: std::collections::HashSet<String>,
     /// Pi processes (PID, birth tick) that attached a Messages stream during
     /// their life. Runtime only.
     pub(crate) messages_attached_pis: std::collections::HashSet<(u32, u64)>,
@@ -957,6 +961,8 @@ impl App {
             mailbox_bootstrap_test_process_births: HashMap::new(),
             #[cfg(test)]
             messages_test_process_ages: HashMap::new(),
+            #[cfg(test)]
+            messages_test_live_executions: std::collections::HashSet::new(),
             messages_attached_pis: std::collections::HashSet::new(),
             event_tx,
             event_rx,

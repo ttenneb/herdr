@@ -459,10 +459,16 @@ pub(crate) fn session_execution(session: &crate::app::MailboxBootstrapSession) -
 pub(crate) const MESSAGES_ATTACH_GRACE: std::time::Duration = std::time::Duration::from_secs(30);
 
 impl App {
-    /// Whether a claiming execution still runs: `pid:<pid>:<ticks>` while
-    /// that exact process lives; `managed:<terminal>:<generation>` while that
-    /// generation holds the pane's Active sender authority.
-    pub(crate) fn execution_alive(&self, execution: &str) -> bool {
+    /// Whether a claiming execution still runs in the pane `terminal_key`:
+    /// `pid:<pid>:<ticks>` while that exact process lives, is still the
+    /// pane's foreground Pi and is not stopped (a stopped or backgrounded old
+    /// Pi must not block Drop/Retry forever); `managed:<terminal>:<generation>`
+    /// while that generation holds the pane's Active sender authority.
+    pub(crate) fn execution_alive(&self, execution: &str, terminal_key: &str) -> bool {
+        #[cfg(test)]
+        if self.messages_test_live_executions.contains(execution) {
+            return true;
+        }
         if let Some(rest) = execution.strip_prefix("pid:") {
             let Some((pid, ticks)) = rest.split_once(':') else {
                 return false;
@@ -470,9 +476,8 @@ impl App {
             let (Ok(pid), Ok(ticks)) = (pid.parse::<u32>(), ticks.parse::<u64>()) else {
                 return false;
             };
-            return self
-                .managed_pi_process_birth(pid)
-                .is_some_and(|birth| birth.start_ticks == ticks);
+            return self.foreground_pi_identity(terminal_key) == Some((pid, ticks))
+                && !crate::platform::process_stopped(pid);
         }
         if let Some(rest) = execution.strip_prefix("managed:") {
             let Some((terminal, generation)) = rest.rsplit_once(':') else {

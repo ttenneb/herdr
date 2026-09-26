@@ -424,7 +424,7 @@ impl App {
                 .values()
                 .filter(|claim| recipients.contains(&claim.recipient))
                 .filter_map(|claim| claim.execution.clone())
-                .filter(|owner| *owner != execution && self.execution_alive(owner))
+                .filter(|owner| *owner != execution && self.execution_alive(owner, &session.caller))
                 .collect();
             let held_by_live_other = |claim: &crate::mailbox::Claim| {
                 claim

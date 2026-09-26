@@ -2199,14 +2199,12 @@ async fn only_a_gone_executions_claim_can_be_dropped_or_retried() {
             .cloned()
             .unwrap()
     };
-    // A live other Pi process (known birth) and two gone ones (no process).
+    // A live other execution and two gone ones (no process).
     let live_pid = 4_000_000_001_u32;
-    let mut birth = crate::platform::process_birth_identity(std::process::id()).unwrap();
-    birth.start_ticks = 5;
     fixture
         .app
-        .mailbox_bootstrap_test_process_births
-        .insert(live_pid, birth);
+        .messages_test_live_executions
+        .insert(format!("pid:{live_pid}:5"));
     for (body, execution) in [
         ("live", format!("pid:{live_pid}:5")),
         ("gone-drop", "pid:4000000002:5".to_string()),
@@ -3009,4 +3007,67 @@ async fn recovered_settle_needs_an_admitted_claim() {
     )
     .unwrap();
     assert_eq!(settled["resolution"]["closedBy"], "recovered", "{settled}");
+}
+
+/// QA 2b #2: a pid execution counts as alive only while it is the pane's
+/// foreground Pi and not stopped. A SIGSTOPped or no-longer-foreground old
+/// Pi does not block Drop/Retry.
+#[tokio::test]
+async fn a_stopped_or_backgrounded_old_pi_is_not_alive() {
+    let mut fixture = fixture();
+    let terminal = fixture.app.state.workspaces[1]
+        .terminal_id(fixture.panes[1])
+        .unwrap()
+        .clone();
+    let key = fixture.terminals[1].clone();
+    let mut child = std::process::Command::new("sleep")
+        .arg("30")
+        .spawn()
+        .unwrap();
+    let pid = child.id();
+    let ticks = crate::platform::process_birth_identity(pid)
+        .unwrap()
+        .start_ticks;
+    let execution = format!("pid:{pid}:{ticks}");
+    let foreground = |pid| crate::platform::ForegroundJob {
+        process_group_id: pid,
+        processes: vec![crate::platform::ForegroundProcess {
+            pid,
+            name: "pi".into(),
+            argv0: None,
+            argv: Some(vec!["pi".into()]),
+            cmdline: Some("pi".into()),
+        }],
+    };
+    fixture
+        .app
+        .install_mailbox_bootstrap_test_foreground_job(terminal.clone(), foreground(pid));
+    assert!(
+        fixture.app.execution_alive(&execution, &key),
+        "running foreground Pi"
+    );
+    unsafe { libc::kill(pid as i32, libc::SIGSTOP) };
+    let stopped = (0..100).any(|_| {
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        crate::platform::process_stopped(pid)
+    });
+    assert!(stopped);
+    assert!(!fixture.app.execution_alive(&execution, &key), "stopped");
+    unsafe { libc::kill(pid as i32, libc::SIGCONT) };
+    let resumed = (0..100).any(|_| {
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        !crate::platform::process_stopped(pid)
+    });
+    assert!(resumed);
+    assert!(fixture.app.execution_alive(&execution, &key));
+    // Another process is now the pane's foreground Pi.
+    fixture
+        .app
+        .install_mailbox_bootstrap_test_foreground_job(terminal, foreground(std::process::id()));
+    assert!(
+        !fixture.app.execution_alive(&execution, &key),
+        "backgrounded"
+    );
+    let _ = child.kill();
+    let _ = child.wait();
 }

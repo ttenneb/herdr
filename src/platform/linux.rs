@@ -481,6 +481,17 @@ fn first_post_launch_birth_tick_at(seconds: u64, nanoseconds: u64, hz: u64) -> O
         .checked_add(1)
 }
 
+/// Whether the process is stopped (SIGSTOP / job control, or traced).
+pub(crate) fn process_stopped(pid: u32) -> bool {
+    std::fs::read_to_string(format!("/proc/{pid}/stat"))
+        .ok()
+        .and_then(|stat| {
+            let rest = stat.get(stat.rfind(')')? + 2..)?;
+            rest.chars().next()
+        })
+        .is_some_and(|state| matches!(state, 'T' | 't'))
+}
+
 /// How long ago a process with this kernel birth tick started.
 pub(crate) fn process_age_from_birth_tick(start_ticks: u64) -> Option<std::time::Duration> {
     let mut now: libc::timespec = unsafe { std::mem::zeroed() };
