@@ -3319,3 +3319,69 @@ async fn only_a_real_enter_clears_the_draft() {
     );
     assert!(fixture.app.pane_draft_pending(&focused));
 }
+
+/// VQRO 1b: a held message is pinned to the recipient's execution. If
+/// another agent of the same kind replaced it by the time the draft clears,
+/// the message fails with agent_replaced (sender told) and is never typed.
+#[tokio::test]
+async fn a_held_message_is_never_typed_into_a_replacement_agent() {
+    use crossterm::event::KeyCode;
+    let mut fixture = fixture();
+    let terminal = fixture.app.state.workspaces[1]
+        .terminal_id(fixture.panes[1])
+        .unwrap()
+        .clone();
+    let pi = |pid: u32| crate::platform::ForegroundJob {
+        process_group_id: pid,
+        processes: vec![crate::platform::ForegroundProcess {
+            pid,
+            name: "pi".into(),
+            argv0: None,
+            argv: Some(vec!["pi".into()]),
+            cmdline: Some("pi".into()),
+        }],
+    };
+    let mut birth = crate::platform::process_birth_identity(std::process::id()).unwrap();
+    for (pid, ticks) in [(4_000_000_060_u32, 21_u64), (4_000_000_061, 22)] {
+        birth.start_ticks = ticks;
+        fixture
+            .app
+            .mailbox_bootstrap_test_process_births
+            .insert(pid, birth);
+    }
+    fixture
+        .app
+        .install_mailbox_bootstrap_test_foreground_job(terminal.clone(), pi(4_000_000_060));
+    human_key(&mut fixture.app, &terminal, KeyCode::Char('d'));
+    let sequence = fixture.app.event_hub.current_sequence();
+    let held = prompt_pane(&mut fixture, "for the original Pi", None);
+    assert_eq!(held["result"]["delivery"]["path"], "pty_deferred", "{held}");
+    // The Pi is replaced by another Pi in the same pane.
+    fixture
+        .app
+        .install_mailbox_bootstrap_test_foreground_job(terminal.clone(), pi(4_000_000_061));
+    human_key(&mut fixture.app, &terminal, KeyCode::Enter);
+    assert!(fixture.app.typed_deferrals.is_empty());
+    assert!(
+        fixture.rx[1].try_recv().is_err(),
+        "never typed into the new agent"
+    );
+    let events = deferral_events(&fixture.app, sequence);
+    assert!(
+        matches!(
+            events.as_slice(),
+            [crate::api::schema::EventData::DeliveryDeferredFailed { code, .. }] if code == "agent_replaced"
+        ),
+        "{events:?}"
+    );
+    // The same execution still gets its held message.
+    human_key(&mut fixture.app, &terminal, KeyCode::Char('e'));
+    let held = prompt_pane(&mut fixture, "for the same Pi", None);
+    assert_eq!(held["result"]["delivery"]["path"], "pty_deferred");
+    human_key(&mut fixture.app, &terminal, KeyCode::Enter);
+    let typed = tokio::time::timeout(std::time::Duration::from_secs(2), fixture.rx[1].recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(String::from_utf8_lossy(&typed).contains("for the same Pi"));
+}

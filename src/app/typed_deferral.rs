@@ -43,6 +43,10 @@ pub(crate) struct TypedDeferral {
     pub sender: crate::app::messages::SenderAttribution,
     pub origin: &'static str,
     pub deadline: Instant,
+    /// The recipient agent's execution when the message was sent (managed
+    /// generation and foreground process PID plus birth tick). A held
+    /// message is only ever typed into that same execution.
+    pub execution: Option<String>,
 }
 
 /// How a human keystroke changes the draft estimate.
@@ -213,6 +217,7 @@ impl App {
         origin: &'static str,
     ) -> String {
         let id = new_deferral_id();
+        let execution = self.current_agent_execution(&terminal_id);
         tracing::info!(
             deferral = %id,
             terminal = %terminal_id,
@@ -228,8 +233,37 @@ impl App {
             sender,
             origin,
             deadline: Instant::now() + TYPED_DEFERRAL_LIMIT,
+            execution,
         });
         id
+    }
+
+    /// The pane's current agent execution: its managed generation (if any)
+    /// and its foreground agent process as PID plus kernel birth tick.
+    pub(crate) fn current_agent_execution(&self, terminal_id: &TerminalId) -> Option<String> {
+        let generation = self
+            .state
+            .terminals
+            .get(terminal_id)
+            .and_then(|terminal| terminal.managed_agent_generation())
+            .filter(|generation| *generation > 0);
+        let process = self
+            .mailbox_bootstrap_foreground_job(terminal_id)
+            .and_then(|job| {
+                crate::detect::identify_agent_process_in_job(&job).map(|(_, process)| process.pid)
+            })
+            .and_then(|pid| {
+                self.managed_pi_process_birth(pid)
+                    .map(|birth| (pid, birth.start_ticks))
+            });
+        if generation.is_none() && process.is_none() {
+            return None;
+        }
+        Some(format!(
+            "g{}/p{}",
+            generation.map_or_else(|| "-".into(), |g| g.to_string()),
+            process.map_or_else(|| "-".into(), |(pid, ticks)| format!("{pid}:{ticks}"))
+        ))
     }
 
     pub(crate) fn next_typed_deferral_deadline(&self) -> Option<Instant> {
@@ -263,6 +297,15 @@ impl App {
                     blocked.push(deferral.terminal_id.clone());
                     keep.push(deferral);
                 }
+                continue;
+            }
+            if self.current_agent_execution(&deferral.terminal_id) != deferral.execution {
+                self.fail_typed_deferral(
+                    &deferral,
+                    "agent_replaced",
+                    "the agent in the recipient pane was replaced while the message waited; it was not typed into the new agent",
+                );
+                changed = true;
                 continue;
             }
             match self.type_submission(
