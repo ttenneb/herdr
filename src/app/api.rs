@@ -178,6 +178,7 @@ impl App {
             ..
         } = &ev
         {
+            self.end_sleep_on_live_agent(*pane_id);
             self.promote_and_install_offline_mailbox_authority(
                 *pane_id,
                 *agent,

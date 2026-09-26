@@ -622,11 +622,14 @@ impl App {
             );
         }
         let recipient = params.recipient.recipient_id.clone();
-        let stable_id = params.submit.stable_id.clone();
         let response = self.handle_mailbox_server_scoped_submit(id, params);
         // Wake hook: a head queued for a pane Herdr put to sleep wakes it.
-        if !response.contains("\"error\"") {
-            self.wake_for_appended_recipient(&recipient, stable_id);
+        if let Ok(SuccessResponse {
+            result: ResponseResult::MailboxOfflineSubmitted { receipt },
+            ..
+        }) = serde_json::from_str::<SuccessResponse>(&response)
+        {
+            self.wake_for_appended_recipient(&recipient, receipt.stable_id);
         }
         response
     }
@@ -1777,6 +1780,65 @@ mod tests {
     /// Defense in depth: a report head for another recipient (a parent over a
     /// provisioned cross grant) is never admitted by the generic submit path;
     /// only report_submit_parent on a ready bound route may admit one.
+    /// The offline-submit wake decision uses the typed result: an admitted
+    /// head for a slept pane wakes it; a refused submit does not.
+    #[tokio::test]
+    async fn offline_submit_to_a_slept_pane_wakes_it_only_when_admitted() {
+        let (mut app, _pane_id, sender_a, directory) = app_with_active_sender();
+        app.state.workspaces.push(Workspace::test_new("slept"));
+        app.state.ensure_test_terminals();
+        let pane = app.state.workspaces[1].tabs[0].root_pane.unwrap();
+        let terminal = app.state.workspaces[1].terminal_id(pane).unwrap().clone();
+        let (runtime, mut input) = crate::terminal::TerminalRuntime::test_with_channel(80, 24);
+        app.terminal_runtimes.insert(terminal.clone(), runtime);
+        {
+            let state = app.state.terminals.get_mut(&terminal).unwrap();
+            state.launch_recipe =
+                crate::launch_recipe::LaunchRecipe::capture("slept", "pi", &[], &[]);
+            state.sleep = Some(App::new_pane_sleep("slept".into(), 1));
+        }
+        let recipient = RecipientKey {
+            recipient_id: terminal.to_string(),
+            generation: "1".into(),
+        };
+        let grant_id = app
+            .provision_cross_recipient_mailbox_grant(&sender_a, recipient.clone())
+            .expect("grant");
+        let mut refused = submit(
+            sender_a.clone(),
+            grant_id.clone(),
+            recipient.clone(),
+            "a".repeat(64),
+        );
+        refused.submit.kind = "report".into();
+        let response = app.handle_api_request(Request {
+            id: "refused".into(),
+            method: Method::MailboxOfflineSubmit(refused),
+        });
+        assert!(
+            serde_json::from_str::<ErrorResponse>(&response).is_ok(),
+            "{response}"
+        );
+        assert!(app.pane_wakes.is_empty(), "a refused submit wakes nothing");
+        let response = app.handle_api_request(Request {
+            id: "admitted".into(),
+            method: Method::MailboxOfflineSubmit(submit(
+                sender_a,
+                grant_id,
+                recipient,
+                "b".repeat(64),
+            )),
+        });
+        assert!(
+            serde_json::from_str::<SuccessResponse>(&response).is_ok(),
+            "{response}"
+        );
+        assert_eq!(app.pane_wakes[&terminal].trigger.head_id, "stable-1");
+        assert!(input.try_recv().is_ok(), "one launch");
+        drop(app);
+        std::fs::remove_dir_all(directory).expect("remove mailbox directory");
+    }
+
     #[test]
     fn generic_report_submit_over_a_cross_grant_is_refused_without_a_head() {
         let (mut app, _pane_id, sender_a, directory) = app_with_active_sender();

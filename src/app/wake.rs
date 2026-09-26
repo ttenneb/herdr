@@ -25,6 +25,9 @@ use crate::terminal::TerminalId;
 pub(crate) const WAKE_ATTACH_TIMEOUT: Duration = Duration::from_secs(60);
 /// After a failed or timed-out wake, further wakes for the pane wait this long.
 pub(crate) const WAKE_FAILURE_COOLDOWN: Duration = Duration::from_secs(30);
+/// A slept parent has no live generation or trusted session, so its children's
+/// bound report routes would stop working; such a pane never sleeps.
+pub(crate) const PARENT_OF_ACTIVE_ROUTES: &str = "parent of active delegation routes; not sleeping";
 
 /// Why the mailbox asks for a wake. Both are level-triggered: the caller asks
 /// whenever a slept pane has unsettled heads; wake_pane refuses or coalesces.
@@ -78,6 +81,7 @@ pub(crate) enum WakeRefusal {
     PiAttached,
     PaneNotAtIdleShell,
     CoolingDown { retry_after_ms: u64 },
+    ParentOfActiveRoutes,
 }
 
 impl WakeRefusal {
@@ -90,6 +94,7 @@ impl WakeRefusal {
             Self::PiAttached => "pi_attached",
             Self::PaneNotAtIdleShell => "pane_not_at_idle_shell",
             Self::CoolingDown { .. } => "cooling_down",
+            Self::ParentOfActiveRoutes => "parent_of_active_routes",
         }
     }
 }
@@ -135,6 +140,113 @@ impl App {
         let (ws_idx, pane_id) = self.parse_current_public_pane_id(pane_key)?;
         let terminal_id = self.state.workspaces.get(ws_idx)?.terminal_id(pane_id)?;
         Some((ws_idx, pane_id, terminal_id.clone()))
+    }
+
+    /// Whether the pane of this terminal is the parent of a ready delegation
+    /// route, or of a live child delegation (a child pane with an agent,
+    /// running or asleep).
+    pub(crate) fn terminal_parents_active_routes(&self, terminal_id: &TerminalId) -> bool {
+        let pane_of = |terminal: &TerminalId| {
+            self.state.workspaces.iter().find_map(|workspace| {
+                workspace.tabs.iter().find_map(|tab| {
+                    tab.panes
+                        .iter()
+                        .find(|(_, pane)| &pane.attached_terminal_id == terminal)
+                        .map(|(pane_id, _)| *pane_id)
+                })
+            })
+        };
+        let Some(pane) = pane_of(terminal_id) else {
+            return false;
+        };
+        if self
+            .ready_delegation_routes
+            .values()
+            .any(|route| route.parent_pane == pane)
+        {
+            return true;
+        }
+        let Some(parent) = self
+            .state
+            .delegations
+            .delegation_for_pane(pane)
+            .filter(|record| !record.tombstone)
+            .map(|record| record.id)
+        else {
+            return false;
+        };
+        self.state.delegations.records().values().any(|child| {
+            child.parent_id == Some(parent)
+                && !child.tombstone
+                && child.pane_id.is_some_and(|child_pane| {
+                    self.find_pane(child_pane)
+                        .and_then(|(ws_idx, _)| {
+                            self.state.workspaces[ws_idx].terminal_id(child_pane)
+                        })
+                        .and_then(|terminal| self.state.terminals.get(terminal))
+                        .is_some_and(|terminal| {
+                            terminal.is_agent_terminal() || terminal.sleep.is_some()
+                        })
+                })
+        })
+    }
+
+    /// Sleeping agents holding `name`, except in `except_terminal`.
+    pub(crate) fn sleeping_name_conflicts(
+        &self,
+        name: &str,
+        except_terminal: Option<&TerminalId>,
+    ) -> Vec<crate::api::schema::AgentInfo> {
+        self.state
+            .workspaces
+            .iter()
+            .enumerate()
+            .flat_map(|(ws_idx, workspace)| {
+                workspace.tabs.iter().flat_map(move |tab| {
+                    tab.panes.iter().map(move |(pane_id, pane)| {
+                        (ws_idx, *pane_id, pane.attached_terminal_id.clone())
+                    })
+                })
+            })
+            .filter(|(_, _, terminal_id)| Some(terminal_id) != except_terminal)
+            .filter(|(_, _, terminal_id)| {
+                self.state
+                    .terminals
+                    .get(terminal_id)
+                    .is_some_and(|terminal| {
+                        terminal.agent_name.is_none()
+                            && terminal
+                                .sleep
+                                .as_ref()
+                                .is_some_and(|sleep| sleep.agent_name == name)
+                    })
+            })
+            .filter_map(|(ws_idx, pane_id, _)| self.agent_info_with_sleeping(ws_idx, pane_id, true))
+            .collect()
+    }
+
+    /// Any live agent appearing in a slept pane other than the one a wake is
+    /// starting (for example a hand-typed `pi`) ends the Herdr sleep, so
+    /// prompts route normally again instead of queueing unread.
+    pub(crate) fn end_sleep_on_live_agent(&mut self, pane_id: crate::layout::PaneId) {
+        let Some(terminal_id) = self
+            .find_pane(pane_id)
+            .and_then(|(ws_idx, _)| self.state.workspaces[ws_idx].terminal_id(pane_id).cloned())
+        else {
+            return;
+        };
+        if self.pane_wakes.contains_key(&terminal_id) {
+            return;
+        }
+        let Some(terminal) = self.state.terminals.get_mut(&terminal_id) else {
+            return;
+        };
+        // While the slept agent itself is still exiting it keeps its name.
+        if terminal.sleep.is_some() && terminal.agent_name.is_none() {
+            terminal.sleep = None;
+            self.state.mark_session_dirty();
+            self.schedule_session_save();
+        }
     }
 
     fn pane_wake_dir(&self) -> std::path::PathBuf {
@@ -279,6 +391,9 @@ impl App {
         };
         if recipe.lifecycle_role.is_some() {
             return refuse(self, Some(&terminal_id), WakeRefusal::LifecycleOwned);
+        }
+        if retry && self.terminal_parents_active_routes(&terminal_id) {
+            return refuse(self, Some(&terminal_id), WakeRefusal::ParentOfActiveRoutes);
         }
         let runtime = self.terminal_runtimes.get(&terminal_id);
         if runtime.is_some_and(super::agents::runtime_has_live_agent) {
@@ -464,6 +579,9 @@ impl App {
         )?;
         if recipe.lifecycle_role.is_some() {
             return Err("a lifecycle role manager owns this agent");
+        }
+        if self.terminal_parents_active_routes(terminal_id) {
+            return Err(PARENT_OF_ACTIVE_ROUTES);
         }
         if terminal.launch_argv.is_some() {
             return Err("Collection helpers cannot sleep: their pane closes when the agent exits");
@@ -1228,6 +1346,154 @@ mod tests {
         assert!(
             app.first_unsettled_head(&terminal).is_some(),
             "the handoff is queued"
+        );
+    }
+
+    fn second_pane(app: &mut App) -> (crate::layout::PaneId, TerminalId, String) {
+        app.state
+            .workspaces
+            .push(crate::workspace::Workspace::test_new("second"));
+        app.state.ensure_test_terminals();
+        let ws_idx = app.state.workspaces.len() - 1;
+        let pane = app.state.workspaces[ws_idx].tabs[0].root_pane.unwrap();
+        let terminal = app.state.workspaces[ws_idx]
+            .terminal_id(pane)
+            .unwrap()
+            .clone();
+        let public = app.public_pane_id(ws_idx, pane).unwrap();
+        (pane, terminal, public)
+    }
+
+    /// QA: a slept parent would break its children's bound report routes, so a
+    /// parent of live delegations neither sleeps nor is re-woken by a retry.
+    #[tokio::test]
+    async fn a_parent_of_active_delegation_routes_does_not_sleep() {
+        let (mut app, pane, terminal, public) = app_with_shell_pane();
+        let _input = start(&mut app, &public, Vec::new());
+        pi_attaches(&mut app, pane, 1);
+        let (child_pane, child_terminal, _) = second_pane(&mut app);
+        let parent = app
+            .state
+            .delegations
+            .create(Some(pane), None, None)
+            .unwrap();
+        let _child = app
+            .state
+            .delegations
+            .create(Some(child_pane), Some(parent), None)
+            .unwrap();
+        app.state
+            .terminals
+            .get_mut(&child_terminal)
+            .unwrap()
+            .set_detected_state(
+                Some(crate::detect::Agent::Pi),
+                crate::detect::AgentState::Idle,
+            );
+        let refused = request(
+            &mut app,
+            crate::api::schema::Method::AgentSleep(AgentTarget {
+                target: "owner".into(),
+            }),
+        );
+        assert_eq!(
+            refused["error"]["code"], "agent_sleep_unavailable",
+            "{refused}"
+        );
+        assert_eq!(refused["error"]["message"], PARENT_OF_ACTIVE_ROUTES);
+        assert!(app.state.terminals[&terminal].sleep.is_none());
+        // A retry never wakes such a pane either.
+        pi_exits(&mut app, pane);
+        app.state.terminals.get_mut(&terminal).unwrap().sleep =
+            Some(App::new_pane_sleep("owner".into(), 1));
+        assert!(matches!(
+            app.wake_pane_attempt(&public, trigger(), true),
+            WakeOutcome::Refused {
+                reason: WakeRefusal::ParentOfActiveRoutes,
+                ..
+            }
+        ));
+        // Once the child is gone, the pane may sleep again.
+        app.state
+            .terminals
+            .get_mut(&child_terminal)
+            .unwrap()
+            .set_detected_state(None, crate::detect::AgentState::Unknown);
+        assert!(!app.terminal_parents_active_routes(&terminal));
+    }
+
+    /// QA: a hand-typed pi in a slept pane ends the sleep, so prompts are no
+    /// longer queued unread.
+    #[tokio::test]
+    async fn a_live_agent_appearing_in_a_slept_pane_ends_the_sleep() {
+        let (mut app, pane, terminal, public) = app_with_shell_pane();
+        let mut input = start(&mut app, &public, Vec::new());
+        pi_attaches(&mut app, pane, 1);
+        request(
+            &mut app,
+            crate::api::schema::Method::AgentSleep(AgentTarget {
+                target: "owner".into(),
+            }),
+        );
+        pi_exits(&mut app, pane);
+        assert!(app.state.terminals[&terminal].sleep.is_some());
+        while input.try_recv().is_ok() {}
+        // The human types `pi` into the pane: an unmanaged Pi is detected.
+        app.handle_internal_event(crate::events::AppEvent::AgentProcessDetected {
+            pane_id: pane,
+            agent: crate::detect::Agent::Pi,
+            process_generation: 0,
+            observed_at: Instant::now(),
+        });
+        assert!(app.state.terminals[&terminal].sleep.is_none());
+        assert!(app.pane_wakes.is_empty());
+        let queued = prompt(&mut app, "owner", "hello?");
+        assert!(
+            queued.get("error").is_some(),
+            "no longer addressed as a sleeping agent: {queued}"
+        );
+        assert!(
+            app.first_unsettled_head(&terminal).is_none(),
+            "nothing queued unread"
+        );
+    }
+
+    /// QA: a sleeping agent's name stays taken, except by a relaunch in its own pane.
+    #[tokio::test]
+    async fn a_sleeping_agents_name_stays_taken() {
+        let (mut app, pane, terminal, public) = app_with_shell_pane();
+        let _input = start(&mut app, &public, Vec::new());
+        pi_attaches(&mut app, pane, 1);
+        request(
+            &mut app,
+            crate::api::schema::Method::AgentSleep(AgentTarget {
+                target: "owner".into(),
+            }),
+        );
+        pi_exits(&mut app, pane);
+        let (_other_pane, other_terminal, other_public) = second_pane(&mut app);
+        let (runtime, _other_input) = crate::terminal::TerminalRuntime::test_with_channel(80, 24);
+        app.terminal_runtimes.insert(other_terminal, runtime);
+        let taken = app.start_agent(AgentStartParams {
+            name: "owner".into(),
+            kind: "pi".into(),
+            pane_id: other_public,
+            args: Vec::new(),
+            env: Vec::new(),
+            timeout_ms: None,
+        });
+        assert!(matches!(
+            taken,
+            Err(crate::app::agents::AgentStartError::DuplicateName { .. })
+        ));
+        // The wake itself relaunches the same name in the same pane.
+        assert!(matches!(
+            app.wake_pane(&public, trigger()),
+            WakeOutcome::Started { .. }
+        ));
+        assert_eq!(
+            app.state.terminals[&terminal].agent_name.as_deref(),
+            Some("owner")
         );
     }
 

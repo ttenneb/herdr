@@ -287,7 +287,19 @@ impl App {
         if !valid_agent_environment(&params.env) {
             return Err(AgentStartError::InvalidEnvironment);
         }
-        let conflicts = self.agent_name_conflicts(&params.name, "");
+        let mut conflicts = self.agent_name_conflicts(&params.name, "");
+        // A sleeping agent keeps its name; only a relaunch in its own pane
+        // (a wake or a start in that pane) may use it.
+        let target_terminal =
+            self.parse_current_public_pane_id(&params.pane_id)
+                .and_then(|(ws_idx, pane_id)| {
+                    self.state
+                        .workspaces
+                        .get(ws_idx)?
+                        .terminal_id(pane_id)
+                        .cloned()
+                });
+        conflicts.extend(self.sleeping_name_conflicts(&params.name, target_terminal.as_ref()));
         if !conflicts.is_empty() {
             return Err(AgentStartError::DuplicateName {
                 name: params.name.clone(),

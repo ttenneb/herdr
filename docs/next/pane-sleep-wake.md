@@ -20,8 +20,11 @@ A launch that passes the reserved `--env HERDR_LIFECYCLE_ROLE=<roleId>` belongs 
 
 - agents without a recipe, including a hand-typed `pi`;
 - lifecycle-owned agents;
+- the parent of a ready delegation route or of a live child delegation (`parent of active delegation routes; not sleeping`): a slept parent has no live generation or trusted session, so its children's bound report routes would stop working;
 - Collection helpers: their agent is the pane's first process, so the pane closes when it exits, and there is nothing left to wake;
 - agents that are working or blocked.
+
+A sleeping agent keeps its name: another agent cannot take it, while a relaunch in its own pane can. Any other live agent appearing in the slept pane (for example a hand-typed `pi`) ends the sleep, so prompts route normally again.
 
 The sleep record is persisted. After a server restart, a slept pane stays asleep, and it is not resumed.
 
@@ -64,4 +67,5 @@ A hand start (`agent start`, helper launch) never inherits a route; it drops the
 ## Policy notes and known issues
 
 - **Launch-time session checks are policy, not a security boundary.** The directory a `--session` file must sit in is resolved from the launch's own `--env` (`PI_CODING_AGENT_SESSION_DIR`, `PI_CODING_AGENT_DIR`) before the server environment, so a caller can steer it. The checks are path based: the file is verified at launch and again at every identity read, but not held open, so a same-user process can swap it in between (TOCTOU). Both are accepted: the caller already runs as the same user.
+- **Later:** a parent-side route carry across a wake. Today a parent of active routes refuses to sleep; carrying the parent side would let it sleep and re-bind its children's routes to its next generation.
 - **Known issue:** two panes launched as managed on the same `--session` file are out of scope. Both would present the same trusted session identity. Wake, restart resume and route carry assume one pane per session file.
