@@ -777,10 +777,9 @@ impl MailboxStore {
                 .find(|claim| {
                     recipients.contains(&claim.recipient)
                         && !is_withdrawn_claim(claim)
-                        && claim
-                            .execution
-                            .as_deref()
-                            .is_none_or(|owner| owner == execution)
+                        // A legacy claim without an execution is never
+                        // this execution's (upgrade safety).
+                        && claim.execution.as_deref() == Some(execution)
                         && !matches!(
                             recovered.resolutions.get(&claim.claim_id),
                             Some(ClaimResolution {

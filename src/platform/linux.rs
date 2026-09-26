@@ -481,6 +481,24 @@ fn first_post_launch_birth_tick_at(seconds: u64, nanoseconds: u64, hz: u64) -> O
         .checked_add(1)
 }
 
+/// How long ago a process with this kernel birth tick started.
+pub(crate) fn process_age_from_birth_tick(start_ticks: u64) -> Option<std::time::Duration> {
+    let mut now: libc::timespec = unsafe { std::mem::zeroed() };
+    if unsafe { libc::clock_gettime(libc::CLOCK_BOOTTIME, &mut now) } != 0 {
+        return None;
+    }
+    let hz = u64::try_from(unsafe { libc::sysconf(libc::_SC_CLK_TCK) }).ok()?;
+    if hz == 0 {
+        return None;
+    }
+    let now_ms = u64::try_from(now.tv_sec).ok()?.checked_mul(1000)?
+        + u64::try_from(now.tv_nsec).ok()? / 1_000_000;
+    let start_ms = start_ticks.checked_mul(1000)? / hz;
+    Some(std::time::Duration::from_millis(
+        now_ms.saturating_sub(start_ms),
+    ))
+}
+
 pub(crate) fn random_route_epoch() -> Option<String> {
     use std::io::Read;
     let mut bytes = [0u8; 16];

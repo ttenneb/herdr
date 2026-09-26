@@ -43,6 +43,11 @@ pub(crate) fn first_post_launch_birth_tick() -> Option<u64> {
 }
 
 #[cfg(not(target_os = "linux"))]
+pub(crate) fn process_age_from_birth_tick(_start_ticks: u64) -> Option<std::time::Duration> {
+    None
+}
+
+#[cfg(not(target_os = "linux"))]
 pub(crate) fn wait_until_birth_tick(_tick: u64) -> bool {
     false
 }

@@ -279,12 +279,12 @@ pub(crate) fn inbox_snapshot(
     Ok(out)
 }
 
-/// Legacy claims without an execution belong to whichever Pi holds the pane.
+/// A claim is this execution's only when it names this execution. A legacy
+/// claim with no execution (written before per-execution claims) counts as
+/// another, gone execution's: it is never silently resumed or re-run by a
+/// new Pi, only settled, retried or dropped explicitly.
 pub(crate) fn claim_is_current(claim: &crate::mailbox::Claim, execution: &str) -> bool {
-    claim
-        .execution
-        .as_deref()
-        .is_none_or(|owner| owner == execution)
+    claim.execution.as_deref() == Some(execution)
 }
 
 /// Removes withdrawn heads (with their states and receipts) from a recipient
@@ -454,6 +454,10 @@ pub(crate) fn session_execution(session: &crate::app::MailboxBootstrapSession) -
     }
 }
 
+/// How long a live Pi may take to attach Messages before new sends to its
+/// pane are typed instead of queued.
+pub(crate) const MESSAGES_ATTACH_GRACE: std::time::Duration = std::time::Duration::from_secs(30);
+
 impl App {
     /// Whether a claiming execution still runs: `pid:<pid>:<ticks>` while
     /// that exact process lives; `managed:<terminal>:<generation>` while that
@@ -555,7 +559,39 @@ impl App {
         }
         // A Pi attached right now, or a pane whose Pi attached before and is
         // restarting or asleep. A Pi that never attached keeps typed input.
-        self.attached_messages_recipient(terminal_key).is_some() || terminal.messages_capable
+        if self.attached_messages_recipient(terminal_key).is_some() {
+            return true;
+        }
+        if !terminal.messages_capable {
+            return false;
+        }
+        // A live Pi that has not attached Messages within 30 s of starting
+        // (an older Pi, the extension off, receive-only disabled) gets NEW
+        // messages typed again; queued heads wait for the next Messages Pi.
+        // A pane with no Pi (plain shell, restarting) keeps queueing.
+        if let Some((pid, start_ticks)) = self.foreground_pi_identity(terminal_key) {
+            if !self.messages_attached_pis.contains(&(pid, start_ticks))
+                && self
+                    .pi_process_age(pid, start_ticks)
+                    .is_some_and(|age| age >= MESSAGES_ATTACH_GRACE)
+            {
+                tracing::warn!(
+                    terminal = terminal_key,
+                    pid,
+                    "messages: the Pi in this pane has not attached Messages within 30 s; new messages are typed (queued ones wait for a Messages Pi)"
+                );
+                return false;
+            }
+        }
+        true
+    }
+
+    fn pi_process_age(&self, pid: u32, start_ticks: u64) -> Option<std::time::Duration> {
+        #[cfg(test)]
+        if let Some(age) = self.messages_test_process_ages.get(&pid) {
+            return Some(*age);
+        }
+        crate::platform::process_age_from_birth_tick(start_ticks)
     }
 
     /// Runs the backlog sweep from the server tick: first a few seconds after
@@ -657,18 +693,25 @@ impl App {
         }
         let (ws_idx, pane_id) = self.parse_current_public_pane_id(target).or_else(|| {
             // A sleeping agent is still addressed by the name it slept under.
-            let terminal_id = self
-                .state
-                .terminals
-                .values()
-                .find(|terminal| {
-                    terminal
-                        .sleep
-                        .as_ref()
-                        .is_some_and(|sleep| sleep.agent_name == target)
-                })?
-                .id
-                .clone();
+            let slept = self.state.terminals.values().find(|terminal| {
+                terminal
+                    .sleep
+                    .as_ref()
+                    .is_some_and(|sleep| sleep.agent_name == target)
+            });
+            // An agent whose Pi exited (hand quit, restarting) keeps its last
+            // name for its pane's queue, when exactly one such pane has it
+            // (a live agent with the name was already resolved first).
+            let exited = || {
+                let mut named = self.state.terminals.values().filter(|terminal| {
+                    terminal.agent_name.is_none()
+                        && terminal.messages_agent_name.as_deref() == Some(target)
+                        && self.pane_takes_messages(&terminal.id.to_string())
+                });
+                let only = named.next()?;
+                named.next().is_none().then_some(only)
+            };
+            let terminal_id = slept.or_else(exited)?.id.clone();
             self.state
                 .workspaces
                 .iter()

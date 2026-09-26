@@ -121,6 +121,9 @@ pub(crate) enum MailboxBootstrapError {
     /// The head's claim belongs to another execution that is still alive;
     /// only a gone execution's claim may be dropped, retried or recovered.
     ClaimExecutionAlive,
+    /// provision_recipient for an agent outside the caller's own delegation
+    /// edges (its parent or a direct child).
+    RecipientNotAllowed,
 }
 
 /// Error codes a mailbox handler may return that are passed through to the
@@ -138,6 +141,8 @@ const PASSTHROUGH_CODES: &[&str] = &[
     "mailbox_edit_conflict",
     "mailbox_head_out_of_scope",
     "mailbox_claim_execution_alive",
+    "mailbox_recipient_not_allowed",
+    "mailbox_caller_unauthenticated",
     "mailbox_resolve_failed",
     "mailbox_snapshot_failed",
     "report_route_required",
@@ -929,6 +934,35 @@ impl App {
         if recipient_terminal_id == sender_terminal_id {
             return Err(MailboxBootstrapError::InvalidRequest);
         }
+        // Policy: a managed Pi may provision a send grant only along its own
+        // delegation edges (its parent or a direct child). Everyone else is
+        // reached through server-side routing (agent prompt, handoff).
+        let sender_pane = self.state.workspaces.iter().find_map(|workspace| {
+            workspace.tabs.iter().find_map(|tab| {
+                tab.panes
+                    .iter()
+                    .find(|(_, pane)| &pane.attached_terminal_id == sender_terminal_id)
+                    .map(|(pane_id, _)| *pane_id)
+            })
+        });
+        let live = |record: &&crate::delegation::DelegationRecord| !record.tombstone;
+        let sender_edge = sender_pane
+            .and_then(|pane| self.state.delegations.delegation_for_pane(pane))
+            .filter(live);
+        let recipient_edge = self
+            .state
+            .delegations
+            .delegation_for_pane(recipient.pane_id)
+            .filter(live);
+        let related = match (sender_edge, recipient_edge) {
+            (Some(sender), Some(recipient)) => {
+                sender.parent_id == Some(recipient.id) || recipient.parent_id == Some(sender.id)
+            }
+            _ => false,
+        };
+        if !related {
+            return Err(MailboxBootstrapError::RecipientNotAllowed);
+        }
         let recipient_terminal = self
             .state
             .terminals
@@ -1264,6 +1298,12 @@ impl App {
     }
 
     fn mark_pane_messages_capable(&mut self, terminal_key: &str) {
+        // Remember that this exact Pi process attached (the typed fallback
+        // never applies to it, even while its stream reconnects).
+        if let Some(pi) = self.foreground_pi_identity(terminal_key) {
+            self.messages_attached_pis.insert(pi);
+        }
+        let mut flipped = false;
         if let Some(terminal) = self
             .state
             .terminals
@@ -1272,9 +1312,37 @@ impl App {
         {
             if !terminal.messages_capable {
                 terminal.messages_capable = true;
-                self.state.mark_session_dirty();
+                flipped = true;
             }
         }
+        if flipped {
+            // Durable at once, not on the debounced save: after a crash the
+            // pane must still queue for its next Pi.
+            self.state.mark_session_dirty();
+            if self.no_session {
+                return;
+            }
+            if let Err(err) = self.durably_save_delegation_edge() {
+                tracing::warn!(terminal = terminal_key, %err, "messages: could not persist the Messages-capable pane at once; the next session save will");
+            }
+        }
+    }
+
+    /// The pane's current foreground Pi process as (PID, birth tick).
+    pub(crate) fn foreground_pi_identity(&self, terminal_key: &str) -> Option<(u32, u64)> {
+        let terminal_id = self
+            .state
+            .terminals
+            .keys()
+            .find(|terminal_id| terminal_id.to_string() == terminal_key)?;
+        let job = self.mailbox_bootstrap_foreground_job(terminal_id)?;
+        let (agent, process) = crate::detect::identify_agent_process_in_job(&job)?;
+        if agent != crate::detect::Agent::Pi || process.pid == 0 {
+            return None;
+        }
+        let pid = process.pid;
+        let birth = self.managed_pi_process_birth(pid)?;
+        Some((pid, birth.start_ticks))
     }
 
     /// Releases the binding of a closed bootstrap stream so "has Messages"

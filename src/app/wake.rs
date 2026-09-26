@@ -1412,15 +1412,12 @@ mod tests {
         });
         assert!(app.state.terminals[&terminal].sleep.is_none());
         assert!(app.pane_wakes.is_empty());
+        // The pane's queue (read by the live Pi) still takes the last name
+        // (next-messages cb1988cb), but nothing wakes or launches.
         let queued = prompt(&mut app, "owner", "hello?");
-        assert!(
-            queued.get("error").is_some(),
-            "no longer addressed as a sleeping agent: {queued}"
-        );
-        assert!(
-            app.first_unsettled_head(&terminal).is_none(),
-            "nothing queued unread"
-        );
+        assert_eq!(queued["result"]["delivery"]["path"], "mailbox", "{queued}");
+        assert!(app.pane_wakes.is_empty(), "the sleep is over: no wake");
+        assert!(input.try_recv().is_err(), "nothing launched or typed");
     }
 
     /// QA: a sleeping agent's name stays taken, except by a relaunch in its own pane.
@@ -1485,18 +1482,23 @@ mod tests {
         );
     }
 
+    /// A hand-quit agent's last name queues in its pane (next-messages
+    /// cb1988cb), but only panes Herdr put to sleep are ever woken.
     #[tokio::test]
-    async fn prompt_after_a_manual_quit_neither_queues_nor_wakes() {
+    async fn prompt_after_a_manual_quit_queues_but_never_wakes() {
         let (mut app, pane, terminal, public) = app_with_shell_pane();
         let mut input = start(&mut app, &public, Vec::new());
         pi_attaches(&mut app, pane, 1);
         pi_exits(&mut app, pane);
         while input.try_recv().is_ok() {}
         let response = prompt(&mut app, "owner", "hello?");
-        assert!(response.get("error").is_some(), "{response}");
+        assert_eq!(
+            response["result"]["delivery"]["path"], "mailbox",
+            "{response}"
+        );
         assert!(app.pane_wakes.is_empty());
         assert!(input.try_recv().is_err(), "nothing launched or typed");
-        assert_eq!(app.first_unsettled_head(&terminal), None, "nothing queued");
+        assert!(app.first_unsettled_head(&terminal).is_some(), "queued");
     }
 
     /// A sleeping pane with a backlog whose shell is not at its prompt yet is

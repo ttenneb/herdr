@@ -183,6 +183,12 @@ pub struct App {
     #[cfg(test)]
     pub(crate) mailbox_bootstrap_test_process_births:
         HashMap<u32, crate::platform::ProcessBirthIdentity>,
+    /// Test override for a process's age (the typed fallback's 30 s rule).
+    #[cfg(test)]
+    pub(crate) messages_test_process_ages: HashMap<u32, std::time::Duration>,
+    /// Pi processes (PID, birth tick) that attached a Messages stream during
+    /// their life. Runtime only.
+    pub(crate) messages_attached_pis: std::collections::HashSet<(u32, u64)>,
     pub event_tx: mpsc::Sender<AppEvent>,
     pub(crate) event_rx: mpsc::Receiver<AppEvent>,
     pub(crate) api_rx: tokio::sync::mpsc::UnboundedReceiver<crate::api::ApiRequestMessage>,
@@ -946,6 +952,9 @@ impl App {
             mailbox_bootstrap_test_foreground_jobs: HashMap::new(),
             #[cfg(test)]
             mailbox_bootstrap_test_process_births: HashMap::new(),
+            #[cfg(test)]
+            messages_test_process_ages: HashMap::new(),
+            messages_attached_pis: std::collections::HashSet::new(),
             event_tx,
             event_rx,
             last_git_remote_status_refresh: Instant::now() - GIT_REMOTE_STATUS_REFRESH_INTERVAL,
