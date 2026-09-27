@@ -2668,11 +2668,23 @@ impl AppState {
         self.workspace_close_indices(ws_idx).len() >= 2
     }
 
+    /// The workspaces a close of `ws_idx` takes down: a primary-checkout
+    /// workspace takes its linked worktree workspaces with it (a group), unless
+    /// another primary-checkout workspace of the same repository stays open to
+    /// hold them; then only `ws_idx` closes.
     pub(crate) fn workspace_close_indices(&self, ws_idx: usize) -> Vec<usize> {
         self.workspaces
             .get(ws_idx)
             .and_then(|ws| ws.worktree_space())
             .filter(|space| !space.is_linked_worktree)
+            .filter(|space| {
+                !self.workspaces.iter().enumerate().any(|(idx, ws)| {
+                    idx != ws_idx
+                        && ws.worktree_space().is_some_and(|other| {
+                            other.key == space.key && !other.is_linked_worktree
+                        })
+                })
+            })
             .map(|space| {
                 self.workspaces
                     .iter()

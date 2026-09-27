@@ -25,6 +25,9 @@
 ### Removed
 - Retired the external systemd role lifecycle (`scripts/herdr_role_lifecycle.py`, `scripts/herdr_mailbox_transport.py`, `herdr mailbox dispatch`, the reserved `HERDR_LIFECYCLE_ROLE` launch key). Roles start through `launch-role-agent.sh`; sleeping panes are woken in-process by `herdr agent sleep` and Messages.
 
+### Fixed
+- `herdr workspace close` on a primary-checkout workspace no longer requires `--group` when another primary-checkout workspace of the same repository stays open; only the named workspace closes (the remaining primary keeps the linked worktrees).
+
 ### Changed
 - `herdr agent start` now accepts bounded repeatable `--env NAME=VALUE` child-only assignments, for example to transport the exact secure `PI_TASKING_HERDR_ADAPTER_CONFIG` into a Pi launched by the separate Herdr server.
 - Corrected the parent-acknowledgement wire to use tasking's exact assignment object, canonical 22-character IDs, four-field Herdr identities, and authoritative 512-byte required-identity bounds while rejecting every additional property; optional `assignedByPaneId` remains capped at 128 bytes.

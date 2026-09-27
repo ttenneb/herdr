@@ -854,6 +854,50 @@ mod tests {
         }
     }
 
+    /// A second primary-checkout workspace of the same repository (a duplicate)
+    /// closes on its own, without --group: the other primary stays and holds the
+    /// linked worktrees. With only one primary left, a close needs --group again.
+    #[test]
+    fn api_workspace_close_duplicate_primary_closes_alone() {
+        let mut app = app_with_worktree_group();
+        let mut duplicate = Workspace::test_new("duplicate");
+        duplicate.worktree_space = app.state.workspaces[0].worktree_space.clone();
+        app.state.workspaces.push(duplicate);
+        app.state.ensure_test_terminals();
+        let duplicate_id = app.public_workspace_id(2);
+        let close = |app: &mut App, workspace_id: String| -> serde_json::Value {
+            let request: crate::api::schema::Request = serde_json::from_value(serde_json::json!({
+                "id": "req",
+                "method": "workspace.close",
+                "params": { "workspace_id": workspace_id }
+            }))
+            .unwrap();
+            serde_json::from_str(&app.handle_api_request(request)).unwrap()
+        };
+        let response = close(&mut app, duplicate_id);
+        assert!(response.get("error").is_none(), "{response}");
+        assert_eq!(app.state.workspaces.len(), 2, "only the duplicate closed");
+        let linked: Vec<bool> = app
+            .state
+            .workspaces
+            .iter()
+            .map(|ws| {
+                ws.worktree_space()
+                    .is_some_and(|space| space.is_linked_worktree)
+            })
+            .collect();
+        assert_eq!(
+            linked,
+            [false, true],
+            "the other primary and its worktree remain"
+        );
+        // The remaining primary still needs --group.
+        let parent_id = app.public_workspace_id(0);
+        let response = close(&mut app, parent_id);
+        assert_eq!(response["error"]["code"], "workspace_group_close_required");
+        assert_eq!(app.state.workspaces.len(), 2);
+    }
+
     #[test]
     fn api_workspace_close_noncontiguous_group_preserves_adversarial_identity_state() {
         let mut app = app_with_worktree_group();
