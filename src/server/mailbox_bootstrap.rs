@@ -1131,6 +1131,10 @@ mod tests {
                 public_pane_id: app.public_pane_id(0, child_pane).unwrap(),
                 fallback_command: "pi".into(),
                 deadline: std::time::Instant::now() + Duration::from_secs(5),
+                // The shell has been idle long enough to settle.
+                idle_since: Some(std::time::Instant::now() - Duration::from_secs(1)),
+                last_error: None,
+                started_at: std::time::Instant::now(),
             },
         );
         assert!(app.retry_pending_managed_resumes(std::time::Instant::now()));

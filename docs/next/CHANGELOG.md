@@ -26,6 +26,7 @@
 - Retired the external systemd role lifecycle (`scripts/herdr_role_lifecycle.py`, `scripts/herdr_mailbox_transport.py`, `herdr mailbox dispatch`, the reserved `HERDR_LIFECYCLE_ROLE` launch key). Roles start through `launch-role-agent.sh`; sleeping panes are woken in-process by `herdr agent sleep` and Messages.
 
 ### Fixed
+- After a server restart, panes with a launch recipe come back managed even when many panes restore at once: the managed resume waits until the restored shell has settled at its prompt (idle for 0.5 s) and retries a start the pane refuses for now, for up to 60 s, instead of falling back to a plain `pi --session` after 5 s or on the first refusal. Each pane's decision is logged (`managed resume: …`). (#182)
 - `herdr workspace close` on a primary-checkout workspace no longer requires `--group` when another primary-checkout workspace of the same repository stays open; only the named workspace closes (the remaining primary keeps the linked worktrees).
 
 ### Changed
