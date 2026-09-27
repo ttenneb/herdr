@@ -1120,6 +1120,23 @@ impl App {
             .map(|session| session.recipient.clone())
     }
 
+    /// #181: the `--session` of the pane's managed Pi launch recipe, when no
+    /// Pi runs in the pane now.
+    pub(crate) fn pane_recipe_session(&self, terminal_key: &str) -> Option<String> {
+        if self.foreground_pi_identity(terminal_key).is_some() {
+            return None;
+        }
+        let recipe = self
+            .state
+            .terminals
+            .values()
+            .find(|terminal| terminal.id.to_string() == terminal_key)?
+            .launch_recipe
+            .as_ref()
+            .filter(|recipe| recipe.kind == "pi")?;
+        super::agents::explicit_pi_session_path(&recipe.args)
+    }
+
     /// Current `agent_session` value of the agent in this terminal.
     pub(crate) fn current_agent_session_value(&self, terminal_id: &str) -> Option<String> {
         self.collect_agent_infos()
@@ -1225,7 +1242,13 @@ impl App {
             .clone()
             .or_else(|| sender.external_key.clone())
             .unwrap_or_else(|| "external".into());
-        let recipient_session = self.current_agent_session_value(recipient_terminal);
+        // #181: with no live Pi in the pane, a message is still addressed to
+        // the pane's managed agent: pin it to the session of the pane's last
+        // managed Pi launch, so it follows that session if it is relaunched
+        // in another pane.
+        let recipient_session = self
+            .current_agent_session_value(recipient_terminal)
+            .or_else(|| self.pane_recipe_session(recipient_terminal));
 
         // An identical send (same message ID from the same sender) returns its
         // existing head instead of queuing a duplicate.

@@ -4162,3 +4162,36 @@ fn c181_supersede_is_once_repairs_a_crash_gap_and_loses_to_a_claim() {
     assert!(!store.load().unwrap().heads.contains_key("moved.c"));
     std::fs::remove_dir_all(directory).unwrap();
 }
+
+/// #181: a message sent to a pane whose managed Pi has exited is pinned to
+/// the session of the pane's managed launch recipe, so it can follow that
+/// session; with a live Pi in the pane the live session wins.
+#[tokio::test]
+async fn c181_a_message_to_a_pane_whose_managed_pi_exited_is_pinned_to_its_recipe_session() {
+    let mut fixture = fixture();
+    let key = fixture.terminals[1].clone();
+    let terminal = fixture.app.state.workspaces[1]
+        .terminal_id(fixture.panes[1])
+        .unwrap()
+        .clone();
+    {
+        let state = fixture.app.state.terminals.get_mut(&terminal).unwrap();
+        state.messages_capable = true;
+        state.launch_recipe = Some(crate::launch_recipe::LaunchRecipe {
+            name: "tpm".into(),
+            kind: "pi".into(),
+            args: vec!["--session".into(), "/sessions/managed-s.jsonl".into()],
+            env: Vec::new(),
+        });
+    }
+    // No live Pi in the pane (no foreground job): the recipe session.
+    assert!(fixture.app.foreground_pi_identity(&key).is_none());
+    assert_eq!(
+        fixture.app.pane_recipe_session(&key).as_deref(),
+        Some("/sessions/managed-s.jsonl")
+    );
+    // A live Pi in the pane: its own session wins (no recipe fallback).
+    bootstrap_recipient(&mut fixture);
+    assert!(fixture.app.foreground_pi_identity(&key).is_some());
+    assert_eq!(fixture.app.pane_recipe_session(&key), None);
+}
