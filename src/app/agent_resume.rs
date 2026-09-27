@@ -399,12 +399,21 @@ impl App {
                 self.recipe_relaunches.remove(&terminal_id);
                 match started {
                     Ok(_) => {
+                        // A Pi recipe naming a --session gets a launch record
+                        // only if that file passes the launch checks (0600,
+                        // single link, inside Pi's session dir); otherwise it
+                        // runs managed but its identity stays reported.
+                        let untrusted = pending.recipe.kind == "pi"
+                            && super::agents::explicit_pi_session_path(&pending.recipe.args)
+                                .is_some()
+                            && !self.managed_pi_launches.contains_key(&terminal_id);
                         if let Some(terminal) = self.state.terminals.get_mut(&terminal_id) {
-                            terminal.resume_outcome =
-                                Some(crate::api::schema::AgentResumeOutcome {
-                                    outcome: "managed".into(),
-                                    reason: None,
-                                });
+                            terminal.resume_outcome = Some(crate::api::schema::AgentResumeOutcome {
+                                outcome: "managed".into(),
+                                reason: untrusted.then(|| {
+                                    "its --session file failed the launch checks (must be 0600, one link, inside Pi's session dir); trust stays reported".into()
+                                }),
+                            });
                         }
                         tracing::info!(
                             pane = %pending.public_pane_id,

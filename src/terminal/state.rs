@@ -2066,7 +2066,32 @@ impl TerminalState {
                 });
                 return true;
             }
+            // An expected agent already idle past its settle point is ready,
+            // even if this reconcile runs after the start deadline.
+            if known_agent == Some(managed.kind)
+                && self.state == AgentState::Idle
+                && ready_after.is_none_or(|ready_after| now >= ready_after)
+            {
+                self.managed_agent = Some(ManagedAgent {
+                    kind: managed.kind,
+                    phase: ManagedAgentPhase::Active,
+                });
+                return true;
+            }
             if now >= deadline {
+                if self
+                    .resume_outcome
+                    .as_ref()
+                    .is_some_and(|resume| resume.outcome == "managed")
+                {
+                    self.resume_outcome = Some(crate::api::schema::AgentResumeOutcome {
+                        outcome: "managed_start_failed".into(),
+                        reason: Some(
+                            "the resumed agent did not become ready before its start timeout"
+                                .into(),
+                        ),
+                    });
+                }
                 self.clear_agent_name();
                 return true;
             }
@@ -2278,6 +2303,56 @@ mod tests {
             agent: agent_label.into(),
             session_ref,
         });
+    }
+
+    /// #184: a managed start whose agent went idle before the settle point is
+    /// ready even when the first reconcile after it runs past the start
+    /// deadline (it is not dropped); an agent that never became ready is
+    /// dropped at the deadline, and a "managed" resume marker says so.
+    #[test]
+    fn managed_agent_idle_before_settle_survives_a_late_reconcile() {
+        let mut terminal = test_terminal();
+        let now = Instant::now();
+        terminal.begin_managed_agent(
+            "owner".into(),
+            Agent::Pi,
+            now,
+            Duration::from_secs(3),
+            Duration::from_secs(30),
+        );
+        terminal.set_detected_state(Some(Agent::Pi), AgentState::Idle);
+        // Idle before ready_after: still pending.
+        terminal.reconcile_managed_agent_at(now + Duration::from_secs(1), false);
+        assert!(terminal.managed_agent_launch_pending());
+        // No reconcile until well past the deadline (the headless server did
+        // not run the scheduled reconcile): still becomes Active.
+        assert!(terminal.reconcile_managed_agent_at(now + Duration::from_secs(100), false));
+        assert!(terminal.managed_agent_interactive_ready());
+        assert_eq!(terminal.agent_name.as_deref(), Some("owner"));
+
+        // Never ready: dropped at the deadline; the resume marker reflects it.
+        let mut stuck = test_terminal();
+        stuck.begin_managed_agent(
+            "owner".into(),
+            Agent::Pi,
+            now,
+            Duration::from_secs(3),
+            Duration::from_secs(30),
+        );
+        stuck.resume_outcome = Some(crate::api::schema::AgentResumeOutcome {
+            outcome: "managed".into(),
+            reason: None,
+        });
+        stuck.set_detected_state(Some(Agent::Pi), AgentState::Working);
+        assert!(stuck.reconcile_managed_agent_at(now + Duration::from_secs(31), false));
+        assert_eq!(stuck.agent_name, None);
+        assert_eq!(
+            stuck
+                .resume_outcome
+                .as_ref()
+                .map(|resume| resume.outcome.as_str()),
+            Some("managed_start_failed")
+        );
     }
 
     #[test]

@@ -5098,6 +5098,27 @@ impl HeadlessServer {
             }
         }
 
+        // Managed agent starts: Pending -> Active at the settle point, or
+        // expiry at the start deadline. The TUI app runs this in its own
+        // scheduled tasks; the headless server must too, or a Pi that became
+        // idle before its settle point stays Pending until a later reconcile
+        // finds the deadline passed and drops the managed launch (#184).
+        if self
+            .app
+            .state
+            .next_managed_agent_deadline()
+            .is_some_and(|deadline| now >= deadline)
+        {
+            let panes = self.app.state.reconcile_managed_agents_at(now);
+            if !panes.is_empty() {
+                for (ws_idx, pane_id) in panes {
+                    self.app.emit_pane_updated(ws_idx, pane_id);
+                }
+                self.app.state.mark_session_dirty();
+                changed = true;
+            }
+        }
+
         if self
             .app
             .copy_feedback_deadline
