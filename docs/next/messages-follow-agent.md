@@ -44,6 +44,8 @@ and O has no consuming Pi on S. They move to N's queue exactly once, in their or
 
 It closes first, then appends. A repeat finds the deterministic copy and does nothing. A crash between the two writes is repaired on the session's next consumer attach, which appends the missing copy. The claim store uses the same lock, so a head is either claimed in O or moved, never both.
 
+**The session pin.** A message queued for a pane is pinned to the session of the Pi running there. If no Pi runs in the pane, for example because its managed Pi exited, it is pinned to the `--session` of the pane's managed Pi launch recipe, so it still follows that agent. A live Pi's own session always wins. A pane with neither has no pin, and its messages stay with the pane.
+
 **What does not move:**
 - **Heads with no session pin** are pane-owned and stay.
 - **Claimed heads**, including an ended execution's leftover claim (`recoveryNeeded`), stay in O. Moving them could run them twice. They are resolved there with Retry or Drop, as before.
