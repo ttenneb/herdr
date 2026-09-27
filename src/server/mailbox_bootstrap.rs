@@ -57,8 +57,11 @@ pub(crate) struct MailboxBootstrapDescriptor {
     pub parent_report: Option<ParentReportAdvertisement>,
     /// C2, managed sessions only: this pane as a delegation parent can read
     /// "child reported done, no report seen yet" facts for its bound routes.
+    /// Deliberately NOT `parentSignals`: installed Pi (d74c3a4) validates that
+    /// key strictly (it requires the #115 recovery/bind methods) and would
+    /// turn Messages off; a new key is ignored by an older Pi.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub parent_signals: Option<ParentSignalsAdvertisement>,
+    pub child_done_signals: Option<ChildDoneSignalsAdvertisement>,
     pub endpoint: String,
     pub caller: String,
     pub recipient: crate::mailbox::RecipientKey,
@@ -70,7 +73,7 @@ pub(crate) struct MailboxBootstrapDescriptor {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
-pub(crate) struct ParentSignalsAdvertisement {
+pub(crate) struct ChildDoneSignalsAdvertisement {
     pub method: &'static str,
     pub protocol: &'static str,
     pub max_wait_ms: u64,
@@ -174,13 +177,12 @@ impl MailboxBootstrapDescriptor {
                     recipient: route.recipient.clone(),
                     grant_id: route.grant_id.clone(),
                 }),
-            parent_signals: (!session.history_only && session.recipient_only.is_none()).then_some(
-                ParentSignalsAdvertisement {
+            child_done_signals: (!session.history_only && session.recipient_only.is_none())
+                .then_some(ChildDoneSignalsAdvertisement {
                     method: "child_report_signals",
                     protocol: crate::mailbox_v1::PROTOCOL,
                     max_wait_ms: MAX_WATCH_TIMEOUT_MS,
-                },
-            ),
+                }),
             endpoint: endpoint.display().to_string(),
             caller: session.caller.clone(),
             recipient: session.recipient.clone(),
@@ -2036,6 +2038,60 @@ mod tests {
     }
 
     #[test]
+    fn c2_descriptor_advertises_child_done_signals_and_never_parent_signals() {
+        // Installed Pi d74c3a4 rejects a `parentSignals` without the #115
+        // recovery/bind methods; C2 must use only its own new key.
+        let (mut app, directory, sender) = active_app();
+        let mut listener = listener(&directory);
+        let mut client = UnixStream::connect(listener.path()).unwrap();
+        client
+            .set_read_timeout(Some(Duration::from_secs(1)))
+            .unwrap();
+        let descriptor = bootstrap(&mut listener, &mut app, &mut client);
+        assert_eq!(descriptor["result"]["caller"], sender, "{descriptor}");
+        assert_eq!(descriptor["result"]["binding"], "managed");
+        assert_eq!(
+            descriptor["result"]["childDoneSignals"],
+            json!({"method":"child_report_signals","protocol":crate::mailbox_v1::PROTOCOL,
+                   "maxWaitMs":30000})
+        );
+        assert!(
+            descriptor["result"].get("parentSignals").is_none(),
+            "{descriptor}"
+        );
+        let mut keys: Vec<_> = descriptor["result"]
+            .as_object()
+            .unwrap()
+            .keys()
+            .cloned()
+            .collect();
+        keys.sort();
+        assert_eq!(
+            keys,
+            [
+                "activeExecutionGeneration",
+                "binding",
+                "bindingGeneration",
+                "caller",
+                "childDoneSignals",
+                "endpoint",
+                "grantId",
+                "historyOnly",
+                "historySnapshot",
+                "messages",
+                "protocolVersion",
+                "recipient",
+                "reportSubmit",
+                "requestIdPolicy",
+            ],
+            "only the one new key is added to the rc3 descriptor"
+        );
+        drop(client);
+        drop(listener);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
     fn c2_parent_reads_child_done_without_report_until_admission_or_reopen() {
         let (mut app, directory, child) = active_app();
         let (parent, _) = active_managed_recipient(&mut app, &directory);
@@ -2065,8 +2121,9 @@ mod tests {
                 .unwrap();
             let descriptor = bootstrap(listener, app, &mut stream);
             assert_eq!(descriptor["result"]["caller"], who, "{descriptor}");
+            assert!(descriptor["result"].get("parentSignals").is_none());
             assert_eq!(
-                descriptor["result"]["parentSignals"],
+                descriptor["result"]["childDoneSignals"],
                 json!({"method":"child_report_signals","protocol":crate::mailbox_v1::PROTOCOL,
                        "maxWaitMs":30000})
             );
@@ -3723,6 +3780,8 @@ mod tests {
         let descriptor = bootstrap(&mut listener, &mut app, &mut client);
         assert_eq!(descriptor["ok"], true);
         assert_eq!(descriptor["result"]["historyOnly"], true);
+        assert!(descriptor["result"].get("childDoneSignals").is_none());
+        assert!(descriptor["result"].get("parentSignals").is_none());
         assert_eq!(
             descriptor["result"]["historySnapshot"],
             json!({

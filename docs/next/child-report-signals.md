@@ -15,14 +15,14 @@ It clears when such a report is admitted, when the child sends a later `not_done
 
 - Inputs are existing mailbox-journal (`mailbox.v1.jsonl`) records: `child_report`/`todo_state`, `child_report`/`prepared_attempt`, `head` (kind `report`) and `receipt`. The journal positions used for ordering are computed in memory while loading; nothing new is written.
 - `doneAt` is Herdr's wall clock (unix ms) when it committed the `done` `todo_state`, kept **in memory only**, keyed by delegation, route epoch and journal position. An identical repeat keeps the first time. Bound routes do not survive a server restart, so after a restart the fact is simply absent until the child's route is ready and it reports `done` again.
-- **rc2 rollback:** C2 writes no record rc3 doesn't already write, and `child_report.rs` records decode identically in rc2 (c4cbcd03). rc2 has no `parentSignals`, so the Pi consumer stays off.
+- **rc2 rollback:** C2 writes no record rc3 doesn't already write, and `child_report.rs` records decode identically in rc2 (c4cbcd03). rc2 has no `childDoneSignals`, so the Pi consumer stays off.
 
 ## Wire (the parent's own accepted bootstrap stream)
 
-Descriptor, on managed sessions only (not `history_only` or `recipient_only`):
+Descriptor key `childDoneSignals`, on managed sessions only (not `history_only` or `recipient_only`). It is deliberately **not** `parentSignals`: installed Pi d74c3a4 validates `parentSignals` strictly (it requires the #115 `recoveryMethod`/`bindMethod`) and would report "invalid parent signal advertisement" and turn Messages off. Herdr never sends `parentSignals`; an older Pi ignores the new key.
 
 ```json
-"parentSignals": {"method": "child_report_signals", "protocol": "mailbox.v1", "maxWaitMs": 30000}
+"childDoneSignals": {"method": "child_report_signals", "protocol": "mailbox.v1", "maxWaitMs": 30000}
 ```
 
 Request: `child_report_signals {protocol, afterCursor?, waitMs?}`. Unknown fields, a wrong protocol, `waitMs > 30000` or a second parked poll on the same connection are `invalid_request`. A forged or stale binding is `grant_revoked`, as is a `history_only` or `recipient_only` session.

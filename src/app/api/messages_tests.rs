@@ -1999,6 +1999,8 @@ async fn recipient_only_binding_never_grants_send_report_or_route_authority() {
     let binding = session.recipient_only.expect("recipient-only binding");
     let descriptor = crate::server::mailbox_bootstrap::descriptor_value(&session);
     assert_eq!(descriptor["binding"], "recipient_only");
+    assert!(descriptor.get("childDoneSignals").is_none());
+    assert!(descriptor.get("parentSignals").is_none());
     assert!(
         descriptor.get("recipientOnly").is_none(),
         "only the agreed binding field"
