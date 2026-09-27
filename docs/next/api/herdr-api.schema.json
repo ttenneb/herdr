@@ -11855,6 +11855,17 @@
             "pane_id": {
               "type": "string"
             },
+            "resume": {
+              "anyOf": [
+                {
+                  "$ref": "#/schemas/success_response/$defs/AgentResumeOutcome"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "The restart-resume outcome for this pane, until the next agent start\nin it."
+            },
             "revision": {
               "format": "uint64",
               "minimum": 0,
@@ -11982,6 +11993,24 @@
             "source",
             "source_kind",
             "local_override_shadowing_remote"
+          ],
+          "type": "object"
+        },
+        "AgentResumeOutcome": {
+          "description": "How the pane's agent came back after the last server restart (recipe panes\nonly): `managed` from its launch recipe, or `plain_fallback` (typed\n`pi --session`, reported, no name) with the reason.",
+          "properties": {
+            "outcome": {
+              "type": "string"
+            },
+            "reason": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          "required": [
+            "outcome"
           ],
           "type": "object"
         },

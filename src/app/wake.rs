@@ -1639,6 +1639,14 @@ mod tests {
             !typed.contains("--session /s.jsonl"),
             "not the plain fallback: {typed}"
         );
+        let pane_id = app.state.workspaces[0].tabs[0].root_pane.unwrap();
+        assert_eq!(
+            app.agent_info(0, pane_id)
+                .and_then(|info| info.resume)
+                .map(|resume| resume.outcome),
+            Some("managed".to_string()),
+            "agent get shows the managed resume"
+        );
 
         // A shell still busy at 59 s keeps waiting; at the 60 s bound the plain
         // resume command is typed.
@@ -1652,6 +1660,13 @@ mod tests {
         assert!(app.pending_managed_resumes.is_empty());
         let typed = String::from_utf8_lossy(&input.try_recv().unwrap()).to_string();
         assert!(typed.contains("pi --session /s.jsonl"), "{typed}");
+        // The fallback is recorded for agent get, with its reason.
+        let outcome = app.state.terminals[&terminal]
+            .resume_outcome
+            .clone()
+            .unwrap();
+        assert_eq!(outcome.outcome, "plain_fallback");
+        assert!(outcome.reason.unwrap().contains("did not settle"));
         busy(false);
     }
 

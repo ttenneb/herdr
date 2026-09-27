@@ -271,11 +271,25 @@ pub enum AgentSessionTrust {
     Reported,
 }
 
+/// How the pane's agent came back after the last server restart (recipe panes
+/// only): `managed` from its launch recipe, or `plain_fallback` (typed
+/// `pi --session`, reported, no name) with the reason.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct AgentResumeOutcome {
+    pub outcome: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct AgentInfo {
     /// The agent's last reported "editor has unsent text" (Pi only).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub editor_has_text: Option<bool>,
+    /// The restart-resume outcome for this pane, until the next agent start
+    /// in it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resume: Option<AgentResumeOutcome>,
     pub terminal_id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,

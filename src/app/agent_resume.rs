@@ -399,6 +399,13 @@ impl App {
                 self.recipe_relaunches.remove(&terminal_id);
                 match started {
                     Ok(_) => {
+                        if let Some(terminal) = self.state.terminals.get_mut(&terminal_id) {
+                            terminal.resume_outcome =
+                                Some(crate::api::schema::AgentResumeOutcome {
+                                    outcome: "managed".into(),
+                                    reason: None,
+                                });
+                        }
                         tracing::info!(
                             pane = %pending.public_pane_id,
                             terminal = %terminal_id,
@@ -446,6 +453,12 @@ impl App {
                 "managed resume: plain resume fallback (the agent comes back reported, not managed)"
             );
             self.pending_managed_resumes.remove(&terminal_id);
+            if let Some(terminal) = self.state.terminals.get_mut(&terminal_id) {
+                terminal.resume_outcome = Some(crate::api::schema::AgentResumeOutcome {
+                    outcome: "plain_fallback".into(),
+                    reason: Some(reason.clone()),
+                });
+            }
             let mut input = pending.fallback_command;
             input.push('\r');
             if let Some(runtime) = self.terminal_runtimes.get(&terminal_id) {

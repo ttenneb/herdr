@@ -500,6 +500,7 @@ impl App {
         if let Some(terminal) = self.state.terminals.get_mut(terminal_id) {
             // The durable recipe is what a later wake or restart relaunches.
             terminal.launch_recipe = recipe;
+            terminal.resume_outcome = None;
             if relaunch {
                 // A wake keeps the sleep until its Pi attaches; a recipe
                 // relaunch may carry the pane's delegation route over.
@@ -1008,6 +1009,7 @@ impl App {
             foreground_cwd: pane.foreground_cwd,
             revision: pane.revision,
             editor_has_text: pane.editor_has_text,
+            resume: terminal.resume_outcome.clone(),
         })
     }
 

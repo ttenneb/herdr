@@ -134,6 +134,9 @@ pub struct TerminalState {
     /// The agent's last `editor_has_text` report (Pi, edge-triggered). Runtime
     /// only; cleared when the agent process exits.
     pub editor_has_text: Option<bool>,
+    /// The last restart-resume outcome (runtime only); cleared by the next
+    /// managed start in the pane.
+    pub resume_outcome: Option<crate::api::schema::AgentResumeOutcome>,
     pub id: TerminalId,
     pub cwd: PathBuf,
     pub detected_agent: Option<Agent>,
@@ -202,6 +205,7 @@ impl TerminalState {
             messages_capable: false,
             messages_agent_name: None,
             editor_has_text: None,
+            resume_outcome: None,
             id,
             cwd,
             detected_agent: None,
