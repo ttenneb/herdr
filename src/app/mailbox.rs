@@ -823,6 +823,130 @@ impl App {
         })
     }
 
+    /// C2: remember when the server committed a child's done TodoState (first
+    /// commit wins; an identical repeat keeps the original time). Entries for
+    /// routes that are no longer ready are dropped.
+    pub(crate) fn record_child_done_at(
+        &mut self,
+        event: &crate::child_report::ChildReportEvent,
+        recovered: &crate::mailbox::RecoveredMailbox,
+    ) {
+        let crate::child_report::ChildReportEvent::TodoState {
+            route,
+            state: crate::child_report::LocalTodoState::Done,
+            ..
+        } = event
+        else {
+            return;
+        };
+        let Some(position) = recovered
+            .child_report_events
+            .iter()
+            .position(|recorded| recorded == event)
+            .and_then(|index| recovered.child_report_event_cursors.get(index).copied())
+        else {
+            return;
+        };
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|elapsed| u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX))
+            .unwrap_or(0);
+        let ready = &self.ready_delegation_routes;
+        self.child_report_done_at.retain(|(child, epoch, _), _| {
+            ready
+                .values()
+                .any(|route| &route.child.to_string() == child && &route.epoch == epoch)
+        });
+        self.child_report_done_at
+            .entry((
+                route.child_delegation_id.clone(),
+                route.route_epoch.clone(),
+                position,
+            ))
+            .or_insert(now_ms);
+    }
+
+    /// C2 `child_report_signals`: a snapshot of this parent's open
+    /// "child reported done, no report seen yet" facts, over its current ready
+    /// bound routes only. `marker` is the journal marker read before the load.
+    pub(crate) fn child_report_signals_for_parent(
+        &self,
+        session: &MailboxBootstrapSession,
+        marker: u64,
+    ) -> Result<serde_json::Value, MailboxBootstrapError> {
+        const MAX_SIGNALS: usize = 64;
+        self.mailbox_bootstrap_session_current(session)?;
+        if session.history_only || session.recipient_only.is_some() {
+            return Err(MailboxBootstrapError::GrantRevoked);
+        }
+        let mut routes: Vec<_> = self
+            .ready_delegation_routes
+            .values()
+            .filter(|ready| {
+                ready.parent_terminal.to_string() == session.caller
+                    && ready.parent_generation == session.active_execution_generation
+            })
+            .filter(|ready| {
+                self.ready_route_shape(ready.child, ready.parent)
+                    .is_some_and(|mut current| {
+                        current.epoch = ready.epoch.clone();
+                        &current == *ready
+                    })
+            })
+            .filter_map(|ready| self.ready_report_identity(ready))
+            .collect();
+        let mut signals = Vec::new();
+        if !routes.is_empty() {
+            let recovered = crate::mailbox::MailboxStore::existing(&self.sender_authority_dir)
+                .load()
+                .map_err(|_| MailboxBootstrapError::GrantMissing)?;
+            routes.sort_by(|a, b| a.child_delegation_id.cmp(&b.child_delegation_id));
+            for identity in &routes {
+                let Some(fact) =
+                    crate::child_report::done_without_admitted_report(identity, &recovered)
+                else {
+                    continue;
+                };
+                let done_at = self
+                    .child_report_done_at
+                    .get(&(
+                        identity.child_delegation_id.clone(),
+                        identity.route_epoch.clone(),
+                        fact.todo_state_cursor,
+                    ))
+                    .copied();
+                signals.push(serde_json::json!({
+                    "type": "report_unknown",
+                    "reason": "coverage_unqualified",
+                    "delegationId": identity.child_delegation_id,
+                    "routeEpoch": identity.route_epoch,
+                    "doneAt": done_at,
+                    "child": {
+                        "paneId": identity.child_pane_id,
+                        "terminalId": identity.child_terminal_id,
+                        "session": identity.child_session,
+                    },
+                    "todo": {
+                        "localRoot": fact.local_root,
+                        "localRevision": fact.local_revision,
+                        "stateDigest": fact.state_digest,
+                        "state": "done",
+                        "todoStateCursor": fact.todo_state_cursor,
+                    },
+                }));
+            }
+        }
+        signals.sort_by_key(|signal| signal["todo"]["todoStateCursor"].as_u64());
+        let truncated = signals.len() > MAX_SIGNALS;
+        signals.truncate(MAX_SIGNALS);
+        Ok(serde_json::json!({
+            "type": "child_report_signals",
+            "throughCursor": marker,
+            "signals": signals,
+            "truncated": truncated,
+        }))
+    }
+
     /// Parent-scoped, read-only observation. A local CLI selector alone is
     /// insufficient: the accepted stream must be the current parent Pi.
     pub(crate) fn child_report_disposition_for_parent(

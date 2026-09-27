@@ -55,6 +55,10 @@ pub(crate) struct MailboxBootstrapDescriptor {
     /// admission or the parent's acceptance of the report.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub parent_report: Option<ParentReportAdvertisement>,
+    /// C2, managed sessions only: this pane as a delegation parent can read
+    /// "child reported done, no report seen yet" facts for its bound routes.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub parent_signals: Option<ParentSignalsAdvertisement>,
     pub endpoint: String,
     pub caller: String,
     pub recipient: crate::mailbox::RecipientKey,
@@ -62,6 +66,14 @@ pub(crate) struct MailboxBootstrapDescriptor {
     pub active_execution_generation: u64,
     pub binding_generation: String,
     pub request_id_policy: &'static str,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct ParentSignalsAdvertisement {
+    pub method: &'static str,
+    pub protocol: &'static str,
+    pub max_wait_ms: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -162,6 +174,13 @@ impl MailboxBootstrapDescriptor {
                     recipient: route.recipient.clone(),
                     grant_id: route.grant_id.clone(),
                 }),
+            parent_signals: (!session.history_only && session.recipient_only.is_none()).then_some(
+                ParentSignalsAdvertisement {
+                    method: "child_report_signals",
+                    protocol: crate::mailbox_v1::PROTOCOL,
+                    max_wait_ms: MAX_WATCH_TIMEOUT_MS,
+                },
+            ),
             endpoint: endpoint.display().to_string(),
             caller: session.caller.clone(),
             recipient: session.recipient.clone(),
@@ -262,6 +281,8 @@ struct AcceptedMailboxConnection {
     session: Option<MailboxBootstrapSession>,
     /// One parked `mailbox.watch` long-poll, answered from `poll`.
     watch: Option<ParkedWatch>,
+    /// One parked `child_report_signals` long-poll (C2), answered from `poll`.
+    signals: Option<ParkedWatch>,
 }
 
 struct ParkedWatch {
@@ -281,6 +302,23 @@ fn watch_response(request_id: Option<String>, changed: bool, cursor: u64) -> Str
         result: serde_json::json!({"type": "mailbox_watch", "changed": changed, "cursor": cursor}),
     })
     .unwrap_or_else(|_| failure(None, MailboxBootstrapError::GrantMissing))
+}
+
+fn signals_response(
+    app: &App,
+    session: &MailboxBootstrapSession,
+    request_id: Option<String>,
+    marker: u64,
+) -> String {
+    match app.child_report_signals_for_parent(session, marker) {
+        Ok(result) => serde_json::to_string(&BootstrapSuccess {
+            ok: true,
+            request_id,
+            result,
+        })
+        .unwrap_or_else(|_| failure(None, MailboxBootstrapError::GrantMissing)),
+        Err(error) => failure(request_id, error),
+    }
 }
 
 /// A HeadlessServer-owned listener.  It is nonblocking; accepted streams are
@@ -334,6 +372,7 @@ impl MailboxBootstrapListener {
                             input: Vec::new(),
                             session: None,
                             watch: None,
+                            signals: None,
                         },
                     );
                 }
@@ -401,6 +440,31 @@ impl MailboxBootstrapListener {
                 };
                 if let Some(response) = response {
                     connection.watch = None;
+                    if write_response(&mut connection.stream, &response).is_err() {
+                        closed.push(*id);
+                    }
+                }
+            }
+            // A parked C2 signals poll answers with a fresh snapshot once the
+            // journal changed or its deadline passed.
+            if let (Some(parked), Some(session)) = (&connection.signals, &connection.session) {
+                let response = match app.mailbox_watch_marker(session) {
+                    Ok(marker)
+                        if marker != parked.after_marker
+                            || std::time::Instant::now() >= parked.deadline =>
+                    {
+                        Some(signals_response(
+                            app,
+                            session,
+                            parked.request_id.clone(),
+                            marker,
+                        ))
+                    }
+                    Ok(_) => None,
+                    Err(error) => Some(failure(parked.request_id.clone(), error)),
+                };
+                if let Some(response) = response {
+                    connection.signals = None;
                     if write_response(&mut connection.stream, &response).is_err() {
                         closed.push(*id);
                     }
@@ -499,6 +563,45 @@ impl MailboxBootstrapListener {
                 }
                 after => Some(watch_response(request_id, after.is_some(), marker)),
             };
+        }
+        if request.method == "child_report_signals" {
+            #[derive(Deserialize)]
+            #[serde(rename_all = "camelCase", deny_unknown_fields)]
+            struct SignalsParams {
+                protocol: String,
+                #[serde(default)]
+                after_cursor: Option<u64>,
+                #[serde(default)]
+                wait_ms: Option<u64>,
+            }
+            let Ok(params) = serde_json::from_value::<SignalsParams>(request.params) else {
+                return Some(failure(request_id, MailboxBootstrapError::InvalidRequest));
+            };
+            if params.protocol != crate::mailbox_v1::PROTOCOL
+                || params
+                    .wait_ms
+                    .is_some_and(|wait| wait > MAX_WATCH_TIMEOUT_MS)
+                || connection.signals.is_some()
+            {
+                return Some(failure(request_id, MailboxBootstrapError::InvalidRequest));
+            }
+            if session.history_only || session.recipient_only.is_some() {
+                return Some(failure(request_id, MailboxBootstrapError::GrantRevoked));
+            }
+            let marker = match app.mailbox_watch_marker(session) {
+                Ok(marker) => marker,
+                Err(error) => return Some(failure(request_id, error)),
+            };
+            let wait = params.wait_ms.unwrap_or(0);
+            if params.after_cursor == Some(marker) && wait > 0 {
+                connection.signals = Some(ParkedWatch {
+                    request_id,
+                    after_marker: marker,
+                    deadline: std::time::Instant::now() + std::time::Duration::from_millis(wait),
+                });
+                return None;
+            }
+            return Some(signals_response(app, session, request_id, marker));
         }
         let result = app.dispatch_mailbox_bootstrap(session, &request.method, request.params);
         Some(match result {
@@ -1928,6 +2031,275 @@ mod tests {
         );
         assert_eq!(stale["error"]["code"], "grant_revoked");
         drop(client);
+        drop(listener);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn c2_parent_reads_child_done_without_report_until_admission_or_reopen() {
+        let (mut app, directory, child) = active_app();
+        let (parent, _) = active_managed_recipient(&mut app, &directory);
+        let child_pane = app.state.workspaces[0].tabs[0].root_pane.unwrap();
+        let parent_pane = app.state.workspaces[1].tabs[0].root_pane.unwrap();
+        let parent_id = app
+            .state
+            .delegations
+            .create(Some(parent_pane), None, None)
+            .unwrap();
+        let child_id = app
+            .state
+            .delegations
+            .create(Some(child_pane), Some(parent_id), None)
+            .unwrap();
+        ready_test_route(&mut app, &directory, child_id, parent_id);
+        let mut listener = listener(&directory);
+        let me = std::process::id();
+        // The test process plays one Pi at a time; each role gets a fresh stream.
+        let become_pi = |app: &mut App, listener: &mut MailboxBootstrapListener, who: &str| {
+            let other = if who == child { &parent } else { &child };
+            install_trusted_test_pi(app, &directory, other, me + 2);
+            install_trusted_test_pi(app, &directory, who, me);
+            let mut stream = UnixStream::connect(listener.path()).unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(1)))
+                .unwrap();
+            let descriptor = bootstrap(listener, app, &mut stream);
+            assert_eq!(descriptor["result"]["caller"], who, "{descriptor}");
+            assert_eq!(
+                descriptor["result"]["parentSignals"],
+                json!({"method":"child_report_signals","protocol":crate::mailbox_v1::PROTOCOL,
+                       "maxWaitMs":30000})
+            );
+            let binding = descriptor["result"]["bindingGeneration"]
+                .as_str()
+                .unwrap()
+                .to_owned();
+            (stream, binding)
+        };
+        let todo = |revision: u64, state: &str| {
+            json!({"protocol":crate::mailbox_v1::PROTOCOL,"localRoot":"root",
+                   "localRevision":revision,"stateDigest":format!("{revision:064x}"),"state":state})
+        };
+        let signals = |binding: &str, params: Value| json!({"method":"child_report_signals","bindingGeneration":binding,"params":params});
+        let protocol = json!({"protocol":crate::mailbox_v1::PROTOCOL});
+
+        // Child: not done, then done.
+        let (mut cs, cb) = become_pi(&mut app, &mut listener, &child);
+        for (revision, state) in [(1, "not_done"), (2, "done")] {
+            let ack = exchange(
+                &mut listener,
+                &mut app,
+                &mut cs,
+                json!({"method":"todo_state","bindingGeneration":cb,"params":todo(revision, state)}),
+            );
+            assert_eq!(ack["result"]["type"], "todo_state", "{ack}");
+        }
+        // The child is nobody's parent: an empty snapshot.
+        let own = exchange(
+            &mut listener,
+            &mut app,
+            &mut cs,
+            signals(&cb, protocol.clone()),
+        );
+        assert_eq!(own["result"]["signals"], json!([]), "{own}");
+        drop(cs);
+
+        // Parent: exactly one fact, with the full wire shape.
+        let (mut ps, pb) = become_pi(&mut app, &mut listener, &parent);
+        let first = exchange(
+            &mut listener,
+            &mut app,
+            &mut ps,
+            signals(&pb, protocol.clone()),
+        );
+        assert_eq!(first["result"]["type"], "child_report_signals", "{first}");
+        assert_eq!(first["result"]["truncated"], false);
+        let fact = &first["result"]["signals"][0];
+        assert_eq!(
+            first["result"]["signals"].as_array().unwrap().len(),
+            1,
+            "{first}"
+        );
+        assert_eq!(fact["type"], "report_unknown");
+        assert_eq!(fact["reason"], "coverage_unqualified");
+        assert_eq!(fact["delegationId"], child_id.to_string());
+        assert_eq!(
+            fact["routeEpoch"],
+            app.ready_delegation_routes[&child_id].epoch
+        );
+        assert!(fact["doneAt"].as_u64().is_some_and(|at| at > 0), "{fact}");
+        assert_eq!(fact["child"]["terminalId"], child);
+        assert!(fact["child"]["paneId"]
+            .as_str()
+            .is_some_and(|id| !id.is_empty()));
+        assert_eq!(fact["child"]["session"]["source"], "herdr:pi");
+        assert_eq!(fact["child"]["session"]["agent"], "pi");
+        assert_eq!(fact["child"]["session"]["kind"], "path");
+        assert!(fact["child"]["session"]["value"]
+            .as_str()
+            .unwrap()
+            .ends_with(".jsonl"));
+        assert_eq!(
+            fact["todo"],
+            json!({"localRoot":"root","localRevision":2,
+            "stateDigest":format!("{:064x}", 2),"state":"done",
+            "todoStateCursor":fact["todo"]["todoStateCursor"].clone()})
+        );
+        assert!(fact["todo"]["todoStateCursor"].as_u64().unwrap() > 0);
+        let through = first["result"]["throughCursor"].as_u64().unwrap();
+        let again = exchange(
+            &mut listener,
+            &mut app,
+            &mut ps,
+            signals(
+                &pb,
+                json!({"protocol":crate::mailbox_v1::PROTOCOL,"afterCursor":through}),
+            ),
+        );
+        assert_eq!(
+            again["result"]["signals"], first["result"]["signals"],
+            "doneAt is stable"
+        );
+        for bad in [
+            json!({"protocol":"wrong"}),
+            json!({"protocol":crate::mailbox_v1::PROTOCOL,"waitMs":30001}),
+            json!({"protocol":crate::mailbox_v1::PROTOCOL,"caller":child}),
+        ] {
+            let denied = exchange(&mut listener, &mut app, &mut ps, signals(&pb, bad.clone()));
+            assert_eq!(
+                denied["error"]["code"], "invalid_request",
+                "{bad}: {denied}"
+            );
+        }
+        let forged = exchange(
+            &mut listener,
+            &mut app,
+            &mut ps,
+            signals("forged", protocol.clone()),
+        );
+        assert_eq!(forged["error"]["code"], "grant_revoked");
+
+        // Parked until the journal changes: the child's reopen clears the fact.
+        let frame = signals(
+            &pb,
+            json!({"protocol":crate::mailbox_v1::PROTOCOL,
+            "afterCursor":through,"waitMs":5000}),
+        );
+        ps.write_all(format!("{frame}\n").as_bytes()).unwrap();
+        listener.poll(&mut app).unwrap();
+        ps.set_read_timeout(Some(Duration::from_millis(100)))
+            .unwrap();
+        let mut byte = [0_u8; 1];
+        assert!(
+            ps.read_exact(&mut byte).is_err(),
+            "signals poll must be parked"
+        );
+        let recorded = crate::mailbox::MailboxStore::open(&directory)
+            .unwrap()
+            .load()
+            .unwrap();
+        let crate::child_report::ChildReportEvent::TodoState { route, .. } =
+            recorded.child_report_events.last().unwrap().clone()
+        else {
+            panic!("last event is the done TodoState");
+        };
+        crate::mailbox::MailboxStore::open(&directory)
+            .unwrap()
+            .append_child_report_event(crate::child_report::ChildReportEvent::TodoState {
+                route,
+                local_root: "root".into(),
+                local_revision: 3,
+                state_digest: format!("{:064x}", 3),
+                state: crate::child_report::LocalTodoState::NotDone,
+            })
+            .unwrap();
+        listener.poll(&mut app).unwrap();
+        ps.set_read_timeout(Some(Duration::from_secs(1))).unwrap();
+        let mut response = Vec::new();
+        loop {
+            ps.read_exact(&mut byte).unwrap();
+            if byte[0] == b'\n' {
+                break;
+            }
+            response.push(byte[0]);
+        }
+        let woke: Value = serde_json::from_slice(&response).unwrap();
+        assert_eq!(
+            woke["result"]["signals"],
+            json!([]),
+            "reopen clears: {woke}"
+        );
+        assert!(woke["result"]["throughCursor"].as_u64().unwrap() > through);
+        drop(ps);
+
+        // Child: done again (fact is back), then an admitted bound report.
+        let (mut cs, cb) = become_pi(&mut app, &mut listener, &child);
+        let ack = exchange(
+            &mut listener,
+            &mut app,
+            &mut cs,
+            json!({"method":"todo_state","bindingGeneration":cb,"params":todo(4, "done")}),
+        );
+        assert_eq!(ack["result"]["type"], "todo_state", "{ack}");
+        drop(cs);
+        let (mut ps, pb) = become_pi(&mut app, &mut listener, &parent);
+        let back = exchange(
+            &mut listener,
+            &mut app,
+            &mut ps,
+            signals(&pb, protocol.clone()),
+        );
+        assert_eq!(
+            back["result"]["signals"][0]["todo"]["localRevision"], 4,
+            "{back}"
+        );
+        assert!(back["result"]["signals"][0]["doneAt"].as_u64().is_some());
+        drop(ps);
+        let (mut cs, cb) = become_pi(&mut app, &mut listener, &child);
+        let preparation = json!({
+            "protocol":crate::mailbox_v1::PROTOCOL,
+            "localRoot":"root","localRevision":4,"reportId":"report-one",
+            "reportDigest":"a".repeat(64),"stableId":"c2-report",
+            "submitRevision":1,"submitDigest":"a".repeat(64),
+            "deliveryDigest":"b".repeat(64),"messageId":"c2-message"
+        });
+        let prepared = exchange(
+            &mut listener,
+            &mut app,
+            &mut cs,
+            json!({"method":"report_prepared","bindingGeneration":cb,"params":preparation}),
+        );
+        assert_eq!(prepared["result"]["type"], "report_prepared", "{prepared}");
+        let submit = json!({
+            "protocol": crate::mailbox_v1::PROTOCOL, "stableId": "c2-report",
+            "revision": 1, "digest": "a".repeat(64), "deliveryDigest": "b".repeat(64),
+            "subject": "report", "body": "body", "messageId": "c2-message",
+            "kind": "report", "priority": "normal", "originalSequence": 1
+        });
+        let admitted = exchange(
+            &mut listener,
+            &mut app,
+            &mut cs,
+            json!({"method":"report_submit_parent","bindingGeneration":cb,"params":submit}),
+        );
+        assert_eq!(
+            admitted["result"]["receipt"]["status"], "admitted",
+            "{admitted}"
+        );
+        drop(cs);
+        let (mut ps, pb) = become_pi(&mut app, &mut listener, &parent);
+        let cleared = exchange(
+            &mut listener,
+            &mut app,
+            &mut ps,
+            signals(&pb, protocol.clone()),
+        );
+        assert_eq!(
+            cleared["result"]["signals"],
+            json!([]),
+            "admitted report clears: {cleared}"
+        );
+        drop(ps);
         drop(listener);
         std::fs::remove_dir_all(directory).unwrap();
     }

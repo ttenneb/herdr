@@ -124,6 +124,7 @@ impl App {
                     return Err(MailboxBootstrapError::GrantMissing);
                 }
                 self.bound_parent_report_current(session)?;
+                self.record_child_done_at(&event, &recovered);
                 return Ok(serde_json::json!({"type":"todo_state", "cursor":cursor,
                                             "routeEpoch":route.route_epoch()}));
             }

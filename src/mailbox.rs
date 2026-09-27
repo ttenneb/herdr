@@ -252,6 +252,12 @@ pub struct RecoveredMailbox {
     pub grants: BTreeMap<String, MailboxGrant>,
     /// Full identity and provider coverage are required before a missing status.
     pub child_report_events: Vec<crate::child_report::ChildReportEvent>,
+    /// In-memory only (never serialized): the 1-based journal position of
+    /// each entry of `child_report_events`, same index.
+    pub child_report_event_cursors: Vec<u64>,
+    /// In-memory only: the 1-based journal position of each receipt, keyed
+    /// like `receipts` (delivery digest).
+    pub receipt_cursors: BTreeMap<String, u64>,
     /// Count of durably replayed records, including other mailbox events.
     pub record_cursor: u64,
 }
@@ -1077,7 +1083,11 @@ impl RecoveredMailbox {
             }
             MailboxRecord::HeadEdit { edit } => self.apply_head_edit(edit),
             MailboxRecord::Receipt { receipt } => {
-                insert_exact(&mut self.receipts, receipt.delivery_digest.clone(), receipt)
+                let digest = receipt.delivery_digest.clone();
+                let position = self.record_cursor.saturating_add(1);
+                insert_exact(&mut self.receipts, digest.clone(), receipt).map(|()| {
+                    self.receipt_cursors.entry(digest).or_insert(position);
+                })
             }
             MailboxRecord::Claim { claim } => {
                 insert_exact(&mut self.claims, claim.stable_id.clone(), claim)
@@ -1120,6 +1130,8 @@ impl RecoveredMailbox {
                 match crate::child_report::validate_next(&self.child_report_events, &event) {
                     Ok(true) => {
                         self.child_report_events.push(event);
+                        self.child_report_event_cursors
+                            .push(self.record_cursor.saturating_add(1));
                         Ok(())
                     }
                     Ok(false) | Err(()) => Err(MailboxError::CorruptRecord),

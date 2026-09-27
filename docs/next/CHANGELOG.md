@@ -3,6 +3,7 @@
 ## Unreleased
 
 ### Added
+- Added `child_report_signals` (C2) on a delegation parent's accepted Pi stream, advertised as `parentSignals`: a snapshot of "child reported done at T, no report seen yet" facts for its current bound routes, as `report_unknown(coverage_unqualified)` with `doneAt`, `delegationId`, `child` and the Todo state. It is never a missing-report claim and writes no new records. See `docs/next/child-report-signals.md`.
 - Added `herdr agent sleep <agent>` and in-process pane wake: Herdr records a durable launch recipe (name, kind, args, explicit non-credential `--env` keys) for every managed launch, can put an idle managed agent to sleep with a guarded ctrl+d, and relaunches only such slept panes in the same pane and terminal through the managed launch path when a message is queued for them (`App::wake_pane`, single-flight with durable per-wake records). Restart resume uses the same recipe, so resumed agents come back managed. See `docs/next/pane-sleep-wake.md`.
 - `herdr collection helper-launch ... -- --session <file>` now gets the same managed Pi launch as `agent start` (generation, launch record, session-file checks), so such helpers show `managed` trust and attach to Messages.
 - Custom build channels (`HERDR_BUILD_CHANNEL` other than stable/preview, e.g. `stabilized`) show the channel in `herdr --version`, refuse `herdr update`, and never show an upstream update notice.

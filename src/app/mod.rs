@@ -240,6 +240,10 @@ pub struct App {
     pub(crate) session_writer_healthy: Arc<AtomicBool>,
     pub(crate) ready_delegation_routes:
         HashMap<crate::delegation::DelegationId, mailbox::ReadyDelegationRoute>,
+    /// C2 `doneAt`: server wall clock (unix ms) when a child's done TodoState
+    /// was committed, keyed by (child delegation, route epoch, journal
+    /// position). In memory only: bound routes do not outlive the server.
+    pub(crate) child_report_done_at: HashMap<(String, String, u64), u64>,
     /// Runtime cancellation signals for provider processes. These stay out of
     /// `AppState` so pure state and rendering never own process lifecycle.
     pub(crate) plugin_choice_provider_cancellations:
@@ -999,6 +1003,7 @@ impl App {
             session_writer: None,
             session_writer_healthy: Arc::new(AtomicBool::new(true)),
             ready_delegation_routes: HashMap::new(),
+            child_report_done_at: HashMap::new(),
             plugin_choice_provider_cancellations: HashMap::new(),
             detached_process_children: Vec::new(),
             tab_bar_status_generation: 0,

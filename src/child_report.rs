@@ -588,6 +588,103 @@ pub(crate) fn matches_prepared_head(
         && head.grant_id == prepared.route.bound_grant_id()
 }
 
+/// C2 fact: the child's latest Todo state on this exact bound route is done,
+/// and no report sent through this route's bound report path has been
+/// admitted since the child last reported not done (or since the route began).
+/// This is never a "missing report" claim: reports that reached the parent
+/// by any other path (typed prompt, handoff PTY, an exported file) are not
+/// seen here.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DoneWithoutAdmittedReport {
+    pub local_root: String,
+    pub local_revision: u64,
+    pub state_digest: String,
+    /// 1-based mailbox journal position of the done TodoState record.
+    pub todo_state_cursor: u64,
+}
+
+/// Pure projection for C2. Returns `None` unless the fact holds; missing
+/// journal positions fail closed (no fact).
+pub fn done_without_admitted_report(
+    current: &RouteIdentity,
+    mailbox: &RecoveredMailbox,
+) -> Option<DoneWithoutAdmittedReport> {
+    if !current.is_exact_pi_route() {
+        return None;
+    }
+    let mut latest: Option<(&ChildReportEvent, u64)> = None;
+    let mut window_start = 0_u64;
+    let mut attempts = Vec::new();
+    for (index, event) in mailbox.child_report_events.iter().enumerate() {
+        if event.route() != current {
+            continue;
+        }
+        let position = *mailbox.child_report_event_cursors.get(index)?;
+        match event {
+            ChildReportEvent::TodoState { state, .. } => {
+                if *state == LocalTodoState::NotDone {
+                    window_start = position;
+                }
+                latest = Some((event, position));
+            }
+            ChildReportEvent::PreparedAttempt { preparation } => attempts.push(preparation),
+            _ => {}
+        }
+    }
+    let (
+        ChildReportEvent::TodoState {
+            local_root,
+            local_revision,
+            state_digest,
+            state: LocalTodoState::Done,
+            ..
+        },
+        todo_state_cursor,
+    ) = latest?
+    else {
+        return None;
+    };
+    if attempts.iter().any(|preparation| {
+        admitted_report_position(preparation, mailbox).is_some_and(|at| at > window_start)
+    }) {
+        return None;
+    }
+    Some(DoneWithoutAdmittedReport {
+        local_root: local_root.clone(),
+        local_revision: *local_revision,
+        state_digest: state_digest.clone(),
+        todo_state_cursor,
+    })
+}
+
+/// Journal position of the Admitted receipt for a bound-route report head.
+/// Unlike `exact_admitted`, a later edit of the head does not undo admission:
+/// the receipt must match the originally prepared revision and digest.
+fn admitted_report_position(prepared: &PreparedReport, mailbox: &RecoveredMailbox) -> Option<u64> {
+    let route = &prepared.route;
+    let head = mailbox.heads.get(&prepared.stable_id)?;
+    let head_ok = head.kind == "report"
+        && head.delivery_digest == prepared.delivery_digest
+        && head.message_id == prepared.message_id
+        && head.sender == route.child_terminal_id
+        && head.target == route.parent_terminal_id
+        && head.recipient.recipient_id == route.parent_terminal_id
+        && head.grant_id == route.bound_grant_id();
+    let receipt = mailbox.receipts.get(&prepared.delivery_digest)?;
+    let receipt_ok = receipt.status == ReceiptStatus::Admitted
+        && receipt.stable_id == prepared.stable_id
+        && receipt.revision == prepared.submit_revision
+        && receipt.digest == prepared.submit_digest;
+    (head_ok && receipt_ok)
+        .then(|| {
+            mailbox
+                .receipt_cursors
+                .get(&prepared.delivery_digest)
+                .copied()
+        })
+        .flatten()
+}
+
 fn exact_admitted(prepared: &PreparedReport, mailbox: &RecoveredMailbox) -> bool {
     let heads: Vec<_> = mailbox
         .heads
@@ -823,6 +920,249 @@ mod tests {
             message_id: "message".into(),
         }
     }
+    /// C2 helpers: append in journal order with in-memory positions, as
+    /// `MailboxStore::load` would.
+    fn c2_push(m: &mut RecoveredMailbox, event: ChildReportEvent) {
+        m.record_cursor += 1;
+        m.child_report_events.push(event);
+        m.child_report_event_cursors.push(m.record_cursor);
+    }
+    fn c2_todo(r: &RouteIdentity, revision: u64, state: LocalTodoState) -> ChildReportEvent {
+        ChildReportEvent::TodoState {
+            route: r.clone(),
+            local_root: "root".into(),
+            local_revision: revision,
+            state_digest: format!("{revision:064x}"),
+            state,
+        }
+    }
+    fn c2_report_head(r: &RouteIdentity, p: &PreparedReport) -> MailboxHead {
+        MailboxHead {
+            stable_id: p.stable_id.clone(),
+            revision: p.submit_revision,
+            digest: p.submit_digest.clone(),
+            delivery_digest: p.delivery_digest.clone(),
+            recipient: RecipientKey {
+                recipient_id: r.parent_terminal_id.clone(),
+                generation: "1".into(),
+            },
+            subject: "report".into(),
+            body: "body".into(),
+            recipient_generation: "1".into(),
+            sender: r.child_terminal_id.clone(),
+            target: r.parent_terminal_id.clone(),
+            grant_id: r.bound_grant_id(),
+            message_id: p.message_id.clone(),
+            kind: "report".into(),
+            priority: "normal".into(),
+            original_sequence: 1,
+            enqueue_epoch: 1,
+            accepted_at: 1,
+            delivery: None,
+        }
+    }
+    /// Prepared + attempt + head + receipt, in journal order.
+    fn c2_report(
+        m: &mut RecoveredMailbox,
+        r: &RouteIdentity,
+        tag: &str,
+        status: ReceiptStatus,
+    ) -> MailboxHead {
+        let mut p = prepared(r.clone());
+        p.stable_id = format!("s-{tag}");
+        p.message_id = format!("m-{tag}");
+        p.delivery_digest = format!("{:0>64}", tag);
+        c2_push(
+            m,
+            ChildReportEvent::Prepared {
+                preparation: p.clone(),
+            },
+        );
+        c2_push(
+            m,
+            ChildReportEvent::PreparedAttempt {
+                preparation: p.clone(),
+            },
+        );
+        let head = c2_report_head(r, &p);
+        m.record_cursor += 1;
+        m.heads.insert(head.stable_id.clone(), head.clone());
+        m.record_cursor += 1;
+        m.receipts.insert(
+            p.delivery_digest.clone(),
+            AdmissionReceipt {
+                delivery_digest: p.delivery_digest.clone(),
+                stable_id: p.stable_id.clone(),
+                revision: p.submit_revision,
+                digest: p.submit_digest.clone(),
+                status,
+            },
+        );
+        m.receipt_cursors
+            .insert(p.delivery_digest.clone(), m.record_cursor);
+        head
+    }
+
+    #[test]
+    fn c2_done_without_report_is_a_fact_that_clears_on_admission_or_reopen() {
+        let r = route();
+        let mut m = RecoveredMailbox::default();
+        assert_eq!(done_without_admitted_report(&r, &m), None, "nothing yet");
+        c2_push(&mut m, c2_todo(&r, 1, LocalTodoState::NotDone));
+        assert_eq!(done_without_admitted_report(&r, &m), None, "not done");
+        c2_push(&mut m, c2_todo(&r, 2, LocalTodoState::Done));
+        let fact = done_without_admitted_report(&r, &m).expect("done, no report");
+        assert_eq!(
+            fact,
+            DoneWithoutAdmittedReport {
+                local_root: "root".into(),
+                local_revision: 2,
+                state_digest: format!("{:064x}", 2),
+                todo_state_cursor: 2,
+            }
+        );
+        // Another route's (older epoch) admitted report never clears it.
+        let mut old = r.clone();
+        old.route_epoch = "epoch-old".into();
+        c2_report(&mut m, &old, "old", ReceiptStatus::Admitted);
+        assert!(done_without_admitted_report(&r, &m).is_some());
+        // A rejected receipt, or a head without a receipt, does not clear it.
+        c2_report(&mut m, &r, "rejected", ReceiptStatus::Rejected);
+        assert!(done_without_admitted_report(&r, &m).is_some());
+        let mut unreceipted = m.clone();
+        let mut p = prepared(r.clone());
+        p.stable_id = "s-none".into();
+        p.delivery_digest = "d".repeat(64);
+        c2_push(
+            &mut unreceipted,
+            ChildReportEvent::PreparedAttempt {
+                preparation: p.clone(),
+            },
+        );
+        let head = c2_report_head(&r, &p);
+        unreceipted.heads.insert(head.stable_id.clone(), head);
+        assert!(done_without_admitted_report(&r, &unreceipted).is_some());
+        // An admitted bound report clears it, even if the head is edited later.
+        let head = c2_report(&mut m, &r, "ok", ReceiptStatus::Admitted);
+        assert_eq!(
+            done_without_admitted_report(&r, &m),
+            None,
+            "report admitted"
+        );
+        let mut edited = m.clone();
+        let current = edited.heads.get_mut(&head.stable_id).unwrap();
+        current.revision = 2;
+        current.digest = "e".repeat(64);
+        assert_eq!(
+            done_without_admitted_report(&r, &edited),
+            None,
+            "edit keeps admission"
+        );
+        // Reopen: the old report belongs to the previous work period.
+        c2_push(&mut m, c2_todo(&r, 3, LocalTodoState::NotDone));
+        assert_eq!(done_without_admitted_report(&r, &m), None, "reopened");
+        c2_push(&mut m, c2_todo(&r, 4, LocalTodoState::Done));
+        let fact = done_without_admitted_report(&r, &m).expect("done again, no new report");
+        assert_eq!(fact.local_revision, 4);
+        // Report first, then done (no reopen in between): cleared.
+        c2_push(&mut m, c2_todo(&r, 5, LocalTodoState::NotDone));
+        c2_report(&mut m, &r, "early", ReceiptStatus::Admitted);
+        c2_push(&mut m, c2_todo(&r, 6, LocalTodoState::Done));
+        assert_eq!(
+            done_without_admitted_report(&r, &m),
+            None,
+            "report before done"
+        );
+        // Another epoch of the same delegation sees none of this route's facts.
+        let mut newer = r.clone();
+        newer.route_epoch = "epoch-b".into();
+        assert_eq!(done_without_admitted_report(&newer, &m), None);
+    }
+
+    #[test]
+    fn c2_fails_closed_without_positions_and_ignores_non_report_heads() {
+        let r = route();
+        let mut m = RecoveredMailbox::default();
+        c2_push(&mut m, c2_todo(&r, 1, LocalTodoState::Done));
+        let mut no_positions = m.clone();
+        no_positions.child_report_event_cursors.clear();
+        assert_eq!(done_without_admitted_report(&r, &no_positions), None);
+        // A non-report head from the child to the parent (e.g. a chat line)
+        // with an admitted receipt never clears the fact.
+        let mut p = prepared(r.clone());
+        p.delivery_digest = "9".repeat(64);
+        let mut head = c2_report_head(&r, &p);
+        head.kind = "message".into();
+        m.heads.insert(head.stable_id.clone(), head);
+        m.record_cursor += 1;
+        m.receipts.insert(
+            p.delivery_digest.clone(),
+            AdmissionReceipt {
+                delivery_digest: p.delivery_digest.clone(),
+                stable_id: p.stable_id.clone(),
+                revision: 1,
+                digest: p.submit_digest.clone(),
+                status: ReceiptStatus::Admitted,
+            },
+        );
+        m.receipt_cursors
+            .insert(p.delivery_digest.clone(), m.record_cursor);
+        c2_push(&mut m, ChildReportEvent::PreparedAttempt { preparation: p });
+        assert!(done_without_admitted_report(&r, &m).is_some());
+        // An inexact route (not a Pi session) never yields a fact.
+        let mut inexact = r.clone();
+        inexact.child_session.source = "herdr:other".into();
+        assert_eq!(done_without_admitted_report(&inexact, &m), None);
+    }
+
+    #[test]
+    fn c2_store_load_records_positions_in_memory_only() {
+        use crate::mailbox::MailboxStore;
+        let path = std::env::temp_dir().join(format!(
+            "herdr-c2-positions-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let store = MailboxStore::open(&path).unwrap();
+        let r = route();
+        assert_eq!(
+            store
+                .append_child_report_event(c2_todo(&r, 1, LocalTodoState::NotDone))
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            store
+                .append_child_report_event(c2_todo(&r, 2, LocalTodoState::Done))
+                .unwrap(),
+            2
+        );
+        let loaded = store.load().unwrap();
+        assert_eq!(loaded.child_report_event_cursors, vec![1, 2]);
+        assert_eq!(
+            done_without_admitted_report(&r, &loaded)
+                .unwrap()
+                .todo_state_cursor,
+            2
+        );
+        // Nothing new on disk: every line is an existing `child_report` record.
+        let journal =
+            std::fs::read_to_string(path.join(crate::mailbox::RECORD_STREAM_FILE)).unwrap();
+        for line in journal.lines() {
+            let value: serde_json::Value = serde_json::from_str(line).unwrap();
+            assert_eq!(value["kind"], "child_report", "{line}");
+            assert_eq!(value["event"]["kind"], "todo_state", "{line}");
+            assert!(
+                !line.contains("doneAt") && !line.contains("done_at"),
+                "{line}"
+            );
+        }
+        std::fs::remove_dir_all(path).unwrap();
+    }
+
     #[test]
     fn no_false_missing_without_durable_done_and_coverage() {
         let r = route();
