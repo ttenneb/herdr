@@ -1584,6 +1584,77 @@ mod tests {
         assert!(input.try_recv().is_ok(), "one launch");
     }
 
+    /// #182: a restored shell that is only briefly idle (rc startup, prompt
+    /// helpers) is not started yet; the managed start waits until the shell
+    /// has settled, and the plain fallback is used only after the 60 s bound.
+    #[tokio::test]
+    async fn managed_resume_waits_for_a_settled_shell_within_the_bound() {
+        let busy = |value: bool| crate::app::agents::TEST_SHELLS_BUSY.with(|cell| cell.set(value));
+        let setup = |app: &mut App, terminal: &TerminalId, public: &str| {
+            let (runtime, input) = crate::terminal::TerminalRuntime::test_with_channel(80, 24);
+            app.terminal_runtimes.insert(terminal.clone(), runtime);
+            let recipe =
+                crate::launch_recipe::LaunchRecipe::capture("owner", "pi", &[], &[]).unwrap();
+            let t0 = Instant::now();
+            app.pending_managed_resumes.insert(
+                terminal.clone(),
+                crate::app::agent_resume::PendingManagedResume {
+                    recipe,
+                    public_pane_id: public.to_string(),
+                    fallback_command: "pi --session /s.jsonl".into(),
+                    deadline: t0 + crate::app::agent_resume::MANAGED_RESUME_SHELL_WAIT,
+                    idle_since: None,
+                    last_error: None,
+                    started_at: t0,
+                },
+            );
+            (input, t0)
+        };
+        let ms = Duration::from_millis;
+
+        // Settling: idle, busy again, idle: started only 500 ms after the last idle edge.
+        let (mut app, _pane, terminal, public) = app_with_shell_pane();
+        let (mut input, t0) = setup(&mut app, &terminal, &public);
+        busy(false);
+        app.retry_pending_managed_resumes(t0);
+        busy(true);
+        app.retry_pending_managed_resumes(t0 + ms(300));
+        busy(false);
+        app.retry_pending_managed_resumes(t0 + ms(400));
+        app.retry_pending_managed_resumes(t0 + ms(800));
+        assert!(
+            app.pending_managed_resumes.contains_key(&terminal),
+            "not settled yet"
+        );
+        assert!(input.try_recv().is_err(), "nothing typed yet");
+        app.retry_pending_managed_resumes(t0 + ms(950));
+        assert!(app.pending_managed_resumes.is_empty());
+        assert_eq!(
+            app.state.terminals[&terminal].managed_agent_kind(),
+            Some(crate::detect::Agent::Pi),
+            "started managed"
+        );
+        let typed = String::from_utf8_lossy(&input.try_recv().unwrap()).to_string();
+        assert!(
+            !typed.contains("--session /s.jsonl"),
+            "not the plain fallback: {typed}"
+        );
+
+        // A shell still busy at 59 s keeps waiting; at the 60 s bound the plain
+        // resume command is typed.
+        let (mut app, _pane, terminal, public) = app_with_shell_pane();
+        let (mut input, t0) = setup(&mut app, &terminal, &public);
+        busy(true);
+        app.retry_pending_managed_resumes(t0 + Duration::from_secs(59));
+        assert!(app.pending_managed_resumes.contains_key(&terminal));
+        assert!(input.try_recv().is_err());
+        app.retry_pending_managed_resumes(t0 + Duration::from_secs(60));
+        assert!(app.pending_managed_resumes.is_empty());
+        let typed = String::from_utf8_lossy(&input.try_recv().unwrap()).to_string();
+        assert!(typed.contains("pi --session /s.jsonl"), "{typed}");
+        busy(false);
+    }
+
     #[cfg(unix)]
     #[tokio::test]
     async fn restart_resume_with_a_recipe_comes_back_managed() {

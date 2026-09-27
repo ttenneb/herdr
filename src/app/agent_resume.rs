@@ -291,6 +291,9 @@ impl App {
                     public_pane_id,
                     fallback_command: resume_command,
                     deadline: Instant::now() + MANAGED_RESUME_SHELL_WAIT,
+                    idle_since: None,
+                    last_error: None,
+                    started_at: Instant::now(),
                 },
             );
             self.retry_pending_managed_resumes(Instant::now());
@@ -320,9 +323,17 @@ impl App {
     }
 }
 
-/// How long a restored pane's new shell may take to reach its prompt before a
-/// recipe resume falls back to the plain resume command.
-pub(crate) const MANAGED_RESUME_SHELL_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
+/// How long a restored pane's new shell may take to reach its prompt (and a
+/// managed start may keep being retried) before a recipe resume falls back to
+/// the plain resume command. A restore of 100+ panes starts every shell and
+/// its rc files at once, so this is generous.
+pub(crate) const MANAGED_RESUME_SHELL_WAIT: std::time::Duration =
+    std::time::Duration::from_secs(60);
+/// The shell must look idle (its own process alone in the foreground) this
+/// long before the managed start: during rc startup a shell is briefly alone
+/// before it forks prompt helpers (starship, git status, ...).
+pub(crate) const MANAGED_RESUME_SHELL_SETTLE: std::time::Duration =
+    std::time::Duration::from_millis(500);
 const MANAGED_RESUME_POLL: std::time::Duration = std::time::Duration::from_millis(100);
 
 #[derive(Debug, Clone)]
@@ -331,6 +342,11 @@ pub(crate) struct PendingManagedResume {
     pub(crate) public_pane_id: String,
     pub(crate) fallback_command: String,
     pub(crate) deadline: Instant,
+    /// Since when the shell has been continuously idle.
+    pub(crate) idle_since: Option<Instant>,
+    /// The last managed-start refusal, for the fallback log line.
+    pub(crate) last_error: Option<String>,
+    pub(crate) started_at: Instant,
 }
 
 impl App {
@@ -338,20 +354,31 @@ impl App {
         (!self.pending_managed_resumes.is_empty()).then(|| now + MANAGED_RESUME_POLL)
     }
 
-    /// Start pending recipe resumes whose shell is now at its prompt; past the
-    /// deadline, type the plain resume command instead.
+    /// Start pending recipe resumes whose shell has settled at its prompt.
+    /// A managed start the pane refuses for now (busy, unavailable) is retried
+    /// until the deadline; only then, or on a permanent error, is the plain
+    /// resume command typed. Each pane's decision is logged.
     pub(crate) fn retry_pending_managed_resumes(&mut self, now: Instant) -> bool {
         let terminals: Vec<_> = self.pending_managed_resumes.keys().cloned().collect();
         let mut changed = false;
         for terminal_id in terminals {
-            let Some(pending) = self.pending_managed_resumes.get(&terminal_id).cloned() else {
+            let Some(mut pending) = self.pending_managed_resumes.get(&terminal_id).cloned() else {
                 continue;
             };
-            let shell_ready = self
+            let idle = self
                 .terminal_runtimes
                 .get(&terminal_id)
                 .is_some_and(super::agents::runtime_at_idle_shell);
-            if shell_ready {
+            pending.idle_since = if idle {
+                pending.idle_since.or(Some(now))
+            } else {
+                None
+            };
+            let settled = pending
+                .idle_since
+                .is_some_and(|since| now.duration_since(since) >= MANAGED_RESUME_SHELL_SETTLE);
+            let mut permanent = None;
+            if settled {
                 // Restore marked the pane with its old agent (name, detected
                 // Pi, session metadata) for display; the managed start below
                 // re-establishes all of it for the new process.
@@ -372,23 +399,52 @@ impl App {
                 self.recipe_relaunches.remove(&terminal_id);
                 match started {
                     Ok(_) => {
+                        tracing::info!(
+                            pane = %pending.public_pane_id,
+                            terminal = %terminal_id,
+                            after_ms = now.duration_since(pending.started_at).as_millis() as u64,
+                            "managed resume: started managed from the launch recipe"
+                        );
                         self.pending_managed_resumes.remove(&terminal_id);
                         changed = true;
                         continue;
                     }
                     Err(err) => {
-                        let body = self.agent_start_error_body(err);
-                        tracing::warn!(
-                            terminal = %terminal_id,
-                            code = %body.code,
-                            message = %body.message,
-                            "managed resume failed; falling back to a plain resume"
+                        let retryable = matches!(
+                            err,
+                            super::agents::AgentStartError::TargetBusy(_)
+                                | super::agents::AgentStartError::TargetUnavailable(_)
                         );
+                        let body = self.agent_start_error_body(err);
+                        let reason = format!("{}: {}", body.code, body.message);
+                        if retryable {
+                            // The shell got busy again (rc still running):
+                            // wait for it to settle once more.
+                            pending.idle_since = None;
+                            pending.last_error = Some(reason);
+                        } else {
+                            permanent = Some(reason);
+                        }
                     }
                 }
-            } else if now < pending.deadline {
+            }
+            if permanent.is_none() && now < pending.deadline {
+                self.pending_managed_resumes.insert(terminal_id, pending);
                 continue;
             }
+            let reason = permanent.or(pending.last_error.clone()).unwrap_or_else(|| {
+                format!(
+                    "the shell did not settle at its prompt within {} s",
+                    MANAGED_RESUME_SHELL_WAIT.as_secs()
+                )
+            });
+            tracing::warn!(
+                pane = %pending.public_pane_id,
+                terminal = %terminal_id,
+                after_ms = now.duration_since(pending.started_at).as_millis() as u64,
+                reason = %reason,
+                "managed resume: plain resume fallback (the agent comes back reported, not managed)"
+            );
             self.pending_managed_resumes.remove(&terminal_id);
             let mut input = pending.fallback_command;
             input.push('\r');
