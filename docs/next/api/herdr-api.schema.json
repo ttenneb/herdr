@@ -13913,6 +13913,14 @@
             "lifecycle": {
               "$ref": "#/schemas/success_response/$defs/HeadLifecycle"
             },
+            "movedTo": {
+              "description": "public pane ID, or `a closed pane`).",
+              "title": "181: for a head closed `moved`: the pane its copy went to (current",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
             "previousSession": {
               "description": "True for a held head pinned to a different session than the viewing\nrecipient's current one: shown, never claimed, until Retry or Drop.",
               "type": "boolean"
@@ -17538,6 +17546,14 @@
                 {
                   "type": "null"
                 }
+              ]
+            },
+            "movedFrom": {
+              "description": "when a message followed its agent's session to another pane, or the\ntyped-history row of a queued head typed after the 30 s fallback. The\nearlier head's stable ID. Older builds ignore it.",
+              "title": "181: set on a head that replaces an earlier held head: the copy made",
+              "type": [
+                "string",
+                "null"
               ]
             },
             "origin": {

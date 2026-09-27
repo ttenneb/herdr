@@ -53,6 +53,9 @@ pub(crate) struct TypedDeferral {
     pub execution: Option<String>,
     /// Why it is typed rather than queued (for the history record).
     pub reason: String,
+    /// #181: the history row was written when a queued head was converted
+    /// (in the same lock that closed it); typing must not write another.
+    pub history_recorded: bool,
 }
 
 /// How a human keystroke changes the draft state: `None` clears it,
@@ -272,6 +275,7 @@ impl App {
             deadline: Instant::now() + TYPED_DEFERRAL_LIMIT,
             execution,
             reason,
+            history_recorded: false,
         });
         id
     }
@@ -421,13 +425,15 @@ impl App {
             ) {
                 Ok(()) => {
                     tracing::info!(deferral = %deferral.id, "held typed delivery typed");
-                    self.record_typed_delivery(
-                        &deferral.terminal_id,
-                        &deferral.sender,
-                        &deferral.text,
-                        &deferral.reason,
-                        deferral.origin,
-                    );
+                    if !deferral.history_recorded {
+                        self.record_typed_delivery(
+                            &deferral.terminal_id,
+                            &deferral.sender,
+                            &deferral.text,
+                            &deferral.reason,
+                            deferral.origin,
+                        );
+                    }
                     self.emit_deferral_event(&deferral, "delivered", None, None);
                 }
                 Err((code, message)) => self.fail_typed_deferral(&deferral, code, &message),
@@ -450,7 +456,12 @@ impl App {
         }
     }
 
-    fn fail_typed_deferral(&mut self, deferral: &TypedDeferral, code: &str, message: &str) {
+    pub(crate) fn fail_typed_deferral(
+        &mut self,
+        deferral: &TypedDeferral,
+        code: &str,
+        message: &str,
+    ) {
         tracing::warn!(
             deferral = %deferral.id,
             terminal = %deferral.terminal_id,

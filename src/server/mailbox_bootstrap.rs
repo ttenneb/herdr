@@ -539,6 +539,10 @@ impl MailboxBootstrapListener {
             {
                 return Some(failure(request_id, MailboxBootstrapError::InvalidRequest));
             }
+            // #181: a watch on its own inbox makes this stream a Messages consumer.
+            let consumer = session.clone();
+            app.note_messages_consumer(&consumer);
+            let session = &consumer;
             let marker = match app.mailbox_watch_marker(session) {
                 Ok(marker) => marker,
                 Err(error) => return Some(failure(request_id, error)),
@@ -1407,7 +1411,8 @@ mod tests {
             .as_str()
             .unwrap()
             .to_owned();
-        assert!(app.attached_messages_recipient(&sender).is_some());
+        // #181: bootstrap alone is not a Messages consumer; the first watch is.
+        assert!(app.attached_messages_recipient(&sender).is_none());
         let first = exchange(
             &mut listener,
             &mut app,
@@ -1416,6 +1421,7 @@ mod tests {
                    "params":{"protocol":crate::mailbox_v1::PROTOCOL}}),
         );
         assert_eq!(first["result"]["changed"], false);
+        assert!(app.attached_messages_recipient(&sender).is_some());
         let marker = first["result"]["cursor"].as_u64().unwrap();
         // Parked: no response while nothing changes.
         let frame = json!({"method":"mailbox.watch","requestId":"w1","bindingGeneration":binding,
@@ -2033,6 +2039,215 @@ mod tests {
         );
         assert_eq!(stale["error"]["code"], "grant_revoked");
         drop(client);
+        drop(listener);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// #181 test head: a server-sent message waiting in `recipient`'s queue,
+    /// pinned to `session` (or unpinned).
+    fn c181_head(
+        id: &str,
+        recipient: &crate::mailbox::RecipientKey,
+        session: Option<&str>,
+    ) -> crate::mailbox::MailboxHead {
+        let digest = crate::app::messages::sha256_fields(&[id.as_bytes(), b"digest"]);
+        crate::mailbox::MailboxHead {
+            stable_id: id.into(),
+            revision: 1,
+            digest,
+            delivery_digest: crate::app::messages::sha256_fields(&[id.as_bytes(), b"delivery"]),
+            recipient: recipient.clone(),
+            subject: format!("subject {id}"),
+            body: format!("body {id}"),
+            recipient_generation: recipient.generation.clone(),
+            sender: "external:1".into(),
+            target: recipient.recipient_id.clone(),
+            grant_id: "g".into(),
+            message_id: format!("m-{id}"),
+            kind: "advisory".into(),
+            priority: "normal".into(),
+            original_sequence: 1,
+            enqueue_epoch: 0,
+            accepted_at: 1,
+            delivery: Some(crate::mailbox::ServerDelivery {
+                origin: "agent_prompt".into(),
+                sender_label: "pm".into(),
+                sender_session: None,
+                recipient_session: session.map(str::to_string),
+                correlation: None,
+                retry_of: None,
+                typed_reason: None,
+                moved_from: None,
+            }),
+        }
+    }
+
+    #[test]
+    fn c181_waiting_messages_follow_a_managed_session_to_its_new_pane_once() {
+        let (mut app, directory, new_pane) = active_app();
+        let (old_pane, _) = active_managed_recipient(&mut app, &directory);
+        // The managed Pi in the new pane runs on session S (its launch record).
+        let pinned = app
+            .current_agent_session_value(&new_pane)
+            .expect("managed session");
+        assert_eq!(
+            app.managed_pi_launches
+                .iter()
+                .find(|(id, _)| id.to_string() == new_pane)
+                .unwrap()
+                .1
+                .session_path,
+            pinned
+        );
+        let old_inbox =
+            crate::app::messages::pane_recipient(&app.pane_queue_key(&old_pane).unwrap());
+        let new_inbox =
+            crate::app::messages::pane_recipient(&app.pane_queue_key(&new_pane).unwrap());
+        let store = crate::mailbox::MailboxStore::open(&directory).unwrap();
+        for (id, session) in [
+            ("h1", Some(pinned.as_str())),
+            ("h2", Some(pinned.as_str())),
+            ("h3", None),
+            ("h4", Some("/other/session.jsonl")),
+            ("h5", Some(pinned.as_str())),
+        ] {
+            store
+                .append_offline_head(c181_head(id, &old_inbox, session))
+                .unwrap();
+        }
+        // h5 was picked up by an earlier run of S that has since ended.
+        let h5 = store.load().unwrap().heads["h5"].clone();
+        store
+            .claim(crate::mailbox::Claim {
+                claim_id: "claim-h5".into(),
+                recipient: old_inbox.clone(),
+                stable_id: "h5".into(),
+                revision: 1,
+                digest: h5.digest.clone(),
+                execution: Some("managed:gone:1".into()),
+            })
+            .unwrap();
+
+        let mut listener = listener(&directory);
+        let mut client = UnixStream::connect(listener.path()).unwrap();
+        client
+            .set_read_timeout(Some(Duration::from_secs(1)))
+            .unwrap();
+        let descriptor = bootstrap(&mut listener, &mut app, &mut client);
+        assert_eq!(descriptor["result"]["caller"], new_pane, "{descriptor}");
+        let binding = descriptor["result"]["bindingGeneration"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        // Bootstrap alone moves nothing: the Pi may have no Messages.
+        assert!(!store.load().unwrap().claims.contains_key("h1"));
+        let watch = exchange(
+            &mut listener,
+            &mut app,
+            &mut client,
+            json!({"method":"mailbox.watch","bindingGeneration":binding,
+                   "params":{"protocol":crate::mailbox_v1::PROTOCOL}}),
+        );
+        assert_eq!(watch["ok"], true, "{watch}");
+        let recovered = store.load().unwrap();
+        let closed_by = |id: &str| {
+            let claim = recovered.claims.get(id)?;
+            recovered
+                .resolutions
+                .get(&claim.claim_id)
+                .and_then(|resolution| resolution.closed_by.clone())
+        };
+        let mut copies = Vec::new();
+        for id in ["h1", "h2"] {
+            assert!(crate::mailbox::is_withdrawn_claim(&recovered.claims[id]));
+            assert_eq!(closed_by(id).as_deref(), Some("moved"));
+            let copy = &recovered.heads[&crate::app::message_follow::moved_copy_id(id, &pinned)];
+            assert_eq!(copy.recipient, new_inbox);
+            assert_eq!(copy.moved_from(), Some(id));
+            assert_eq!(copy.body, format!("body {id}"));
+            assert!(
+                !recovered.claims.contains_key(&copy.stable_id),
+                "held in the new pane"
+            );
+            copies.push(copy.enqueue_epoch);
+        }
+        assert!(copies[0] < copies[1], "original order kept");
+        assert!(
+            !recovered.claims.contains_key("h3"),
+            "unpinned: pane-owned, stays"
+        );
+        assert!(
+            !recovered.claims.contains_key("h4"),
+            "another session's: stays"
+        );
+        assert_eq!(
+            recovered.claims["h5"].claim_id, "claim-h5",
+            "claimed: stays"
+        );
+        let notes: Vec<_> = recovered
+            .heads
+            .values()
+            .filter(|head| head.subject == "Messages moved to this pane")
+            .collect();
+        assert_eq!(notes.len(), 1);
+        assert_eq!(notes[0].recipient, new_inbox);
+        assert!(
+            notes[0].body.starts_with("2 waiting message(s)"),
+            "{}",
+            notes[0].body
+        );
+        assert!(notes[0].body.contains("1 message(s)"), "{}", notes[0].body);
+        // The old pane's history says where they went.
+        let mut old_view = crate::app::messages::inbox_snapshot(
+            &recovered,
+            &app.inbox_recipients(&old_pane),
+            "x",
+            None,
+            &|_| false,
+        )
+        .unwrap();
+        app.annotate_moved_heads(&mut old_view, &recovered);
+        let new_public = app.public_pane_for_terminal(&new_pane).unwrap();
+        for state in old_view
+            .head_states
+            .iter()
+            .filter(|state| ["h1", "h2"].contains(&state.stable_id.as_str()))
+        {
+            assert_eq!(state.closed_by.as_deref(), Some("moved"));
+            assert_eq!(state.moved_to.as_deref(), Some(new_public.as_str()));
+        }
+        // Once only: a second stream of the same execution moves nothing more.
+        let records = std::fs::read_to_string(directory.join(crate::mailbox::RECORD_STREAM_FILE))
+            .unwrap()
+            .lines()
+            .count();
+        let mut again = UnixStream::connect(listener.path()).unwrap();
+        again
+            .set_read_timeout(Some(Duration::from_secs(1)))
+            .unwrap();
+        let second = bootstrap(&mut listener, &mut app, &mut again);
+        let second_binding = second["result"]["bindingGeneration"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let snapshot = exchange(
+            &mut listener,
+            &mut app,
+            &mut again,
+            json!({"method":"mailbox.snapshot","bindingGeneration":second_binding,
+                   "params":{"protocol":crate::mailbox_v1::PROTOCOL}}),
+        );
+        assert_eq!(snapshot["ok"], true, "{snapshot}");
+        assert_eq!(
+            std::fs::read_to_string(directory.join(crate::mailbox::RECORD_STREAM_FILE))
+                .unwrap()
+                .lines()
+                .count(),
+            records,
+            "no second move and no second note"
+        );
+        drop(client);
+        drop(again);
         drop(listener);
         std::fs::remove_dir_all(directory).unwrap();
     }

@@ -262,6 +262,14 @@ impl App {
                 "only Pi recipients have a Messages queue",
             );
         }
+        // #181: `--transport mailbox` to a Pi that has not turned Messages on
+        // is refused, never typed and never queued silently.
+        if params.send.transport == Some(crate::api::schema::MessageTransport::Mailbox) {
+            return crate::app::messages::messages_unavailable_json(
+                id,
+                "the Pi in the recipient pane has not turned Messages on (for example no .pi/pi-input-gate.json in its checkout); the message was not queued",
+            );
+        }
         // Typed while older messages still wait in this pane's queue (the
         // typed fallback): never silently; the sender is told how many.
         let queued_ahead = self.unsettled_queue_len(&terminal_id.to_string());

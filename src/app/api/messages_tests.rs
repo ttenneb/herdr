@@ -120,6 +120,16 @@ fn report_session(app: &mut App, ws: usize, pane: crate::layout::PaneId, path: &
 /// Makes the recipient (pane 1) look like this test process's foreground Pi
 /// and attaches a recipient-only Messages stream from this process.
 fn attach_recipient(fixture: &mut Fixture) -> MailboxBootstrapSession {
+    let session = bootstrap_recipient(fixture);
+    // A Pi with Messages on reads its inbox at start (#181: only then is it
+    // a Messages consumer).
+    fixture.app.note_messages_consumer(&session);
+    session
+}
+
+/// The pane-1 Pi opens its bootstrap stream but never reads its inbox (for
+/// example no `.pi/pi-input-gate.json` in its checkout).
+fn bootstrap_recipient(fixture: &mut Fixture) -> MailboxBootstrapSession {
     let pid = std::process::id();
     let terminal_id = fixture.app.state.workspaces[1]
         .terminal_id(fixture.panes[1])
@@ -3767,6 +3777,7 @@ async fn a_partly_written_typed_history_row_is_never_delivered_or_recovered() {
             correlation: None,
             retry_of: None,
             typed_reason: Some("no_messages".into()),
+            moved_from: None,
         }),
         ..scoped_test_head(
             stable_id,
@@ -3882,4 +3893,272 @@ async fn a_partly_written_typed_history_row_is_never_delivered_or_recovered() {
     );
     plain.delivery = None;
     assert!(store.append_typed_history(plain).is_err());
+}
+
+/// #181 (b): a Pi that bootstrapped but never reads its inbox is not a
+/// Messages recipient; a pane whose earlier Pi had Messages queues only for
+/// the 30 s grace, then the heads queued for this Pi are typed in order
+/// through the draft guard, each closed in the same lock so it can never
+/// also be claimed.
+#[tokio::test]
+async fn c181_a_pi_without_messages_never_keeps_a_silent_queue() {
+    let mut fixture = fixture();
+    let key = fixture.terminals[1].clone();
+    let terminal = fixture.app.state.workspaces[1]
+        .terminal_id(fixture.panes[1])
+        .unwrap()
+        .clone();
+    bootstrap_recipient(&mut fixture);
+    assert!(fixture.app.attached_messages_recipient(&key).is_none());
+    assert!(
+        !fixture.app.pane_takes_messages(&key),
+        "a fresh pane: typed"
+    );
+    let refused = prompt_pane(&mut fixture, "must queue", Some(MessageTransport::Mailbox));
+    assert_eq!(
+        refused["error"]["code"], "messages_unavailable",
+        "{refused}"
+    );
+    assert!(
+        refused["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("has not turned Messages on"),
+        "{refused}"
+    );
+
+    // An earlier Pi in this pane had Messages; this one is in its grace.
+    fixture
+        .app
+        .state
+        .terminals
+        .get_mut(&terminal)
+        .unwrap()
+        .messages_capable = true;
+    let pi = fixture.app.foreground_pi_identity(&key).expect("pane Pi");
+    fixture
+        .app
+        .messages_test_process_ages
+        .insert(pi.0, std::time::Duration::from_secs(5));
+    assert!(
+        fixture.app.pane_takes_messages(&key),
+        "within the grace: queued"
+    );
+    let first = prompt_pane(&mut fixture, "first", None);
+    assert_eq!(first["result"]["delivery"]["path"], "mailbox", "{first}");
+    let options = MessageSendOptions {
+        send_new: true,
+        ..Default::default()
+    };
+    fixture
+        .app
+        .route_ordinary_send(&key, &sender(&fixture), plain("second"), &options)
+        .unwrap();
+    // Nothing is converted while the grace lasts.
+    fixture.app.next_unconsumed_queue_scan = None;
+    assert!(!fixture
+        .app
+        .maybe_type_unconsumed_queues(std::time::Instant::now()));
+    let store = crate::mailbox::MailboxStore::open(&fixture.directory).unwrap();
+    let recipients = fixture.app.inbox_recipients(&key);
+
+    // Grace over: typed, in order, held behind the human's draft.
+    fixture
+        .app
+        .messages_test_process_ages
+        .insert(pi.0, std::time::Duration::from_secs(300));
+    assert!(
+        !fixture.app.pane_takes_messages(&key),
+        "after the grace: typed"
+    );
+    human_key(
+        &mut fixture.app,
+        &terminal,
+        crossterm::event::KeyCode::Char('d'),
+    );
+    let before = fixture.app.typed_deferrals.len();
+    fixture.app.next_unconsumed_queue_scan = None;
+    assert!(fixture
+        .app
+        .maybe_type_unconsumed_queues(std::time::Instant::now()));
+    let recovered = store.load().unwrap();
+    let rows: Vec<_> = recovered
+        .heads
+        .values()
+        .filter(|head| {
+            head.delivery
+                .as_ref()
+                .and_then(|delivery| delivery.typed_reason.as_deref())
+                == Some("fallback_30s")
+        })
+        .collect();
+    assert_eq!(rows.len(), 2);
+    for row in &rows {
+        let old = row.moved_from().expect("movedFrom");
+        let claim = &recovered.claims[old];
+        assert!(crate::mailbox::is_withdrawn_claim(claim), "old head closed");
+        assert_eq!(
+            recovered.resolutions[&claim.claim_id].closed_by.as_deref(),
+            Some("typed")
+        );
+    }
+    assert!(
+        store
+            .claim_next_for_execution(&recipients, "pid:9:9")
+            .unwrap()
+            .is_none(),
+        "a typed head can never also be claimed"
+    );
+    let held: Vec<_> = fixture.app.typed_deferrals[before..].to_vec();
+    assert_eq!(
+        held.iter().map(|d| d.text.as_str()).collect::<Vec<_>>(),
+        ["first", "second"],
+        "original order"
+    );
+    assert!(held
+        .iter()
+        .all(|d| d.history_recorded && d.reason == "fallback_30s"));
+    assert!(
+        fixture.rx[1].try_recv().is_err(),
+        "nothing typed over the draft"
+    );
+    // A repeat scan converts nothing more.
+    fixture.app.next_unconsumed_queue_scan = None;
+    assert!(!fixture
+        .app
+        .maybe_type_unconsumed_queues(std::time::Instant::now()));
+    // The pane's history shows each message once, as its typed row.
+    let session = attach_recipient(&mut fixture);
+    let heads = snapshot_heads(&mut fixture.app, &session);
+    let typed_rows = heads
+        .iter()
+        .filter(|head| head["delivery"]["typedReason"] == "fallback_30s")
+        .count();
+    assert_eq!(typed_rows, 2, "{heads:?}");
+    assert!(
+        heads
+            .iter()
+            .all(|head| head["delivery"]["typedReason"] == "fallback_30s"),
+        "the replaced queued heads are not shown: {heads:?}"
+    );
+}
+
+/// #181 (a): a hand-typed (recipient-only) Pi on a session never pulls that
+/// session's messages from another pane.
+#[tokio::test]
+async fn c181_a_hand_typed_pi_never_pulls_another_panes_messages() {
+    let mut fixture = fixture();
+    // A message for session s1-a waits in pane 0's queue.
+    let other = crate::app::messages::pane_recipient(
+        &fixture.app.pane_queue_key(&fixture.terminals[0]).unwrap(),
+    );
+    let store = crate::mailbox::MailboxStore::open(&fixture.directory).unwrap();
+    let mut head = store_head_for(&other, Some("/sessions/s1-a.jsonl"));
+    head.stable_id = "pinned".into();
+    store.append_offline_head(head).unwrap();
+    // Pane 1's hand-typed Pi runs on s1-a and reads its inbox.
+    attach_recipient(&mut fixture);
+    let recovered = store.load().unwrap();
+    assert!(!recovered.claims.contains_key("pinned"), "not moved");
+    assert!(!recovered
+        .heads
+        .values()
+        .any(|head| head.moved_from().is_some()));
+}
+
+fn store_head_for(
+    recipient: &crate::mailbox::RecipientKey,
+    session: Option<&str>,
+) -> crate::mailbox::MailboxHead {
+    crate::mailbox::MailboxHead {
+        stable_id: "h".into(),
+        revision: 1,
+        digest: "a".repeat(64),
+        delivery_digest: "b".repeat(64),
+        recipient: recipient.clone(),
+        subject: "s".into(),
+        body: "b".into(),
+        recipient_generation: "1".into(),
+        sender: "external:1".into(),
+        target: recipient.recipient_id.clone(),
+        grant_id: "g".into(),
+        message_id: "m".into(),
+        kind: "advisory".into(),
+        priority: "normal".into(),
+        original_sequence: 1,
+        enqueue_epoch: 0,
+        accepted_at: 1,
+        delivery: Some(crate::mailbox::ServerDelivery {
+            origin: "agent_prompt".into(),
+            sender_label: "pm".into(),
+            sender_session: None,
+            recipient_session: session.map(str::to_string),
+            correlation: None,
+            retry_of: None,
+            typed_reason: None,
+            moved_from: None,
+        }),
+    }
+}
+
+/// #181 store: close-then-replace is one lock section, idempotent, repairs
+/// a crash between its two writes, and never replaces a claimed head.
+#[test]
+fn c181_supersede_is_once_repairs_a_crash_gap_and_loses_to_a_claim() {
+    let directory = unique_dir();
+    let store = crate::mailbox::MailboxStore::open(&directory).unwrap();
+    let old = crate::app::messages::pane_recipient("old");
+    let new = crate::app::messages::pane_recipient("new");
+    let mut head = store_head_for(&old, Some("/s.jsonl"));
+    head.stable_id = "h".into();
+    store.append_offline_head(head.clone()).unwrap();
+    let copy = |id: &str| {
+        let mut copy = store_head_for(&new, Some("/s.jsonl"));
+        copy.stable_id = id.into();
+        copy.delivery_digest = crate::app::messages::sha256_fields(&[id.as_bytes()]);
+        copy.delivery.as_mut().unwrap().moved_from = Some("h".into());
+        copy
+    };
+    let journal = directory.join(crate::mailbox::RECORD_STREAM_FILE);
+    let lines = || std::fs::read_to_string(&journal).unwrap().lines().count();
+    store
+        .supersede_unclaimed_head("h", 1, &head.digest, "moved", copy("moved.a"))
+        .unwrap();
+    let after = lines();
+    store
+        .supersede_unclaimed_head("h", 1, &head.digest, "moved", copy("moved.a"))
+        .unwrap();
+    assert_eq!(lines(), after, "a repeat appends nothing");
+    // Crash after the close, before the copy: drop the copy's head+receipt.
+    let text = std::fs::read_to_string(&journal).unwrap();
+    let kept: Vec<&str> = text.lines().take(after - 2).collect();
+    std::fs::write(&journal, kept.join("\n") + "\n").unwrap();
+    assert!(!store.load().unwrap().heads.contains_key("moved.a"));
+    store
+        .supersede_unclaimed_head("h", 1, &head.digest, "moved", copy("moved.a"))
+        .unwrap();
+    let recovered = store.load().unwrap();
+    assert!(recovered.heads.contains_key("moved.a"), "repaired");
+    assert_eq!(lines(), after, "exactly one close and one copy");
+    // A differently-closed or claimed head is never replaced.
+    let mut claimed = store_head_for(&old, Some("/s.jsonl"));
+    claimed.stable_id = "c".into();
+    claimed.delivery_digest = "c".repeat(64);
+    store.append_offline_head(claimed.clone()).unwrap();
+    store
+        .claim(crate::mailbox::Claim {
+            claim_id: "claim-c".into(),
+            recipient: old.clone(),
+            stable_id: "c".into(),
+            revision: 1,
+            digest: claimed.digest.clone(),
+            execution: Some("pid:1:1".into()),
+        })
+        .unwrap();
+    assert_eq!(
+        store.supersede_unclaimed_head("c", 1, &claimed.digest, "moved", copy("moved.c")),
+        Err(crate::mailbox::MailboxError::HeadClaimed)
+    );
+    assert!(!store.load().unwrap().heads.contains_key("moved.c"));
+    std::fs::remove_dir_all(directory).unwrap();
 }

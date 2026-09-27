@@ -152,6 +152,10 @@ pub struct HeadState {
     /// run: `dropped` or `retried`. Kept in history.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub closed_by: Option<String>,
+    /// #181: for a head closed `moved`: the pane its copy went to (current
+    /// public pane ID, or `a closed pane`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub moved_to: Option<String>,
 }
 
 pub fn snapshot(
@@ -237,6 +241,7 @@ pub fn snapshot(
                     recovery_needed: false,
                     claim_execution_alive: None,
                     closed_by: Some("typed".into()),
+                    moved_to: None,
                 };
             }
             let claim = recovered.claims.get(&head.stable_id);
@@ -262,6 +267,7 @@ pub fn snapshot(
                 recovery_needed: false,
                 claim_execution_alive: None,
                 closed_by: resolution.and_then(|resolution| resolution.closed_by.clone()),
+                moved_to: None,
             }
         })
         .collect();

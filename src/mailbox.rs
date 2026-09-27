@@ -79,6 +79,12 @@ pub struct ServerDelivery {
     /// `closedBy:"typed"` and is never claimable.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub typed_reason: Option<String>,
+    /// #181: set on a head that replaces an earlier held head: the copy made
+    /// when a message followed its agent's session to another pane, or the
+    /// typed-history row of a queued head typed after the 30 s fallback. The
+    /// earlier head's stable ID. Older builds ignore it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub moved_from: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
@@ -99,6 +105,15 @@ pub fn is_typed_history(head: &MailboxHead) -> bool {
     head.delivery
         .as_ref()
         .is_some_and(|delivery| delivery.typed_reason.is_some())
+}
+
+impl MailboxHead {
+    /// #181: the head this one replaces (`delivery.movedFrom`).
+    pub fn moved_from(&self) -> Option<&str> {
+        self.delivery
+            .as_ref()
+            .and_then(|delivery| delivery.moved_from.as_deref())
+    }
 }
 
 pub fn is_withdrawn_claim(claim: &Claim) -> bool {
@@ -943,6 +958,111 @@ impl MailboxStore {
                     closed_by: Some("dropped".into()),
                 },
             })
+        })
+    }
+
+    /// #181: closes one held, unclaimed head and appends its replacement, in
+    /// one exclusive-lock section, so the head is either claimed by its old
+    /// pane or replaced, never both. The old head is closed with the Drop
+    /// records (a `withdrawn:` claim settled with `closed_by`), which every
+    /// older build reads as dropped; the replacement is an ordinary held head
+    /// (a moved copy) or a settled typed-history row. Closing comes first: a
+    /// crash between the two leaves the replacement to [`Self::supersede`]'s
+    /// idempotent repeat, never a second delivery. Repeats are no-ops.
+    pub fn supersede_unclaimed_head(
+        &self,
+        stable_id: &str,
+        revision: u64,
+        digest: &str,
+        closed_by: &str,
+        mut replacement: MailboxHead,
+    ) -> Result<(), MailboxError> {
+        let typed = is_typed_history(&replacement);
+        self.with_exclusive_lock(|| {
+            let recovered = self.load()?;
+            let head = recovered
+                .heads
+                .get(stable_id)
+                .ok_or(MailboxError::EditConflict)?;
+            let claim_id = format!("{WITHDRAWN_CLAIM_PREFIX}{stable_id}");
+            match recovered.claims.get(stable_id) {
+                None => {
+                    if head.revision != revision || head.digest != digest {
+                        return Err(MailboxError::EditConflict);
+                    }
+                    let claim = Claim {
+                        claim_id: claim_id.clone(),
+                        recipient: head.recipient.clone(),
+                        stable_id: head.stable_id.clone(),
+                        revision: head.revision,
+                        digest: head.digest.clone(),
+                        execution: None,
+                    };
+                    self.append_synced(&MailboxRecord::Claim { claim })?;
+                    self.append_synced(&MailboxRecord::Resolution {
+                        resolution: ClaimResolution {
+                            claim_id: claim_id.clone(),
+                            outcome: ClaimResolutionOutcome::Settled,
+                            closed_by: Some(closed_by.into()),
+                        },
+                    })?;
+                }
+                // Our own earlier close (a repeat, or repair after a crash
+                // between the two appends): only the replacement may be missing.
+                Some(claim)
+                    if claim.claim_id == claim_id
+                        && recovered
+                            .resolutions
+                            .get(&claim_id)
+                            .and_then(|resolution| resolution.closed_by.as_deref())
+                            == Some(closed_by) => {}
+                Some(_) => return Err(MailboxError::HeadClaimed),
+            }
+            if let Some(existing) = recovered.heads.get(&replacement.stable_id) {
+                return if existing.moved_from() == Some(stable_id) {
+                    Ok(())
+                } else {
+                    Err(MailboxError::ConflictingDuplicate)
+                };
+            }
+            replacement.enqueue_epoch = recovered
+                .heads
+                .values()
+                .map(|existing| existing.enqueue_epoch)
+                .max()
+                .unwrap_or(0)
+                .checked_add(1)
+                .ok_or(MailboxError::InvalidRecord)?;
+            validate_head(&replacement)?;
+            let receipt = AdmissionReceipt {
+                delivery_digest: replacement.delivery_digest.clone(),
+                stable_id: replacement.stable_id.clone(),
+                revision: replacement.revision,
+                digest: replacement.digest.clone(),
+                status: ReceiptStatus::Admitted,
+            };
+            let typed_claim = typed.then(|| Claim {
+                claim_id: format!("typed:{}", replacement.stable_id),
+                recipient: replacement.recipient.clone(),
+                stable_id: replacement.stable_id.clone(),
+                revision: replacement.revision,
+                digest: replacement.digest.clone(),
+                execution: None,
+            });
+            self.append_synced(&MailboxRecord::Head { head: replacement })?;
+            self.append_synced(&MailboxRecord::Receipt { receipt })?;
+            if let Some(claim) = typed_claim {
+                let claim_id = claim.claim_id.clone();
+                self.append_synced(&MailboxRecord::Claim { claim })?;
+                self.append_synced(&MailboxRecord::Resolution {
+                    resolution: ClaimResolution {
+                        claim_id,
+                        outcome: ClaimResolutionOutcome::Settled,
+                        closed_by: Some("typed".into()),
+                    },
+                })?;
+            }
+            Ok(())
         })
     }
 

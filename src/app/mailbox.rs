@@ -1396,7 +1396,8 @@ impl App {
             };
             self.mailbox_bootstrap_bindings
                 .insert(binding_generation, session.clone());
-            self.mark_pane_messages_capable(&session.caller);
+            // #181: Messages-capable only once this stream reads its inbox
+            // (`note_messages_consumer`), not at bootstrap.
             return Ok(session);
         }
         Err(MailboxBootstrapError::PeerRejected)
@@ -1429,7 +1430,7 @@ impl App {
                 .is_some_and(|birth| birth.start_ticks == binding.start_ticks)
     }
 
-    fn mark_pane_messages_capable(&mut self, terminal_key: &str) {
+    pub(super) fn mark_pane_messages_capable(&mut self, terminal_key: &str) {
         // Remember that this exact Pi process attached (the typed fallback
         // never applies to it, even while its stream reconnects).
         if let Some(pi) = self.foreground_pi_identity(terminal_key) {
@@ -1483,12 +1484,15 @@ impl App {
         let Some(session) = self.mailbox_bootstrap_bindings.remove(binding_generation) else {
             return;
         };
-        // The pane's Pi closed its last stream: remember when, so a Pi whose
-        // Messages extension died falls back to typed input after 30 s.
-        let still_open = self
-            .mailbox_bootstrap_bindings
-            .values()
-            .any(|other| other.caller == session.caller);
+        self.messages_consumer_bindings.remove(binding_generation);
+        // The pane's Pi closed its last consuming stream: remember when, so a
+        // Pi whose Messages extension died falls back to typed input after 30 s.
+        let still_open = self.mailbox_bootstrap_bindings.values().any(|other| {
+            other.caller == session.caller
+                && self
+                    .messages_consumer_bindings
+                    .contains(&other.binding_generation)
+        });
         if !still_open {
             let pi = session
                 .recipient_only
@@ -1594,7 +1598,8 @@ impl App {
             };
             self.mailbox_bootstrap_bindings
                 .insert(binding_generation, session.clone());
-            self.mark_pane_messages_capable(&session.caller);
+            // #181: Messages-capable only once this stream reads its inbox
+            // (`note_messages_consumer`), not at bootstrap.
             return Ok(session);
         }
         Err(MailboxBootstrapError::PeerRejected)
@@ -1748,6 +1753,7 @@ impl App {
             &|execution| self.execution_alive(execution, &session.caller),
         )
         .map_err(|_| MailboxBootstrapError::GrantMissing)?;
+        self.annotate_moved_heads(&mut snapshot, &recovered);
         let settled: std::collections::HashSet<_> = snapshot
             .head_states
             .iter()

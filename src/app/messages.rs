@@ -28,6 +28,7 @@ pub(crate) fn retry_head(head: &MailboxHead, claim: &crate::mailbox::Claim) -> M
         correlation: None,
         retry_of: None,
         typed_reason: None,
+        moved_from: None,
     });
     delivery.retry_of = Some(head.stable_id.clone());
     MailboxHead {
@@ -112,13 +113,14 @@ pub(crate) fn human_self_head(
             correlation: None,
             retry_of: None,
             typed_reason: None,
+            moved_from: None,
         }),
     })
 }
 
 /// Pi's per-head limits for the Messages path; larger sends use the PTY path.
 const MAX_SUBJECT_BYTES: usize = 160;
-const MAX_BODY_BYTES: usize = 16_384;
+pub(crate) const MAX_BODY_BYTES: usize = 16_384;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct SenderAttribution {
@@ -245,7 +247,20 @@ pub(crate) fn inbox_snapshot(
             .get(&state.stable_id)
             .is_some_and(is_withdrawn_claim)
         {
-            state.closed_by = Some("dropped".into());
+            // #181: a withdrawn head closed `moved` (its copy is in another
+            // pane) or `typed` (its typed-history row replaces it); any other
+            // withdrawn head is the recipient's Drop.
+            let closed = recovered
+                .claims
+                .get(&state.stable_id)
+                .and_then(|claim| recovered.resolutions.get(&claim.claim_id))
+                .and_then(|resolution| resolution.closed_by.as_deref());
+            state.closed_by = Some(
+                closed
+                    .filter(|by| matches!(*by, "moved" | "typed"))
+                    .unwrap_or("dropped")
+                    .into(),
+            );
             state.claim_execution = None;
             continue;
         }
@@ -283,6 +298,31 @@ pub(crate) fn inbox_snapshot(
                 crate::mailbox_v1::HeadLifecycle::Claimed
                     | crate::mailbox_v1::HeadLifecycle::Admitted
             );
+    }
+    // A queued head typed after the 30 s fallback is shown once, as its
+    // typed-history row.
+    let replaced: std::collections::HashSet<String> = out
+        .head_states
+        .iter()
+        .filter(|state| {
+            state.closed_by.as_deref() == Some("typed")
+                && recovered
+                    .claims
+                    .get(&state.stable_id)
+                    .is_some_and(is_withdrawn_claim)
+        })
+        .map(|state| state.stable_id.clone())
+        .collect();
+    if !replaced.is_empty() {
+        let (heads, states): (Vec<_>, Vec<_>) = std::mem::take(&mut out.heads)
+            .into_iter()
+            .zip(std::mem::take(&mut out.head_states))
+            .filter(|(head, _)| !replaced.contains(&head.stable_id))
+            .unzip();
+        out.heads = heads;
+        out.head_states = states;
+        out.receipts
+            .retain(|receipt| !replaced.contains(&receipt.stable_id));
     }
     out.claim = out
         .head_states
@@ -349,7 +389,7 @@ pub(crate) fn filter_recipient_snapshot(
     snapshot
 }
 
-fn now_secs() -> u64 {
+pub(crate) fn now_secs() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|elapsed| elapsed.as_secs())
@@ -357,7 +397,7 @@ fn now_secs() -> u64 {
         .max(1)
 }
 
-fn sha256_fields(fields: &[&[u8]]) -> String {
+pub(crate) fn sha256_fields(fields: &[&[u8]]) -> String {
     use sha2::{Digest as _, Sha256};
     let mut hasher = Sha256::new();
     for value in fields {
@@ -449,6 +489,7 @@ pub(crate) fn append_typed_history(
             correlation: None,
             retry_of: None,
             typed_reason: Some(reason.to_string()),
+            moved_from: None,
         }),
     };
     store
@@ -751,7 +792,7 @@ impl App {
         true
     }
 
-    fn pi_process_age(&self, pid: u32, start_ticks: u64) -> Option<std::time::Duration> {
+    pub(super) fn pi_process_age(&self, pid: u32, start_ticks: u64) -> Option<std::time::Duration> {
         #[cfg(not(test))]
         let _ = pid;
         #[cfg(test)]
@@ -1063,10 +1104,18 @@ impl App {
 
     /// The server-issued recipient key of a live, current, non-history
     /// Messages stream for this terminal, if any.
+    /// #181: only a stream that has read its own inbox (`mailbox.watch`,
+    /// `mailbox.snapshot` or `mailbox.claim`) counts. A Pi that bootstrapped
+    /// for reports or sender authority but runs no inbox consumer (for
+    /// example no `.pi/pi-input-gate.json` in its checkout) is not attached.
     pub(crate) fn attached_messages_recipient(&self, terminal_id: &str) -> Option<RecipientKey> {
         self.mailbox_bootstrap_bindings
             .values()
             .filter(|session| session.caller == terminal_id && !session.history_only)
+            .filter(|session| {
+                self.messages_consumer_bindings
+                    .contains(&session.binding_generation)
+            })
             .find(|session| self.mailbox_bootstrap_session_current(session).is_ok())
             .map(|session| session.recipient.clone())
     }
@@ -1142,6 +1191,14 @@ impl App {
             .filter(|_| self.pane_takes_messages(recipient_terminal))
         else {
             return match transport {
+                // #181: a live Pi that has not turned Messages on is named.
+                MessageTransport::Mailbox
+                    if self.foreground_pi_identity(recipient_terminal).is_some() =>
+                {
+                    Err(SendRefusal::MailboxUnavailable(
+                        "the Pi in the recipient pane has not turned Messages on (for example no .pi/pi-input-gate.json in its checkout); the message was not queued",
+                    ))
+                }
                 MessageTransport::Mailbox => Err(SendRefusal::MailboxUnavailable(
                     "the recipient pane is not a Pi pane",
                 )),
@@ -1338,6 +1395,7 @@ impl App {
                 correlation: message.correlation,
                 retry_of: None,
                 typed_reason: None,
+                moved_from: None,
             }),
         };
         let receipt = store

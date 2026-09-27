@@ -21,6 +21,7 @@ mod git_refresh;
 mod ids;
 mod input;
 mod mailbox;
+pub(crate) mod message_follow;
 pub(crate) mod messages;
 pub(crate) use mailbox::{MailboxBootstrapError, MailboxBootstrapSession};
 pub(crate) mod pane_graphics;
@@ -198,6 +199,11 @@ pub struct App {
     /// Pi processes (PID, birth tick) that attached a Messages stream, with
     /// when their last stream closed (None while one is open). Runtime only.
     pub(crate) messages_attached_pis: HashMap<(u32, u64), Option<Instant>>,
+    /// #181: bootstrap bindings that have read their own inbox (a Messages
+    /// consumer), by binding generation. Runtime only.
+    pub(crate) messages_consumer_bindings: std::collections::HashSet<String>,
+    /// #181: next scan for queued heads of a live Pi without Messages.
+    pub(crate) next_unconsumed_queue_scan: Option<Instant>,
     pub event_tx: mpsc::Sender<AppEvent>,
     pub(crate) event_rx: mpsc::Receiver<AppEvent>,
     pub(crate) api_rx: tokio::sync::mpsc::UnboundedReceiver<crate::api::ApiRequestMessage>,
@@ -972,6 +978,8 @@ impl App {
             #[cfg(test)]
             messages_test_live_executions: std::collections::HashSet::new(),
             messages_attached_pis: HashMap::new(),
+            messages_consumer_bindings: std::collections::HashSet::new(),
+            next_unconsumed_queue_scan: None,
             event_tx,
             event_rx,
             last_git_remote_status_refresh: Instant::now() - GIT_REMOTE_STATUS_REFRESH_INTERVAL,

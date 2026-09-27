@@ -61,6 +61,10 @@ impl App {
         if session.history_only {
             return Err(MailboxBootstrapError::GrantRevoked);
         }
+        if matches!(method, "mailbox.snapshot" | "mailbox.claim") {
+            // #181: reading its own inbox makes this stream a Messages consumer.
+            self.note_messages_consumer(session);
+        }
         if let Some(result) = self.dispatch_recipient_inbox(session, method, &params) {
             return result;
         }
@@ -448,14 +452,16 @@ impl App {
                     .is_some_and(|owner| live_others.contains(owner))
             };
             let view = |recovered: &crate::mailbox::RecoveredMailbox| {
-                crate::app::messages::inbox_snapshot(
+                let mut snapshot = crate::app::messages::inbox_snapshot(
                     recovered,
                     &recipients,
                     &execution,
                     current.as_deref(),
                     &|owner| live_others.contains(owner),
                 )
-                .map_err(|_| MailboxBootstrapError::GrantMissing)
+                .map_err(|_| MailboxBootstrapError::GrantMissing)?;
+                self.annotate_moved_heads(&mut snapshot, recovered);
+                Ok(snapshot)
             };
             // Scope: a head (or claim) that exists outside this pane's own
             // inbox is refused with a distinct error and never touched.

@@ -5160,6 +5160,7 @@ impl HeadlessServer {
         changed |= self.app.handle_pane_wake_deadlines(now);
         changed |= self.app.flush_typed_deferrals(now);
         changed |= self.app.maybe_sweep_sleeping_backlog(now);
+        changed |= self.app.maybe_type_unconsumed_queues(now);
         changed |= self.app.retry_pending_managed_resumes(now);
         changed |= self.app.retry_route_carries(now);
 
